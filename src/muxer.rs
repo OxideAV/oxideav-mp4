@@ -147,10 +147,10 @@ pub fn open_mov(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Bo
 /// (major=`iso4`, compatible=`iso4 piff iso6 isml`). Registered under the
 /// `"ismv"` name.
 ///
-/// NOTE: real ISMV requires fragmentation; until the fragmentation agent
-/// wires `frag_keyframe` on for this preset, the file is structurally a
-/// non-fragmented MP4 with an ISMV ftyp brand. Most Smooth Streaming clients
-/// will reject it, but the layout is still a valid ISOBMFF.
+/// NOTE: real ISMV requires fragmentation (moof/mfra), which this crate
+/// does not yet emit; the file is structurally a non-fragmented MP4 with
+/// an ISMV ftyp brand. Most Smooth Streaming clients will reject it, but
+/// the layout is still a valid ISOBMFF.
 pub fn open_ismv(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
     let opts = Mp4MuxerOptions {
         brand: BrandPreset::Ismv,

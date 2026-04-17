@@ -93,15 +93,25 @@ the file is streamable from the first byte.
 
 ### Demuxer
 
-- Sample-entry FourCCs recognised: `mp4a`, `fLaC`/`flac`, `Opus`/`opus`,
-  `alac`, `avc1`/`avc3`, `hvc1`/`hev1`, `vp08`, `vp09`, `av01`,
-  `jpeg`/`mjpa`/`mjpb`, `mp4v`, `s263`/`h263`, `lpcm`/`sowt`/`twos`.
-  Unknown FourCCs are surfaced as `CodecId("mp4:xxxx")` so callers can
-  plug their own decoders.
-- `mp4a` / `mp4v` disambiguation: when an `esds` box is present the
-  MPEG-4 `objectTypeIndication` byte is consulted to pick the concrete
-  codec id (e.g. `mp3`, `aac`, `mpeg1video`, `mpeg2video`,
-  `mpeg4video`).
+Sample-entry FourCCs resolve to these codec ids:
+
+| FourCC                   | Codec id                                |
+|--------------------------|-----------------------------------------|
+| `mp4a`                   | `aac` (default) or `mp3` via esds OTI   |
+| `mp4v`                   | `mpeg4video` (default); esds OTI refines to `mpeg1video`, `mpeg2video`, `h264`, `h265`, `mjpeg` |
+| `alac`                   | `alac`                                  |
+| `fLaC` / `flac`          | `flac`                                  |
+| `Opus` / `opus`          | `opus`                                  |
+| `avc1` / `avc3`          | `h264`                                  |
+| `hvc1` / `hev1`          | `h265`                                  |
+| `vp08`                   | `vp8`                                   |
+| `vp09`                   | `vp9`                                   |
+| `av01`                   | `av1`                                   |
+| `jpeg` / `mjpa` / `mjpb` | `mjpeg`                                 |
+| `s263` / `h263`          | `h263`                                  |
+| `lpcm` / `sowt` / `twos` | `pcm_s16le` (endianness of `twos` is not re-swapped) |
+| any other                | `mp4:<fourcc>` — callers can register their own decoder |
+
 - Codec-specific config records (`avcC`, `hvcC`, `av1C`, `vpcC`,
   `dfLa`, `dOps`, esds DSI) are forwarded as `extradata`.
 - Sample-table expansion: `stts`, `stsc`, `stsz`/`stz2`, `stco`/`co64`,
@@ -117,10 +127,17 @@ Only codecs with an `mp4` sample-entry packaging are accepted. Codec
 knowledge is confined to `sample_entries::sample_entry_for`; the rest
 of the muxer appends opaque packet bytes.
 
-Currently encoded at `write_header` time: `pcm_s16le` (`sowt`),
-`flac` (`fLaC` + `dfLa`), `aac` (`mp4a` + `esds`), `h264` (`avc1` +
-`avcC`), `mjpeg` (`jpeg`). Other codec ids fail with
-`Error::Unsupported` at open, never at `write_packet` time.
+Supported encode codec ids (produced sample entry FourCC in
+parentheses):
+
+- `pcm_s16le` → `sowt`
+- `flac` → `fLaC` with `dfLa` config (requires STREAMINFO extradata)
+- `aac` → `mp4a` with `esds` (requires AudioSpecificConfig extradata)
+- `h264` → `avc1` with `avcC` (requires AVCConfigurationRecord extradata)
+- `mjpeg` → `jpeg`
+
+Other codec ids fail with `Error::Unsupported` at `open`, never at
+`write_packet` time.
 
 Chunk offsets auto-promote from `stco` (32-bit) to `co64` (64-bit) when
 any offset exceeds 4 GiB. The mdat box header stays 32-bit — files
@@ -128,14 +145,14 @@ whose mdat payload exceeds 4 GiB fail at `write_trailer`.
 
 ### Not (yet) supported
 
-- Fragmented MP4 (moof / mfra / trun). The `frag_keyframe`,
-  `empty_moov`, `delay_moov`, and `fragment_duration_ms` knobs exist on
-  `Mp4MuxerOptions` but are no-ops — the muxer emits a single `moov`
-  per file.
+- Fragmented MP4 (moof / mfra / trun). The muxer emits a single `moov`
+  per file; the demuxer ignores `moof` / `trun` entirely.
 - Edit lists (`elst`) on demux or mux.
 - Sample groups (`sbgp`/`sgpd`), subtitle tracks, DRM (`sinf`/`pssh`).
 - Multiple sample descriptions per track (only the first entry of
   `stsd` is used).
+- mdat payloads larger than 4 GiB (the 32-bit box header is not
+  promoted to `largesize`).
 
 ## Container registry
 

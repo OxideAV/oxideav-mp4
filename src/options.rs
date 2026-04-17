@@ -1,10 +1,10 @@
 //! Muxer configuration for the MP4 / ISOBMFF writer.
 //!
 //! The default [`Mp4MuxerOptions`] matches what `muxer::open` has always done:
-//! major brand `mp42`, no faststart, no fragmentation. Three convenience
-//! presets are provided via [`BrandPreset`] for the common `mp4`, `mov`, and
-//! `ismv` registry entries; a `Custom` variant lets callers supply any major
-//! + compatible brand list directly.
+//! major brand `mp42`, no faststart. Three convenience presets are provided
+//! via [`BrandPreset`] for the common `mp4`, `mov`, and `ismv` registry
+//! entries; a `Custom` variant lets callers supply any major + compatible
+//! brand list directly.
 
 /// Brand preset controlling the `ftyp` box written at the start of the file.
 ///
@@ -23,10 +23,9 @@ pub enum BrandPreset {
     Mov,
     /// Microsoft Smooth Streaming / ISMV — `major=iso4`, compatible=`iso4 piff iso6 isml`.
     ///
-    /// NOTE: real ISMV requires fragmentation (moof/mfra); our muxer currently
-    /// emits a non-fragmented layout. The fragmentation agent will wire
-    /// `frag_keyframe` on for this preset later. For now, the file is
-    /// structurally an MP4 with an ISMV ftyp brand.
+    /// NOTE: real ISMV requires fragmentation (moof/mfra), which this crate
+    /// does not yet emit; the file is structurally a non-fragmented MP4 with
+    /// an ISMV ftyp brand. Most Smooth Streaming clients will reject it.
     Ismv,
     /// Custom brand with an explicit major + compatible list.
     Custom {
@@ -60,7 +59,7 @@ impl BrandPreset {
 /// Runtime options controlling how the MP4 muxer shapes its output.
 ///
 /// Call [`Mp4MuxerOptions::default`] for the historical behavior of the
-/// plain `"mp4"` registry entry (major=`mp42`, no faststart, no frag).
+/// plain `"mp4"` registry entry (major=`mp42`, no faststart).
 #[derive(Clone, Debug)]
 pub struct Mp4MuxerOptions {
     /// `ftyp` brand preset written at the beginning of the file.
@@ -69,22 +68,6 @@ pub struct Mp4MuxerOptions {
     /// `mdat` ("faststart" / "web-optimized" layout). Requires a seekable
     /// output (which `WriteSeek` already provides).
     pub faststart: bool,
-
-    // --- Fragmentation flags (owned by another agent) ----------------------
-    // These are kept in the struct so the API is stable; defaults are all
-    // `false` / sensible no-ops until the fragmentation state machine is
-    // implemented.
-    //
-    /// TODO(fragmentation-agent): emit a new fragment whenever a keyframe arrives.
-    pub frag_keyframe: bool,
-    /// TODO(fragmentation-agent): initial `moov` contains no samples (all data
-    /// lives in moof fragments).
-    pub empty_moov: bool,
-    /// TODO(fragmentation-agent): delay writing `moov` until the first
-    /// fragment is finalised.
-    pub delay_moov: bool,
-    /// TODO(fragmentation-agent): target fragment duration in milliseconds.
-    pub fragment_duration_ms: u32,
 }
 
 impl Default for Mp4MuxerOptions {
@@ -92,10 +75,6 @@ impl Default for Mp4MuxerOptions {
         Self {
             brand: BrandPreset::Mp4,
             faststart: false,
-            frag_keyframe: false,
-            empty_moov: false,
-            delay_moov: false,
-            fragment_duration_ms: 2000,
         }
     }
 }
