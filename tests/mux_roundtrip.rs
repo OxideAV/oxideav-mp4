@@ -985,3 +985,232 @@ fn seek_to_nearest_keyframe() {
     let landed = dmx.seek_to(0, i64::MAX / 2).unwrap();
     assert_eq!(landed, (total_packets as i64 - 1) * frames_per_packet);
 }
+
+// --- OTI-based codec dispatch --------------------------------------------
+
+/// Build a minimal but fully-valid mp4 file where the only track uses the
+/// `mp4a` sample entry with an `esds` box whose `objectTypeIndication`
+/// picks `mpeg1_audio` (0x6B). This is the on-disk shape that MP4s carrying
+/// MP3 audio use; the demuxer should resolve it to `CodecId("mp3")`
+/// rather than the default `CodecId("aac")`.
+fn build_mp4_with_mp4a_oti(oti: u8) -> Vec<u8> {
+    fn box_be(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let total = (8 + body.len()) as u32;
+        let mut out = Vec::with_capacity(total as usize);
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+    fn u32be(x: u32) -> [u8; 4] {
+        x.to_be_bytes()
+    }
+    fn u16be(x: u16) -> [u8; 2] {
+        x.to_be_bytes()
+    }
+
+    // ftyp
+    let mut ftyp_body = Vec::new();
+    ftyp_body.extend_from_slice(b"mp42");
+    ftyp_body.extend_from_slice(&u32be(0x0000_0200));
+    ftyp_body.extend_from_slice(b"isom");
+    ftyp_body.extend_from_slice(b"mp42");
+    let ftyp = box_be(b"ftyp", &ftyp_body);
+
+    // mdat (just one byte payload — demuxer only cares about the track tables).
+    let mdat = box_be(b"mdat", &[0x00]);
+    let mdat_payload_offset: u32 = (ftyp.len() + 8) as u32;
+
+    // esds body: FullBox (4 bytes) + ES_Descriptor(0x03) { ES_ID u16 + flags u8
+    //   + DecoderConfigDescriptor(0x04) {
+    //       objectTypeIndication u8, streamType+flags u8,
+    //       bufferSizeDB u24, maxBitrate u32, avgBitrate u32,
+    //       DecoderSpecificInfo(0x05) — we leave this empty for the synthetic test.
+    //     }
+    //   + SLConfigDescriptor(0x06) { predefined=0x02 }
+    // }
+    // We use single-byte BER length encodings throughout.
+    let dcd_body = {
+        let mut v = Vec::new();
+        v.push(oti); // objectTypeIndication
+        v.push((0x05u8 << 2) | 0x01); // streamType=audio(5), upstream=0, reserved=1
+        v.extend_from_slice(&[0, 0, 0]); // bufferSizeDB (u24)
+        v.extend_from_slice(&[0, 0, 0, 0]); // maxBitrate
+        v.extend_from_slice(&[0, 0, 0, 0]); // avgBitrate
+        v
+    };
+    let mut dcd = vec![0x04u8, dcd_body.len() as u8];
+    dcd.extend_from_slice(&dcd_body);
+
+    let slc = vec![0x06u8, 0x01, 0x02];
+
+    let mut esd = Vec::new();
+    esd.push(0x03); // ES_Descriptor tag
+    let esd_body_len = 3 + dcd.len() + slc.len();
+    esd.push(esd_body_len as u8);
+    esd.extend_from_slice(&[0, 0, 0]); // ES_ID (u16) + flags (u8)
+    esd.extend_from_slice(&dcd);
+    esd.extend_from_slice(&slc);
+
+    let mut esds_body = vec![0u8, 0, 0, 0]; // FullBox version + flags
+    esds_body.extend_from_slice(&esd);
+    let esds = box_be(b"esds", &esds_body);
+
+    // mp4a sample entry: 28-byte AudioSampleEntryV0 preamble + esds.
+    let mut mp4a_body = Vec::new();
+    mp4a_body.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // 6 bytes reserved
+    mp4a_body.extend_from_slice(&u16be(1)); // data_reference_index
+    mp4a_body.extend_from_slice(&[0u8; 8]); // reserved
+    mp4a_body.extend_from_slice(&u16be(1)); // channel_count
+    mp4a_body.extend_from_slice(&u16be(16)); // sample_size
+    mp4a_body.extend_from_slice(&[0u8; 4]); // pre_defined + reserved
+    mp4a_body.extend_from_slice(&u32be(44_100 << 16)); // sample_rate 16.16
+    mp4a_body.extend_from_slice(&esds);
+    let mp4a = box_be(b"mp4a", &mp4a_body);
+
+    // stsd: FullBox + entry_count(u32=1) + mp4a sample entry.
+    let mut stsd_body = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+    stsd_body.extend_from_slice(&mp4a);
+    let stsd = box_be(b"stsd", &stsd_body);
+
+    // stts: 1 entry (1 sample, delta=1).
+    let mut stts_body = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+    stts_body.extend_from_slice(&u32be(1));
+    stts_body.extend_from_slice(&u32be(1));
+    let stts = box_be(b"stts", &stts_body);
+
+    // stsc: 1 entry — chunk 1 has 1 sample, sample desc idx 1.
+    let mut stsc_body = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+    stsc_body.extend_from_slice(&u32be(1));
+    stsc_body.extend_from_slice(&u32be(1));
+    stsc_body.extend_from_slice(&u32be(1));
+    let stsc = box_be(b"stsc", &stsc_body);
+
+    // stsz: uniform size = 1 byte per sample.
+    let mut stsz_body = vec![0u8, 0, 0, 0];
+    stsz_body.extend_from_slice(&u32be(1)); // uniform
+    stsz_body.extend_from_slice(&u32be(1)); // count
+    let stsz = box_be(b"stsz", &stsz_body);
+
+    // stco: 1 entry pointing at mdat payload start.
+    let mut stco_body = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+    stco_body.extend_from_slice(&u32be(mdat_payload_offset));
+    let stco = box_be(b"stco", &stco_body);
+
+    // stbl
+    let mut stbl_body = Vec::new();
+    stbl_body.extend_from_slice(&stsd);
+    stbl_body.extend_from_slice(&stts);
+    stbl_body.extend_from_slice(&stsc);
+    stbl_body.extend_from_slice(&stsz);
+    stbl_body.extend_from_slice(&stco);
+    let stbl = box_be(b"stbl", &stbl_body);
+
+    // dref: FullBox + count=1 + url " (flags=1, self-contained)
+    let mut dref_body = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+    let url_box = box_be(b"url ", &[0u8, 0, 0, 1]);
+    dref_body.extend_from_slice(&url_box);
+    let dref = box_be(b"dref", &dref_body);
+    let dinf = box_be(b"dinf", &dref);
+
+    // smhd (FullBox)
+    let smhd = box_be(b"smhd", &[0u8, 0, 0, 0, 0, 0, 0, 0]);
+
+    let mut minf_body = Vec::new();
+    minf_body.extend_from_slice(&smhd);
+    minf_body.extend_from_slice(&dinf);
+    minf_body.extend_from_slice(&stbl);
+    let minf = box_be(b"minf", &minf_body);
+
+    // hdlr — handler type "soun"
+    let mut hdlr_body = vec![0u8, 0, 0, 0]; // FullBox
+    hdlr_body.extend_from_slice(&u32be(0)); // pre_defined
+    hdlr_body.extend_from_slice(b"soun"); // handler_type
+    hdlr_body.extend_from_slice(&[0u8; 12]); // reserved
+    hdlr_body.extend_from_slice(b"SoundHandler\0");
+    let hdlr = box_be(b"hdlr", &hdlr_body);
+
+    // mdhd (version 0): 4-byte FullBox + 4-byte creation + 4-byte modification
+    //   + 4-byte timescale + 4-byte duration + 2-byte language + 2-byte pre_defined
+    let mut mdhd_body = vec![0u8, 0, 0, 0];
+    mdhd_body.extend_from_slice(&u32be(0)); // creation
+    mdhd_body.extend_from_slice(&u32be(0)); // modification
+    mdhd_body.extend_from_slice(&u32be(44_100)); // timescale
+    mdhd_body.extend_from_slice(&u32be(1)); // duration
+    mdhd_body.extend_from_slice(&u16be(0x55c4)); // "und"
+    mdhd_body.extend_from_slice(&u16be(0));
+    let mdhd = box_be(b"mdhd", &mdhd_body);
+
+    let mut mdia_body = Vec::new();
+    mdia_body.extend_from_slice(&mdhd);
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = box_be(b"mdia", &mdia_body);
+
+    // tkhd (version 0): 92 bytes total — we only need it to be parsed-and-ignored
+    // by the demuxer, which skips unknown-to-it children of `trak`. So just a
+    // minimal tkhd won't be required; but structurally `trak` must contain
+    // `mdia`, which it does.
+    let trak = box_be(b"trak", &mdia);
+
+    // mvhd (version 0): similar to tkhd — demuxer's parse_mvhd reads it.
+    let mut mvhd_body = vec![0u8, 0, 0, 0];
+    mvhd_body.extend_from_slice(&u32be(0)); // creation
+    mvhd_body.extend_from_slice(&u32be(0)); // modification
+    mvhd_body.extend_from_slice(&u32be(1000)); // timescale
+    mvhd_body.extend_from_slice(&u32be(1)); // duration
+    mvhd_body.extend_from_slice(&u32be(0x0001_0000)); // rate
+    mvhd_body.extend_from_slice(&u16be(0x0100)); // volume
+    mvhd_body.extend_from_slice(&[0u8; 10]); // reserved u16 + 2x u32
+    let identity: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
+    for v in identity {
+        mvhd_body.extend_from_slice(&u32be(v));
+    }
+    mvhd_body.extend_from_slice(&[0u8; 24]); // pre_defined (6x u32)
+    mvhd_body.extend_from_slice(&u32be(2)); // next_track_id
+    let mvhd = box_be(b"mvhd", &mvhd_body);
+
+    let mut moov_body = Vec::new();
+    moov_body.extend_from_slice(&mvhd);
+    moov_body.extend_from_slice(&trak);
+    let moov = box_be(b"moov", &moov_body);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&ftyp);
+    out.extend_from_slice(&mdat);
+    out.extend_from_slice(&moov);
+    out
+}
+
+#[test]
+fn mp4a_mpeg1_audio_oti_resolves_to_mp3() {
+    // OTI 0x6B = MPEG-1 Audio Layer I/II/III. Historically these are
+    // packaged in MP4 as `mp4a` + esds; we should demux them as mp3.
+    let bytes = build_mp4_with_mp4a_oti(0x6B);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs).unwrap();
+    assert_eq!(dmx.streams().len(), 1);
+    assert_eq!(
+        dmx.streams()[0].params.codec_id.as_str(),
+        "mp3",
+        "MP4 OTI=0x6B should resolve to 'mp3' (was 'aac' before OTI dispatch)"
+    );
+}
+
+#[test]
+fn mp4a_mpeg2_audio_oti_resolves_to_mp3() {
+    // OTI 0x69 = MPEG-2 Audio Part 3.
+    let bytes = build_mp4_with_mp4a_oti(0x69);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs).unwrap();
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "mp3");
+}
+
+#[test]
+fn mp4a_aac_oti_resolves_to_aac() {
+    // OTI 0x40 = AAC. Baseline check that the historical path is preserved.
+    let bytes = build_mp4_with_mp4a_oti(0x40);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs).unwrap();
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
+}

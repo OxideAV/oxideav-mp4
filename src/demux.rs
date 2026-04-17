@@ -17,7 +17,7 @@ use oxideav_core::{
 };
 
 use crate::boxes::*;
-use crate::codec_id::from_sample_entry;
+use crate::codec_id::{from_sample_entry, from_sample_entry_with_oti};
 
 pub fn open(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
     // Walk top-level boxes looking for ftyp + moov.
@@ -97,6 +97,9 @@ struct Track {
     height: Option<u32>,
     // Codec-specific setup payload, if any.
     extradata: Vec<u8>,
+    /// MPEG-4 `objectTypeIndication` (OTI) from the esds box, if present.
+    /// Used to refine `mp4a` / `mp4v` FourCCs into concrete codec ids.
+    esds_oti: Option<u8>,
     // Sample tables.
     stts: Vec<(u32, u32)>, // (sample_count, sample_delta) — in media timescale
     stsc: Vec<(u32, u32, u32)>, // (first_chunk, samples_per_chunk, sample_description_index)
@@ -342,6 +345,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         width: None,
         height: None,
         extradata: Vec::new(),
+        esds_oti: None,
         stts: Vec::new(),
         stsc: Vec::new(),
         stsz: Vec::new(),
@@ -564,9 +568,14 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             // ES Descriptor box for MPEG-4 audio (mp4a): strip the nested
             // descriptor wrappers and hand the DecoderSpecificInfo (the AAC
             // AudioSpecificConfig) straight to the decoder via extradata.
+            // We also capture the `objectTypeIndication` so the codec-id
+            // resolver can disambiguate MP3-in-mp4a vs. AAC-in-mp4a.
             b"esds" if body.len() >= 4 => {
-                if let Some(dsi) = parse_esds_dsi(&body[4..]) {
-                    t.extradata = dsi;
+                if let Some(parsed) = parse_esds(&body[4..]) {
+                    if !parsed.dsi.is_empty() {
+                        t.extradata = parsed.dsi;
+                    }
+                    t.esds_oti = parsed.oti;
                 }
             }
             _ => {}
@@ -575,9 +584,17 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
     Ok(())
 }
 
+/// What we extract from an esds box: the DecoderSpecificInfo (empty when
+/// absent) and the DecoderConfigDescriptor's `objectTypeIndication` byte.
+#[derive(Default)]
+struct EsdsInfo {
+    dsi: Vec<u8>,
+    oti: Option<u8>,
+}
+
 /// Parse an esds `ES_Descriptor` payload (the part after the `FullBox`
-/// version+flags) and return the inner `DecoderSpecificInfo` bytes — for
-/// AAC-in-MP4 that is the `AudioSpecificConfig` our AAC decoder consumes.
+/// version+flags) and return its DecoderSpecificInfo bytes together with
+/// the `objectTypeIndication` byte from the DecoderConfigDescriptor.
 ///
 /// ES_Descriptor layout (ISO/IEC 14496-1 §7.2.6):
 ///   tag 0x03, BER length,
@@ -588,10 +605,15 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
 ///     bufferSizeDB (u24),
 ///     maxBitrate (u32),
 ///     avgBitrate (u32),
-///     DecoderSpecificInfo (tag 0x05) — the ASC we want,
+///     DecoderSpecificInfo (tag 0x05) — the ASC (or whatever the codec
+///     uses as its setup header),
 ///   },
 ///   SLConfigDescriptor (tag 0x06).
-fn parse_esds_dsi(buf: &[u8]) -> Option<Vec<u8>> {
+///
+/// Returns `None` only if the outer ES_Descriptor itself is malformed.
+/// A well-formed ES_Descriptor with no DCD returns `EsdsInfo::default()`.
+fn parse_esds(buf: &[u8]) -> Option<EsdsInfo> {
+    let mut info = EsdsInfo::default();
     let mut cur = 0usize;
     let (tag, len, hdr_bytes) = read_descr(buf, cur)?;
     if tag != 0x03 {
@@ -634,26 +656,42 @@ fn parse_esds_dsi(buf: &[u8]) -> Option<Vec<u8>> {
         }
         if sub_tag == 0x04 {
             // DecoderConfigDescriptor: 13 fixed bytes then nested descriptors.
-            if sub_len <= 13 {
+            // First byte is the objectTypeIndication we care about.
+            if sub_len < 13 {
                 return None;
             }
-            let mut inner = cur + 13;
-            while inner < sub_end {
-                let (dsi_tag, dsi_len, dsi_hdr) = read_descr(buf, inner)?;
-                inner += dsi_hdr;
-                let dsi_end = inner.checked_add(dsi_len)?;
-                if dsi_end > sub_end {
-                    return None;
+            info.oti = Some(buf[cur]);
+            if sub_len > 13 {
+                let mut inner = cur + 13;
+                while inner < sub_end {
+                    let (dsi_tag, dsi_len, dsi_hdr) = read_descr(buf, inner)?;
+                    inner += dsi_hdr;
+                    let dsi_end = inner.checked_add(dsi_len)?;
+                    if dsi_end > sub_end {
+                        return None;
+                    }
+                    if dsi_tag == 0x05 {
+                        info.dsi = buf[inner..dsi_end].to_vec();
+                        break;
+                    }
+                    inner = dsi_end;
                 }
-                if dsi_tag == 0x05 {
-                    return Some(buf[inner..dsi_end].to_vec());
-                }
-                inner = dsi_end;
             }
         }
         cur = sub_end;
     }
-    None
+    Some(info)
+}
+
+/// Back-compat thin wrapper — returns just the DSI bytes.
+#[cfg(test)]
+fn parse_esds_dsi(buf: &[u8]) -> Option<Vec<u8>> {
+    let info = parse_esds(buf)?;
+    if info.dsi.is_empty() {
+        None
+    } else {
+        Some(info.dsi)
+    }
 }
 
 /// Read one MPEG-4 descriptor header (tag + BER-encoded length). Returns
@@ -718,6 +756,18 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             b"av1C" => t.extradata = body,
             // VPCodecConfigurationRecord — vpcC box for VP8 / VP9.
             b"vpcC" => t.extradata = body,
+            // esds for `mp4v` sample entries. Same shape as the audio variant.
+            // We keep the DSI (MPEG-4 VOL header for Part 2, etc.) as
+            // extradata and remember the OTI so `from_sample_entry_with_oti`
+            // can refine `mp4v` into `mpeg1video` / `mpeg2video` / etc.
+            b"esds" if body.len() >= 4 => {
+                if let Some(parsed) = parse_esds(&body[4..]) {
+                    if !parsed.dsi.is_empty() {
+                        t.extradata = parsed.dsi;
+                    }
+                    t.esds_oti = parsed.oti;
+                }
+            }
             _ => {}
         }
     }
@@ -1013,7 +1063,10 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
 }
 
 fn build_stream_info(index: u32, t: &Track) -> StreamInfo {
-    let codec_id = from_sample_entry(&t.codec_id_fourcc);
+    let codec_id = match t.esds_oti {
+        Some(oti) => from_sample_entry_with_oti(&t.codec_id_fourcc, oti),
+        None => from_sample_entry(&t.codec_id_fourcc),
+    };
     let mut params = match t.media_type {
         MediaType::Audio => CodecParameters::audio(codec_id),
         MediaType::Video => CodecParameters::video(codec_id),
