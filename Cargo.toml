@@ -20,4 +20,4 @@ oxideav-container = "0.1"
 [dev-dependencies]
 oxideav-basic = "0.0"
 oxideav-flac = "0.0"
-oxideav-mjpeg = "0.0"
+oxideav-mjpeg = "0.1"
