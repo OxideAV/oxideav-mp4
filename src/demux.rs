@@ -13,14 +13,14 @@ use std::io::SeekFrom;
 
 use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat, StreamInfo,
-    TimeBase,
+    CodecId, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, Result,
+    SampleFormat, StreamInfo, TimeBase,
 };
 
 use crate::boxes::*;
 use crate::codec_id::{from_sample_entry, from_sample_entry_with_oti};
 
-pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     // Walk top-level boxes looking for ftyp + moov.
     let mut saw_ftyp = false;
     let mut moov: Option<Vec<u8>> = None;
@@ -50,7 +50,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     let mut streams: Vec<StreamInfo> = Vec::with_capacity(parsed.tracks.len());
     let mut samples: Vec<SampleRef> = Vec::new();
     for (i, t) in parsed.tracks.iter().enumerate() {
-        streams.push(build_stream_info(i as u32, t));
+        streams.push(build_stream_info(i as u32, t, codecs));
         expand_samples(t, i as u32, &mut samples)?;
     }
     samples.sort_by_key(|s| s.offset);
@@ -1063,10 +1063,23 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
     Ok(())
 }
 
-fn build_stream_info(index: u32, t: &Track) -> StreamInfo {
-    let codec_id = match t.esds_oti {
-        Some(oti) => from_sample_entry_with_oti(&t.codec_id_fourcc, oti),
-        None => from_sample_entry(&t.codec_id_fourcc),
+fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> StreamInfo {
+    // Try the shared CodecResolver registry first — this lets codec crates
+    // own their sample-entry FourCCs / OTI mapping. For `mp4a` / `mp4v`
+    // entries we prefer the OTI-aware tag (more specific) over the bare
+    // FourCC, then fall back to the static `from_sample_entry*` tables.
+    let codec_id = {
+        let mut resolved: Option<CodecId> = None;
+        if let Some(oti) = t.esds_oti {
+            resolved = codecs.resolve_tag(&CodecTag::mp4_object_type(oti), None);
+        }
+        if resolved.is_none() {
+            resolved = codecs.resolve_tag(&CodecTag::fourcc(&t.codec_id_fourcc), None);
+        }
+        resolved.unwrap_or_else(|| match t.esds_oti {
+            Some(oti) => from_sample_entry_with_oti(&t.codec_id_fourcc, oti),
+            None => from_sample_entry(&t.codec_id_fourcc),
+        })
     };
     let mut params = match t.media_type {
         MediaType::Audio => CodecParameters::audio(codec_id),
