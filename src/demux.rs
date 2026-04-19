@@ -13,8 +13,8 @@ use std::io::SeekFrom;
 
 use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, Result,
-    SampleFormat, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, ProbeContext,
+    Result, SampleFormat, StreamInfo, TimeBase,
 };
 
 use crate::boxes::*;
@@ -1063,18 +1063,47 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
     Ok(())
 }
 
+fn build_ctx<'a>(tag: &'a CodecTag, t: &'a Track) -> ProbeContext<'a> {
+    let mut ctx = ProbeContext::new(tag);
+    if !t.extradata.is_empty() {
+        ctx = ctx.header(&t.extradata);
+    }
+    if let Some(b) = t.sample_size_bits {
+        ctx = ctx.bits(b);
+    }
+    if let Some(c) = t.channels {
+        ctx = ctx.channels(c);
+    }
+    if let Some(sr) = t.sample_rate {
+        ctx = ctx.sample_rate(sr);
+    }
+    if let Some(w) = t.width {
+        ctx = ctx.width(w);
+    }
+    if let Some(h) = t.height {
+        ctx = ctx.height(h);
+    }
+    ctx
+}
+
 fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> StreamInfo {
     // Try the shared CodecResolver registry first — this lets codec crates
     // own their sample-entry FourCCs / OTI mapping. For `mp4a` / `mp4v`
     // entries we prefer the OTI-aware tag (more specific) over the bare
     // FourCC, then fall back to the static `from_sample_entry*` tables.
     let codec_id = {
+        // Fill a ProbeContext with the hints we've already parsed so
+        // codec probes can disambiguate (e.g. PCM flavours by bit depth).
         let mut resolved: Option<CodecId> = None;
         if let Some(oti) = t.esds_oti {
-            resolved = codecs.resolve_tag(&CodecTag::mp4_object_type(oti), None);
+            let tag = CodecTag::mp4_object_type(oti);
+            let ctx = build_ctx(&tag, t);
+            resolved = codecs.resolve_tag(&ctx);
         }
         if resolved.is_none() {
-            resolved = codecs.resolve_tag(&CodecTag::fourcc(&t.codec_id_fourcc), None);
+            let tag = CodecTag::fourcc(&t.codec_id_fourcc);
+            let ctx = build_ctx(&tag, t);
+            resolved = codecs.resolve_tag(&ctx);
         }
         resolved.unwrap_or_else(|| match t.esds_oti {
             Some(oti) => from_sample_entry_with_oti(&t.codec_id_fourcc, oti),
