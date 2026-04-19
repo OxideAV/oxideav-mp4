@@ -64,7 +64,7 @@ fn pcm_roundtrip_byte_exact() {
 
     // Demux and verify.
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.format_name(), "mp4");
     assert_eq!(dmx.streams().len(), 1);
     assert_eq!(
@@ -171,7 +171,7 @@ fn multi_track_two_streams() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams().len(), 2, "expected 2 tracks");
     // Track order is preserved.
     assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
@@ -236,7 +236,7 @@ fn flac_packet_bytes_preserved() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("flac"));
     // Extradata round-trips.
     assert_eq!(dmx.streams()[0].params.extradata, flac_extradata);
@@ -344,7 +344,7 @@ fn real_flac_encoder_roundtrip() {
 
     // Demux and decode.
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("flac"));
     let decoded_extradata = dmx.streams()[0].params.extradata.clone();
     assert_eq!(decoded_extradata, extradata);
@@ -522,7 +522,7 @@ fn mjpeg_roundtrip_via_mp4() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut demuxer = oxideav_mp4::demux::open(rs).unwrap();
+    let mut demuxer = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     let streams = demuxer.streams().to_vec();
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].params.codec_id.as_str(), "mjpeg");
@@ -663,7 +663,7 @@ fn mp4_faststart_has_moov_before_mdat() {
 
     // Demuxer still accepts it.
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     let mut got_count = 0;
     loop {
@@ -709,7 +709,7 @@ fn faststart_roundtrip_pcm() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     let mut got: Vec<Vec<u8>> = Vec::new();
     loop {
@@ -817,7 +817,7 @@ fn faststart_roundtrip_flac() {
 
     // Decode and compare bit-exact.
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams()[0].params.extradata, extradata);
     let decoder_params = dmx.streams()[0].params.clone();
     let mut decoder = oxideav_flac::decoder::make_decoder(&decoder_params).unwrap();
@@ -913,7 +913,7 @@ fn chunk_offsets_patched_after_faststart() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     let mut got: Vec<Vec<u8>> = Vec::new();
     loop {
         match dmx.next_packet() {
@@ -958,7 +958,7 @@ fn seek_to_nearest_keyframe() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
 
     // Seek to pts just past sample 5's start. Should land on sample 5.
     let target_pts = 5 * frames_per_packet + 100;
@@ -1188,7 +1188,7 @@ fn mp4a_mpeg1_audio_oti_resolves_to_mp3() {
     // packaged in MP4 as `mp4a` + esds; we should demux them as mp3.
     let bytes = build_mp4_with_mp4a_oti(0x6B);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams().len(), 1);
     assert_eq!(
         dmx.streams()[0].params.codec_id.as_str(),
@@ -1202,7 +1202,7 @@ fn mp4a_mpeg2_audio_oti_resolves_to_mp3() {
     // OTI 0x69 = MPEG-2 Audio Part 3.
     let bytes = build_mp4_with_mp4a_oti(0x69);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "mp3");
 }
 
@@ -1211,6 +1211,6 @@ fn mp4a_aac_oti_resolves_to_aac() {
     // OTI 0x40 = AAC. Baseline check that the historical path is preserved.
     let bytes = build_mp4_with_mp4a_oti(0x40);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let dmx = oxideav_mp4::demux::open(rs).unwrap();
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
 }
