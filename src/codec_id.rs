@@ -27,6 +27,19 @@ pub fn from_sample_entry(fourcc: &[u8; 4]) -> CodecId {
         b"vp09" => "vp9",
         b"av01" => "av1",
         b"jpeg" | b"mjpa" | b"mjpb" => "mjpeg",
+        // Apple ProRes — six profile FourCCs from the April 2022 white
+        // paper ("Apple ProRes Family Overview"). Container-side
+        // dispatch is case-insensitive; QuickTime historically stored
+        // these upper-case (`APCN`, `AP4H`, …) while every Apple doc
+        // spells them lower-case. Most real-world `.mov` files today
+        // use lower-case, so match that spelling first and also accept
+        // the upper-case form some legacy muxers still emit.
+        b"apco" | b"APCO" => "prores",
+        b"apcs" | b"APCS" => "prores",
+        b"apcn" | b"APCN" => "prores",
+        b"apch" | b"APCH" => "prores",
+        b"ap4h" | b"AP4H" => "prores",
+        b"ap4x" | b"AP4X" => "prores",
         // MP4 sample entry `mp4v` is carried for both MPEG-1 video (OTI 0x6A)
         // and MPEG-4 Part 2 / ASP (OTI 0x20). Part 2 is overwhelmingly more
         // common in MP4, so default to `mpeg4video` here when no OTI is
@@ -178,5 +191,36 @@ mod tests {
     fn unknown_fourcc_preserves_fallback() {
         let id = from_sample_entry(b"xyzw");
         assert_eq!(id.as_str(), "mp4:xyzw");
+    }
+
+    #[test]
+    fn prores_fourccs_map_to_prores() {
+        // Lower-case (canonical Apple spelling, used by modern ffmpeg).
+        for fc in [b"apco", b"apcs", b"apcn", b"apch", b"ap4h", b"ap4x"] {
+            assert_eq!(
+                from_sample_entry(fc),
+                CodecId::new("prores"),
+                "lower-case fourcc {fc:?}",
+            );
+        }
+        // Upper-case (legacy QuickTime muxers).
+        for fc in [b"APCO", b"APCS", b"APCN", b"APCH", b"AP4H", b"AP4X"] {
+            assert_eq!(
+                from_sample_entry(fc),
+                CodecId::new("prores"),
+                "upper-case fourcc {fc:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn prores_fourccs_with_oti_still_map_to_prores() {
+        // ProRes has no esds / OTI on its sample entries (it's a plain
+        // QuickTime codec), but defend against garbage OTI on one of
+        // our FourCCs — the FourCC alone must still dispatch to prores.
+        assert_eq!(
+            from_sample_entry_with_oti(b"ap4h", 0x42),
+            CodecId::new("prores")
+        );
     }
 }
