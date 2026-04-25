@@ -11,11 +11,11 @@
 use std::collections::HashSet;
 use std::io::SeekFrom;
 
-use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, ProbeContext,
     Result, SampleFormat, StreamInfo, TimeBase,
 };
+use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::boxes::*;
 use crate::codec_id::{from_sample_entry, from_sample_entry_with_oti};

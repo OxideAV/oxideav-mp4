@@ -14,7 +14,7 @@ mod sample_entries;
 
 pub use options::{BrandPreset, Mp4MuxerOptions};
 
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 
 pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("mp4", demux::open);
@@ -33,7 +33,7 @@ pub fn register(reg: &mut ContainerRegistry) {
 /// `....ftyp` at offset 0 — ISO base media file format. Some files lead
 /// with a `wide` or `free` box before `ftyp`, so accept that with a
 /// slightly lower confidence.
-fn probe(p: &oxideav_container::ProbeData) -> u8 {
+fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() < 8 {
         return 0;
     }

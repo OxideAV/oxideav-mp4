@@ -4,8 +4,8 @@
 
 use std::io::Cursor;
 
-use oxideav_container::{ReadSeek, WriteSeek};
 use oxideav_core::{CodecId, CodecParameters, Packet, SampleFormat, StreamInfo, TimeBase};
+use oxideav_core::{ReadSeek, WriteSeek};
 
 fn pcm_stream_info() -> StreamInfo {
     let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
@@ -442,7 +442,7 @@ fn mjpeg_roundtrip_via_mp4() {
     // Encode a tiny video frame to JPEG, mux it into MP4 as "mjpeg",
     // demux back, check the sample entry → codec_id mapping yields
     // "mjpeg" and that the decoded bytes round-trip.
-    use oxideav_codec::CodecRegistry;
+    use oxideav_core::CodecRegistry;
     use oxideav_core::{Frame, MediaType, PixelFormat, VideoFrame, VideoPlane};
 
     // Build a synthetic 64x64 Yuv420P frame (gradient).
@@ -543,7 +543,7 @@ fn mjpeg_roundtrip_via_mp4() {
 
 // --- Brand presets + faststart --------------------------------------------
 
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_mp4::{BrandPreset, Mp4MuxerOptions};
 
 #[test]

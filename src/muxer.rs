@@ -32,8 +32,8 @@
 
 use std::io::{Cursor, Seek, SeekFrom, Write};
 
-use oxideav_container::{Muxer, WriteSeek};
 use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
+use oxideav_core::{Muxer, WriteSeek};
 
 use crate::options::{BrandPreset, Mp4MuxerOptions};
 use crate::sample_entries::{sample_entry_for, SampleEntry};
