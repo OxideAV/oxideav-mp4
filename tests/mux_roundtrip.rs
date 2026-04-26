@@ -292,12 +292,8 @@ fn real_flac_encoder_roundtrip() {
 
     // Encode: feed one AudioFrame containing all samples, then flush.
     let frame = AudioFrame {
-        format: SampleFormat::S16,
-        channels,
-        sample_rate,
         samples: total_frames as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, sample_rate as i64),
         data: vec![pcm_bytes.clone()],
     };
     encoder.send_frame(&Frame::Audio(frame)).unwrap();
@@ -400,7 +396,6 @@ fn real_flac_encoder_roundtrip() {
         loop {
             match decoder.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    assert_eq!(a.format, SampleFormat::S16);
                     for plane in &a.data {
                         for chunk in plane.chunks_exact(2) {
                             decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
@@ -456,11 +451,7 @@ fn mjpeg_roundtrip_via_mp4() {
 
     let time_base = TimeBase::new(1, 25); // 25 fps
     let frame = Frame::Video(VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base,
         planes: vec![
             VideoPlane {
                 stride: w as usize,
@@ -755,12 +746,8 @@ fn faststart_roundtrip_flac() {
     let mut encoder = oxideav_flac::encoder::make_encoder(&enc_params).unwrap();
 
     let frame = AudioFrame {
-        format: SampleFormat::S16,
-        channels,
-        sample_rate,
         samples: total_frames as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, sample_rate as i64),
         data: vec![pcm_bytes.clone()],
     };
     encoder.send_frame(&Frame::Audio(frame)).unwrap();
