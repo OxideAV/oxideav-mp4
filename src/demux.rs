@@ -109,6 +109,32 @@ struct Track {
     /// 1-based sample indices that are sync (key) frames. Empty means
     /// "all samples are sync frames" per ISO/IEC 14496-12.
     stss: Vec<u32>,
+    /// §8.6.1.3 ctts (CompositionOffsetBox). Run-length pairs of
+    /// `(sample_count, sample_offset)` mapping decoding-order index
+    /// to a composition-time offset (CTS = DTS + offset). Version 0
+    /// uses unsigned offsets, version 1 signed; we always store i32
+    /// so callers can apply it uniformly. Empty when the box is
+    /// absent (every sample's CTS equals its DTS — no B-frames or
+    /// the encoder didn't reorder).
+    ctts: Vec<(u32, i32)>,
+    /// §8.6.6 edts/elst — `media_time` of the first non-empty edit
+    /// segment, in this track's media timescale, or 0 when no edit
+    /// list is present.
+    ///
+    /// The edit list lets the container shift the presentation start
+    /// by a constant amount; with B-frames the encoder commonly
+    /// emits ctts offsets such that the first sample's CTS sits at
+    /// the largest reorder buffer (e.g. CTS=2 frames for a 2-B-frame
+    /// pyramid) and pairs that with `media_time = 2 frames` so the
+    /// effective presentation timeline still starts at 0 — exactly
+    /// the offset ffmpeg/ffprobe report.
+    ///
+    /// Spec coverage of the full edit list (multi-segment, dwell,
+    /// rate changes) is deferred — solana-ad and the broad MP4 muxer
+    /// population only ever write a single `media_time` shift, and
+    /// that's what's needed for B-frame composition timestamps to
+    /// land at zero.
+    elst_media_time: i64,
 }
 
 fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
@@ -352,6 +378,8 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         stsz: Vec::new(),
         chunk_offsets: Vec::new(),
         stss: Vec::new(),
+        ctts: Vec::new(),
+        elst_media_time: 0,
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -368,6 +396,10 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
                 parse_mdia(&sub, &mut t)?;
                 has_media = true;
             }
+            EDTS => {
+                let sub = read_bytes_vec(&mut cur, psz)?;
+                parse_edts(&sub, &mut t)?;
+            }
             _ => {
                 cur.set_position(cur.position() + psz as u64);
             }
@@ -378,6 +410,85 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
     } else {
         Ok(None)
     }
+}
+
+/// §8.6.5 — `edts` (EditBox) container. We only care about the inner
+/// `elst` (EditListBox) child; everything else in the container is
+/// reserved.
+fn parse_edts(body: &[u8], t: &mut Track) -> Result<()> {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        match hdr.fourcc {
+            ELST => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                parse_elst(&b, t)?;
+            }
+            _ => cur.set_position(cur.position() + psz as u64),
+        }
+    }
+    Ok(())
+}
+
+/// §8.6.6 — `elst` (EditListBox).
+///
+/// Each entry is `(segment_duration, media_time, media_rate)`. Width
+/// of the first two fields depends on the FullBox `version`:
+/// * v0 → both 32-bit (unsigned dur, signed media_time)
+/// * v1 → both 64-bit (unsigned dur, signed media_time)
+///
+/// Special values:
+/// * `media_time = -1` → an "empty" edit (no underlying media for the
+///   given duration); we skip it without changing the recorded shift.
+/// * `media_rate = 0x00010000` (1.0) is the only spec-blessed rate;
+///   anything else (slow-motion / reverse) is out of scope for this
+///   demuxer.
+///
+/// Multi-segment edit lists are out of scope: we record only the
+/// first non-empty edit's `media_time`. solana-ad and the vast
+/// majority of single-track MP4s emit exactly one segment, used to
+/// shift the presentation timeline so B-frame ctts offsets net to
+/// zero at the first frame.
+fn parse_elst(body: &[u8], t: &mut Track) -> Result<()> {
+    if body.len() < 8 {
+        return Err(Error::invalid("MP4: elst too short"));
+    }
+    let version = body[0];
+    let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let mut off = 8;
+    for _ in 0..count {
+        let entry_size = if version == 1 { 20 } else { 12 };
+        if off + entry_size > body.len() {
+            return Err(Error::invalid("MP4: elst truncated"));
+        }
+        let media_time: i64 = if version == 1 {
+            i64::from_be_bytes([
+                body[off + 8],
+                body[off + 9],
+                body[off + 10],
+                body[off + 11],
+                body[off + 12],
+                body[off + 13],
+                body[off + 14],
+                body[off + 15],
+            ])
+        } else {
+            i32::from_be_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]) as i64
+        };
+        if media_time != -1 {
+            // First non-empty edit wins; only the leading shift is
+            // applied to packet pts.
+            t.elst_media_time = media_time;
+            return Ok(());
+        }
+        off += entry_size;
+    }
+    Ok(())
 }
 
 fn parse_mdia(body: &[u8], t: &mut Track) -> Result<()> {
@@ -485,6 +596,7 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             STCO => t.chunk_offsets = parse_stco(&b)?,
             CO64 => t.chunk_offsets = parse_co64(&b)?,
             STSS => t.stss = parse_stss(&b)?,
+            CTTS => t.ctts = parse_ctts(&b)?,
             _ => {}
         }
     }
@@ -903,6 +1015,51 @@ fn parse_stss(body: &[u8]) -> Result<Vec<u32>> {
     Ok(out)
 }
 
+/// Parse `ctts` (CompositionOffsetBox, ISO/IEC 14496-12 §8.6.1.3).
+///
+/// Run-length pairs of `(sample_count, sample_offset)` mapping the
+/// decoding-order index to the composition-time offset that converts
+/// the sample's DTS into its CTS (CTS = DTS + offset). The header is
+/// the standard FullBox: `version(8) flags(24) entry_count(32)`.
+///
+/// * Version 0 (the common case) stores `sample_offset` as `u32`,
+///   permitting only non-negative offsets.
+/// * Version 1 stores it as `i32`, allowing negative offsets — used
+///   when the encoder shifts the entire CTS timeline below DTS so
+///   the first frame's CTS can sit at zero (Apple-style negative
+///   composition shift).
+///
+/// We always return `i32` so callers can apply the offset uniformly.
+fn parse_ctts(body: &[u8]) -> Result<Vec<(u32, i32)>> {
+    if body.len() < 8 {
+        return Err(Error::invalid("MP4: ctts too short"));
+    }
+    let version = body[0];
+    let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut off = 8;
+    for _ in 0..count {
+        if off + 8 > body.len() {
+            return Err(Error::invalid("MP4: ctts truncated"));
+        }
+        let cnt = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        let raw = [body[off + 4], body[off + 5], body[off + 6], body[off + 7]];
+        let dlt: i32 = if version == 0 {
+            // Spec says u32 here, but real-world v0 files routinely
+            // emit large unsigned values that exceed i32::MAX only
+            // when the timescale is itself huge — `as i32` preserves
+            // bit-pattern, and a sane v0 producer keeps the offset
+            // representable.
+            u32::from_be_bytes(raw) as i32
+        } else {
+            i32::from_be_bytes(raw)
+        };
+        out.push((cnt, dlt));
+        off += 8;
+    }
+    Ok(out)
+}
+
 fn parse_stco(body: &[u8]) -> Result<Vec<u64>> {
     if body.len() < 8 {
         return Err(Error::invalid("MP4: stco too short"));
@@ -955,7 +1112,14 @@ struct SampleRef {
     track_idx: u32,
     offset: u64,
     size: u32,
+    /// Composition-time stamp (CTS), media timescale. Equals DTS for
+    /// streams without a `ctts` box (e.g. audio, intra-only video);
+    /// otherwise CTS = DTS + ctts_offset, see ISO/IEC 14496-12 §8.6.1.3.
     pts: i64,
+    /// Decoding-time stamp, media timescale. Carried separately so the
+    /// packet can advertise both — the codec consumes the buffer in
+    /// decode order (`dts`) and the player paces presentation by `pts`.
+    dts: i64,
     duration: i64,
     keyframe: bool,
 }
@@ -966,7 +1130,10 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
     }
     let n_samples = t.stsz.len();
 
-    // Build per-sample pts by scanning stts (cumulative).
+    // Build per-sample DTS by scanning stts (cumulative).
+    // ISO/IEC 14496-12 §8.6.1.2 — stts maps decoding-order index to
+    // a per-sample delta in the media timescale, so the running sum
+    // is the sample's DTS.
     let mut pts = Vec::with_capacity(n_samples);
     {
         let mut i = 0;
@@ -983,6 +1150,26 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
         }
         while pts.len() < n_samples {
             pts.push((t_accum, 0));
+        }
+    }
+
+    // Apply ctts (§8.6.1.3) to convert DTS → CTS. Without this the
+    // packets we hand the codec carry DTS as `pts`, and any codec
+    // that reorders for display (B-frames in H.264 / H.265 / AV1)
+    // emits frames in display order with decode-time pts attached
+    // — i.e. monotonic-decreasing pts at every B-frame boundary.
+    // The CTS is what downstream pacing wants.
+    let mut cts_offsets: Vec<i64> = vec![0; n_samples];
+    if !t.ctts.is_empty() {
+        let mut i = 0usize;
+        for &(count, off) in &t.ctts {
+            for _ in 0..count {
+                if i >= n_samples {
+                    break;
+                }
+                cts_offsets[i] = off as i64;
+                i += 1;
+            }
         }
     }
 
@@ -1048,14 +1235,27 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
             preceding += t.stsz[j] as u64;
         }
         let size = t.stsz[i];
-        let (pts_v, dur) = pts[i];
+        let (dts_v, dur) = pts[i];
+        // CTS = DTS + ctts_offset (§8.6.1.3). Streams without a ctts
+        // box leave `cts_offsets` zero-filled, so audio + intra-only
+        // video continue to take the DTS path unchanged.
+        //
+        // The edit list (§8.6.6) shifts the presentation timeline by
+        // `media_time`; subtract it from CTS so the first presented
+        // frame's pts lands at zero. Tracks without elst leave
+        // `elst_media_time = 0`, a no-op.
+        let cts_v = dts_v
+            .saturating_add(cts_offsets[i])
+            .saturating_sub(t.elst_media_time);
+        let dts_v_shifted = dts_v.saturating_sub(t.elst_media_time);
         let one_based = (i as u32) + 1;
         let keyframe = stss_all_keyframes || stss_set.contains(&one_based);
         out.push(SampleRef {
             track_idx,
             offset: chunk_off + preceding,
             size,
-            pts: pts_v,
+            pts: cts_v,
+            dts: dts_v_shifted,
             duration: dur,
             keyframe,
         });
@@ -1174,8 +1374,11 @@ impl Demuxer for Mp4Demuxer {
         self.input.read_exact(&mut data)?;
         let stream = &self.streams[s.track_idx as usize];
         let mut pkt = Packet::new(s.track_idx, stream.time_base, data);
+        // CTS for `pts` (display order), DTS for `dts` (decode order).
+        // For tracks without a ctts box `pts == dts` because the
+        // demuxer fills `cts_offsets[i]` with zero (§8.6.1.3).
         pkt.pts = Some(s.pts);
-        pkt.dts = Some(s.pts);
+        pkt.dts = Some(s.dts);
         pkt.duration = Some(s.duration);
         pkt.flags.keyframe = s.keyframe;
         Ok(pkt)
