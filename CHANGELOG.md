@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.4...v0.0.5) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- parse ctts + edts/elst so packets carry composition timestamps
+- adopt slim VideoFrame/AudioFrame shape
+- pin release-plz to patch-only bumps
+
 ### Fixed
 
 - **Composition timestamps for streams with B-frames** (ISO/IEC
