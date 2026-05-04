@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sidx` (SegmentIndexBox §8.16.3) and `mfra/tfra` (Movie
+  Fragment Random Access §8.8.10–11) parsers. The demuxer now
+  reads them at open time and exposes `parse_sidx_box` /
+  `parse_mfra_box` as public entry points for tooling.
+  `seek_to` consults the per-track `tfra` table when present
+  and lands directly on the moof byte offset of the last
+  random-access point at-or-before the requested pts —
+  O(log N) on the tfra plus a bounded scan within one
+  fragment, instead of the prior O(N) walk over every sample.
+  Falls through to the linear scan when no `mfra` is present.
 - Fragmented-MP4 (DASH / HLS / Smooth-Streaming / CMAF) **mux**
   (ISO/IEC 14496-12 §8.8 + DASH-IF Interop). New
   `Mp4MuxerOptions::fragmented = Some(FragmentedOptions { .. })`

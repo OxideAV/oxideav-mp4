@@ -140,7 +140,10 @@ pub const TFDT: [u8; 4] = fourcc("tfdt");
 pub const TRUN: [u8; 4] = fourcc("trun");
 pub const SIDX: [u8; 4] = fourcc("sidx");
 pub const STYP: [u8; 4] = fourcc("styp");
+// Random-access boxes (§8.8.10–12 + §8.16.3).
 pub const MFRA: [u8; 4] = fourcc("mfra");
+pub const TFRA: [u8; 4] = fourcc("tfra");
+pub const MFRO: [u8; 4] = fourcc("mfro");
 
 // Handler types.
 pub const HANDLER_SOUN: [u8; 4] = fourcc("soun");

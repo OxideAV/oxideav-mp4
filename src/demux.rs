@@ -28,6 +28,8 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     let mut saw_ftyp = false;
     let mut moov: Option<Vec<u8>> = None;
     let mut moofs: Vec<MoofRecord> = Vec::new();
+    let mut sidxes: Vec<SidxRecord> = Vec::new();
+    let mut tfras: Vec<TfraRecord> = Vec::new();
     while let Some(hdr) = read_box_header(&mut *input)? {
         match hdr.fourcc {
             FTYP => {
@@ -41,9 +43,21 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
             // Same shape as ftyp; we just skip its payload.
             STYP => skip_box_body(&mut *input, &hdr)?,
             // §8.16.3 — `sidx` SegmentIndexBox. Sample-precision seek
-            // index for adaptive-bitrate streams; useful for `seek_to`
-            // optimisation but not required for sequential demux.
-            SIDX => skip_box_body(&mut *input, &hdr)?,
+            // index for adaptive-bitrate streams. Capture the absolute
+            // file offset of the sidx itself — sidx-internal references
+            // are relative to "the first byte after this box" (per
+            // spec), so we need that anchor to resolve them.
+            SIDX => {
+                let body_start = input.stream_position()?;
+                let sidx_end_offset = body_start
+                    + hdr
+                        .payload_size()
+                        .ok_or_else(|| Error::invalid("MP4: open-ended sidx"))?;
+                let body = read_box_body(&mut *input, &hdr)?;
+                if let Some(r) = parse_sidx(&body, sidx_end_offset)? {
+                    sidxes.push(r);
+                }
+            }
             // §8.8.4 — `moof` MovieFragmentBox. Capture the body and
             // remember where the box itself started — the
             // `default-base-is-moof` flag in `tfhd` makes per-sample
@@ -59,10 +73,14 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                 let body = read_bytes_vec(&mut *input, payload_size as usize)?;
                 moofs.push(MoofRecord { moof_start, body });
             }
-            // §8.8.7 — `mfra` MovieFragmentRandomAccessBox. Top-level
-            // index of fragment positions for random access. Not
-            // required for sequential demux, skip.
-            MFRA => skip_box_body(&mut *input, &hdr)?,
+            // §8.8.10 — `mfra` MovieFragmentRandomAccessBox. Container
+            // for one `tfra` per track-with-random-access plus the
+            // size-of-mfra `mfro` trailer. Parsed for the byte-range
+            // seek-table consumed by `seek_to`.
+            MFRA => {
+                let body = read_box_body(&mut *input, &hdr)?;
+                parse_mfra(&body, &mut tfras)?;
+            }
             _ => skip_box_body(&mut *input, &hdr)?,
         }
     }
@@ -115,6 +133,11 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         cursor: 0,
         metadata: parsed.metadata,
         duration_micros,
+        sidxes,
+        tfras,
+        movie_timescale: parsed.movie_timescale,
+        track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
+        track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
     }))
 }
 
@@ -126,6 +149,71 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
 struct MoofRecord {
     moof_start: u64,
     body: Vec<u8>,
+}
+
+/// Decoded `sidx` (SegmentIndexBox, §8.16.3) for one track. Each
+/// reference describes one subsegment (typically one `moof+mdat` pair):
+/// its byte size, its decode-time duration in this track's timescale,
+/// and a SAP-type flag (we keep the sync-bit surface but only use the
+/// "starts-with-SAP" marker).
+#[derive(Clone, Debug)]
+pub struct SidxRecord {
+    /// `reference_ID` — usually a `tkhd.track_ID` for a single-track
+    /// segment, or a hierarchical index ID for nested sidx.
+    pub reference_id: u32,
+    /// Timescale for `earliest_presentation_time` and per-reference
+    /// `subsegment_duration` (per spec, NOT the track's media timescale
+    /// — DASH-IF Interop §6.2.3 uses the track timescale here, but the
+    /// sidx is allowed to pick its own).
+    pub timescale: u32,
+    /// Composition timestamp of the first sample referenced.
+    pub earliest_presentation_time: u64,
+    /// File offset of the first byte of the FIRST referenced
+    /// subsegment, computed from `first_offset` + `sidx_end_offset`
+    /// (§8.16.3.1: "an unsigned integer that gives the offset relative
+    /// to the first byte after this box").
+    pub first_byte_offset: u64,
+    pub references: Vec<SidxReference>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SidxReference {
+    /// True when this reference points to another `sidx` (hierarchical
+    /// index), false when it points to the actual media subsegment.
+    pub is_sidx: bool,
+    /// Total byte size of the referenced subsegment / sidx.
+    pub referenced_size: u32,
+    /// Decode-time duration of the subsegment in `timescale` units.
+    pub subsegment_duration: u32,
+    /// True when the subsegment starts with a Stream Access Point.
+    pub starts_with_sap: bool,
+    /// SAP type (0..=7); 1 = Closed-GOP (IDR), 2 = open-GOP IDR-like,
+    /// 3 = open-GOP, etc. Per §I.2 of ISO/IEC 14496-12.
+    pub sap_type: u8,
+}
+
+/// Decoded `tfra` (TrackFragmentRandomAccessBox, §8.8.11) — per-track
+/// table of moof byte offsets keyed by presentation time. One entry per
+/// random-access point in the track.
+#[derive(Clone, Debug)]
+pub struct TfraRecord {
+    pub track_id: u32,
+    pub entries: Vec<TfraEntry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TfraEntry {
+    /// Decoding time of the random-access sample in the track's media
+    /// timescale (NOT the movie timescale).
+    pub time: u64,
+    /// File offset of the `moof` box containing the sample.
+    pub moof_offset: u64,
+    /// 1-based traf number within that moof.
+    pub traf_number: u32,
+    /// 1-based trun number within that traf.
+    pub trun_number: u32,
+    /// 1-based sample index within that trun.
+    pub sample_number: u32,
 }
 
 #[derive(Default)]
@@ -1781,6 +1869,242 @@ fn parse_trun(body: &[u8]) -> Result<ParsedTrun> {
     Ok(out)
 }
 
+// --- Random-access index parsers (§8.16.3 sidx, §8.8.10–11 mfra/tfra) ----
+
+/// §8.16.3 — `sidx` SegmentIndexBox.
+///
+/// Layout (FullBox 4 bytes already consumed by caller):
+///   reference_ID (u32),
+///   timescale (u32),
+///   if version==0: earliest_presentation_time (u32) + first_offset (u32)
+///   if version==1: earliest_presentation_time (u64) + first_offset (u64)
+///   reserved (u16) = 0
+///   reference_count (u16)
+///   for each ref:
+///     [bit 31] reference_type (1 = sidx, 0 = media subseg)
+///     [bits 30..0] referenced_size (u31)
+///     subsegment_duration (u32)
+///     [bit 31] starts_with_SAP (1 bit)
+///     [bits 30..28] SAP_type (3 bits)
+///     [bits 27..0] SAP_delta_time (u28) — we don't surface
+///
+/// `sidx_end_offset` is the absolute file offset of the first byte AFTER
+/// the sidx box (its body's spec-defined anchor for `first_offset`).
+fn parse_sidx(body: &[u8], sidx_end_offset: u64) -> Result<Option<SidxRecord>> {
+    if body.len() < 12 {
+        return Err(Error::invalid("MP4: sidx too short"));
+    }
+    let version = body[0];
+    let mut off = 4usize; // skip version + 3-byte flags
+    let reference_id = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    off += 4;
+    let timescale = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    off += 4;
+    let (ept, first_offset) = if version == 0 {
+        if off + 8 > body.len() {
+            return Err(Error::invalid("MP4: sidx v0 truncated"));
+        }
+        let e = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]) as u64;
+        off += 4;
+        let f = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]) as u64;
+        off += 4;
+        (e, f)
+    } else {
+        if off + 16 > body.len() {
+            return Err(Error::invalid("MP4: sidx v1 truncated"));
+        }
+        let e = u64::from_be_bytes([
+            body[off],
+            body[off + 1],
+            body[off + 2],
+            body[off + 3],
+            body[off + 4],
+            body[off + 5],
+            body[off + 6],
+            body[off + 7],
+        ]);
+        off += 8;
+        let f = u64::from_be_bytes([
+            body[off],
+            body[off + 1],
+            body[off + 2],
+            body[off + 3],
+            body[off + 4],
+            body[off + 5],
+            body[off + 6],
+            body[off + 7],
+        ]);
+        off += 8;
+        (e, f)
+    };
+    if off + 4 > body.len() {
+        return Err(Error::invalid("MP4: sidx header truncated"));
+    }
+    // skip 2-byte reserved
+    let reference_count = u16::from_be_bytes([body[off + 2], body[off + 3]]) as usize;
+    off += 4;
+    let needed = reference_count.saturating_mul(12);
+    if off + needed > body.len() {
+        return Err(Error::invalid("MP4: sidx references truncated"));
+    }
+    let mut references = Vec::with_capacity(reference_count);
+    for _ in 0..reference_count {
+        let r0 = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        off += 4;
+        let r1 = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        off += 4;
+        let r2 = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        off += 4;
+        let is_sidx = (r0 & 0x8000_0000) != 0;
+        let referenced_size = r0 & 0x7FFF_FFFF;
+        let starts_with_sap = (r2 & 0x8000_0000) != 0;
+        let sap_type = ((r2 >> 28) & 0x7) as u8;
+        references.push(SidxReference {
+            is_sidx,
+            referenced_size,
+            subsegment_duration: r1,
+            starts_with_sap,
+            sap_type,
+        });
+    }
+    Ok(Some(SidxRecord {
+        reference_id,
+        timescale,
+        earliest_presentation_time: ept,
+        first_byte_offset: sidx_end_offset.saturating_add(first_offset),
+        references,
+    }))
+}
+
+/// §8.8.10 — `mfra` MovieFragmentRandomAccessBox. Container for one
+/// `tfra` per track-with-random-access plus the size-of-mfra `mfro`
+/// trailer. We collect the tfra entries; mfro is not consumed (we
+/// already know the mfra size from the box header).
+fn parse_mfra(body: &[u8], out: &mut Vec<TfraRecord>) -> Result<()> {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        match hdr.fourcc {
+            TFRA => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                if let Some(r) = parse_tfra(&b)? {
+                    out.push(r);
+                }
+            }
+            MFRO => {
+                // mfro: FullBox + size (u32). We've already read the
+                // outer mfra box header so the size is redundant here.
+                cur.set_position(cur.position() + psz as u64);
+            }
+            _ => cur.set_position(cur.position() + psz as u64),
+        }
+    }
+    Ok(())
+}
+
+/// §8.8.11 — `tfra` TrackFragmentRandomAccessBox.
+///
+/// Layout (FullBox 4 bytes consumed by caller):
+///   track_ID (u32),
+///   reserved (28-bit zero) + length_size_of_traf_num (2 bits) +
+///     length_size_of_trun_num (2 bits) + length_size_of_sample_num (2 bits)
+///   number_of_entry (u32)
+///   for each entry:
+///     time         — u32 (v0) or u64 (v1)
+///     moof_offset  — u32 (v0) or u64 (v1)
+///     traf_number  — variable (1..=4 bytes)
+///     trun_number  — variable (1..=4 bytes)
+///     sample_number — variable (1..=4 bytes)
+fn parse_tfra(body: &[u8]) -> Result<Option<TfraRecord>> {
+    if body.len() < 12 {
+        return Err(Error::invalid("MP4: tfra too short"));
+    }
+    let version = body[0];
+    let mut off = 4usize;
+    let track_id = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    off += 4;
+    let lengths = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    off += 4;
+    // Per spec: each `length_size_of_*` is 2 bits encoding (0..=3),
+    // and the actual byte length is value+1.
+    let len_traf = (((lengths >> 4) & 0x3) as usize) + 1;
+    let len_trun = (((lengths >> 2) & 0x3) as usize) + 1;
+    let len_sample = ((lengths & 0x3) as usize) + 1;
+    if off + 4 > body.len() {
+        return Err(Error::invalid("MP4: tfra entry_count truncated"));
+    }
+    let n = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]) as usize;
+    off += 4;
+    let mut entries = Vec::with_capacity(n);
+    let entry_size = if version == 1 { 16 } else { 8 } + len_traf + len_trun + len_sample;
+    if off + n.saturating_mul(entry_size) > body.len() {
+        return Err(Error::invalid("MP4: tfra entries truncated"));
+    }
+    for _ in 0..n {
+        let (time, moof_offset) = if version == 1 {
+            let t = u64::from_be_bytes([
+                body[off],
+                body[off + 1],
+                body[off + 2],
+                body[off + 3],
+                body[off + 4],
+                body[off + 5],
+                body[off + 6],
+                body[off + 7],
+            ]);
+            off += 8;
+            let m = u64::from_be_bytes([
+                body[off],
+                body[off + 1],
+                body[off + 2],
+                body[off + 3],
+                body[off + 4],
+                body[off + 5],
+                body[off + 6],
+                body[off + 7],
+            ]);
+            off += 8;
+            (t, m)
+        } else {
+            let t =
+                u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]) as u64;
+            off += 4;
+            let m =
+                u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]) as u64;
+            off += 4;
+            (t, m)
+        };
+        let traf_number = read_var_u32(&body[off..off + len_traf]);
+        off += len_traf;
+        let trun_number = read_var_u32(&body[off..off + len_trun]);
+        off += len_trun;
+        let sample_number = read_var_u32(&body[off..off + len_sample]);
+        off += len_sample;
+        entries.push(TfraEntry {
+            time,
+            moof_offset,
+            traf_number,
+            trun_number,
+            sample_number,
+        });
+    }
+    Ok(Some(TfraRecord { track_id, entries }))
+}
+
+/// Read a 1..=4 byte big-endian unsigned integer into a u32.
+fn read_var_u32(buf: &[u8]) -> u32 {
+    let mut v: u32 = 0;
+    for &b in buf {
+        v = (v << 8) | b as u32;
+    }
+    v
+}
+
 // --- Sample-table expansion ----------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
@@ -2038,6 +2362,27 @@ struct Mp4Demuxer {
     cursor: usize,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
+    /// Parsed `sidx` SegmentIndexBoxes; one per top-level sidx encountered.
+    /// Currently not consulted by `next_packet` / `seek_to` — the moofs
+    /// already carry the same information (per-fragment time + byte
+    /// offset). We keep the parsed table for downstream tooling that
+    /// wants the higher-level segment-index abstraction (DASH MPD
+    /// generation, byte-range index for on-demand profile, etc.).
+    #[allow(dead_code)]
+    sidxes: Vec<SidxRecord>,
+    /// Parsed `tfra` random-access tables, one per track that the file's
+    /// `mfra` indexes. Each holds (presentation time, moof offset) pairs
+    /// for keyframes — `seek_to` walks these to land directly on a moof
+    /// boundary instead of scanning every sample.
+    tfras: Vec<TfraRecord>,
+    /// Per-track media timescale (1-based parallel to `track_ids`),
+    /// needed to translate `tfra.time` (track timescale) to the seek-to
+    /// caller's pts (also track timescale, but this lets us add unit
+    /// asserts later if they diverge).
+    #[allow(dead_code)]
+    movie_timescale: u32,
+    track_timescales: Vec<u32>,
+    track_ids: Vec<u32>,
 }
 
 impl Demuxer for Mp4Demuxer {
@@ -2076,7 +2421,40 @@ impl Demuxer for Mp4Demuxer {
                 "MP4: stream index {stream_index} out of range"
             )));
         }
-        // Find the last keyframe of this stream with pts <= target.
+
+        // Optional fast-path: if we have a `tfra` random-access index
+        // for this track, use it to locate the moof byte offset of the
+        // last keyframe at-or-before `pts`. We then convert the
+        // `moof_offset` back to a sample index by looking up the first
+        // sample of this track whose `offset >= moof_offset`. This is
+        // O(log N) on the tfra (binary search by time) + O(N) on the
+        // sample list (linear scan from the moof boundary), where the
+        // sample list scan is bounded by one fragment's worth of
+        // samples — far better than the full O(N) walk below.
+        //
+        // The tfra entries' `time` field is in this track's media
+        // timescale, same as the caller's `pts`.
+        if let Some(target) = self.tfra_seek_target(stream_index, pts) {
+            // Find the cursor: first sample of this track whose offset
+            // matches the moof's first sample. The moof's samples land
+            // in mdat, which starts after the moof box; the first one
+            // belongs to this track (single-track sidx) or the first
+            // traf for this track.
+            for (i, s) in self.samples.iter().enumerate() {
+                if s.track_idx != stream_index {
+                    continue;
+                }
+                if s.offset >= target.moof_offset && s.keyframe {
+                    self.cursor = i;
+                    return Ok(s.pts);
+                }
+            }
+            // Fall through to the linear scan if the tfra entry didn't
+            // resolve cleanly (e.g. mdat layout the file lied about).
+        }
+
+        // Default linear scan: find the last keyframe of this stream
+        // with pts <= target.
         let mut best_cursor: Option<usize> = None;
         let mut best_pts: i64 = 0;
         for (i, s) in self.samples.iter().enumerate() {
@@ -2123,6 +2501,62 @@ impl Demuxer for Mp4Demuxer {
             None
         }
     }
+}
+
+impl Mp4Demuxer {
+    /// Look up the latest tfra entry for `stream_index` whose `time`
+    /// is `<= pts`. Returns the `TfraEntry` or `None` when no tfra
+    /// covers this track or no entry is at-or-before `pts`.
+    fn tfra_seek_target(&self, stream_index: u32, pts: i64) -> Option<TfraEntry> {
+        if self.tfras.is_empty() {
+            return None;
+        }
+        let track_id = self.track_ids.get(stream_index as usize)?;
+        let tfra = self.tfras.iter().find(|t| t.track_id == *track_id)?;
+        if tfra.entries.is_empty() {
+            return None;
+        }
+        let _ts = self.track_timescales.get(stream_index as usize)?;
+        // tfra entries are sorted by `time` per spec. Binary search for
+        // the largest `time <= pts`. We treat negative pts as "before
+        // any keyframe" → return the first entry.
+        if pts < 0 {
+            return Some(tfra.entries[0]);
+        }
+        let target = pts as u64;
+        match tfra.entries.binary_search_by_key(&target, |e| e.time) {
+            Ok(i) => Some(tfra.entries[i]),
+            Err(i) => {
+                if i == 0 {
+                    Some(tfra.entries[0])
+                } else {
+                    Some(tfra.entries[i - 1])
+                }
+            }
+        }
+    }
+}
+
+// --- Public parser entry points (tests + diagnostic tools) ---------------
+
+/// Parse a standalone `sidx` (SegmentIndexBox, §8.16.3) body from
+/// `body` (the bytes after the 8/16-byte box header). `sidx_end_offset`
+/// is the absolute file offset of the first byte AFTER the sidx box;
+/// it anchors `first_offset` per spec.
+///
+/// Exposed as a public entry point so tooling can read DASH segment
+/// indexes without re-running `open()`.
+pub fn parse_sidx_box(body: &[u8], sidx_end_offset: u64) -> Result<Option<SidxRecord>> {
+    parse_sidx(body, sidx_end_offset)
+}
+
+/// Parse a standalone `mfra` (MovieFragmentRandomAccessBox, §8.8.10)
+/// body, returning the per-track `tfra` tables (one per track that the
+/// file's mfra indexes).
+pub fn parse_mfra_box(body: &[u8]) -> Result<Vec<TfraRecord>> {
+    let mut out = Vec::new();
+    parse_mfra(body, &mut out)?;
+    Ok(out)
 }
 
 use std::io::Read;
