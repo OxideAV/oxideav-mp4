@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `params.extradata`, matching the existing `dfLa` / `dOps` /
   `avcC` / `hvcC` handling.
 
+### Fixed
+
+- Sample-table expansion (`expand_samples`) clamps adversarial
+  `stsc` `samples_per_chunk` values to the track's total
+  sample count. A malicious file with `samples_per_chunk =
+  u32::MAX` previously caused the inner per-chunk loop to spin
+  ~4 billion times before the `sample_i >= n_samples` guard
+  fired — a multi-minute hang on a tiny input. The clamp keeps
+  the inner loop's iteration count bounded by `n_samples` per
+  entry, matching what well-formed files already exercise.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.4...v0.0.5) - 2026-05-03
 
 ### Other

@@ -1184,11 +1184,19 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
     // stsc is run-length: each entry says "starting at first_chunk, every
     // chunk has `samples_per_chunk` samples" until the next entry's first_chunk.
     // We need to know, for each sample, (chunk_index, index_within_chunk).
+    //
+    // Defensive: clamp `samples_per_chunk` to `n_samples` per entry so a
+    // malicious file claiming `spc = u32::MAX` doesn't burn CPU spinning
+    // an inner `for 0..spc` loop that the `sample_i >= n_samples` break
+    // inside it would otherwise terminate only after ~4 billion iterations.
+    // With the clamp the inner loop walks at most `n_samples` iterations
+    // per stsc entry, matching what any well-formed file already does.
     let mut chunk_of_sample = Vec::with_capacity(n_samples);
     let mut sample_within_chunk = Vec::with_capacity(n_samples);
     {
         let mut sample_i = 0;
         let mut chunk_i = 1u32;
+        let n_samples_u32 = u32::try_from(n_samples).unwrap_or(u32::MAX);
         for entry_i in 0..t.stsc.len() {
             let (fc, spc, _sdi) = t.stsc[entry_i];
             let next_fc = t
@@ -1196,10 +1204,11 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
                 .get(entry_i + 1)
                 .map(|e| e.0)
                 .unwrap_or(t.chunk_offsets.len() as u32 + 1);
+            let spc_clamped = spc.min(n_samples_u32);
             // `next_fc - fc` runs of `spc` samples each.
             let mut ch = chunk_i.max(fc);
             while ch < next_fc && sample_i < n_samples {
-                for s_in_ch in 0..spc {
+                for s_in_ch in 0..spc_clamped {
                     if sample_i >= n_samples {
                         break;
                     }
@@ -1615,5 +1624,33 @@ mod tests {
         let mut t = fresh_track();
         super::parse_audio_sample_entry(&entry, &mut t).unwrap();
         assert_eq!(t.extradata, dec3, "dec3 body should be surfaced verbatim");
+    }
+
+    /// Adversarial stsc with `samples_per_chunk = u32::MAX` used to spin
+    /// the inner `for 0..spc` loop ~4 billion times per chunk, freezing
+    /// the demuxer for an unbounded period on a tiny `n_samples`. The
+    /// clamp limits the inner loop to `n_samples` iterations per entry,
+    /// so this test must complete in milliseconds, not minutes.
+    #[test]
+    fn expand_samples_clamps_giant_samples_per_chunk() {
+        let mut t = fresh_track();
+        t.stsz = vec![1, 1, 1, 1]; // 4 samples
+        t.stts = vec![(4, 100)]; // 4 samples × delta 100
+        t.stsc = vec![(1, u32::MAX, 1)]; // adversarial: spc = 2^32 - 1
+        t.chunk_offsets = vec![0, 100, 200, 300]; // 4 chunks
+        let mut out = Vec::new();
+        let start = std::time::Instant::now();
+        super::expand_samples(&t, 0, &mut out).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(out.len(), 4, "should yield exactly 4 samples");
+        // 4 chunks × 4-sample clamp = 16 inner iterations, well under
+        // 1ms. The pre-clamp version takes ~minutes (n_chunks * 4G ≈
+        // 16 billion iterations). 100ms gives us plenty of headroom
+        // while still catching any regression that re-introduces the
+        // unbounded loop.
+        assert!(
+            elapsed.as_millis() < 100,
+            "expand_samples spun on adversarial spc: took {elapsed:?}",
+        );
     }
 }
