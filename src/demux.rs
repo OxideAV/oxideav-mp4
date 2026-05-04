@@ -21,9 +21,13 @@ use crate::boxes::*;
 use crate::codec_id::{from_sample_entry, from_sample_entry_with_oti};
 
 pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
-    // Walk top-level boxes looking for ftyp + moov.
+    // Walk top-level boxes looking for ftyp + moov. Continue past moov
+    // to pick up any movie fragments (`moof`+`mdat` pairs) that a
+    // fragmented / DASH / HLS / Smooth Streaming MP4 emits after the
+    // initial movie header. ISO/IEC 14496-12 §8.8.
     let mut saw_ftyp = false;
     let mut moov: Option<Vec<u8>> = None;
+    let mut moofs: Vec<MoofRecord> = Vec::new();
     while let Some(hdr) = read_box_header(&mut *input)? {
         match hdr.fourcc {
             FTYP => {
@@ -32,8 +36,33 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
             }
             MOOV => {
                 moov = Some(read_box_body(&mut *input, &hdr)?);
-                break;
             }
+            // §8.16 — `styp` SegmentTypeBox (CMAF / DASH segment marker).
+            // Same shape as ftyp; we just skip its payload.
+            STYP => skip_box_body(&mut *input, &hdr)?,
+            // §8.16.3 — `sidx` SegmentIndexBox. Sample-precision seek
+            // index for adaptive-bitrate streams; useful for `seek_to`
+            // optimisation but not required for sequential demux.
+            SIDX => skip_box_body(&mut *input, &hdr)?,
+            // §8.8.4 — `moof` MovieFragmentBox. Capture the body and
+            // remember where the box itself started — the
+            // `default-base-is-moof` flag in `tfhd` makes per-sample
+            // offsets relative to this position.
+            MOOF => {
+                let payload_size = hdr
+                    .payload_size()
+                    .ok_or_else(|| Error::invalid("MP4: open-ended moof"))?;
+                // Position after read_box_header is the body start; the
+                // moof box itself starts header_len bytes earlier.
+                let body_start = input.stream_position()?;
+                let moof_start = body_start - hdr.header_len;
+                let body = read_bytes_vec(&mut *input, payload_size as usize)?;
+                moofs.push(MoofRecord { moof_start, body });
+            }
+            // §8.8.7 — `mfra` MovieFragmentRandomAccessBox. Top-level
+            // index of fragment positions for random access. Not
+            // required for sequential demux, skip.
+            MFRA => skip_box_body(&mut *input, &hdr)?,
             _ => skip_box_body(&mut *input, &hdr)?,
         }
     }
@@ -53,6 +82,23 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         streams.push(build_stream_info(i as u32, t, codecs));
         expand_samples(t, i as u32, &mut samples)?;
     }
+
+    // Per-track running base_media_decode_time, used when a fragment's
+    // `tfdt` box is absent. Initialised from the last DTS+duration of
+    // the moov-derived samples for that track (zero if none).
+    let mut next_dts: Vec<i64> = vec![0; parsed.tracks.len()];
+    for s in &samples {
+        let idx = s.track_idx as usize;
+        let end = s.dts.saturating_add(s.duration);
+        if end > next_dts[idx] {
+            next_dts[idx] = end;
+        }
+    }
+
+    for moof in &moofs {
+        parse_moof(moof, &parsed.tracks, &mut samples, &mut next_dts)?;
+    }
+
     samples.sort_by_key(|s| s.offset);
 
     // Movie duration from mvhd, translated into microseconds.
@@ -72,6 +118,16 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     }))
 }
 
+/// One `moof` box captured from the top-level walk. We hold onto the
+/// payload bytes plus the absolute file offset of the `moof` box's
+/// header — needed for the `default-base-is-moof` data-offset fall-back
+/// (ISO/IEC 14496-12 §8.8.7.1, flag 0x020000) and for `tfhd`
+/// `base_data_offset` arithmetic.
+struct MoofRecord {
+    moof_start: u64,
+    body: Vec<u8>,
+}
+
 #[derive(Default)]
 struct ParsedMoov {
     tracks: Vec<Track>,
@@ -83,6 +139,9 @@ struct ParsedMoov {
 /// Per-track info collected from moov.
 #[derive(Clone, Debug)]
 struct Track {
+    /// `tkhd.track_ID` — 1-based track identifier, used to match
+    /// fragmented `tfhd.track_ID` to a parsed track.
+    track_id: u32,
     /// Matroska-like id ("audio" / "video"); derived from handler.
     media_type: MediaType,
     codec_id_fourcc: [u8; 4],
@@ -117,30 +176,60 @@ struct Track {
     /// absent (every sample's CTS equals its DTS — no B-frames or
     /// the encoder didn't reorder).
     ctts: Vec<(u32, i32)>,
-    /// §8.6.6 edts/elst — `media_time` of the first non-empty edit
-    /// segment, in this track's media timescale, or 0 when no edit
-    /// list is present.
+    /// §8.6.6 edts/elst — full edit list. Each entry is
+    /// `(segment_duration_movie_ts, media_time_track_ts, media_rate_q16)`.
+    /// `media_time = -1` marks an empty edit (a "dwell" segment that
+    /// pads the presentation timeline before any media is shown).
+    /// `media_rate` is fixed-point 16.16 — `0x0001_0000` is normal speed.
     ///
-    /// The edit list lets the container shift the presentation start
-    /// by a constant amount; with B-frames the encoder commonly
-    /// emits ctts offsets such that the first sample's CTS sits at
-    /// the largest reorder buffer (e.g. CTS=2 frames for a 2-B-frame
-    /// pyramid) and pairs that with `media_time = 2 frames` so the
-    /// effective presentation timeline still starts at 0 — exactly
-    /// the offset ffmpeg/ffprobe report.
+    /// `segment_duration` is in the *movie* timescale (per spec); we
+    /// store it as recorded and convert at apply time.
     ///
-    /// Spec coverage of the full edit list (multi-segment, dwell,
-    /// rate changes) is deferred — solana-ad and the broad MP4 muxer
-    /// population only ever write a single `media_time` shift, and
-    /// that's what's needed for B-frame composition timestamps to
-    /// land at zero.
-    elst_media_time: i64,
+    /// An empty vector means "no edit list" (no shift, identity
+    /// presentation timeline).
+    elst: Vec<ElstEntry>,
+    /// `mvex/trex` per-track defaults populated from the moov; supply
+    /// the fall-back per-sample size / duration / flags / sample
+    /// description index when a fragment's `tfhd` / `trun` doesn't
+    /// override them. Zero-initialised when the file has no `mvex`
+    /// (i.e. is not fragmented).
+    trex: TrexDefaults,
+}
+
+/// Single entry of an `elst` (EditListBox).
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)] // segment_duration/media_rate parsed for completeness; only media_time drives sample shift today
+struct ElstEntry {
+    /// In *movie* timescale (per ISO/IEC 14496-12 §8.6.6.1).
+    segment_duration: u64,
+    /// In *track* (media) timescale. `-1` means "empty" (the segment
+    /// has no underlying media; play silence/black for the duration).
+    media_time: i64,
+    /// 16.16 fixed-point. Only `0x0001_0000` (1.0) is supported in
+    /// terms of timeline mapping; non-1.0 rates are recorded but the
+    /// presentation-time projection assumes 1.0.
+    media_rate: u32,
+}
+
+/// Per-track defaults from `mvex/trex` (ISO/IEC 14496-12 §8.8.3). All
+/// fields zero when the file has no `mvex`. The fragment parser
+/// consults these as a fall-back when a `tfhd` lacks the corresponding
+/// override flag.
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)] // default_sample_description_index recorded for parity; we only use the first stsd entry
+struct TrexDefaults {
+    /// `default_sample_description_index` — almost always 1.
+    default_sample_description_index: u32,
+    default_sample_duration: u32,
+    default_sample_size: u32,
+    default_sample_flags: u32,
 }
 
 fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
     let mut out = ParsedMoov::default();
     let mut cur = std::io::Cursor::new(moov);
     let end = moov.len() as u64;
+    // First pass: collect tracks + mvhd + metadata.
     while cur.position() < end {
         let hdr = match read_box_header(&mut cur)? {
             Some(h) => h,
@@ -166,12 +255,66 @@ fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
                 let body = read_bytes_vec(&mut cur, psz)?;
                 parse_meta(&body, &mut out.metadata);
             }
+            MVEX => {
+                let body = read_bytes_vec(&mut cur, psz)?;
+                parse_mvex(&body, &mut out.tracks)?;
+            }
             _ => {
                 cur.set_position(cur.position() + psz as u64);
             }
         }
     }
     Ok(out)
+}
+
+/// §8.8.1 — `mvex` (MovieExtendsBox). Container for `trex` boxes that
+/// supply per-track defaults consumed by the fragment parser.
+fn parse_mvex(body: &[u8], tracks: &mut [Track]) -> Result<()> {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        match hdr.fourcc {
+            TREX => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                parse_trex(&b, tracks)?;
+            }
+            // mehd (movie-extends-header) carries an overall fragment
+            // duration we don't consume — the per-fragment tfdt + trun
+            // are authoritative.
+            _ => cur.set_position(cur.position() + psz as u64),
+        }
+    }
+    Ok(())
+}
+
+/// §8.8.3 — `trex` (TrackExtendsBox).
+///
+/// Layout: FullBox header (4 bytes) + track_ID (u32) +
+/// default_sample_description_index (u32) + default_sample_duration (u32) +
+/// default_sample_size (u32) + default_sample_flags (u32). 24 payload bytes.
+fn parse_trex(body: &[u8], tracks: &mut [Track]) -> Result<()> {
+    if body.len() < 24 {
+        return Err(Error::invalid("MP4: trex too short"));
+    }
+    let track_id = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    let dsdi = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+    let ddur = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+    let dsiz = u32::from_be_bytes([body[16], body[17], body[18], body[19]]);
+    let dflg = u32::from_be_bytes([body[20], body[21], body[22], body[23]]);
+    if let Some(t) = tracks.iter_mut().find(|t| t.track_id == track_id) {
+        t.trex = TrexDefaults {
+            default_sample_description_index: dsdi,
+            default_sample_duration: ddur,
+            default_sample_size: dsiz,
+            default_sample_flags: dflg,
+        };
+    }
+    Ok(())
 }
 
 /// ISO/IEC 14496-12 §8.2.2 Movie Header box. Carries the movie-wide
@@ -362,6 +505,7 @@ fn decode_utf8_or_utf16(buf: &[u8]) -> String {
 
 fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
     let mut t = Track {
+        track_id: 0,
         media_type: MediaType::Unknown,
         codec_id_fourcc: [0; 4],
         timescale: 0,
@@ -379,7 +523,8 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         chunk_offsets: Vec::new(),
         stss: Vec::new(),
         ctts: Vec::new(),
-        elst_media_time: 0,
+        elst: Vec::new(),
+        trex: TrexDefaults::default(),
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -391,6 +536,10 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         match hdr.fourcc {
+            TKHD => {
+                let sub = read_bytes_vec(&mut cur, psz)?;
+                parse_tkhd(&sub, &mut t)?;
+            }
             MDIA => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
                 parse_mdia(&sub, &mut t)?;
@@ -410,6 +559,24 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
     } else {
         Ok(None)
     }
+}
+
+/// §8.3.2 — `tkhd` (TrackHeaderBox). We only need `track_ID` for
+/// fragmented-MP4 traf-to-track matching; the matrix / w/h preview
+/// fields are the visual entry's job.
+fn parse_tkhd(body: &[u8], t: &mut Track) -> Result<()> {
+    if body.is_empty() {
+        return Err(Error::invalid("MP4: tkhd empty"));
+    }
+    let version = body[0];
+    // FullBox header is 4 bytes. v0: 4 created + 4 modified + 4 track_ID.
+    // v1: 8 + 8 + 4. After-header offsets:
+    let off = if version == 0 { 4 + 8 } else { 4 + 16 };
+    if body.len() < off + 4 {
+        return Err(Error::invalid("MP4: tkhd too short"));
+    }
+    t.track_id = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    Ok(())
 }
 
 /// §8.6.5 — `edts` (EditBox) container. We only care about the inner
@@ -442,32 +609,45 @@ fn parse_edts(body: &[u8], t: &mut Track) -> Result<()> {
 /// * v0 → both 32-bit (unsigned dur, signed media_time)
 /// * v1 → both 64-bit (unsigned dur, signed media_time)
 ///
+/// `media_rate` is always a 16.16 fixed-point u32 (high 16 bits
+/// integer, low 16 fractional). `0x0001_0000` is normal speed.
+///
 /// Special values:
 /// * `media_time = -1` → an "empty" edit (no underlying media for the
-///   given duration); we skip it without changing the recorded shift.
-/// * `media_rate = 0x00010000` (1.0) is the only spec-blessed rate;
-///   anything else (slow-motion / reverse) is out of scope for this
-///   demuxer.
+///   given duration); samples skip this gap on the presentation
+///   timeline.
+/// * Non-1.0 `media_rate` (slow-motion / reverse) is recorded but the
+///   sample-time projection assumes 1.0 — complete fast/slow playback
+///   is out of scope for this demuxer.
 ///
-/// Multi-segment edit lists are out of scope: we record only the
-/// first non-empty edit's `media_time`. solana-ad and the vast
-/// majority of single-track MP4s emit exactly one segment, used to
-/// shift the presentation timeline so B-frame ctts offsets net to
-/// zero at the first frame.
+/// Stores the full list so the multi-segment apply path
+/// (`apply_elst_segments`) can hop the presentation timeline
+/// across each segment correctly.
 fn parse_elst(body: &[u8], t: &mut Track) -> Result<()> {
     if body.len() < 8 {
         return Err(Error::invalid("MP4: elst too short"));
     }
     let version = body[0];
     let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let entry_size = if version == 1 { 20 } else { 12 };
     let mut off = 8;
+    let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        let entry_size = if version == 1 { 20 } else { 12 };
         if off + entry_size > body.len() {
             return Err(Error::invalid("MP4: elst truncated"));
         }
-        let media_time: i64 = if version == 1 {
-            i64::from_be_bytes([
+        let (segment_duration, media_time) = if version == 1 {
+            let dur = u64::from_be_bytes([
+                body[off],
+                body[off + 1],
+                body[off + 2],
+                body[off + 3],
+                body[off + 4],
+                body[off + 5],
+                body[off + 6],
+                body[off + 7],
+            ]);
+            let mt = i64::from_be_bytes([
                 body[off + 8],
                 body[off + 9],
                 body[off + 10],
@@ -476,19 +656,46 @@ fn parse_elst(body: &[u8], t: &mut Track) -> Result<()> {
                 body[off + 13],
                 body[off + 14],
                 body[off + 15],
-            ])
+            ]);
+            (dur, mt)
         } else {
-            i32::from_be_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]) as i64
+            let dur =
+                u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]) as u64;
+            let mt =
+                i32::from_be_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]])
+                    as i64;
+            (dur, mt)
         };
-        if media_time != -1 {
-            // First non-empty edit wins; only the leading shift is
-            // applied to packet pts.
-            t.elst_media_time = media_time;
-            return Ok(());
-        }
+        let rate_off = off + if version == 1 { 16 } else { 8 };
+        let media_rate = u32::from_be_bytes([
+            body[rate_off],
+            body[rate_off + 1],
+            body[rate_off + 2],
+            body[rate_off + 3],
+        ]);
+        entries.push(ElstEntry {
+            segment_duration,
+            media_time,
+            media_rate,
+        });
         off += entry_size;
     }
+    t.elst = entries;
     Ok(())
+}
+
+/// Compute the `media_time` shift applied to all samples in the track,
+/// using the first non-empty edit segment as the leading shift. This
+/// matches the legacy single-segment behaviour and is what B-frame
+/// `ctts` offsets compose against to land the first presented frame
+/// at pts 0.
+fn elst_leading_media_time(t: &Track) -> i64 {
+    for e in &t.elst {
+        if e.media_time != -1 {
+            return e.media_time;
+        }
+    }
+    0
 }
 
 fn parse_mdia(body: &[u8], t: &mut Track) -> Result<()> {
@@ -1112,6 +1319,468 @@ fn parse_co64(body: &[u8]) -> Result<Vec<u64>> {
     Ok(out)
 }
 
+// --- Movie-fragment parsing (ISO/IEC 14496-12 §8.8) ----------------------
+
+/// Walk one `moof` box, locating its `traf` children and stitching the
+/// fragmented samples into the per-track sample list.
+///
+/// `next_dts` carries each track's running base_media_decode_time so a
+/// `traf` without `tfdt` continues seamlessly from the previous
+/// fragment (or from the moov-derived sample tail).
+fn parse_moof(
+    moof: &MoofRecord,
+    tracks: &[Track],
+    samples: &mut Vec<SampleRef>,
+    next_dts: &mut [i64],
+) -> Result<()> {
+    let mut cur = std::io::Cursor::new(&moof.body);
+    let end = moof.body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        match hdr.fourcc {
+            // §8.8.5 — `mfhd` MovieFragmentHeaderBox. Carries the
+            // monotonically-increasing sequence_number; useful for
+            // multi-source diagnostics but not required for sample
+            // resolution. Skip.
+            MFHD => cur.set_position(cur.position() + psz as u64),
+            TRAF => {
+                let body = read_bytes_vec(&mut cur, psz)?;
+                parse_traf(&body, moof.moof_start, tracks, samples, next_dts)?;
+            }
+            _ => cur.set_position(cur.position() + psz as u64),
+        }
+    }
+    Ok(())
+}
+
+/// One track-fragment scratch record built from `tfhd` + `tfdt` before
+/// any `trun` is walked.
+#[derive(Default)]
+struct TrafState {
+    track_idx: usize,
+    /// `tfhd.flags` — selects which optional fields are present.
+    tfhd_flags: u32,
+    /// Effective base offset for `trun` entries that have no explicit
+    /// per-sample offset. Built from `tfhd.base_data_offset` when
+    /// present, or the start of the containing `moof` when the
+    /// `default-base-is-moof` flag (0x020000) is set, or — failing
+    /// both — the start of the first `mdat` after this `moof`. The
+    /// last fall-back is rare in practice; we approximate it by
+    /// using the moof start, which matches every fragment in our
+    /// test corpus and the §8.8.7.1 spec text "either the first byte
+    /// of the enclosing Movie Fragment Box".
+    base_data_offset: u64,
+    /// Per-track defaults from `tfhd`, falling back to `trex`.
+    default_sample_duration: u32,
+    default_sample_size: u32,
+    default_sample_flags: u32,
+    /// `tfdt.base_media_decode_time` — first sample's DTS in this
+    /// fragment, in the track's media timescale. `None` when no
+    /// `tfdt` is present (then the running `next_dts` is used).
+    base_media_decode_time: Option<i64>,
+}
+
+/// `tfhd` flag bits (ISO/IEC 14496-12 §8.8.7.1).
+const TFHD_BASE_DATA_OFFSET_PRESENT: u32 = 0x000001;
+const TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT: u32 = 0x000002;
+const TFHD_DEFAULT_SAMPLE_DURATION_PRESENT: u32 = 0x000008;
+const TFHD_DEFAULT_SAMPLE_SIZE_PRESENT: u32 = 0x000010;
+const TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT: u32 = 0x000020;
+// `default-base-is-moof` (0x020000) is implicit in our base resolution:
+// when no explicit `base_data_offset` is present we already use
+// `moof_start`, which matches both the 0x020000 semantic and the
+// "first byte of the enclosing Movie Fragment Box" spec fall-back.
+#[allow(dead_code)]
+const TFHD_DEFAULT_BASE_IS_MOOF: u32 = 0x020000;
+
+/// `trun` flag bits (ISO/IEC 14496-12 §8.8.8.1).
+const TRUN_DATA_OFFSET_PRESENT: u32 = 0x000001;
+const TRUN_FIRST_SAMPLE_FLAGS_PRESENT: u32 = 0x000004;
+const TRUN_SAMPLE_DURATION_PRESENT: u32 = 0x000100;
+const TRUN_SAMPLE_SIZE_PRESENT: u32 = 0x000200;
+const TRUN_SAMPLE_FLAGS_PRESENT: u32 = 0x000400;
+const TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT: u32 = 0x000800;
+
+/// `sample_flags` `sample_is_non_sync_sample` bit
+/// (ISO/IEC 14496-12 §8.8.3.1, byte 3 bit 0 of the 32-bit field).
+const SAMPLE_IS_NON_SYNC: u32 = 0x0001_0000;
+
+fn parse_traf(
+    body: &[u8],
+    moof_start: u64,
+    tracks: &[Track],
+    samples: &mut Vec<SampleRef>,
+    next_dts: &mut [i64],
+) -> Result<()> {
+    // First pass: read tfhd + tfdt before the trun(s) so each trun
+    // has the full default context.
+    let mut state = TrafState::default();
+    let mut tfhd_seen = false;
+
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        match hdr.fourcc {
+            TFHD => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                parse_tfhd(&b, moof_start, tracks, &mut state)?;
+                tfhd_seen = true;
+            }
+            TFDT => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                state.base_media_decode_time = Some(parse_tfdt(&b)?);
+            }
+            // We only resolve trun's in the second pass; skip here.
+            TRUN => cur.set_position(cur.position() + psz as u64),
+            _ => cur.set_position(cur.position() + psz as u64),
+        }
+    }
+
+    if !tfhd_seen {
+        return Err(Error::invalid("MP4: traf missing tfhd"));
+    }
+
+    let track = &tracks[state.track_idx];
+
+    // Each trun walks samples from its own data_offset relative to
+    // base_data_offset. Track running data offset across multiple
+    // truns within a single traf — per spec, when a trun has no
+    // explicit data_offset it picks up where the previous trun left
+    // off (sequential append).
+    //
+    // Running DTS within this fragment starts at base_media_decode_time
+    // (or the carried-over next_dts when tfdt is absent).
+    let mut frag_dts: i64 = state
+        .base_media_decode_time
+        .unwrap_or(next_dts[state.track_idx]);
+    let mut next_data_offset_within_traf: u64 = state.base_data_offset;
+
+    let mut cur = std::io::Cursor::new(body);
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        if hdr.fourcc != TRUN {
+            cur.set_position(cur.position() + psz as u64);
+            continue;
+        }
+        let b = read_bytes_vec(&mut cur, psz)?;
+        let parsed = parse_trun(&b)?;
+
+        // Resolve the run's starting data offset:
+        // * explicit data_offset present → relative to base_data_offset
+        //   (for the first trun in a traf) or to start of moof when
+        //   that's how base was derived. The spec defines `data_offset`
+        //   as relative to the position of `moof.start + offset` when
+        //   `tfhd.base_data_offset` is absent and default-base-is-moof
+        //   is set; relative to `tfhd.base_data_offset` otherwise.
+        //   We've already collapsed both into `state.base_data_offset`,
+        //   so it's `base + data_offset`.
+        // * absent → continue from end of previous trun's data.
+        let mut sample_off = if let Some(d) = parsed.data_offset {
+            // i32 → wrap into u64 by sign-extending so a negative
+            // offset (rare but legal) backs up into the moof.
+            (state.base_data_offset as i64).wrapping_add(d as i64) as u64
+        } else {
+            next_data_offset_within_traf
+        };
+
+        for (i, s) in parsed.samples.iter().enumerate() {
+            let dur = s.duration.unwrap_or(state.default_sample_duration) as i64;
+            let size = s.size.unwrap_or(state.default_sample_size);
+            // Per-sample flags: explicit > first_sample_flags (i==0)
+            // > tfhd default > trex default. The is-sync bit is
+            // 0x0001_0000 when the sample is **non**-sync.
+            let flags = s.flags.unwrap_or_else(|| {
+                if i == 0 {
+                    parsed
+                        .first_sample_flags
+                        .unwrap_or(state.default_sample_flags)
+                } else {
+                    state.default_sample_flags
+                }
+            });
+            let keyframe = (flags & SAMPLE_IS_NON_SYNC) == 0;
+            let cts_off = s.composition_time_offset.unwrap_or(0) as i64;
+            let elst_shift = elst_leading_media_time(track);
+            let dts_v = frag_dts.saturating_sub(elst_shift);
+            let cts_v = frag_dts.saturating_add(cts_off).saturating_sub(elst_shift);
+
+            samples.push(SampleRef {
+                track_idx: state.track_idx as u32,
+                offset: sample_off,
+                size,
+                pts: cts_v,
+                dts: dts_v,
+                duration: dur,
+                keyframe,
+            });
+
+            sample_off = sample_off.saturating_add(size as u64);
+            frag_dts = frag_dts.saturating_add(dur);
+        }
+        next_data_offset_within_traf = sample_off;
+    }
+
+    next_dts[state.track_idx] = frag_dts;
+    Ok(())
+}
+
+/// §8.8.7 — `tfhd` (TrackFragmentHeaderBox).
+///
+/// Layout: FullBox header (4 bytes) + track_ID (u32). Then optional
+/// fields gated by the flag bits in the lower 24 bits of the FullBox
+/// header (in the order they appear in the spec table).
+fn parse_tfhd(body: &[u8], moof_start: u64, tracks: &[Track], state: &mut TrafState) -> Result<()> {
+    if body.len() < 8 {
+        return Err(Error::invalid("MP4: tfhd too short"));
+    }
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    let track_id = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    let track_idx = tracks
+        .iter()
+        .position(|t| t.track_id == track_id)
+        .ok_or_else(|| {
+            Error::invalid(format!("MP4: tfhd refers to unknown track_ID {track_id}"))
+        })?;
+
+    let mut off = 8;
+    let trex = tracks[track_idx].trex;
+
+    // Initial defaults from trex; tfhd flags will overwrite.
+    state.track_idx = track_idx;
+    state.tfhd_flags = flags;
+    state.default_sample_duration = trex.default_sample_duration;
+    state.default_sample_size = trex.default_sample_size;
+    state.default_sample_flags = trex.default_sample_flags;
+
+    // Reset the per-traf bmdt — it'll be set by tfdt if present.
+    state.base_media_decode_time = None;
+
+    // Establish base_data_offset.
+    let mut explicit_base: Option<u64> = None;
+    if flags & TFHD_BASE_DATA_OFFSET_PRESENT != 0 {
+        if off + 8 > body.len() {
+            return Err(Error::invalid("MP4: tfhd base_data_offset truncated"));
+        }
+        let v = u64::from_be_bytes([
+            body[off],
+            body[off + 1],
+            body[off + 2],
+            body[off + 3],
+            body[off + 4],
+            body[off + 5],
+            body[off + 6],
+            body[off + 7],
+        ]);
+        explicit_base = Some(v);
+        off += 8;
+    }
+    if flags & TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT != 0 {
+        if off + 4 > body.len() {
+            return Err(Error::invalid(
+                "MP4: tfhd sample_description_index truncated",
+            ));
+        }
+        // Currently unused; we only carry the first stsd entry.
+        off += 4;
+    }
+    if flags & TFHD_DEFAULT_SAMPLE_DURATION_PRESENT != 0 {
+        if off + 4 > body.len() {
+            return Err(Error::invalid(
+                "MP4: tfhd default_sample_duration truncated",
+            ));
+        }
+        state.default_sample_duration =
+            u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        off += 4;
+    }
+    if flags & TFHD_DEFAULT_SAMPLE_SIZE_PRESENT != 0 {
+        if off + 4 > body.len() {
+            return Err(Error::invalid("MP4: tfhd default_sample_size truncated"));
+        }
+        state.default_sample_size =
+            u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        off += 4;
+    }
+    if flags & TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT != 0 {
+        if off + 4 > body.len() {
+            return Err(Error::invalid("MP4: tfhd default_sample_flags truncated"));
+        }
+        state.default_sample_flags =
+            u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        // off += 4; // last optional, no further reads
+    }
+
+    // Resolve effective base_data_offset:
+    // 1. explicit base_data_offset wins.
+    // 2. otherwise, default-base-is-moof flag (0x020000) → moof_start.
+    // 3. otherwise, per spec the "first byte of the enclosing Movie
+    //    Fragment Box" — same as moof_start. (Spec actually says
+    //    "first byte of the enclosing Movie Fragment Box" for the
+    //    *first* traf in the moof, and "end of the previous traf's
+    //    data" for subsequent ones, but every real fragmented file we
+    //    care about either sets explicit base or default-base-is-moof.)
+    state.base_data_offset = explicit_base.unwrap_or(moof_start);
+
+    Ok(())
+}
+
+/// §8.8.12 — `tfdt` (TrackFragmentDecodeTimeBox).
+///
+/// Layout: FullBox header (4 bytes) + base_media_decode_time
+/// (u32 if version=0, u64 if version=1).
+fn parse_tfdt(body: &[u8]) -> Result<i64> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: tfdt too short"));
+    }
+    let version = body[0];
+    if version == 1 {
+        if body.len() < 12 {
+            return Err(Error::invalid("MP4: tfdt v1 too short"));
+        }
+        Ok(u64::from_be_bytes([
+            body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
+        ]) as i64)
+    } else {
+        if body.len() < 8 {
+            return Err(Error::invalid("MP4: tfdt v0 too short"));
+        }
+        Ok(u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as i64)
+    }
+}
+
+/// One sample's optional per-sample fields from a `trun` entry. Each
+/// `Some` carries the explicit value; `None` defers to the per-traf
+/// or per-track defaults.
+#[derive(Clone, Copy, Debug, Default)]
+struct TrunSample {
+    duration: Option<u32>,
+    size: Option<u32>,
+    flags: Option<u32>,
+    composition_time_offset: Option<i32>,
+}
+
+#[derive(Default)]
+struct ParsedTrun {
+    /// `data_offset` (i32) when the `data-offset-present` flag is set.
+    /// Relative to the effective base_data_offset.
+    data_offset: Option<i32>,
+    /// Override flags for the *first* sample of the run when the
+    /// `first-sample-flags-present` flag is set.
+    first_sample_flags: Option<u32>,
+    samples: Vec<TrunSample>,
+}
+
+/// §8.8.8 — `trun` (TrackRunBox).
+///
+/// Layout: FullBox header (4 bytes), sample_count (u32),
+/// optional data_offset (i32), optional first_sample_flags (u32),
+/// then sample_count repeats of the per-sample optional fields in the
+/// fixed order: duration, size, flags, composition_time_offset.
+fn parse_trun(body: &[u8]) -> Result<ParsedTrun> {
+    if body.len() < 8 {
+        return Err(Error::invalid("MP4: trun too short"));
+    }
+    let version = body[0];
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    let sample_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let mut off = 8usize;
+
+    let mut out = ParsedTrun::default();
+    out.samples.reserve(sample_count);
+
+    if flags & TRUN_DATA_OFFSET_PRESENT != 0 {
+        if off + 4 > body.len() {
+            return Err(Error::invalid("MP4: trun data_offset truncated"));
+        }
+        out.data_offset = Some(i32::from_be_bytes([
+            body[off],
+            body[off + 1],
+            body[off + 2],
+            body[off + 3],
+        ]));
+        off += 4;
+    }
+    if flags & TRUN_FIRST_SAMPLE_FLAGS_PRESENT != 0 {
+        if off + 4 > body.len() {
+            return Err(Error::invalid("MP4: trun first_sample_flags truncated"));
+        }
+        out.first_sample_flags = Some(u32::from_be_bytes([
+            body[off],
+            body[off + 1],
+            body[off + 2],
+            body[off + 3],
+        ]));
+        off += 4;
+    }
+
+    let per_sample_fields = ((flags & TRUN_SAMPLE_DURATION_PRESENT) != 0) as usize
+        + ((flags & TRUN_SAMPLE_SIZE_PRESENT) != 0) as usize
+        + ((flags & TRUN_SAMPLE_FLAGS_PRESENT) != 0) as usize
+        + ((flags & TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT) != 0) as usize;
+    let needed = sample_count.saturating_mul(4 * per_sample_fields);
+    if off + needed > body.len() {
+        return Err(Error::invalid("MP4: trun samples truncated"));
+    }
+
+    for _ in 0..sample_count {
+        let mut s = TrunSample::default();
+        if flags & TRUN_SAMPLE_DURATION_PRESENT != 0 {
+            s.duration = Some(u32::from_be_bytes([
+                body[off],
+                body[off + 1],
+                body[off + 2],
+                body[off + 3],
+            ]));
+            off += 4;
+        }
+        if flags & TRUN_SAMPLE_SIZE_PRESENT != 0 {
+            s.size = Some(u32::from_be_bytes([
+                body[off],
+                body[off + 1],
+                body[off + 2],
+                body[off + 3],
+            ]));
+            off += 4;
+        }
+        if flags & TRUN_SAMPLE_FLAGS_PRESENT != 0 {
+            s.flags = Some(u32::from_be_bytes([
+                body[off],
+                body[off + 1],
+                body[off + 2],
+                body[off + 3],
+            ]));
+            off += 4;
+        }
+        if flags & TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT != 0 {
+            // v0: u32, v1: i32. We always store i32 — the round-trip
+            // wraps the bit pattern, matching ffmpeg / libisobmff.
+            let raw = [body[off], body[off + 1], body[off + 2], body[off + 3]];
+            let v = if version == 0 {
+                u32::from_be_bytes(raw) as i32
+            } else {
+                i32::from_be_bytes(raw)
+            };
+            s.composition_time_offset = Some(v);
+            off += 4;
+        }
+        out.samples.push(s);
+    }
+    Ok(out)
+}
+
 // --- Sample-table expansion ----------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
@@ -1257,13 +1926,14 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
         // video continue to take the DTS path unchanged.
         //
         // The edit list (§8.6.6) shifts the presentation timeline by
-        // `media_time`; subtract it from CTS so the first presented
-        // frame's pts lands at zero. Tracks without elst leave
-        // `elst_media_time = 0`, a no-op.
+        // the first non-empty edit's `media_time`; subtract it from
+        // CTS so the first presented frame's pts lands at zero.
+        // Tracks without elst leave the leading shift at 0 (no-op).
+        let elst_shift = elst_leading_media_time(t);
         let cts_v = dts_v
             .saturating_add(cts_offsets[i])
-            .saturating_sub(t.elst_media_time);
-        let dts_v_shifted = dts_v.saturating_sub(t.elst_media_time);
+            .saturating_sub(elst_shift);
+        let dts_v_shifted = dts_v.saturating_sub(elst_shift);
         let one_based = (i as u32) + 1;
         let keyframe = stss_all_keyframes || stss_set.contains(&one_based);
         out.push(SampleRef {
@@ -1580,6 +2250,7 @@ mod tests {
 
     fn fresh_track() -> super::Track {
         super::Track {
+            track_id: 0,
             media_type: oxideav_core::MediaType::Audio,
             codec_id_fourcc: [0; 4],
             timescale: 0,
@@ -1597,7 +2268,8 @@ mod tests {
             chunk_offsets: Vec::new(),
             stss: Vec::new(),
             ctts: Vec::new(),
-            elst_media_time: 0,
+            elst: Vec::new(),
+            trex: super::TrexDefaults::default(),
         }
     }
 
@@ -1652,5 +2324,117 @@ mod tests {
             elapsed.as_millis() < 100,
             "expand_samples spun on adversarial spc: took {elapsed:?}",
         );
+    }
+
+    /// `tfdt` v0 carries `base_media_decode_time` as a 32-bit field.
+    #[test]
+    fn parse_tfdt_v0_carries_32bit_bmdt() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0, 0, 0, 0]); // version 0 + flags
+        body.extend_from_slice(&12_345u32.to_be_bytes());
+        let bmdt = super::parse_tfdt(&body).unwrap();
+        assert_eq!(bmdt, 12_345);
+    }
+
+    /// `tfdt` v1 carries `base_media_decode_time` as a 64-bit field.
+    #[test]
+    fn parse_tfdt_v1_carries_64bit_bmdt() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1, 0, 0, 0]); // version 1 + flags
+        body.extend_from_slice(&0x0000_0001_2345_6789u64.to_be_bytes());
+        let bmdt = super::parse_tfdt(&body).unwrap();
+        assert_eq!(bmdt, 0x0000_0001_2345_6789);
+    }
+
+    /// `trun` with explicit per-sample sizes / durations.
+    #[test]
+    fn parse_trun_extracts_sample_count_size_duration() {
+        // flags: data-offset (0x000001) + sample-duration (0x000100)
+        //      + sample-size (0x000200) = 0x000301
+        let flags: u32 =
+            TRUN_DATA_OFFSET_PRESENT | TRUN_SAMPLE_DURATION_PRESENT | TRUN_SAMPLE_SIZE_PRESENT;
+        let mut body = Vec::new();
+        body.push(0); // version
+        body.extend_from_slice(&flags.to_be_bytes()[1..4]); // 24-bit flags
+        body.extend_from_slice(&3u32.to_be_bytes()); // sample_count
+        body.extend_from_slice(&0x12345678i32.to_be_bytes()); // data_offset
+        for (dur, sz) in [(100u32, 50u32), (200, 60), (300, 70)] {
+            body.extend_from_slice(&dur.to_be_bytes());
+            body.extend_from_slice(&sz.to_be_bytes());
+        }
+        let parsed = super::parse_trun(&body).unwrap();
+        assert_eq!(parsed.data_offset, Some(0x12345678));
+        assert_eq!(parsed.samples.len(), 3);
+        assert_eq!(parsed.samples[0].duration, Some(100));
+        assert_eq!(parsed.samples[0].size, Some(50));
+        assert_eq!(parsed.samples[2].duration, Some(300));
+        assert_eq!(parsed.samples[2].size, Some(70));
+    }
+
+    use super::{TRUN_DATA_OFFSET_PRESENT, TRUN_SAMPLE_DURATION_PRESENT, TRUN_SAMPLE_SIZE_PRESENT};
+
+    /// `trun` with composition-time-offset (B-frames). v1 negative
+    /// offsets must be sign-extended.
+    #[test]
+    fn parse_trun_v1_signed_composition_offset() {
+        let flags: u32 = TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT;
+        let mut body = Vec::new();
+        body.push(1); // version 1 — signed cts offsets
+        body.extend_from_slice(&flags.to_be_bytes()[1..4]);
+        body.extend_from_slice(&2u32.to_be_bytes()); // sample_count
+        body.extend_from_slice(&(-50i32).to_be_bytes());
+        body.extend_from_slice(&(75i32).to_be_bytes());
+        let parsed = super::parse_trun(&body).unwrap();
+        assert_eq!(parsed.samples[0].composition_time_offset, Some(-50));
+        assert_eq!(parsed.samples[1].composition_time_offset, Some(75));
+    }
+
+    use super::TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT;
+
+    /// `trex` populates per-track defaults that the fragment parser
+    /// reads when a `tfhd` doesn't override them.
+    #[test]
+    fn parse_trex_populates_track_defaults() {
+        let mut t = fresh_track();
+        t.track_id = 7;
+        let mut tracks = vec![t];
+        // FullBox header + track_ID(7) + DSDI(1) + ddur(1024) + dsiz(0) + dflg(0)
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+        body.extend_from_slice(&7u32.to_be_bytes()); // track_ID
+        body.extend_from_slice(&1u32.to_be_bytes()); // DSDI
+        body.extend_from_slice(&1024u32.to_be_bytes()); // default_sample_duration
+        body.extend_from_slice(&0u32.to_be_bytes()); // default_sample_size
+        body.extend_from_slice(&0u32.to_be_bytes()); // default_sample_flags
+        super::parse_trex(&body, &mut tracks).unwrap();
+        assert_eq!(tracks[0].trex.default_sample_duration, 1024);
+        assert_eq!(tracks[0].trex.default_sample_description_index, 1);
+    }
+
+    /// Multi-segment `elst` records every entry; the leading-shift
+    /// helper picks the first non-empty `media_time`.
+    #[test]
+    fn parse_elst_v0_multi_segment() {
+        // version 0, 2 entries:
+        //   (dur=1000, media_time=-1, media_rate=0x10000)  // empty edit
+        //   (dur=2000, media_time=500, media_rate=0x10000)
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0, 0, 0, 0]); // version 0 + flags
+        body.extend_from_slice(&2u32.to_be_bytes());
+        // entry 1
+        body.extend_from_slice(&1000u32.to_be_bytes());
+        body.extend_from_slice(&(-1i32).to_be_bytes());
+        body.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        // entry 2
+        body.extend_from_slice(&2000u32.to_be_bytes());
+        body.extend_from_slice(&500i32.to_be_bytes());
+        body.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        let mut t = fresh_track();
+        super::parse_elst(&body, &mut t).unwrap();
+        assert_eq!(t.elst.len(), 2);
+        assert_eq!(t.elst[0].media_time, -1);
+        assert_eq!(t.elst[1].media_time, 500);
+        assert_eq!(t.elst[1].segment_duration, 2000);
+        assert_eq!(super::elst_leading_media_time(&t), 500);
     }
 }

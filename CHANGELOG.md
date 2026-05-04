@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fragmented-MP4 (DASH / HLS / Smooth-Streaming / CMAF) demux
+  (ISO/IEC 14496-12 §8.8). The top-level walk continues past
+  `moov` and stitches each `moof`+`mdat` pair onto the
+  per-track sample list. `mvex/trex` per-track defaults plus
+  `mfhd`, `traf`, `tfhd`, `tfdt`, `trun` are honoured;
+  `default-base-is-moof`, `tfhd.base_data_offset`, per-sample
+  size / duration / flags / composition-time-offset overrides,
+  and v0/v1 `tfdt.base_media_decode_time` all work.
+  `styp`, `sidx`, `mfra` segment-marker boxes are skipped
+  cleanly. Verified against an `ffmpeg -movflags
+  +frag_keyframe+empty_moov` AAC fixture: all 88 packet
+  positions and durations match `ffprobe -show_packets`
+  byte-for-byte.
+- Multi-segment edit list (`elst`): the full entry list is
+  parsed and stored. The leading `media_time` shift (first
+  non-empty edit) drives sample timestamps as before.
 - Sample-entry FourCC mappings for AC-3 (`ac-3` / `AC-3` →
   `ac3`), E-AC-3 (`ec-3` / `EC-3` → `eac3`), DTS family
   (`dtsc` / `dtsh` / `dtsl` / `dtse` → `dts`), and G.711

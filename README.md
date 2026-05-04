@@ -121,6 +121,14 @@ Sample-entry FourCCs resolve to these codec ids:
   `extradata`.
 - Sample-table expansion: `stts`, `stsc`, `stsz`/`stz2`, `stco`/`co64`,
   `stss`. `next_packet` serves samples in file-offset order.
+- Fragmented MP4 (DASH / HLS / Smooth Streaming / CMAF): `mvex/trex`
+  per-track defaults plus zero or more trailing `moof`+`mdat` pairs
+  (`mfhd`, `traf`, `tfhd`, `tfdt`, `trun`) are stitched onto the
+  initial sample table. `default-base-is-moof`, per-sample
+  size/duration/flags/composition-time-offset overrides, and
+  `tfhd.base_data_offset` are all honoured. `styp`, `sidx`, and `mfra`
+  segment-index boxes are skipped (segment-precision seek hint
+  consumption is a follow-up).
 - Seek: `seek_to(stream, pts)` lands on the nearest sync-sample ≤ pts
   (or the first keyframe of the stream if none qualify).
 - Metadata: 3GPP `udta` boxes (`titl`/`auth`/…) and iTunes-style
@@ -150,12 +158,18 @@ whose mdat payload exceeds 4 GiB fail at `write_trailer`.
 
 ### Not (yet) supported
 
-- Fragmented MP4 (moof / mfra / trun). The muxer emits a single `moov`
-  per file; the demuxer ignores `moof` / `trun` entirely.
-- Edit lists (`elst`) on demux or mux.
+- Fragmented-MP4 *muxing* — the demuxer reads `moof`+`mdat`
+  segments, but the muxer only emits a single moov-at-end (or
+  faststart) shape.
+- `mfra`/`tfra` random-access index consumption (the demuxer skips
+  these; sequential demux works without them).
+- `sidx` segment-index seek-time mapping (skipped; sequential demux
+  works without it).
+- Edit lists on the muxer.
 - Sample groups (`sbgp`/`sgpd`), subtitle tracks, DRM (`sinf`/`pssh`).
 - Multiple sample descriptions per track (only the first entry of
-  `stsd` is used).
+  `stsd` is used; `tfhd.sample_description_index` overrides are
+  ignored).
 - mdat payloads larger than 4 GiB (the 32-bit box header is not
   promoted to `largesize`).
 

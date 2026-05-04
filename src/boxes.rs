@@ -129,6 +129,19 @@ pub const META: [u8; 4] = fourcc("meta");
 pub const ILST: [u8; 4] = fourcc("ilst");
 pub const DATA: [u8; 4] = fourcc("data");
 
+// Fragmented-MP4 box types (ISO/IEC 14496-12 §8.8 — Movie Fragments).
+pub const MVEX: [u8; 4] = fourcc("mvex");
+pub const TREX: [u8; 4] = fourcc("trex");
+pub const MOOF: [u8; 4] = fourcc("moof");
+pub const MFHD: [u8; 4] = fourcc("mfhd");
+pub const TRAF: [u8; 4] = fourcc("traf");
+pub const TFHD: [u8; 4] = fourcc("tfhd");
+pub const TFDT: [u8; 4] = fourcc("tfdt");
+pub const TRUN: [u8; 4] = fourcc("trun");
+pub const SIDX: [u8; 4] = fourcc("sidx");
+pub const STYP: [u8; 4] = fourcc("styp");
+pub const MFRA: [u8; 4] = fourcc("mfra");
+
 // Handler types.
 pub const HANDLER_SOUN: [u8; 4] = fourcc("soun");
 pub const HANDLER_VIDE: [u8; 4] = fourcc("vide");
