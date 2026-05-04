@@ -97,11 +97,15 @@ Sample-entry FourCCs resolve to these codec ids:
 
 | FourCC                   | Codec id                                |
 |--------------------------|-----------------------------------------|
-| `mp4a`                   | `aac` (default) or `mp3` via esds OTI   |
+| `mp4a`                   | `aac` (default); esds OTI refines to `mp3` (0x69/0x6B), `ac3` (0xA5), `eac3` (0xA6), `dts` (0xA9) |
 | `mp4v`                   | `mpeg4video` (default); esds OTI refines to `mpeg1video`, `mpeg2video`, `h264`, `h265`, `mjpeg` |
 | `alac`                   | `alac`                                  |
 | `fLaC` / `flac`          | `flac`                                  |
 | `Opus` / `opus`          | `opus`                                  |
+| `ac-3` / `AC-3`          | `ac3` (Dolby Digital, ETSI TS 102 366 Annex F) |
+| `ec-3` / `EC-3`          | `eac3` (Dolby Digital Plus, ETSI TS 102 366 Annex G) |
+| `dtsc` / `dtsh` / `dtsl` / `dtse` | `dts` (DTS Coherent Acoustics / DTS-HD HR / DTS-HD MA / DTS Express, ETSI TS 102 114) |
+| `ulaw` / `alaw`          | `pcm_mulaw` / `pcm_alaw` (G.711)        |
 | `avc1` / `avc3`          | `h264`                                  |
 | `hvc1` / `hev1`          | `h265`                                  |
 | `vp08`                   | `vp8`                                   |

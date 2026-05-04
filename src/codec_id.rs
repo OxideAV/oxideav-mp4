@@ -21,6 +21,21 @@ pub fn from_sample_entry(fourcc: &[u8; 4]) -> CodecId {
         b"alac" => "alac",
         b"fLaC" | b"flac" => "flac",
         b"Opus" | b"opus" => "opus",
+        // ETSI TS 102 366 Annex F (AC-3) and Annex G (E-AC-3) define
+        // the `ac-3` / `ec-3` MP4 sample-entry FourCCs. Some legacy
+        // QuickTime muxers also emit the upper-case `AC-3` form.
+        b"ac-3" | b"AC-3" => "ac3",
+        b"ec-3" | b"EC-3" => "eac3",
+        // ETSI TS 102 114 (DTS-in-ISOBMFF). `dtsc` = DTS Coherent
+        // Acoustics (a.k.a. "DTS"); `dtsh` = DTS-HD High Resolution;
+        // `dtsl` = DTS-HD Master Audio; `dtse` = DTS Express. We
+        // surface them all as the bare `dts` codec id today; the
+        // decoder picks the substream based on the DTS frame syncword.
+        b"dtsc" | b"dtsh" | b"dtsl" | b"dtse" => "dts",
+        // QuickTime µ-law / A-law (G.711) — 8 kHz 8-bit logarithmic
+        // companded PCM. Match oxideav-g711's canonical aliases.
+        b"ulaw" => "pcm_mulaw",
+        b"alaw" => "pcm_alaw",
         b"avc1" | b"avc3" => "h264",
         b"hvc1" | b"hev1" => "h265",
         b"vp08" => "vp8",
@@ -78,6 +93,9 @@ pub fn from_sample_entry(fourcc: &[u8; 4]) -> CodecId {
 /// | 0x6A | MPEG-1 Video                          |
 /// | 0x6B | MPEG-1 Audio Part 3 Layer I/II/III    |
 /// | 0x6C | JPEG image                            |
+/// | 0xA5 | AC-3 (Dolby Digital)                  |
+/// | 0xA6 | E-AC-3 (Dolby Digital Plus)           |
+/// | 0xA9 | DTS Coherent Acoustics                |
 pub fn from_sample_entry_with_oti(fourcc: &[u8; 4], oti: u8) -> CodecId {
     match fourcc {
         b"mp4a" => {
@@ -91,6 +109,14 @@ pub fn from_sample_entry_with_oti(fourcc: &[u8; 4], oti: u8) -> CodecId {
                 // mapping (Layer III / "mp3"). Demuxers/decoders can refine
                 // further by sniffing the bitstream if they care.
                 0x69 | 0x6B => "mp3",
+                // The MP4 registration authority assigns 0xA5/0xA6/0xA9
+                // for AC-3 / E-AC-3 / DTS-CA carried inside an `mp4a`
+                // sample entry (rare in practice — most muxers use the
+                // dedicated `ac-3` / `ec-3` / `dtsc` FourCCs — but
+                // handle it for safety).
+                0xA5 => "ac3",
+                0xA6 => "eac3",
+                0xA9 => "dts",
                 _ => {
                     // Unknown/reserved OTI: keep the bare AAC default —
                     // matches historical behaviour. Callers who need the
@@ -221,6 +247,50 @@ mod tests {
         assert_eq!(
             from_sample_entry_with_oti(b"ap4h", 0x42),
             CodecId::new("prores")
+        );
+    }
+
+    #[test]
+    fn ac3_eac3_fourccs_map_to_dolby_codec_ids() {
+        assert_eq!(from_sample_entry(b"ac-3"), CodecId::new("ac3"));
+        assert_eq!(from_sample_entry(b"AC-3"), CodecId::new("ac3"));
+        assert_eq!(from_sample_entry(b"ec-3"), CodecId::new("eac3"));
+        assert_eq!(from_sample_entry(b"EC-3"), CodecId::new("eac3"));
+    }
+
+    #[test]
+    fn dts_fourcc_variants_all_map_to_dts() {
+        for fc in [b"dtsc", b"dtsh", b"dtsl", b"dtse"] {
+            assert_eq!(
+                from_sample_entry(fc),
+                CodecId::new("dts"),
+                "fourcc {fc:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn g711_fourccs_map_to_canonical_pcm_aliases() {
+        // Match the canonical aliases registered by oxideav-g711.
+        assert_eq!(from_sample_entry(b"ulaw"), CodecId::new("pcm_mulaw"));
+        assert_eq!(from_sample_entry(b"alaw"), CodecId::new("pcm_alaw"));
+    }
+
+    #[test]
+    fn mp4a_with_dolby_dts_oti_resolves_correctly() {
+        // OTI dispatch on `mp4a` covers the rarely-used MP4RA-assigned
+        // Dolby / DTS object type indications.
+        assert_eq!(
+            from_sample_entry_with_oti(b"mp4a", 0xA5),
+            CodecId::new("ac3")
+        );
+        assert_eq!(
+            from_sample_entry_with_oti(b"mp4a", 0xA6),
+            CodecId::new("eac3")
+        );
+        assert_eq!(
+            from_sample_entry_with_oti(b"mp4a", 0xA9),
+            CodecId::new("dts")
         );
     }
 }
