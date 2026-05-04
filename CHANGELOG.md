@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fragmented-MP4 (DASH / HLS / Smooth-Streaming / CMAF) **mux**
+  (ISO/IEC 14496-12 §8.8 + DASH-IF Interop). New
+  `Mp4MuxerOptions::fragmented = Some(FragmentedOptions { .. })`
+  switches the muxer into init-segment + media-segment shape:
+  `ftyp + moov(mvex+trex)` first, then `styp? + moof + mdat`
+  per fragment cadence boundary. Cadence policies:
+  `EverySeconds(f64)` (default 2 s, anchored on track 0),
+  `EveryKeyframe`, and `EveryNPackets(u32)` for tests.
+  `tfhd` always sets `default-base-is-moof` (0x020000); per-
+  fragment defaults (size / duration / flags) are emitted only
+  when all samples in the run agree, otherwise per-sample
+  fields land in `trun`. Round-trips byte-exactly through our
+  own demuxer + verified against ffmpeg 8.1 as a black-box
+  validator (PCM extraction matches the original packets).
+  Two new registry entries: `dash` and `cmaf` (both pick the
+  fragmented path with an `iso6` / `dash` / `cmfc` brand);
+  the existing `ismv` entry now also emits real fragmented
+  MP4 (was previously a non-fragmented file with an ISMV
+  ftyp brand — Smooth-Streaming clients rejected it).
 - Fragmented-MP4 (DASH / HLS / Smooth-Streaming / CMAF) demux
   (ISO/IEC 14496-12 §8.8). The top-level walk continues past
   `moov` and stitches each `moof`+`mdat` pair onto the

@@ -8,11 +8,12 @@
 pub mod boxes;
 pub mod codec_id;
 pub mod demux;
+pub(crate) mod frag;
 pub mod muxer;
 pub mod options;
 mod sample_entries;
 
-pub use options::{BrandPreset, Mp4MuxerOptions};
+pub use options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
 
 use oxideav_core::ContainerRegistry;
 
@@ -21,12 +22,19 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_muxer("mp4", muxer::open);
     reg.register_muxer("mov", muxer::open_mov);
     reg.register_muxer("ismv", muxer::open_ismv);
+    // Fragmented MP4: emit init-segment (ftyp+moov+mvex) then per-fragment
+    // styp+moof+mdat. Default cadence: every 2 seconds (see
+    // FragmentedOptions::default). Suitable for DASH / HLS / CMAF output
+    // when piped through a segment slicer.
+    reg.register_muxer("dash", muxer::open_dash);
+    reg.register_muxer("cmaf", muxer::open_dash);
     reg.register_extension("mp4", "mp4");
     reg.register_extension("m4a", "mp4");
     reg.register_extension("m4v", "mp4");
     reg.register_extension("mov", "mov");
     reg.register_extension("3gp", "mp4");
     reg.register_extension("ismv", "ismv");
+    reg.register_extension("m4s", "dash");
     reg.register_probe("mp4", probe);
 }
 

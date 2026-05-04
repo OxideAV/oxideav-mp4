@@ -35,35 +35,35 @@ use std::io::{Cursor, Seek, SeekFrom, Write};
 use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
-use crate::options::{BrandPreset, Mp4MuxerOptions};
+use crate::options::{BrandPreset, FragmentedOptions, Mp4MuxerOptions};
 use crate::sample_entries::{sample_entry_for, SampleEntry};
 
 /// Per-track state kept between `write_packet` calls.
-struct TrackState {
+pub(crate) struct TrackState {
     /// Cloned stream info (for handler, time base, etc.).
-    stream: StreamInfo,
+    pub(crate) stream: StreamInfo,
     /// Media time scale (ticks/second in the track's own time base).
-    media_time_scale: u32,
+    pub(crate) media_time_scale: u32,
     /// Sample entry (built at open, written in `moov`).
-    sample_entry: SampleEntry,
+    pub(crate) sample_entry: SampleEntry,
 
     // Sample tables.
     /// `stsz`: one entry per sample (u32 byte size).
-    sample_sizes: Vec<u32>,
+    pub(crate) sample_sizes: Vec<u32>,
     /// `stts`: run-length `(sample_count, sample_delta)` pairs.
-    stts: Vec<(u32, u32)>,
+    pub(crate) stts: Vec<(u32, u32)>,
     /// `stss`: 1-based sample indices of keyframes.
-    keyframes: Vec<u32>,
+    pub(crate) keyframes: Vec<u32>,
     /// `stco`/`co64`: absolute file offsets of chunks.
-    chunk_offsets: Vec<u64>,
+    pub(crate) chunk_offsets: Vec<u64>,
     /// `stsc`: run-length `(first_chunk, samples_per_chunk, sample_desc_idx)`.
-    stsc: Vec<(u32, u32, u32)>,
+    pub(crate) stsc: Vec<(u32, u32, u32)>,
 
     // Chunking state.
     current_chunk_samples: u32,
     current_chunk_start_offset: u64,
     /// How many samples we want to batch into one chunk (~1 sec worth).
-    samples_per_chunk_target: u32,
+    pub(crate) samples_per_chunk_target: u32,
     /// Number of chunks emitted so far.
     chunk_count: u32,
     /// Used to track stsc runs: samples-per-chunk of the previous chunk.
@@ -73,15 +73,15 @@ struct TrackState {
     /// Sample index of the next packet (0-based).
     next_sample_index: u32,
     /// Cumulative media-time-scale ticks written so far.
-    cumulative_duration: u64,
+    pub(crate) cumulative_duration: u64,
     /// PTS of the previous packet in media time scale, for delta calculation.
-    prev_pts_in_ts: Option<i64>,
+    pub(crate) prev_pts_in_ts: Option<i64>,
     /// First PTS in media time scale (for duration calculation + elst).
-    first_pts_in_ts: Option<i64>,
+    pub(crate) first_pts_in_ts: Option<i64>,
 }
 
 impl TrackState {
-    fn new(stream: StreamInfo, sample_entry: SampleEntry) -> Self {
+    pub(crate) fn new(stream: StreamInfo, sample_entry: SampleEntry) -> Self {
         // Media time scale: for audio prefer sample_rate, for video use a
         // reasonable default of 1000 (so video durations are in ms).
         let media_time_scale = match stream.params.media_type {
@@ -144,16 +144,28 @@ pub fn open_mov(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Bo
 }
 
 /// Open an `ismv` muxer: emits an ISMV / Smooth Streaming `ftyp` brand
-/// (major=`iso4`, compatible=`iso4 piff iso6 isml`). Registered under the
-/// `"ismv"` name.
-///
-/// NOTE: real ISMV requires fragmentation (moof/mfra), which this crate
-/// does not yet emit; the file is structurally a non-fragmented MP4 with
-/// an ISMV ftyp brand. Most Smooth Streaming clients will reject it, but
-/// the layout is still a valid ISOBMFF.
+/// (major=`iso4`, compatible=`iso4 piff iso6 isml`) AND switches to
+/// fragmented output (moof+mdat after each fragment cadence boundary).
+/// Registered under the `"ismv"` name.
 pub fn open_ismv(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
     let opts = Mp4MuxerOptions {
         brand: BrandPreset::Ismv,
+        fragmented: Some(FragmentedOptions::default()),
+        ..Mp4MuxerOptions::default()
+    };
+    open_with_options(output, streams, opts)
+}
+
+/// Open a DASH / CMAF fragmented muxer: emits `iso6 / dash` brand, with
+/// `mvex+trex` in moov and `styp+moof+mdat` per fragment. Registered
+/// under the `"dash"` and `"cmaf"` names.
+pub fn open_dash(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
+    let opts = Mp4MuxerOptions {
+        brand: BrandPreset::Custom {
+            major: *b"iso6",
+            compatible: vec![*b"iso6", *b"mp41", *b"dash", *b"cmfc"],
+        },
+        fragmented: Some(FragmentedOptions::default()),
         ..Mp4MuxerOptions::default()
     };
     open_with_options(output, streams, opts)
@@ -167,6 +179,14 @@ pub fn open_with_options(
 ) -> Result<Box<dyn Muxer>> {
     if streams.is_empty() {
         return Err(Error::invalid("mp4 muxer: need at least one stream"));
+    }
+    if options.faststart && options.fragmented.is_some() {
+        return Err(Error::invalid(
+            "mp4 muxer: faststart and fragmented are mutually exclusive",
+        ));
+    }
+    if let Some(frag_opts) = options.fragmented.clone() {
+        return crate::frag::open_fragmented(output, streams, options, frag_opts);
     }
     let mut tracks = Vec::with_capacity(streams.len());
     for s in streams {
@@ -497,7 +517,7 @@ fn build_moov(tracks: &[TrackState]) -> Result<Vec<u8>> {
     Ok(wrap_box(b"moov", &moov_body))
 }
 
-fn build_mvhd(timescale: u32, duration: u64, next_track_id: u32) -> Vec<u8> {
+pub(crate) fn build_mvhd(timescale: u32, duration: u64, next_track_id: u32) -> Vec<u8> {
     // Choose version 0 if duration fits in u32, else version 1.
     let use_v1 = duration > u32::MAX as u64;
     let mut body = Vec::with_capacity(120);
@@ -541,7 +561,7 @@ fn build_trak(track_id: u32, t: &TrackState, movie_timescale: u32) -> Result<Vec
     Ok(wrap_box(b"trak", &body))
 }
 
-fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> Vec<u8> {
+pub(crate) fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> Vec<u8> {
     let use_v1 = duration > u32::MAX as u64;
     let mut body = Vec::new();
     let flags: u32 = 0x0000_0007; // track_enabled | track_in_movie | track_in_preview
@@ -591,7 +611,7 @@ fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> Vec<u8> {
     wrap_box(b"tkhd", &body)
 }
 
-fn build_mdia(t: &TrackState) -> Result<Vec<u8>> {
+pub(crate) fn build_mdia(t: &TrackState) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     body.extend_from_slice(&build_mdhd(t));
     body.extend_from_slice(&build_hdlr(&t.stream));
@@ -794,7 +814,7 @@ fn build_chunk_offset_box(offsets: &[u64]) -> Vec<u8> {
 // --- Box utilities --------------------------------------------------------
 
 /// Wrap a body into a box with a 32-bit size header. Returns the full box bytes.
-fn wrap_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+pub(crate) fn wrap_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let total = (8 + body.len()) as u32;
     let mut out = Vec::with_capacity(total as usize);
     out.extend_from_slice(&total.to_be_bytes());
@@ -805,7 +825,7 @@ fn wrap_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
 
 // --- Helpers --------------------------------------------------------------
 
-fn default_samples_per_chunk(stream: &StreamInfo) -> u32 {
+pub(crate) fn default_samples_per_chunk(stream: &StreamInfo) -> u32 {
     // Target roughly 1 second per chunk. For PCM we emit large packets; for
     // compressed codecs samples are ~20ms each.
     match stream.params.media_type {
@@ -846,7 +866,7 @@ fn compute_delta(t: &TrackState, packet: &Packet, pts_in_ts: Option<i64>) -> u32
     1
 }
 
-fn rescale_to_media_ts(value: i64, from_tb: oxideav_core::TimeBase, to_ts: u32) -> i64 {
+pub(crate) fn rescale_to_media_ts(value: i64, from_tb: oxideav_core::TimeBase, to_ts: u32) -> i64 {
     let from_r = from_tb.as_rational();
     if from_r.den == 0 || to_ts == 0 {
         return value;
@@ -858,7 +878,7 @@ fn rescale_to_media_ts(value: i64, from_tb: oxideav_core::TimeBase, to_ts: u32) 
     (prod / den) as i64
 }
 
-fn rescale_u64(value: u64, from_ts: u32, to_ts: u32) -> u64 {
+pub(crate) fn rescale_u64(value: u64, from_ts: u32, to_ts: u32) -> u64 {
     if from_ts == 0 {
         return value;
     }
