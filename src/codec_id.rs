@@ -261,11 +261,7 @@ mod tests {
     #[test]
     fn dts_fourcc_variants_all_map_to_dts() {
         for fc in [b"dtsc", b"dtsh", b"dtsl", b"dtse"] {
-            assert_eq!(
-                from_sample_entry(fc),
-                CodecId::new("dts"),
-                "fourcc {fc:?}",
-            );
+            assert_eq!(from_sample_entry(fc), CodecId::new("dts"), "fourcc {fc:?}",);
         }
     }
 
