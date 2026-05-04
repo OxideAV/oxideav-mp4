@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.5...v0.0.6) - 2026-05-04
+
+### Other
+
+- emit sidx + mfra/tfra/mfro random-access indexes
+- parse sidx + mfra/tfra random-access indexes
+- fragmented-MP4 (DASH/HLS/CMAF) writer
+- fragmented-MP4 (DASH/HLS/CMAF) support
+- clamp adversarial stsc samples_per_chunk to n_samples
+- surface dac3 / dec3 sample-entry sub-boxes as extradata
+- rustfmt fix for dts_fourcc test
+- map AC-3, E-AC-3, DTS, G.711 sample-entry FourCCs
+
 ### Added
 
 - Fragmented-MP4 muxer now emits `sidx` (SegmentIndexBox
