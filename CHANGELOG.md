@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ulaw` → `pcm_mulaw`, `alaw` → `pcm_alaw`). MP4-RA
   `objectTypeIndication` 0xA5 / 0xA6 / 0xA9 inside an `mp4a`
   esds also now resolve to `ac3` / `eac3` / `dts` respectively.
+- `dac3` (ETSI TS 102 366 Annex F.4) and `dec3` (Annex G.4)
+  audio sample-entry sub-boxes are now parsed and surfaced as
+  `params.extradata`, matching the existing `dfLa` / `dOps` /
+  `avcC` / `hvcC` handling.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.4...v0.0.5) - 2026-05-03
 

@@ -691,6 +691,13 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
                     t.esds_oti = parsed.oti;
                 }
             }
+            // AC-3 specific config (`dac3`, ETSI TS 102 366 Annex F.4)
+            // and E-AC-3 specific config (`dec3`, Annex G.4). Keep the
+            // raw box payload as extradata so downstream decoders that
+            // care about `fscod`/`bsid`/`acmod`/`lfeon`/etc. can parse
+            // it themselves. For decoders that don't need it the bytes
+            // are harmless extra context.
+            b"dac3" | b"dec3" => t.extradata = body,
             _ => {}
         }
     }
@@ -1537,5 +1544,76 @@ mod tests {
     fn rejects_non_es_descriptor() {
         let payload = vec![0x04, 0x01, 0x00];
         assert!(parse_esds_dsi(&payload).is_none());
+    }
+
+    /// Build a minimal AudioSampleEntryV0 (28-byte preamble) followed by
+    /// an arbitrary child box. Channels 2, sample-size 16, sample-rate
+    /// 48000, then `child_fourcc` carrying `child_body`.
+    fn build_audio_sample_entry(child_fourcc: &[u8; 4], child_body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(28 + 8 + child_body.len());
+        // 28-byte preamble: 6 reserved + 2 data_ref_idx + 8 reserved
+        // + 2 channels + 2 sample_size + 2 pre_defined + 2 reserved
+        // + 4 sample_rate (16.16 fixed).
+        out.extend_from_slice(&[0u8; 6]);
+        out.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+        out.extend_from_slice(&[0u8; 8]); // reserved
+        out.extend_from_slice(&2u16.to_be_bytes()); // channels
+        out.extend_from_slice(&16u16.to_be_bytes()); // sample_size
+        out.extend_from_slice(&[0u8; 4]); // pre_defined + reserved
+        out.extend_from_slice(&((48_000u32) << 16).to_be_bytes()); // sample_rate 16.16
+                                                                   // Child box: 4-byte size + 4-byte fourcc + body.
+        let total = (8 + child_body.len()) as u32;
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(child_fourcc);
+        out.extend_from_slice(child_body);
+        out
+    }
+
+    fn fresh_track() -> super::Track {
+        super::Track {
+            media_type: oxideav_core::MediaType::Audio,
+            codec_id_fourcc: [0; 4],
+            timescale: 0,
+            duration: None,
+            channels: None,
+            sample_rate: None,
+            sample_size_bits: None,
+            width: None,
+            height: None,
+            extradata: Vec::new(),
+            esds_oti: None,
+            stts: Vec::new(),
+            stsc: Vec::new(),
+            stsz: Vec::new(),
+            chunk_offsets: Vec::new(),
+            stss: Vec::new(),
+            ctts: Vec::new(),
+            elst_media_time: 0,
+        }
+    }
+
+    #[test]
+    fn surfaces_dac3_box_as_extradata() {
+        // ETSI TS 102 366 §F.4 dac3 specific box body: 3 bytes packing
+        // fscod/bsid/bsmod/acmod/lfeon/bit_rate_code. Use a recognisable
+        // pattern so the round-trip is visible.
+        let dac3 = [0x10, 0x4C, 0x40];
+        let entry = build_audio_sample_entry(b"dac3", &dac3);
+        let mut t = fresh_track();
+        super::parse_audio_sample_entry(&entry, &mut t).unwrap();
+        assert_eq!(t.extradata, dac3, "dac3 body should be surfaced verbatim");
+        assert_eq!(t.channels, Some(2));
+        assert_eq!(t.sample_rate, Some(48_000));
+    }
+
+    #[test]
+    fn surfaces_dec3_box_as_extradata() {
+        // ETSI TS 102 366 §G.4 dec3 specific box body — variable length,
+        // but the demuxer treats it opaquely. Pick 5 bytes.
+        let dec3 = [0x07, 0xC0, 0x20, 0x00, 0x00];
+        let entry = build_audio_sample_entry(b"dec3", &dec3);
+        let mut t = fresh_track();
+        super::parse_audio_sample_entry(&entry, &mut t).unwrap();
+        assert_eq!(t.extradata, dec3, "dec3 body should be surfaced verbatim");
     }
 }

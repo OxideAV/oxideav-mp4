@@ -117,7 +117,8 @@ Sample-entry FourCCs resolve to these codec ids:
 | any other                | `mp4:<fourcc>` — callers can register their own decoder |
 
 - Codec-specific config records (`avcC`, `hvcC`, `av1C`, `vpcC`,
-  `dfLa`, `dOps`, esds DSI) are forwarded as `extradata`.
+  `dfLa`, `dOps`, `dac3`, `dec3`, esds DSI) are forwarded as
+  `extradata`.
 - Sample-table expansion: `stts`, `stsc`, `stsz`/`stz2`, `stco`/`co64`,
   `stss`. `next_packet` serves samples in file-offset order.
 - Seek: `seek_to(stream, pts)` lands on the nearest sync-sample ≤ pts
