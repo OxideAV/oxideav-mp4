@@ -29,7 +29,7 @@
 //! homogeneous across the whole fragment, falling back to per-sample
 //! `trun` entries otherwise.
 
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 
 use oxideav_core::{Error, Muxer, Packet, Result, StreamInfo, WriteSeek};
 
@@ -71,6 +71,22 @@ struct FragTrackState {
     /// Number of packets seen so far (across all fragments) — used for the
     /// `EveryNPackets` cadence policy.
     packets_total: u64,
+    /// Random-access entries collected for this track's `tfra`. One entry
+    /// per emitted fragment in which this track contributed at least one
+    /// sync sample. All `*_number` fields are 1-based per ISO/IEC 14496-12
+    /// §8.8.11.
+    tfra_entries: Vec<TfraEmitEntry>,
+}
+
+/// One row of an emitted `tfra` table — recorded per fragment as the
+/// muxer walks tracks, used at `write_trailer` to build the mfra.
+#[derive(Clone, Copy, Debug)]
+struct TfraEmitEntry {
+    time: u64,
+    moof_offset: u64,
+    traf_number: u32,
+    trun_number: u32,
+    sample_number: u32,
 }
 
 impl FragTrackState {
@@ -85,6 +101,7 @@ impl FragTrackState {
             pending: Vec::new(),
             next_bmdt: 0,
             packets_total: 0,
+            tfra_entries: Vec::new(),
         }
     }
 
@@ -281,6 +298,15 @@ impl Muxer for FragmentedMuxer {
         if self.tracks.iter().any(|t| !t.pending.is_empty()) {
             self.flush_fragment()?;
         }
+        // Random-access trailer (§8.8.10 mfra + §8.8.11 tfra + §8.8.13 mfro).
+        // Only emit when at least one fragment carried a sync sample on at
+        // least one track; an mfra with all-empty tfras would be useless
+        // and wastes ~24 bytes for nothing.
+        if self.frag_options.emit_random_access_indexes
+            && self.tracks.iter().any(|t| !t.tfra_entries.is_empty())
+        {
+            self.write_mfra()?;
+        }
         self.output.flush()?;
         self.trailer_written = true;
         Ok(())
@@ -376,12 +402,6 @@ impl FragmentedMuxer {
             return Ok(());
         }
 
-        // Optional styp.
-        if let Some(brand) = &self.frag_options.styp {
-            let styp = build_styp(brand);
-            self.output.write_all(&styp)?;
-        }
-
         self.sequence_number += 1;
         let seq = self.sequence_number;
 
@@ -398,6 +418,68 @@ impl FragmentedMuxer {
             }
         }
         let mdat = wrap_box(b"mdat", &mdat_payload);
+        let mdat_size = mdat.len() as u64;
+
+        // Optional sidx (one-reference, covers this fragment only). Per
+        // ISO/IEC 14496-12 §8.16.3 the `first_offset` is relative to the
+        // first byte AFTER the sidx box; we write the sidx immediately
+        // before styp+moof+mdat so the next-byte anchor is exactly where
+        // the optional styp lands. The single referenced subsegment is
+        // `styp? + moof + mdat`, sized accordingly. `first_offset = 0`.
+        if self.frag_options.emit_random_access_indexes {
+            let styp_size: u64 = self
+                .frag_options
+                .styp
+                .as_ref()
+                .map(|b| build_styp(b).len() as u64)
+                .unwrap_or(0);
+            let subsegment_size = styp_size + moof_size + mdat_size;
+            // EPT for this fragment on the anchor (first contributing) track
+            // is the bmdt the track entered the fragment with.
+            let anchor_idx = self
+                .tracks
+                .iter()
+                .position(|t| !t.pending.is_empty())
+                .unwrap_or(0);
+            let ept = self.tracks[anchor_idx].next_bmdt;
+            let timescale = self.tracks[anchor_idx].base.media_time_scale;
+            let frag_dur_anchor: u64 = self.tracks[anchor_idx]
+                .pending
+                .iter()
+                .map(|s| s.duration as u64)
+                .sum();
+            // Per §8.16.3 subsegment_duration is u32; clamp very long
+            // fragments (defensive — single fragments are typically <30 s).
+            let subseg_dur_u32 = frag_dur_anchor.min(u32::MAX as u64) as u32;
+            // starts_with_SAP iff the anchor track's first pending sample
+            // is a sync sample (SAP type 1 = closed-GOP IDR).
+            let starts_sap = self.tracks[anchor_idx]
+                .pending
+                .first()
+                .map(|s| s.flags & SAMPLE_IS_NON_SYNC == 0)
+                .unwrap_or(false);
+            let sidx = build_sidx(
+                self.tracks[anchor_idx].track_id,
+                timescale,
+                ept,
+                subsegment_size,
+                subseg_dur_u32,
+                starts_sap,
+            );
+            self.output.write_all(&sidx)?;
+        }
+
+        // Optional styp.
+        if let Some(brand) = &self.frag_options.styp {
+            let styp = build_styp(brand);
+            self.output.write_all(&styp)?;
+        }
+
+        // Record the absolute byte offset of the moof BEFORE writing it —
+        // this is what `tfra.moof_offset` and DASH random-access seekers
+        // need. `stream_position` is reliable here because all writes so
+        // far have been forward-streaming.
+        let moof_offset = self.output.stream_position()?;
 
         // Patch the trun.data_offset values inside `moof`. We computed
         // offsets relative to moof start during build_moof; now the moof
@@ -407,6 +489,31 @@ impl FragmentedMuxer {
         // verify the moof-local layout produces correct offsets.
         self.output.write_all(&moof)?;
         self.output.write_all(&mdat)?;
+
+        // For each track, record one tfra entry per sync sample in this
+        // fragment. With one traf per track per moof and one trun per
+        // traf, traf/trun numbers are always 1. Most fragments have
+        // exactly one keyframe (the first sample) so this is usually
+        // a single entry per track.
+        for t in self.tracks.iter_mut() {
+            if t.pending.is_empty() {
+                continue;
+            }
+            let mut dts_in_frag: u64 = 0;
+            for (k, s) in t.pending.iter().enumerate() {
+                let is_sync = s.flags & SAMPLE_IS_NON_SYNC == 0;
+                if is_sync {
+                    t.tfra_entries.push(TfraEmitEntry {
+                        time: t.next_bmdt + dts_in_frag,
+                        moof_offset,
+                        traf_number: 1,
+                        trun_number: 1,
+                        sample_number: (k as u32) + 1,
+                    });
+                }
+                dts_in_frag += s.duration as u64;
+            }
+        }
 
         // Advance bmdt for next fragment + drain pending + replay
         // detached.
@@ -421,6 +528,34 @@ impl FragmentedMuxer {
         }
 
         let _ = moof_size;
+        Ok(())
+    }
+
+    /// Write the random-access trailer: one `mfra` containing per-track
+    /// `tfra` tables + an `mfro` size trailer (ISO/IEC 14496-12 §8.8.10–13).
+    /// `mfro.size` is the total size of the `mfra` box including its own
+    /// 8-byte header — players read mfro by reading the last 16 bytes of
+    /// the file (8-byte mfro header + 4 ver/flags + 4 size) to learn
+    /// where to seek for the random-access index.
+    fn write_mfra(&mut self) -> Result<()> {
+        let mut mfra_body: Vec<u8> = Vec::new();
+        for t in &self.tracks {
+            if t.tfra_entries.is_empty() {
+                continue;
+            }
+            mfra_body.extend_from_slice(&build_tfra(t.track_id, &t.tfra_entries));
+        }
+        // mfro is part of the mfra body (it's a child box of mfra). Per
+        // §8.8.13 its `size` field equals the total size of the enclosing
+        // mfra box (header + body + mfro itself). mfro itself is 16 bytes:
+        // 8 box header + 4 version/flags + 4 size.
+        let mfra_total_size: u64 = 8 + mfra_body.len() as u64 + 16;
+        let mfro = build_mfro(mfra_total_size as u32);
+        mfra_body.extend_from_slice(&mfro);
+        let mfra = wrap_box(b"mfra", &mfra_body);
+        debug_assert_eq!(mfra.len() as u64, mfra_total_size);
+        self.output.seek(SeekFrom::End(0))?;
+        self.output.write_all(&mfra)?;
         Ok(())
     }
 }
@@ -782,4 +917,89 @@ fn build_trun(t: &FragTrackState, data_offset: i32, defaults: FragmentDefaults) 
         }
     }
     wrap_box(b"trun", &body)
+}
+
+// --- Random-access boxes (§8.16.3 sidx, §8.8.10–13 mfra/tfra/mfro) -------
+
+/// §8.16.3 — `sidx` SegmentIndexBox.
+///
+/// We always emit a one-reference sidx covering the immediately-following
+/// styp+moof+mdat: this is the simplest legal form per §8.16.3. The
+/// `first_offset` is 0 — the next byte after the sidx box is the first
+/// byte of the referenced subsegment (per §8.16.3.1: "the offset of the
+/// first byte of the first referenced material from the first byte
+/// following this `SegmentIndexBox`").
+///
+/// We pick version=1 (u64 EPT + u64 first_offset) so long-running streams
+/// (DASH live with multi-day decode time at 90 kHz timescale) don't
+/// truncate the earliest-presentation-time field.
+fn build_sidx(
+    reference_id: u32,
+    timescale: u32,
+    earliest_presentation_time: u64,
+    referenced_size: u64,
+    subsegment_duration: u32,
+    starts_with_sap: bool,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(28 + 12);
+    body.push(1); // version 1 — u64 EPT + first_offset
+    body.extend_from_slice(&[0u8; 3]); // flags
+    body.extend_from_slice(&reference_id.to_be_bytes());
+    body.extend_from_slice(&timescale.to_be_bytes());
+    body.extend_from_slice(&earliest_presentation_time.to_be_bytes());
+    body.extend_from_slice(&0u64.to_be_bytes()); // first_offset = 0
+    body.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    body.extend_from_slice(&1u16.to_be_bytes()); // reference_count = 1
+                                                 // Per-reference 12-byte record:
+                                                 //   [bit 31] reference_type (0 = media), [bits 30..0] referenced_size
+                                                 //   subsegment_duration (u32)
+                                                 //   [bit 31] starts_with_SAP, [bits 30..28] SAP_type, [bits 27..0] SAP_delta_time
+    let r0 = (referenced_size.min(0x7FFF_FFFF) as u32) & 0x7FFF_FFFF; // bit 31 = 0 (not sidx)
+    body.extend_from_slice(&r0.to_be_bytes());
+    body.extend_from_slice(&subsegment_duration.to_be_bytes());
+    let sap_type: u32 = if starts_with_sap { 1 } else { 0 }; // SAP type 1 = closed-GOP IDR
+    let r2 = (if starts_with_sap { 0x8000_0000u32 } else { 0 }) | (sap_type << 28);
+    body.extend_from_slice(&r2.to_be_bytes());
+    wrap_box(b"sidx", &body)
+}
+
+/// §8.8.11 `tfra` — TrackFragmentRandomAccessBox.
+///
+/// We always emit version=1 (u64 time + u64 moof_offset) so the index
+/// remains valid for files larger than 4 GiB and decode-time fields
+/// outside u32 range. `length_size_of_*` fields are all zero (1-byte each
+/// for traf/trun/sample numbers), since the muxer always emits exactly
+/// one traf per moof and one trun per traf — those numbers are always 1.
+fn build_tfra(track_id: u32, entries: &[TfraEmitEntry]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(16 + entries.len() * 19);
+    body.push(1); // version 1 — u64 time + moof_offset
+    body.extend_from_slice(&[0u8; 3]); // flags
+    body.extend_from_slice(&track_id.to_be_bytes());
+    // length_size encoding: each 2-bit field encodes (byte_length - 1).
+    // We pick 1-byte for traf/trun/sample numbers → all bits zero.
+    body.extend_from_slice(&0u32.to_be_bytes());
+    body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for e in entries {
+        body.extend_from_slice(&e.time.to_be_bytes());
+        body.extend_from_slice(&e.moof_offset.to_be_bytes());
+        // length_size=0 → each *_number is one byte. Clamp to u8::MAX —
+        // these are always 1 in our writer so no real clamping happens.
+        body.push(e.traf_number.min(u8::MAX as u32) as u8);
+        body.push(e.trun_number.min(u8::MAX as u32) as u8);
+        body.push(e.sample_number.min(u8::MAX as u32) as u8);
+    }
+    wrap_box(b"tfra", &body)
+}
+
+/// §8.8.13 `mfro` — MovieFragmentRandomAccessOffsetBox.
+///
+/// FullBox(version=0, flags=0) + size (u32) where `size` is the total
+/// size in bytes of the enclosing `mfra` box (so a player can find the
+/// mfra by reading the last 16 bytes of the file: 8-byte mfro header +
+/// 4-byte version/flags + 4-byte size).
+fn build_mfro(mfra_total_size: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&[0u8; 4]); // version + flags
+    body.extend_from_slice(&mfra_total_size.to_be_bytes());
+    wrap_box(b"mfro", &body)
 }

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fragmented-MP4 muxer now emits `sidx` (SegmentIndexBox
+  §8.16.3) before each `moof+mdat` and an `mfra`
+  (MovieFragmentRandomAccessBox §8.8.10) trailer with
+  per-track `tfra` (§8.8.11) + `mfro` (§8.8.13) at end of
+  file. The pair lets DASH on-demand profile players seek
+  by byte range without scanning every fragment, and lets
+  HLS / Smooth-Streaming clients land directly on the right
+  moof for a target presentation time. New
+  `FragmentedOptions::emit_random_access_indexes` flag (default
+  `true`) gates the emission for callers that prefer the
+  prior bare-`moof+mdat` shape. Each emitted sidx is a
+  one-reference index covering the immediately-following
+  styp+moof+mdat (`first_offset = 0`, SAP type 1 when the
+  anchor track's first sample is a sync sample); the mfra
+  carries one tfra entry per sync sample per emitted
+  fragment. Cross-validated against ffprobe / ffmpeg
+  (parses every box and recovers byte-exact PCM payload).
 - `sidx` (SegmentIndexBox §8.16.3) and `mfra/tfra` (Movie
   Fragment Random Access §8.8.10–11) parsers. The demuxer now
   reads them at open time and exposes `parse_sidx_box` /

@@ -72,6 +72,7 @@ fn fragmented_options(cadence: FragmentCadence) -> Mp4MuxerOptions {
                 major: *b"msdh",
                 compatible: vec![*b"msdh", *b"msix"],
             }),
+            emit_random_access_indexes: true,
         }),
     }
 }
@@ -217,6 +218,7 @@ fn no_styp_when_disabled() {
             fragmented: Some(FragmentedOptions {
                 cadence: FragmentCadence::EveryNPackets(1),
                 styp: None,
+                emit_random_access_indexes: true,
             }),
         };
         let stream = pcm_stream();
@@ -414,6 +416,193 @@ fn ffmpeg_pcm_extract_matches_input() {
         out.stdout.len(),
         our_bytes.len()
     );
+}
+
+// --- sidx / mfra emission tests (DASH on-demand profile) -----------------
+
+/// With the default `emit_random_access_indexes = true`, every flushed
+/// fragment must be preceded by a `sidx` and the file must end in an
+/// `mfra` containing per-track `tfra` + `mfro` trailer.
+#[test]
+fn sidx_precedes_each_moof_and_mfra_is_at_end() {
+    let stream = pcm_stream();
+    let packets = make_pcm_packets(6, 1024);
+    let path = mux_to_tempfile(
+        "oxideav-mp4-frag-sidx-mfra.mp4",
+        &stream,
+        FragmentCadence::EveryNPackets(2),
+        &packets,
+    );
+    let bytes = std::fs::read(&path).unwrap();
+
+    let n_moof = count_fourcc(&bytes, b"moof");
+    let n_sidx = count_fourcc(&bytes, b"sidx");
+    let n_mfra = count_fourcc(&bytes, b"mfra");
+    let n_tfra = count_fourcc(&bytes, b"tfra");
+    let n_mfro = count_fourcc(&bytes, b"mfro");
+
+    assert_eq!(n_moof, 3, "expected 3 moof boxes (6 / 2)");
+    assert_eq!(n_sidx, 3, "one sidx per moof");
+    assert_eq!(n_mfra, 1, "exactly one mfra trailer");
+    assert_eq!(n_tfra, 1, "one tfra per track");
+    assert_eq!(n_mfro, 1, "exactly one mfro");
+
+    // Layout invariants.
+    let first_sidx = find_fourcc(&bytes, b"sidx").unwrap();
+    let first_moof = find_fourcc(&bytes, b"moof").unwrap();
+    let mfra_pos = find_fourcc(&bytes, b"mfra").unwrap();
+    let mfro_pos = find_fourcc(&bytes, b"mfro").unwrap();
+    let last_moof_pos = bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"moof".as_slice())
+        .map(|(i, _)| i)
+        .next_back()
+        .unwrap();
+    assert!(
+        first_sidx < first_moof,
+        "first sidx must precede first moof"
+    );
+    assert!(
+        last_moof_pos < mfra_pos,
+        "mfra must be at end (after every moof)"
+    );
+    assert!(mfra_pos < mfro_pos, "mfro must be inside (after) mfra");
+    // mfro is the last box of the file. Box layout:
+    //   4-byte size | 4-byte "mfro" | 4-byte ver/flags | 4-byte size_field
+    // find_fourcc returns the offset of the FourCC bytes, so
+    // bytes.len() - mfro_pos = 4 (FourCC) + 8 (body) = 12.
+    assert_eq!(
+        bytes.len() - mfro_pos,
+        12,
+        "mfro must be the file's trailing box"
+    );
+}
+
+/// `emit_random_access_indexes = false` must restore the prior layout.
+#[test]
+fn no_sidx_no_mfra_when_disabled() {
+    let buf_path = std::env::temp_dir().join("oxideav-mp4-frag-no-sidx.mp4");
+    {
+        let f = std::fs::File::create(&buf_path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let opts = Mp4MuxerOptions {
+            brand: BrandPreset::Mp4,
+            faststart: false,
+            fragmented: Some(FragmentedOptions {
+                cadence: FragmentCadence::EveryNPackets(2),
+                styp: None,
+                emit_random_access_indexes: false,
+            }),
+        };
+        let stream = pcm_stream();
+        let packets = make_pcm_packets(4, 1024);
+        let mut mux = open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
+        mux.write_header().unwrap();
+        for p in &packets {
+            mux.write_packet(p).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&buf_path).unwrap();
+    assert_eq!(count_fourcc(&bytes, b"moof"), 2);
+    assert!(
+        find_fourcc(&bytes, b"sidx").is_none(),
+        "no sidx when disabled"
+    );
+    assert!(
+        find_fourcc(&bytes, b"mfra").is_none(),
+        "no mfra when disabled"
+    );
+}
+
+/// Mux a fragmented MP4 with sidx+mfra, then re-parse the emitted boxes
+/// using the public `parse_sidx_box` / `parse_mfra_box` entry points and
+/// confirm they describe the on-disk byte layout correctly.
+#[test]
+fn emitted_sidx_and_mfra_parse_round_trip() {
+    use oxideav_mp4::demux::{parse_mfra_box, parse_sidx_box};
+
+    let stream = pcm_stream();
+    let packets = make_pcm_packets(4, 1024);
+    let path = mux_to_tempfile(
+        "oxideav-mp4-frag-sidx-parse.mp4",
+        &stream,
+        FragmentCadence::EveryNPackets(1), // 4 fragments → 4 sidx, 4 tfra entries
+        &packets,
+    );
+    let bytes = std::fs::read(&path).unwrap();
+
+    // Walk the file, collect (sidx_offset, sidx_body) and the moof_offset
+    // of the very next moof. Verify the sidx record's first_byte_offset
+    // (which is end-of-sidx + first_offset = end-of-sidx, since we emit
+    // first_offset = 0) lands exactly on the styp/moof that follows.
+    let mut moof_offsets: Vec<u64> = Vec::new();
+    let mut sidx_records: Vec<(u64, oxideav_mp4::demux::SidxRecord)> = Vec::new();
+    let mut mfra_body: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    while i + 8 <= bytes.len() {
+        let sz = u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+        let fc = &bytes[i + 4..i + 8];
+        match fc {
+            b"moof" => moof_offsets.push(i as u64),
+            b"sidx" => {
+                let body = bytes[i + 8..i + sz].to_vec();
+                let sidx_end = (i + sz) as u64;
+                let r = parse_sidx_box(&body, sidx_end).unwrap().unwrap();
+                sidx_records.push((sidx_end, r));
+            }
+            b"mfra" => mfra_body = Some(bytes[i + 8..i + sz].to_vec()),
+            _ => {}
+        }
+        if sz == 0 {
+            break;
+        }
+        i += sz;
+    }
+
+    assert_eq!(sidx_records.len(), 4, "one sidx per fragment");
+    assert_eq!(moof_offsets.len(), 4);
+    // first_offset = 0 means first_byte_offset == sidx_end_offset, and that
+    // should be exactly the offset of the next styp-or-moof.
+    for (k, (sidx_end, rec)) in sidx_records.iter().enumerate() {
+        assert_eq!(
+            rec.first_byte_offset, *sidx_end,
+            "sidx[{k}] first_offset = 0 (we always emit zero)",
+        );
+        assert_eq!(rec.references.len(), 1, "single-reference sidx");
+        let r0 = rec.references[0];
+        assert!(!r0.is_sidx, "leaf reference (not hierarchical)");
+        assert!(r0.starts_with_sap, "PCM packets are all sync");
+        assert_eq!(r0.sap_type, 1, "closed-GOP IDR");
+        // Every PCM packet is 4096 bytes; one packet + moof header overhead
+        // → subsegment_size > 4096. Just sanity-check it's positive.
+        assert!(r0.referenced_size > 0);
+        assert_eq!(r0.subsegment_duration, 1024, "one PCM packet per fragment");
+    }
+
+    // mfra: 1 tfra (single audio track) with 4 entries (one per fragment)
+    // pointing at the recorded moof offsets.
+    let mfra_body = mfra_body.expect("mfra present");
+    let tfras = parse_mfra_box(&mfra_body).unwrap();
+    assert_eq!(tfras.len(), 1);
+    let tfra = &tfras[0];
+    assert_eq!(tfra.track_id, 1);
+    assert_eq!(tfra.entries.len(), 4);
+    for (k, e) in tfra.entries.iter().enumerate() {
+        assert_eq!(
+            e.moof_offset, moof_offsets[k],
+            "tfra entry {k} points at the right moof",
+        );
+        assert_eq!(
+            e.time,
+            (k as u64) * 1024,
+            "tfra entry {k} time = bmdt at start of fragment",
+        );
+        assert_eq!(e.traf_number, 1);
+        assert_eq!(e.trun_number, 1);
+        assert_eq!(e.sample_number, 1);
+    }
 }
 
 // --- Helpers --------------------------------------------------------------

@@ -85,14 +85,16 @@ pub enum FragmentCadence {
 ///
 /// ```text
 /// ftyp
-/// moov  (mvex+trex; no media samples in moov)
-/// styp? + moof + mdat   (per fragment, repeated)
-/// styp? + moof + mdat
+/// moov                    (mvex+trex; no media samples in moov)
+/// sidx?                   (one per fragment, references the next moof+mdat)
+/// styp? + moof + mdat     (per fragment, repeated)
+/// sidx? + styp? + moof + mdat
 /// ...
+/// mfra?                   (at end: per-track tfra + mfro size trailer)
 /// ```
 ///
-/// matching ISO/IEC 14496-12 §8.8 (Movie Fragments) + DASH-IF Interop
-/// guidelines for `styp` brands.
+/// matching ISO/IEC 14496-12 §8.8 (Movie Fragments) + §8.16 (sidx) + §8.8.10
+/// (mfra) + DASH-IF Interop guidelines for `styp` brands.
 #[derive(Clone, Debug)]
 pub struct FragmentedOptions {
     /// When to flush a fragment; see [`FragmentCadence`].
@@ -107,6 +109,18 @@ pub struct FragmentedOptions {
     /// signalling. The default `Some(BrandPreset::Custom { major: msdh,
     /// compatible: [msdh, msix] })` is the broadly-interop choice.
     pub styp: Option<BrandPreset>,
+    /// Emit `sidx` (SegmentIndexBox §8.16.3) before each `moof+mdat` and
+    /// an `mfra` (MovieFragmentRandomAccessBox §8.8.10) trailer with
+    /// per-track `tfra` random-access tables + the size-of-mfra `mfro`
+    /// at end of file. Required for the DASH on-demand profile (single
+    /// file with embedded byte-range index) and for fast random-access
+    /// without scanning every moof. Default `true`.
+    ///
+    /// The emitted `sidx` is a single-entry index covering the immediately-
+    /// following moof+mdat (the simplest legal form per §8.16.3); a
+    /// multi-segment top-level sidx can be layered on by an outer
+    /// segmenter if needed.
+    pub emit_random_access_indexes: bool,
 }
 
 impl Default for FragmentedOptions {
@@ -117,6 +131,7 @@ impl Default for FragmentedOptions {
                 major: *b"msdh",
                 compatible: vec![*b"msdh", *b"msix"],
             }),
+            emit_random_access_indexes: true,
         }
     }
 }

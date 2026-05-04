@@ -301,6 +301,9 @@ fn tfra_drives_seek_to_correct_keyframe() {
         fragmented: Some(FragmentedOptions {
             cadence: FragmentCadence::EveryNPackets(1),
             styp: None,
+            // These tests synthesise their own mfra; suppress native
+            // sidx + mfra emission so the appended boxes are the only ones.
+            emit_random_access_indexes: false,
         }),
     };
     let path = std::env::temp_dir().join("oxideav-mp4-tfra-seek.mp4");
@@ -397,6 +400,9 @@ fn mfra_in_fragmented_file_does_not_break_demux() {
         fragmented: Some(FragmentedOptions {
             cadence: FragmentCadence::EveryNPackets(1),
             styp: None,
+            // These tests synthesise their own mfra; suppress native
+            // sidx + mfra emission so the appended boxes are the only ones.
+            emit_random_access_indexes: false,
         }),
     };
     let path = std::env::temp_dir().join("oxideav-mp4-mfra-smoke.mp4");
