@@ -470,7 +470,7 @@ fn mjpeg_roundtrip_via_mp4() {
 
     // Encode one JPEG packet.
     let mut codecs = CodecRegistry::new();
-    oxideav_mjpeg::register(&mut codecs);
+    oxideav_mjpeg::register_codecs(&mut codecs);
 
     let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
     enc_params.media_type = MediaType::Video;
