@@ -44,9 +44,16 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// Convenience wrapper around [`register_containers`] that matches the
 /// uniform `register(&mut RuntimeContext)` entry point every sibling
 /// crate exposes.
+///
+/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
+/// [`oxideav_core::register!`] macro below so consumers calling
+/// [`oxideav_core::RuntimeContext::with_all_features`] pick MP4 up
+/// without any explicit umbrella plumbing.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
+
+oxideav_core::register!("mp4", register);
 
 /// `....ftyp` at offset 0 — ISO base media file format. Some files lead
 /// with a `wide` or `free` box before `ftyp`, so accept that with a
