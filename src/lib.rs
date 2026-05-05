@@ -17,7 +17,7 @@ pub use options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptio
 
 use oxideav_core::ContainerRegistry;
 
-pub fn register(reg: &mut ContainerRegistry) {
+pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_demuxer("mp4", demux::open);
     reg.register_muxer("mp4", muxer::open);
     reg.register_muxer("mov", muxer::open_mov);
@@ -36,6 +36,16 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_extension("ismv", "ismv");
     reg.register_extension("m4s", "dash");
     reg.register_probe("mp4", probe);
+}
+
+/// Install the MP4 / MOV / ISMV / DASH / CMAF containers into a
+/// [`oxideav_core::RuntimeContext`].
+///
+/// Convenience wrapper around [`register_containers`] that matches the
+/// uniform `register(&mut RuntimeContext)` entry point every sibling
+/// crate exposes.
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_containers(&mut ctx.containers);
 }
 
 /// `....ftyp` at offset 0 — ISO base media file format. Some files lead
@@ -59,4 +69,18 @@ fn probe(p: &oxideav_core::ProbeData) -> u8 {
         return 50;
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_container() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        assert_eq!(ctx.containers.container_for_extension("mp4"), Some("mp4"));
+        assert_eq!(ctx.containers.container_for_extension("mov"), Some("mov"));
+        assert_eq!(ctx.containers.container_for_extension("m4s"), Some("dash"));
+    }
 }

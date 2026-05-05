@@ -245,7 +245,7 @@ fn no_styp_when_disabled() {
 fn dash_registry_entry_exists() {
     // `dash` and `cmaf` should be registered as muxer names.
     let mut reg = oxideav_core::ContainerRegistry::new();
-    oxideav_mp4::register(&mut reg);
+    oxideav_mp4::register_containers(&mut reg);
     let names: Vec<&str> = reg.muxer_names().collect();
     assert!(names.contains(&"dash"), "dash name registered ({names:?})");
     assert!(names.contains(&"cmaf"), "cmaf name registered ({names:?})");

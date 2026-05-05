@@ -540,7 +540,7 @@ use oxideav_mp4::{BrandPreset, Mp4MuxerOptions};
 #[test]
 fn mov_registry_entry_exists() {
     let mut reg = ContainerRegistry::new();
-    oxideav_mp4::register(&mut reg);
+    oxideav_mp4::register_containers(&mut reg);
     let names: Vec<&str> = reg.muxer_names().collect();
     assert!(
         names.contains(&"mov"),
@@ -551,7 +551,7 @@ fn mov_registry_entry_exists() {
 #[test]
 fn ismv_registry_entry_exists() {
     let mut reg = ContainerRegistry::new();
-    oxideav_mp4::register(&mut reg);
+    oxideav_mp4::register_containers(&mut reg);
     let names: Vec<&str> = reg.muxer_names().collect();
     assert!(
         names.contains(&"ismv"),
