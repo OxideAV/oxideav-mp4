@@ -477,7 +477,7 @@ fn mjpeg_roundtrip_via_mp4() {
     enc_params.width = Some(w);
     enc_params.height = Some(h);
     enc_params.pixel_format = Some(PixelFormat::Yuv420P);
-    let mut enc = codecs.make_encoder(&enc_params).expect("mjpeg encoder");
+    let mut enc = codecs.first_encoder(&enc_params).expect("mjpeg encoder");
     enc.send_frame(&frame).unwrap();
     let jpeg_bytes = match enc.receive_packet() {
         Ok(p) => p.data,
