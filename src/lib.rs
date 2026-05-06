@@ -45,10 +45,8 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// uniform `register(&mut RuntimeContext)` entry point every sibling
 /// crate exposes.
 ///
-/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
-/// [`oxideav_core::register!`] macro below so consumers calling
-/// [`oxideav_core::RuntimeContext::with_all_features`] pick MP4 up
-/// without any explicit umbrella plumbing.
+/// Also wired into [`oxideav_meta::register_all`] via the
+/// [`oxideav_core::register!`] macro below.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
