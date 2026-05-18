@@ -148,3 +148,33 @@ pub const MFRO: [u8; 4] = fourcc("mfro");
 // Handler types.
 pub const HANDLER_SOUN: [u8; 4] = fourcc("soun");
 pub const HANDLER_VIDE: [u8; 4] = fourcc("vide");
+/// `subt` — Subtitle media (ISO/IEC 14496-12 §12.6.1).
+pub const HANDLER_SUBT: [u8; 4] = fourcc("subt");
+/// `text` — Timed text media (ISO/IEC 14496-12 §12.5.1). Also used by
+/// the QuickTime / 3GPP `tx3g` carriage.
+pub const HANDLER_TEXT: [u8; 4] = fourcc("text");
+/// `sbtl` — QuickTime subtitle handler (legacy variant; common in
+/// `.mov` files muxed by Apple tools alongside the spec `subt`).
+pub const HANDLER_SBTL: [u8; 4] = fourcc("sbtl");
+/// `meta` — Timed metadata handler (ISO/IEC 14496-12 §8.11).
+pub const HANDLER_META: [u8; 4] = fourcc("meta");
+
+// Protection scheme boxes (ISO/IEC 14496-12 §8.12). Files containing
+// CENC-encrypted media rewrite the sample-entry FourCC to one of the
+// `enc*` placeholders below and bury the original FourCC plus the
+// scheme parameters inside a `sinf` container.
+//
+// We recognise `enc*` and unwrap to the original FourCC via `sinf/frma`
+// so callers see the right codec id. The actual key-management
+// surface (`tenc`, `pssh`, `senc`, `saiz`/`saio` payloads) is
+// scheme-specific and lives in ISO/IEC 23001-7, which is partially
+// covered in `docs/container/cenc/`; full CENC decryption is a
+// separate slice.
+pub const SINF: [u8; 4] = fourcc("sinf");
+pub const FRMA: [u8; 4] = fourcc("frma");
+pub const SCHM: [u8; 4] = fourcc("schm");
+pub const SCHI: [u8; 4] = fourcc("schi");
+pub const ENCV: [u8; 4] = fourcc("encv");
+pub const ENCA: [u8; 4] = fourcc("enca");
+pub const ENCT: [u8; 4] = fourcc("enct");
+pub const ENCS: [u8; 4] = fourcc("encs");

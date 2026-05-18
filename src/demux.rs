@@ -282,6 +282,18 @@ struct Track {
     /// override them. Zero-initialised when the file has no `mvex`
     /// (i.e. is not fragmented).
     trex: TrexDefaults,
+    /// Set when the track's sample entry was wrapped as `encv`/`enca`/
+    /// `enct`/`encs` (ISO/IEC 14496-12 §8.12). The carried value is the
+    /// `scheme_type` four-character code recovered from the inner
+    /// `sinf/schm` box — e.g. `cenc` / `cbc1` / `cens` / `cbcs` per
+    /// ISO/IEC 23001-7. Callers should treat the per-sample payloads as
+    /// encrypted (this crate does not decrypt). The original codec
+    /// FourCC is recovered transparently via `sinf/frma` so
+    /// `codec_id_fourcc` reflects the un-transformed sample entry and
+    /// downstream decoders can be set up as if the track were plain —
+    /// they just won't get plaintext bytes until something else
+    /// decrypts them.
+    protection_scheme: Option<[u8; 4]>,
 }
 
 /// Single entry of an `elst` (EditListBox).
@@ -613,6 +625,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         ctts: Vec::new(),
         elst: Vec::new(),
         trex: TrexDefaults::default(),
+        protection_scheme: None,
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -839,6 +852,8 @@ fn parse_mdhd(body: &[u8], t: &mut Track) -> Result<()> {
 }
 
 fn parse_hdlr(body: &[u8], t: &mut Track) -> Result<()> {
+    // FullBox (4 bytes), pre_defined (4 bytes), handler_type (4 bytes
+    // at offset 8). ISO/IEC 14496-12 §8.4.3.2.
     if body.len() < 12 {
         return Err(Error::invalid("MP4: hdlr too short"));
     }
@@ -847,6 +862,14 @@ fn parse_hdlr(body: &[u8], t: &mut Track) -> Result<()> {
     t.media_type = match &handler {
         h if *h == HANDLER_SOUN => MediaType::Audio,
         h if *h == HANDLER_VIDE => MediaType::Video,
+        // `subt` (BMFF §12.6.1), `sbtl` (QuickTime), `text` (BMFF
+        // §12.5.1 timed text — `tx3g` lives here). All three are
+        // surfaced as MediaType::Subtitle so callers can route them
+        // through their subtitle pipeline.
+        h if *h == HANDLER_SUBT || *h == HANDLER_SBTL || *h == HANDLER_TEXT => MediaType::Subtitle,
+        // `meta` — timed metadata (BMFF §8.11). Stays as Data; no
+        // subtitle dispatch.
+        h if *h == HANDLER_META => MediaType::Data,
         _ => MediaType::Data,
     };
     Ok(())
@@ -914,8 +937,100 @@ fn parse_stsd(body: &[u8], t: &mut Track) -> Result<()> {
     let psz = hdr.payload_size().unwrap_or(0) as usize;
     let entry = read_bytes_vec(&mut cur, psz)?;
     t.codec_id_fourcc = hdr.fourcc;
+    // ISO/IEC 14496-12 §8.12 — protected sample entries (`encv`, `enca`,
+    // `enct`, `encs`) wrap the original sample description: the original
+    // FourCC and the encryption parameters move into a child `sinf` box
+    // while the outer FourCC becomes one of the `enc*` placeholders. We
+    // peek into the sinf to recover the original FourCC + scheme type
+    // so downstream codec dispatch sees the un-transformed type (and
+    // callers can read `protection_scheme` on the stream to learn how
+    // to decrypt). The bytes inside the sample entry stay laid out as
+    // if the original FourCC were present — preamble (28 for audio /
+    // 78 for video) then codec config boxes — which is exactly what
+    // §8.12.0 mandates ("leaving all other boxes unmodified").
+    if matches!(hdr.fourcc, ENCV | ENCA | ENCT | ENCS) {
+        let (orig, scheme) = parse_sinf_for_original_format(&entry, t.media_type)?;
+        if let Some(fourcc) = orig {
+            t.codec_id_fourcc = fourcc;
+        }
+        t.protection_scheme = scheme;
+    }
     parse_sample_entry(&entry, t)?;
     Ok(())
+}
+
+/// Result of unwrapping an `enc*` sample entry: `(original_fourcc,
+/// scheme_type)`. Either field may be `None` when the corresponding
+/// child box is absent in the sinf.
+type SinfUnwrap = (Option<[u8; 4]>, Option<[u8; 4]>);
+
+/// Walk a protected sample entry (`enc*`) to find its `sinf` child
+/// container, then pull out the original (un-transformed) FourCC from
+/// `frma` and the scheme type from `schm`. Returns
+/// `(Some(original_fourcc), Some(scheme_type))` when both are present
+/// in well-formed input; either field is `None` when the corresponding
+/// child box is absent. The latter is permitted by §8.12: in IPMP-only
+/// signalling a `sinf` may carry `frma` without `schm`.
+///
+/// The preamble length depends on the original media-type (recorded on
+/// the track via the `hdlr`): 28 bytes for audio (AudioSampleEntry v0)
+/// or 78 bytes for video (VisualSampleEntry). We skip that, then walk
+/// child boxes until we hit `sinf`.
+fn parse_sinf_for_original_format(entry: &[u8], media_type: MediaType) -> Result<SinfUnwrap> {
+    let preamble = match media_type {
+        MediaType::Audio => 28,
+        MediaType::Video => 78,
+        // Other media types we don't currently surface as `enc*`; bail
+        // gracefully without claiming anything.
+        _ => return Ok((None, None)),
+    };
+    if entry.len() <= preamble {
+        return Ok((None, None));
+    }
+    let mut cur = std::io::Cursor::new(&entry[preamble..]);
+    let end = (entry.len() - preamble) as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let body = read_bytes_vec(&mut cur, psz)?;
+        if hdr.fourcc == SINF {
+            return parse_sinf_body(&body);
+        }
+    }
+    Ok((None, None))
+}
+
+/// Inner sinf walker — same shape, but at the sinf level we're looking
+/// for `frma` (original_format, §8.12.2) and `schm` (scheme_type, §8.12.5).
+fn parse_sinf_body(body: &[u8]) -> Result<SinfUnwrap> {
+    let mut original: Option<[u8; 4]> = None;
+    let mut scheme: Option<[u8; 4]> = None;
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let inner = read_bytes_vec(&mut cur, psz)?;
+        match hdr.fourcc {
+            FRMA if inner.len() >= 4 => {
+                original = Some([inner[0], inner[1], inner[2], inner[3]]);
+            }
+            SCHM if inner.len() >= 8 => {
+                // FullBox header (4 bytes) + scheme_type (4 bytes) +
+                // scheme_version (4 bytes) + optional URI. We only need
+                // scheme_type at offset 4.
+                scheme = Some([inner[4], inner[5], inner[6], inner[7]]);
+            }
+            _ => {}
+        }
+    }
+    Ok((original, scheme))
 }
 
 fn parse_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
@@ -925,8 +1040,84 @@ fn parse_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
     match t.media_type {
         MediaType::Audio => parse_audio_sample_entry(entry, t),
         MediaType::Video => parse_video_sample_entry(entry, t),
+        MediaType::Subtitle => parse_subtitle_sample_entry(entry, t),
         _ => Ok(()),
     }
+}
+
+/// Parse a subtitle / timed-text sample entry. Layout per
+/// ISO/IEC 14496-12 §12.5–6 and 3GPP TS 26.245 (for `tx3g`).
+///
+/// Common to every subtitle sample entry: 8 reserved bytes (6 + 2
+/// data_reference_index). After that, the per-codec body varies:
+///
+/// * `wvtt` (WebVTT): the spec defines an inner `vttC` box (config) and
+///   an optional `vlab` (label). We capture `vttC` as extradata.
+/// * `stpp` (XML subtitle / TTML, BMFF §12.6.3.2): null-terminated
+///   UTF-8 strings — namespace, schema_location (optional),
+///   auxiliary_mime_types (optional) — then optional `btrt`. We store
+///   `namespace\0schema_location\0aux_mime_types` as extradata so
+///   callers can recover them.
+/// * `sbtt`/`stxt` (BMFF §12.5–6): content_encoding\0mime_format\0
+///   plus optional `btrt`/`txtC`. Surface the strings as extradata.
+/// * `tx3g` (3GPP TS 26.245): 18 bytes of display flags + colour +
+///   default text box + style record, then optional `ftab` etc. The
+///   3GPP TS 26.245 spec is not in `docs/`; we don't parse the body
+///   today, but the FourCC dispatch / codec id (`mov_text`) is enough
+///   for round-trip carriage through the demuxer.
+/// * `text` (QuickTime plain text): same situation — surfaced as a
+///   subtitle stream without decoding.
+/// * `c608` / `c708`: CEA-608/708 closed captions. Sample bytes carry
+///   the raw caption packets; no extradata to surface.
+fn parse_subtitle_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
+    // 8-byte preamble (6 reserved + 2 data_reference_index).
+    if entry.len() < 8 {
+        return Ok(());
+    }
+    // For BMFF text subtitle entries (`stpp`, `sbtt`, `stxt`) the
+    // body after the preamble is a series of null-terminated UTF-8
+    // strings. Capture them verbatim — the demuxer doesn't interpret
+    // their semantics, but consumers (e.g. a TTML renderer) do.
+    match &t.codec_id_fourcc {
+        b"stpp" | b"sbtt" | b"stxt" => {
+            // Strings + optional child boxes. We need to skip the
+            // strings before walking child boxes. Find the last null
+            // terminator that ends the string-only region: stpp has up
+            // to three strings (namespace, schema_location?,
+            // auxiliary_mime_types?), sbtt/stxt have up to two
+            // (content_encoding?, mime_format). All optional fields
+            // are present as bare null-bytes when empty, so we walk to
+            // the first byte that *could* be a box header (size+type).
+            //
+            // The simplest correct behaviour: copy the entire post-
+            // preamble payload as extradata, including any trailing
+            // `btrt`/`txtC` sub-boxes. Callers that need to extract
+            // the strings can parse them with `splitn('\0')`.
+            t.extradata = entry[8..].to_vec();
+        }
+        b"wvtt" => {
+            // WebVTT in MP4: walk for the `vttC` config box (and
+            // optional `vlab` label). The spec lives in ISO/IEC
+            // 14496-30; we treat the entire post-preamble payload as
+            // extradata so consumers can find the embedded `vttC`
+            // header without re-parsing the BMFF surface.
+            t.extradata = entry[8..].to_vec();
+        }
+        b"tx3g" | b"text" | b"c608" | b"c708" => {
+            // `tx3g` carries an 18-byte fixed header (display flags +
+            // colours + default text box + default style record) plus
+            // optional `ftab` font table. Treat the entire post-
+            // preamble payload as extradata so a downstream renderer
+            // can pick the colour / style defaults out of it.
+            //
+            // For `text` / `c608` / `c708` no useful per-track header
+            // is defined; the post-preamble bytes are still preserved
+            // as extradata for any nonstandard carriage.
+            t.extradata = entry[8..].to_vec();
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
@@ -2323,6 +2514,7 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     let mut params = match t.media_type {
         MediaType::Audio => CodecParameters::audio(codec_id),
         MediaType::Video => CodecParameters::video(codec_id),
+        MediaType::Subtitle => CodecParameters::subtitle(codec_id),
         _ => {
             let mut p = CodecParameters::audio(codec_id);
             p.media_type = MediaType::Data;
@@ -2342,6 +2534,17 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     params.width = t.width;
     params.height = t.height;
     params.extradata = t.extradata.clone();
+
+    // ISO/IEC 14496-12 §8.12: when the track's sample entry was wrapped
+    // as `enc*`, surface the recovered scheme type so callers can
+    // detect (and refuse, or hand off to a CENC layer) protected
+    // tracks. The codec id has already been remapped to the original
+    // un-transformed FourCC via `sinf/frma` so this is the only place
+    // the protection is visible on the public stream surface.
+    if let Some(scheme) = t.protection_scheme {
+        let scheme_str = std::str::from_utf8(&scheme).unwrap_or("????").to_string();
+        params.options.insert("protection_scheme", scheme_str);
+    }
 
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
     StreamInfo {
@@ -2704,7 +2907,208 @@ mod tests {
             ctts: Vec::new(),
             elst: Vec::new(),
             trex: super::TrexDefaults::default(),
+            protection_scheme: None,
         }
+    }
+
+    /// Build an `enca`-wrapped audio sample entry: the 28-byte audio
+    /// preamble (channels 2, 16-bit, 48 kHz) followed by a `sinf` box
+    /// carrying `frma` (original FourCC) + `schm` (scheme type). This
+    /// mirrors what a CENC-protected AAC track looks like on disk
+    /// (ISO/IEC 14496-12 §8.12).
+    fn build_enca_with_sinf(original: &[u8; 4], scheme: &[u8; 4]) -> Vec<u8> {
+        // Preamble: 28 bytes.
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 6]);
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&[0u8; 8]);
+        out.extend_from_slice(&2u16.to_be_bytes());
+        out.extend_from_slice(&16u16.to_be_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&((48_000u32) << 16).to_be_bytes());
+
+        // Build sinf body: frma + schm.
+        let mut sinf_body = Vec::new();
+        // frma: 8 byte header + 4 byte data_format.
+        sinf_body.extend_from_slice(&12u32.to_be_bytes());
+        sinf_body.extend_from_slice(b"frma");
+        sinf_body.extend_from_slice(original);
+        // schm: 8 byte header + 4 byte FullBox version/flags + 4 byte
+        // scheme_type + 4 byte scheme_version.
+        sinf_body.extend_from_slice(&20u32.to_be_bytes());
+        sinf_body.extend_from_slice(b"schm");
+        sinf_body.extend_from_slice(&[0u8; 4]); // version + flags
+        sinf_body.extend_from_slice(scheme);
+        sinf_body.extend_from_slice(&[0u8; 4]); // scheme_version
+
+        // sinf box header + body.
+        let sinf_total = (8 + sinf_body.len()) as u32;
+        out.extend_from_slice(&sinf_total.to_be_bytes());
+        out.extend_from_slice(b"sinf");
+        out.extend_from_slice(&sinf_body);
+        out
+    }
+
+    #[test]
+    fn enca_sample_entry_recovers_original_format() {
+        // CENC-style: outer FourCC `enca`, original `mp4a` (AAC), scheme
+        // `cenc`. Drive the full parse_stsd pathway: build an stsd
+        // payload with entry_count=1 and one `enca` entry containing
+        // the audio preamble + sinf.
+        let entry_body = build_enca_with_sinf(b"mp4a", b"cenc");
+        let mut stsd = Vec::new();
+        stsd.extend_from_slice(&[0u8; 4]); // FullBox version/flags
+        stsd.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        let total = (8 + entry_body.len()) as u32;
+        stsd.extend_from_slice(&total.to_be_bytes());
+        stsd.extend_from_slice(b"enca");
+        stsd.extend_from_slice(&entry_body);
+
+        let mut t = fresh_track();
+        super::parse_stsd(&stsd, &mut t).unwrap();
+        // Original FourCC recovered from sinf/frma.
+        assert_eq!(&t.codec_id_fourcc, b"mp4a");
+        // Scheme type from sinf/schm.
+        assert_eq!(t.protection_scheme, Some(*b"cenc"));
+        // Preamble still parsed (channels populated despite the enc wrap).
+        assert_eq!(t.channels, Some(2));
+    }
+
+    #[test]
+    fn encv_sample_entry_recovers_h264_original() {
+        // Video variant: 78-byte preamble + sinf with frma=avc1, schm=cbcs.
+        let mut entry_body = Vec::new();
+        entry_body.extend_from_slice(&[0u8; 6]);
+        entry_body.extend_from_slice(&1u16.to_be_bytes());
+        entry_body.extend_from_slice(&[0u8; 16]); // pre_defined/reserved
+        entry_body.extend_from_slice(&1280u16.to_be_bytes()); // width
+        entry_body.extend_from_slice(&720u16.to_be_bytes()); // height
+        entry_body.extend_from_slice(&((72u32) << 16).to_be_bytes()); // horizresolution
+        entry_body.extend_from_slice(&((72u32) << 16).to_be_bytes()); // vertresolution
+        entry_body.extend_from_slice(&[0u8; 4]); // reserved
+        entry_body.extend_from_slice(&1u16.to_be_bytes()); // frame_count
+        entry_body.extend_from_slice(&[0u8; 32]); // compressorname
+        entry_body.extend_from_slice(&0x0018u16.to_be_bytes()); // depth
+        entry_body.extend_from_slice(&(-1i16).to_be_bytes()); // pre_defined
+                                                              // Total preamble: 78 bytes.
+        assert_eq!(entry_body.len(), 78);
+
+        let mut sinf_body = Vec::new();
+        sinf_body.extend_from_slice(&12u32.to_be_bytes());
+        sinf_body.extend_from_slice(b"frma");
+        sinf_body.extend_from_slice(b"avc1");
+        sinf_body.extend_from_slice(&20u32.to_be_bytes());
+        sinf_body.extend_from_slice(b"schm");
+        sinf_body.extend_from_slice(&[0u8; 4]);
+        sinf_body.extend_from_slice(b"cbcs");
+        sinf_body.extend_from_slice(&[0u8; 4]);
+
+        let sinf_total = (8 + sinf_body.len()) as u32;
+        entry_body.extend_from_slice(&sinf_total.to_be_bytes());
+        entry_body.extend_from_slice(b"sinf");
+        entry_body.extend_from_slice(&sinf_body);
+
+        let mut stsd = Vec::new();
+        stsd.extend_from_slice(&[0u8; 4]);
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        let total = (8 + entry_body.len()) as u32;
+        stsd.extend_from_slice(&total.to_be_bytes());
+        stsd.extend_from_slice(b"encv");
+        stsd.extend_from_slice(&entry_body);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        super::parse_stsd(&stsd, &mut t).unwrap();
+        assert_eq!(&t.codec_id_fourcc, b"avc1");
+        assert_eq!(t.protection_scheme, Some(*b"cbcs"));
+        assert_eq!(t.width, Some(1280));
+        assert_eq!(t.height, Some(720));
+    }
+
+    #[test]
+    fn subtitle_handler_dispatches_subtitle_media_type() {
+        // hdlr body layout: 4 bytes FullBox + 4 bytes pre_defined +
+        // 4 bytes handler_type + 12 bytes reserved + name (null-term).
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox
+        body.extend_from_slice(&[0u8; 4]); // pre_defined
+        body.extend_from_slice(b"subt"); // handler_type
+        body.extend_from_slice(&[0u8; 12]); // reserved
+        body.extend_from_slice(b"\0");
+
+        let mut t = fresh_track();
+        super::parse_hdlr(&body, &mut t).unwrap();
+        assert_eq!(t.media_type, oxideav_core::MediaType::Subtitle);
+
+        // And `text` (timed text) also lands on Subtitle.
+        let mut body2 = Vec::new();
+        body2.extend_from_slice(&[0u8; 4]);
+        body2.extend_from_slice(&[0u8; 4]);
+        body2.extend_from_slice(b"text");
+        body2.extend_from_slice(&[0u8; 12]);
+        body2.extend_from_slice(b"\0");
+
+        let mut t2 = fresh_track();
+        super::parse_hdlr(&body2, &mut t2).unwrap();
+        assert_eq!(t2.media_type, oxideav_core::MediaType::Subtitle);
+
+        // And `sbtl` (QuickTime subtitle handler) also lands on Subtitle.
+        let mut body3 = Vec::new();
+        body3.extend_from_slice(&[0u8; 4]);
+        body3.extend_from_slice(&[0u8; 4]);
+        body3.extend_from_slice(b"sbtl");
+        body3.extend_from_slice(&[0u8; 12]);
+        body3.extend_from_slice(b"\0");
+
+        let mut t3 = fresh_track();
+        super::parse_hdlr(&body3, &mut t3).unwrap();
+        assert_eq!(t3.media_type, oxideav_core::MediaType::Subtitle);
+    }
+
+    #[test]
+    fn tx3g_sample_entry_preserves_payload_as_extradata() {
+        // tx3g (3GPP TS 26.245) sample entry layout starts with a
+        // 6-byte reserved + 2-byte data_reference_index preamble, then
+        // 18 bytes of display flags / colours / default text box /
+        // default style record. We don't decode the 18 bytes (no
+        // 26.245 in docs/) but we preserve them so renderers can.
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&[0u8; 6]);
+        entry.extend_from_slice(&1u16.to_be_bytes());
+        // 18 bytes of "tx3g header" — arbitrary recognisable pattern.
+        let tx3g_header = [
+            0x00, 0x00, 0x00, 0x00, // display_flags
+            0x00, 0x00, // horizontal/vertical justification
+            0xFF, 0xFF, 0xFF, 0xFF, // background_color_rgba (white)
+            0x00, 0x00, 0x00, 0x00, // default text box (top/left)
+            0x00, 0x10, 0x00, 0x10, // default text box (bot/right)
+        ];
+        entry.extend_from_slice(&tx3g_header);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Subtitle;
+        t.codec_id_fourcc = *b"tx3g";
+        super::parse_subtitle_sample_entry(&entry, &mut t).unwrap();
+        // Post-preamble bytes preserved verbatim.
+        assert_eq!(t.extradata, tx3g_header);
+    }
+
+    #[test]
+    fn stpp_sample_entry_preserves_xml_namespace_strings() {
+        // stpp body: namespace\0schema_location\0auxiliary_mime_types\0
+        // — UTF-8 null-terminated strings. We don't split them; we
+        // hand the whole post-preamble blob to extradata so the caller
+        // can `split('\0')`.
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&[0u8; 6]);
+        entry.extend_from_slice(&1u16.to_be_bytes());
+        entry.extend_from_slice(b"http://www.w3.org/ns/ttml\0\0\0");
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Subtitle;
+        t.codec_id_fourcc = *b"stpp";
+        super::parse_subtitle_sample_entry(&entry, &mut t).unwrap();
+        assert!(t.extradata.starts_with(b"http://www.w3.org/ns/ttml"));
     }
 
     #[test]

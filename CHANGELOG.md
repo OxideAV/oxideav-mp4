@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Subtitle / timed-text track demux (ISO/IEC 14496-12 §12.5–6).
+  The handler-type box (`hdlr`) now recognises `subt` (BMFF
+  Subtitle), `sbtl` (QuickTime subtitle), and `text` (BMFF
+  timed text — used by 3GPP `tx3g` carriage) and lands the
+  resulting track as `MediaType::Subtitle`. Sample-entry FourCC
+  dispatch covers `tx3g` → `mov_text`, `text` → `text`, `wvtt`
+  → `webvtt`, `stpp` → `ttml`, `sbtt` → `sbtt`, `stxt` →
+  `stxt`, `c608` → `eia_608`, and `c708` → `eia_708`. The
+  post-preamble bytes (3GPP `tx3g` display flags + colours +
+  default text box; BMFF stpp / sbtt / stxt UTF-8 strings;
+  WebVTT `vttC` config) are preserved verbatim in
+  `params.extradata` for downstream renderers — no per-codec
+  body parsing is performed (3GPP TS 26.245 is not in `docs/`
+  and BMFF §12.5–6 leaves the strings caller-interpretable).
+- Protected sample-entry unwrap (ISO/IEC 14496-12 §8.12). When a
+  sample entry's outer FourCC is `encv` / `enca` / `enct` /
+  `encs`, the demuxer walks the inner `sinf` container to
+  recover the original (un-transformed) FourCC from `frma` and
+  the protection scheme type from `schm`. The stream surfaces
+  the un-transformed codec id (so decoders are set up as if the
+  track were plain) and exposes the scheme on
+  `params.options["protection_scheme"]` (e.g. `cenc`, `cbc1`,
+  `cens`, `cbcs`) so callers can detect protection without
+  decoding the sample bytes. CENC key management (`tenc`,
+  `pssh`, `senc`, `saiz` / `saio`) is **not** implemented; that
+  needs the base ISO/IEC 23001-7 spec, only AMD1 / 2019 of
+  which is present in `docs/container/cenc/`.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.6...v0.0.7) - 2026-05-06
 
 ### Other

@@ -65,6 +65,27 @@ pub fn from_sample_entry(fourcc: &[u8; 4]) -> CodecId {
         // movies use `h263` directly.
         b"s263" | b"h263" => "h263",
         b"lpcm" | b"sowt" | b"twos" => "pcm_s16le",
+        // Subtitle / timed-text sample entries (ISO/IEC 14496-12 §12.5–6
+        // and the 3GPP TS 26.245 `tx3g` registration).
+        //
+        // - `tx3g`: 3GPP Timed Text (the de-facto MP4 subtitle, called
+        //   "movtext" in ffmpeg parlance). Surfaced as `mov_text` so
+        //   downstream callers can disambiguate from raw 3GPP text.
+        // - `text`: QuickTime plain text (.mov chapter / subtitle).
+        // - `wvtt`: WebVTT (W3C TTML mapping, also used by HLS).
+        // - `stpp`: XML subtitle (ISO/IEC 14496-30 / TTML).
+        // - `sbtt`: Simple text subtitle (BMFF §12.6.3.2 `TextSubtitleSampleEntry`).
+        // - `stxt`: Simple text (BMFF §12.5.3.2 `SimpleTextSampleEntry`).
+        // - `c608`/`c708`: CEA-608/708 closed captions (carried per
+        //   QuickTime tech-note).
+        b"tx3g" => "mov_text",
+        b"text" => "text",
+        b"wvtt" => "webvtt",
+        b"stpp" => "ttml",
+        b"sbtt" => "sbtt",
+        b"stxt" => "stxt",
+        b"c608" => "eia_608",
+        b"c708" => "eia_708",
         other => {
             let s = std::str::from_utf8(other).unwrap_or("????");
             return CodecId::new(format!("mp4:{s}"));
@@ -270,6 +291,22 @@ mod tests {
         // Match the canonical aliases registered by oxideav-g711.
         assert_eq!(from_sample_entry(b"ulaw"), CodecId::new("pcm_mulaw"));
         assert_eq!(from_sample_entry(b"alaw"), CodecId::new("pcm_alaw"));
+    }
+
+    #[test]
+    fn subtitle_fourccs_map_to_named_codecs() {
+        // The dispatch table covers every subtitle / timed-text FourCC
+        // the demuxer recognises. Round-trips a hard-coded expectation
+        // per spec: the FourCCs come from ISO/IEC 14496-12 §12.5–6 and
+        // the 3GPP TS 26.245 registration.
+        assert_eq!(from_sample_entry(b"tx3g"), CodecId::new("mov_text"));
+        assert_eq!(from_sample_entry(b"text"), CodecId::new("text"));
+        assert_eq!(from_sample_entry(b"wvtt"), CodecId::new("webvtt"));
+        assert_eq!(from_sample_entry(b"stpp"), CodecId::new("ttml"));
+        assert_eq!(from_sample_entry(b"sbtt"), CodecId::new("sbtt"));
+        assert_eq!(from_sample_entry(b"stxt"), CodecId::new("stxt"));
+        assert_eq!(from_sample_entry(b"c608"), CodecId::new("eia_608"));
+        assert_eq!(from_sample_entry(b"c708"), CodecId::new("eia_708"));
     }
 
     #[test]

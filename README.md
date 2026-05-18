@@ -114,6 +114,13 @@ Sample-entry FourCCs resolve to these codec ids:
 | `jpeg` / `mjpa` / `mjpb` | `mjpeg`                                 |
 | `s263` / `h263`          | `h263`                                  |
 | `lpcm` / `sowt` / `twos` | `pcm_s16le` (endianness of `twos` is not re-swapped) |
+| `tx3g`                   | `mov_text` (3GPP TS 26.245 timed text — "movtext") |
+| `text`                   | `text` (QuickTime plain text)            |
+| `wvtt`                   | `webvtt` (W3C WebVTT-in-ISOBMFF)         |
+| `stpp`                   | `ttml` (XML / TTML subtitle)             |
+| `sbtt` / `stxt`          | `sbtt` / `stxt` (BMFF §12.5–6 text)      |
+| `c608` / `c708`          | `eia_608` / `eia_708` (closed captions)  |
+| `encv` / `enca` / `enct` / `encs` | original FourCC recovered from `sinf/frma`; `params.options["protection_scheme"]` carries the `schm.scheme_type` (e.g. `cenc`, `cbcs`) |
 | any other                | `mp4:<fourcc>` — callers can register their own decoder |
 
 - Codec-specific config records (`avcC`, `hvcC`, `av1C`, `vpcC`,
@@ -133,6 +140,25 @@ Sample-entry FourCCs resolve to these codec ids:
   (or the first keyframe of the stream if none qualify).
 - Metadata: 3GPP `udta` boxes (`titl`/`auth`/…) and iTunes-style
   `meta`/`ilst` are surfaced via `Demuxer::metadata()`.
+- Handler-type recognition (ISO/IEC 14496-12 §8.4.3): `soun` →
+  Audio, `vide` → Video, `subt` / `sbtl` / `text` → Subtitle,
+  `meta` → Data. Subtitle sample entries (`tx3g`, `text`, `wvtt`,
+  `stpp`, `sbtt`, `stxt`, `c608`, `c708`) come out with
+  `MediaType::Subtitle` and the per-codec id from the table above;
+  their post-preamble payload (BMFF strings / tx3g header / vttC)
+  is preserved verbatim in `params.extradata` for downstream
+  renderers.
+- Protected sample-entry unwrap (ISO/IEC 14496-12 §8.12): when the
+  outer FourCC is `encv` / `enca` / `enct` / `encs`, the demuxer
+  walks the inner `sinf` to recover the original codec FourCC
+  from `frma` and the protection scheme from `schm`. The stream
+  surfaces the un-transformed codec id so downstream decoders can
+  be set up normally; `params.options["protection_scheme"]`
+  carries the four-char scheme type (e.g. `cenc`, `cbcs`) so
+  callers know packet payloads are still ciphertext. CENC key
+  management (`tenc`, `pssh`, `senc`, `saiz` / `saio`) is **not**
+  implemented — the demuxer surfaces packets verbatim and leaves
+  decryption to a layer with key material.
 
 ### Muxer
 
@@ -166,7 +192,17 @@ whose mdat payload exceeds 4 GiB fail at `write_trailer`.
 - `sidx` segment-index seek-time mapping (skipped; sequential demux
   works without it).
 - Edit lists on the muxer.
-- Sample groups (`sbgp`/`sgpd`), subtitle tracks, DRM (`sinf`/`pssh`).
+- Sample groups (`sbgp` / `sgpd`).
+- Subtitle / timed-text **mux** — the demuxer surfaces
+  Subtitle-typed tracks but the muxer's `sample_entry_for` table
+  has no entry for `mov_text` / `webvtt` / `ttml` (would land
+  with `Error::Unsupported` at `open` time).
+- CENC decryption proper — the demuxer detects protected tracks
+  (`encv` / `enca` / `enct` / `encs` → original FourCC plus the
+  scheme on `params.options`) but it doesn't read `tenc`, `pssh`,
+  `senc`, or `saiz` / `saio` and it doesn't decrypt sample bytes.
+  Adding that needs the base ISO/IEC 23001-7 spec (currently only
+  AMD1 / 2019 is in `docs/container/cenc/`).
 - Multiple sample descriptions per track (only the first entry of
   `stsd` is used; `tfhd.sample_description_index` overrides are
   ignored).
