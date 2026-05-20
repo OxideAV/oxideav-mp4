@@ -159,6 +159,17 @@ Sample-entry FourCCs resolve to these codec ids:
   management (`tenc`, `pssh`, `senc`, `saiz` / `saio`) is **not**
   implemented — the demuxer surfaces packets verbatim and leaves
   decryption to a layer with key material.
+- Track references (ISO/IEC 14496-12 §8.3.3, `tref`): each typed
+  `TrackReferenceTypeBox` inside `trak/tref` is parsed and the
+  resulting `(reference_type → track_IDs)` pairs are surfaced on
+  `params.options` as `tref_<type>` keys whose value is a
+  space-separated list of referenced `track_ID`s (e.g.
+  `tref_chap = "3"`, `tref_subt = "10 11"`, `tref_cdsc = "2"`).
+  Useful for wiring subtitle→video (`subt`), chapter (`chap`),
+  content description (`cdsc`), font (`font`), hint (`hint`),
+  depth / parallax auxiliary video (`vdep` / `vplx`), and hint
+  dependency (`hind`) relationships. `track_ID = 0` entries
+  (spec-prohibited) are dropped.
 
 ### Muxer
 

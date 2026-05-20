@@ -294,6 +294,15 @@ struct Track {
     /// they just won't get plaintext bytes until something else
     /// decrypts them.
     protection_scheme: Option<[u8; 4]>,
+    /// §8.3.3 — `tref` (TrackReferenceBox) entries. Each pair is
+    /// `(reference_type, track_IDs)` where `reference_type` is the FourCC
+    /// of an inner `TrackReferenceTypeBox` (e.g. `chap`, `subt`, `cdsc`,
+    /// `hint`, `font`, `hind`, `vdep`, `vplx`) and `track_IDs` is the
+    /// raw `unsigned int(32)` array packed in that inner box's body.
+    /// Empty when the file has no `tref`. A given `reference_type` may
+    /// appear at most once (per spec — track-reference type boxes are
+    /// keyed by their FourCC).
+    tref: Vec<([u8; 4], Vec<u32>)>,
 }
 
 /// Single entry of an `elst` (EditListBox).
@@ -626,6 +635,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         elst: Vec::new(),
         trex: TrexDefaults::default(),
         protection_scheme: None,
+        tref: Vec::new(),
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -649,6 +659,10 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
             EDTS => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
                 parse_edts(&sub, &mut t)?;
+            }
+            TREF => {
+                let sub = read_bytes_vec(&mut cur, psz)?;
+                parse_tref(&sub, &mut t)?;
             }
             _ => {
                 cur.set_position(cur.position() + psz as u64);
@@ -677,6 +691,63 @@ fn parse_tkhd(body: &[u8], t: &mut Track) -> Result<()> {
         return Err(Error::invalid("MP4: tkhd too short"));
     }
     t.track_id = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    Ok(())
+}
+
+/// §8.3.3 — `tref` (TrackReferenceBox).
+///
+/// Spec syntax (§8.3.3.2):
+/// ```text
+/// aligned(8) class TrackReferenceBox extends Box('tref') {
+/// }
+/// aligned(8) class TrackReferenceTypeBox (unsigned int(32) reference_type)
+///     extends Box(reference_type) {
+///   unsigned int(32) track_IDs[];   // array fills the box
+/// }
+/// ```
+///
+/// The outer `tref` is a plain container (no FullBox version/flags) whose
+/// children are typed reference boxes. Each child's *FourCC* is the
+/// `reference_type` (e.g. `hint`, `cdsc`, `font`, `hind`, `vdep`, `vplx`,
+/// `subt`, `chap`, `tmcd`) and its body is a packed array of `u32`
+/// `track_ID`s (big-endian per §4.2 file-format conventions). The array
+/// sizes itself by filling the box payload.
+///
+/// Per §8.3.3.3 `track_ID` is "never zero". We tolerate (skip) zero
+/// entries rather than rejecting the file outright — some hand-rolled
+/// muxers pad the array.
+fn parse_tref(body: &[u8], t: &mut Track) -> Result<()> {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let child = read_bytes_vec(&mut cur, psz)?;
+        // §8.3.3.2 — child body is "unsigned int(32) track_IDs[]"; size
+        // not stored, derived from box length. Reject malformed
+        // sub-boxes whose body isn't a whole number of u32s — that's a
+        // structural error, not a "skip me" hint.
+        if child.len() % 4 != 0 {
+            return Err(Error::invalid("MP4: tref child not a multiple of 4 bytes"));
+        }
+        let mut ids = Vec::with_capacity(child.len() / 4);
+        for chunk in child.chunks_exact(4) {
+            let id = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if id != 0 {
+                ids.push(id);
+            }
+        }
+        // Per spec a given reference_type appears at most once. If a
+        // file violates that, keep the first occurrence and discard the
+        // rest — silently chaining them together would surface bogus
+        // (track,reference_type) pairs.
+        if !t.tref.iter().any(|(ty, _)| *ty == hdr.fourcc) {
+            t.tref.push((hdr.fourcc, ids));
+        }
+    }
     Ok(())
 }
 
@@ -2546,6 +2617,35 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert("protection_scheme", scheme_str);
     }
 
+    // ISO/IEC 14496-12 §8.3.3: surface track references as
+    // `tref_<type>` → space-separated track IDs. Callers use this to
+    // wire up subtitle→video (`subt`), chapter (`chap`), content
+    // description (`cdsc`), font (`font`), hint (`hint`), depth/parallax
+    // auxiliary video (`vdep` / `vplx`), and dependency (`hind`)
+    // relationships. Reference types whose FourCC contains non-printable
+    // bytes are still surfaced (the key is utf8-lossy so they don't
+    // panic), but downstream callers should treat unknown types as
+    // opaque.
+    for (ref_type, ids) in &t.tref {
+        if ids.is_empty() {
+            continue;
+        }
+        let type_str = std::str::from_utf8(ref_type)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| {
+                format!(
+                    "{:02x}{:02x}{:02x}{:02x}",
+                    ref_type[0], ref_type[1], ref_type[2], ref_type[3]
+                )
+            });
+        let value = ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        params.options.insert(format!("tref_{}", type_str), value);
+    }
+
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
     StreamInfo {
         index,
@@ -2908,6 +3008,7 @@ mod tests {
             elst: Vec::new(),
             trex: super::TrexDefaults::default(),
             protection_scheme: None,
+            tref: Vec::new(),
         }
     }
 
@@ -3274,5 +3375,119 @@ mod tests {
         assert_eq!(t.elst[1].media_time, 500);
         assert_eq!(t.elst[1].segment_duration, 2000);
         assert_eq!(super::elst_leading_media_time(&t), 500);
+    }
+
+    /// §8.3.3 — `tref` carrying a single `chap` reference resolves to one
+    /// child box of body `[u32 track_ID]`. The reference type is the
+    /// child's FourCC; the body is a packed big-endian u32 array.
+    #[test]
+    fn parse_tref_chap_single_id() {
+        // Inner TrackReferenceTypeBox: size(12) "chap" track_ID(3)
+        let inner = wrap_box_full_size(b"chap", &3u32.to_be_bytes());
+        // Outer `tref` body is just the concatenation of inner boxes.
+        let mut t = fresh_track();
+        super::parse_tref(&inner, &mut t).unwrap();
+        assert_eq!(t.tref.len(), 1);
+        assert_eq!(&t.tref[0].0, b"chap");
+        assert_eq!(t.tref[0].1, vec![3]);
+    }
+
+    /// Multiple typed references in one `tref` are surfaced in order.
+    #[test]
+    fn parse_tref_multiple_types() {
+        let mut body = Vec::new();
+        // subt → tracks 4, 5
+        let mut subt_payload = Vec::new();
+        subt_payload.extend_from_slice(&4u32.to_be_bytes());
+        subt_payload.extend_from_slice(&5u32.to_be_bytes());
+        body.extend(wrap_box_full_size(b"subt", &subt_payload));
+        // cdsc → track 2
+        body.extend(wrap_box_full_size(b"cdsc", &2u32.to_be_bytes()));
+        let mut t = fresh_track();
+        super::parse_tref(&body, &mut t).unwrap();
+        assert_eq!(t.tref.len(), 2);
+        assert_eq!(&t.tref[0].0, b"subt");
+        assert_eq!(t.tref[0].1, vec![4, 5]);
+        assert_eq!(&t.tref[1].0, b"cdsc");
+        assert_eq!(t.tref[1].1, vec![2]);
+    }
+
+    /// §8.3.3.3 — `track_ID` is never zero; we silently drop zeros from
+    /// the array rather than rejecting the file.
+    #[test]
+    fn parse_tref_drops_zero_track_ids() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&7u32.to_be_bytes());
+        let body = wrap_box_full_size(b"font", &payload);
+        let mut t = fresh_track();
+        super::parse_tref(&body, &mut t).unwrap();
+        assert_eq!(t.tref.len(), 1);
+        assert_eq!(t.tref[0].1, vec![7]);
+    }
+
+    /// Sub-box body that isn't a multiple of 4 bytes is a structural
+    /// error — we surface it as `Error::Invalid` rather than silently
+    /// padding or truncating.
+    #[test]
+    fn parse_tref_misaligned_child_rejected() {
+        let body = wrap_box_full_size(b"hint", &[0u8, 0, 0, 1, 0xFF]); // 5 bytes
+        let mut t = fresh_track();
+        let err = super::parse_tref(&body, &mut t).unwrap_err();
+        assert!(matches!(err, oxideav_core::Error::InvalidData(_)));
+    }
+
+    /// Spec says at most one TrackReferenceTypeBox per reference_type
+    /// inside a `tref`. If a malformed file repeats one, the first wins
+    /// and subsequent duplicates are ignored.
+    #[test]
+    fn parse_tref_duplicate_type_keeps_first() {
+        let mut body = Vec::new();
+        body.extend(wrap_box_full_size(b"subt", &1u32.to_be_bytes()));
+        body.extend(wrap_box_full_size(b"subt", &2u32.to_be_bytes()));
+        let mut t = fresh_track();
+        super::parse_tref(&body, &mut t).unwrap();
+        assert_eq!(t.tref.len(), 1);
+        assert_eq!(t.tref[0].1, vec![1]);
+    }
+
+    /// Empty outer `tref` (no inner boxes) parses cleanly and yields no
+    /// references.
+    #[test]
+    fn parse_tref_empty_body_is_ok() {
+        let mut t = fresh_track();
+        super::parse_tref(&[], &mut t).unwrap();
+        assert!(t.tref.is_empty());
+    }
+
+    /// Track references surface on `StreamInfo.params.options` as
+    /// `tref_<type>` keys whose value is a space-separated track-ID
+    /// list. Reference types with no IDs (after dropping zeros) are
+    /// suppressed.
+    #[test]
+    fn build_stream_info_surfaces_tref_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Subtitle;
+        t.codec_id_fourcc = *b"tx3g";
+        t.timescale = 1000;
+        t.tref.push((*b"subt", vec![10, 11]));
+        t.tref.push((*b"font", vec![20]));
+        t.tref.push((*b"hint", vec![])); // empty after-zero strip: suppressed.
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("tref_subt"), Some("10 11"));
+        assert_eq!(info.params.options.get("tref_font"), Some("20"));
+        assert_eq!(info.params.options.get("tref_hint"), None);
+    }
+
+    /// Build a self-contained Box (size + FourCC + payload, 32-bit
+    /// size field). Used as a building block for stuffing typed
+    /// reference children into a synthetic `tref` body.
+    fn wrap_box_full_size(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let total = (8 + payload.len()) as u32;
+        let mut out = Vec::with_capacity(total as usize);
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(fourcc);
+        out.extend_from_slice(payload);
+        out
     }
 }

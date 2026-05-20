@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Track Reference Box (`tref`, ISO/IEC 14496-12 §8.3.3) demux. The
+  `trak` parser now walks the `tref` container and collects each
+  inner `TrackReferenceTypeBox` (whose FourCC is the reference type
+  — `hint`, `cdsc`, `font`, `hind`, `vdep`, `vplx`, `subt`, `chap`,
+  `tmcd`, etc. — and whose body is a packed big-endian `u32`
+  `track_IDs[]` array). The parsed (`reference_type`, `track_IDs`)
+  pairs are surfaced on `StreamInfo.params.options` as
+  `tref_<type>` keys whose value is a space-separated list of
+  referenced track IDs (e.g. `tref_chap = "3"`,
+  `tref_subt = "10 11"`). Zero IDs (spec-prohibited per §8.3.3.3)
+  are silently dropped; repeated `reference_type` boxes inside one
+  `tref` keep the first occurrence (spec says at most one per
+  type). Sub-box bodies whose length isn't a multiple of 4 are
+  rejected as malformed.
 - Subtitle / timed-text track demux (ISO/IEC 14496-12 §12.5–6).
   The handler-type box (`hdlr`) now recognises `subt` (BMFF
   Subtitle), `sbtl` (QuickTime subtitle), and `text` (BMFF

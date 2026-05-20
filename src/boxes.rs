@@ -104,6 +104,8 @@ pub const MOOV: [u8; 4] = fourcc("moov");
 pub const MVHD: [u8; 4] = fourcc("mvhd");
 pub const TRAK: [u8; 4] = fourcc("trak");
 pub const TKHD: [u8; 4] = fourcc("tkhd");
+/// `tref` — TrackReferenceBox (ISO/IEC 14496-12 §8.3.3).
+pub const TREF: [u8; 4] = fourcc("tref");
 pub const EDTS: [u8; 4] = fourcc("edts");
 pub const MDIA: [u8; 4] = fourcc("mdia");
 pub const MDHD: [u8; 4] = fourcc("mdhd");
