@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.7...v0.0.8) - 2026-05-21
+
+### Other
+
+- mp4 muxer: subtitle / timed-text track support (mov_text, webvtt, ttml, sbtt, stxt)
+- parse tref + surface track references as tref_<type> options
+- subtitle-handler dispatch + sinf protection unwrap
+
 ### Added
 
 - Subtitle / timed-text **muxer** support for `mov_text` (`tx3g`,
