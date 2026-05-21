@@ -1201,3 +1201,213 @@ fn mp4a_aac_oti_resolves_to_aac() {
     let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
 }
+
+// --- Subtitle / timed-text mux round-trip --------------------------------
+//
+// These verify that the muxer accepts the demuxer's surfaced subtitle
+// codec ids (`mov_text`, `webvtt`, `ttml`, `sbtt`, `stxt`), emits a
+// well-formed sample entry with the inner config preserved, picks the
+// right BMFF handler (`text` for tx3g, `subt` for the others) and
+// media-header (`nmhd` vs `sthd`), and that the resulting file demuxes
+// back to the same codec id / handler / extradata / packet bytes.
+//
+// Spec refs: ISO/IEC 14496-12 §12.5–6 (Text / Subtitle media);
+// 3GPP TS 26.245 (mov_text, no spec in docs/ — the muxer carries the
+// 18-byte tx3g header opaquely as the demuxer already round-trips it).
+
+fn subtitle_stream(codec: &str, extradata: Vec<u8>) -> StreamInfo {
+    let mut params = CodecParameters::subtitle(CodecId::new(codec));
+    params.extradata = extradata;
+    StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 1000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    }
+}
+
+fn subtitle_roundtrip(codec: &str, extradata: Vec<u8>, payloads: &[&[u8]]) {
+    let stream = subtitle_stream(codec, extradata.clone());
+    let tmp = std::env::temp_dir().join(format!("oxideav-mp4-subs-{codec}.mp4"));
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = oxideav_mp4::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
+        mux.write_header().unwrap();
+        for (i, payload) in payloads.iter().enumerate() {
+            let mut pkt = Packet::new(0, stream.time_base, payload.to_vec());
+            // 1-second cues at 1000-tick timebase.
+            pkt.pts = Some((i as i64) * 1000);
+            pkt.duration = Some(1000);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    assert_eq!(dmx.streams().len(), 1, "{codec}: stream count");
+    let s = &dmx.streams()[0];
+    assert_eq!(
+        s.params.codec_id,
+        CodecId::new(codec),
+        "{codec}: codec id round-trip"
+    );
+    assert_eq!(
+        s.params.media_type,
+        oxideav_core::MediaType::Subtitle,
+        "{codec}: media type round-trip"
+    );
+    assert_eq!(
+        s.params.extradata, extradata,
+        "{codec}: extradata (sample entry inner config) preserved"
+    );
+
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => got.push(p.data),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("{codec}: demux error: {e}"),
+        }
+    }
+    assert_eq!(got.len(), payloads.len(), "{codec}: packet count");
+    for (i, (g, p)) in got.iter().zip(payloads.iter()).enumerate() {
+        assert_eq!(g.as_slice(), *p, "{codec}: packet {i} byte mismatch");
+    }
+}
+
+#[test]
+fn mov_text_subtitle_roundtrip() {
+    // 18-byte tx3g default header (3GPP TS 26.245). Contents opaque.
+    let tx3g_header: Vec<u8> = vec![
+        0x00, 0x00, 0x00, 0x00, // display_flags
+        0x01, 0x00, // horiz_justify + vert_justify
+        0xFF, 0xFF, 0xFF, 0xFF, // background colour RGBA
+        0x00, 0x00, 0x00, 0x00, // default text box top,left
+        0x00, 0x80, 0x01, 0x40, // default text box bottom,right
+    ];
+    // A few "subtitle samples": each is a length-prefixed UTF-8 string
+    // (the tx3g sample format) — but the muxer is codec-agnostic and
+    // just passes bytes through.
+    let cue1: &[u8] = b"\x00\x05Hello";
+    let cue2: &[u8] = b"\x00\x05World";
+    subtitle_roundtrip("mov_text", tx3g_header, &[cue1, cue2]);
+}
+
+#[test]
+fn webvtt_subtitle_roundtrip() {
+    // Inner `vttC` box: 4-byte size + "vttC" + "WEBVTT".
+    let mut vttc = Vec::new();
+    vttc.extend_from_slice(&14u32.to_be_bytes());
+    vttc.extend_from_slice(b"vttC");
+    vttc.extend_from_slice(b"WEBVTT");
+    // WebVTT cues in BMFF are themselves boxed (vttc + payl) but the
+    // muxer just appends the supplied bytes.
+    subtitle_roundtrip("webvtt", vttc, &[b"cue-bytes-1", b"cue-bytes-2"]);
+}
+
+#[test]
+fn ttml_subtitle_roundtrip() {
+    // stpp body: namespace + \0 + schema_location + \0 + aux_mime + \0.
+    let mut strings = Vec::new();
+    strings.extend_from_slice(b"http://www.w3.org/ns/ttml\0");
+    strings.extend_from_slice(b"\0"); // empty schema_location
+    strings.extend_from_slice(b"\0"); // empty auxiliary_mime_types
+    let sample = b"<tt xmlns=\"http://www.w3.org/ns/ttml\"/>";
+    subtitle_roundtrip("ttml", strings, &[sample.as_ref()]);
+}
+
+#[test]
+fn sbtt_subtitle_roundtrip() {
+    // sbtt body: content_encoding\0 + mime_format\0.
+    let strings: Vec<u8> = b"\0text/plain\0".to_vec();
+    subtitle_roundtrip("sbtt", strings, &[b"line one\n", b"line two\n"]);
+}
+
+#[test]
+fn stxt_subtitle_roundtrip() {
+    let strings: Vec<u8> = b"\0text/html\0".to_vec();
+    subtitle_roundtrip("stxt", strings, &[b"<p>one</p>"]);
+}
+
+#[test]
+fn subtitle_handler_routing_round_trip() {
+    // mov_text must end up on a `text` handler (BMFF §12.5) and use
+    // `nmhd`. wvtt/stpp/sbtt/stxt must end up on a `subt` handler
+    // (BMFF §12.6) and use `sthd`. We assert this by scanning the
+    // muxer output bytes for the expected box types.
+    fn mux_subtitle_to_bytes(codec: &str, extradata: Vec<u8>) -> Vec<u8> {
+        let stream = subtitle_stream(codec, extradata);
+        let buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+        let ws: Box<dyn WriteSeek> = Box::new(buf);
+        let mut mux = oxideav_mp4::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
+        mux.write_header().unwrap();
+        let mut pkt = Packet::new(0, stream.time_base, b"x".to_vec());
+        pkt.pts = Some(0);
+        pkt.duration = Some(1000);
+        pkt.flags.keyframe = true;
+        mux.write_packet(&pkt).unwrap();
+        mux.write_trailer().unwrap();
+        drop(mux);
+        // Re-mux to a file so we can re-read it (Cursor was moved into the muxer).
+        let tmp = std::env::temp_dir().join(format!("oxideav-mp4-handler-{codec}.mp4"));
+        let stream2 = subtitle_stream(codec, stream.params.extradata.clone());
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = oxideav_mp4::muxer::open(ws, std::slice::from_ref(&stream2)).unwrap();
+        mux.write_header().unwrap();
+        let mut pkt = Packet::new(0, stream2.time_base, b"x".to_vec());
+        pkt.pts = Some(0);
+        pkt.duration = Some(1000);
+        pkt.flags.keyframe = true;
+        mux.write_packet(&pkt).unwrap();
+        mux.write_trailer().unwrap();
+        drop(mux);
+        std::fs::read(&tmp).unwrap()
+    }
+
+    let bytes = mux_subtitle_to_bytes("mov_text", vec![0; 18]);
+    assert!(
+        find_box(&bytes, b"text").is_some(),
+        "mov_text must use the `text` handler"
+    );
+    assert!(
+        find_box(&bytes, b"nmhd").is_some(),
+        "mov_text must use nmhd media header"
+    );
+    assert!(
+        find_box(&bytes, b"sthd").is_none(),
+        "mov_text must NOT emit sthd"
+    );
+    assert!(
+        find_box(&bytes, b"tx3g").is_some(),
+        "mov_text must emit a tx3g sample entry"
+    );
+
+    for codec in ["webvtt", "ttml", "sbtt", "stxt"] {
+        let bytes = mux_subtitle_to_bytes(codec, b"\0\0".to_vec());
+        assert!(
+            find_box(&bytes, b"subt").is_some(),
+            "{codec} must use the `subt` handler"
+        );
+        assert!(
+            find_box(&bytes, b"sthd").is_some(),
+            "{codec} must use sthd media header"
+        );
+        assert!(
+            find_box(&bytes, b"nmhd").is_none(),
+            "{codec} must NOT emit nmhd"
+        );
+    }
+}
+
+/// Find the offset of `needle` (a FourCC) appearing as a box type in
+/// `haystack`. Box types appear at offset+4 of each box; we just grep
+/// the whole byte stream since FourCC collisions inside payload are
+/// rare for the box types we look up.
+fn find_box(haystack: &[u8], needle: &[u8; 4]) -> Option<usize> {
+    haystack.windows(4).position(|w| w == needle.as_slice())
+}

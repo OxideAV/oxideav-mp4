@@ -36,7 +36,9 @@ use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 use crate::options::{BrandPreset, FragmentedOptions, Mp4MuxerOptions};
-use crate::sample_entries::{sample_entry_for, SampleEntry};
+use crate::sample_entries::{
+    sample_entry_for, subtitle_handler_for, subtitle_uses_sthd, SampleEntry,
+};
 
 /// Per-track state kept between `write_packet` calls.
 pub(crate) struct TrackState {
@@ -653,15 +655,26 @@ fn pack_language(code: &[u8; 3]) -> u16 {
 }
 
 fn build_hdlr(stream: &StreamInfo) -> Vec<u8> {
-    let (handler_type, name): (&[u8; 4], &str) = match stream.params.media_type {
-        MediaType::Audio => (b"soun", "SoundHandler"),
-        MediaType::Video => (b"vide", "VideoHandler"),
-        _ => (b"data", "DataHandler"),
+    // ISO/IEC 14496-12 §8.4.3 handler-type four-char-codes:
+    // `soun` (Audio), `vide` (Video), `subt` (BMFF §12.6.1 subtitle),
+    // `text` (BMFF §12.5.1 timed text — `tx3g`/`mov_text`), `data`
+    // (everything else). The handler-type drives the demuxer's
+    // MediaType mapping; the muxer mirrors that here so a
+    // mov_text/webvtt/ttml/sbtt/stxt round-trip ends up on the same
+    // MediaType::Subtitle stream the demuxer surfaced.
+    let (handler_type, name): ([u8; 4], &str) = match stream.params.media_type {
+        MediaType::Audio => (*b"soun", "SoundHandler"),
+        MediaType::Video => (*b"vide", "VideoHandler"),
+        MediaType::Subtitle => (
+            subtitle_handler_for(stream.params.codec_id.as_str()),
+            "SubtitleHandler",
+        ),
+        _ => (*b"data", "DataHandler"),
     };
     let mut body = Vec::new();
     body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
     body.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
-    body.extend_from_slice(handler_type);
+    body.extend_from_slice(&handler_type);
     body.extend_from_slice(&[0u8; 12]); // 3x reserved u32
     body.extend_from_slice(name.as_bytes());
     body.push(0); // NUL terminator
@@ -673,11 +686,28 @@ fn build_minf(t: &TrackState) -> Result<Vec<u8>> {
     match t.stream.params.media_type {
         MediaType::Audio => body.extend_from_slice(&build_smhd()),
         MediaType::Video => body.extend_from_slice(&build_vmhd()),
+        MediaType::Subtitle => {
+            // BMFF §12.6.2 SubtitleMediaHeader (`sthd`) for the `subt`
+            // handler (wvtt/stpp/sbtt/stxt); BMFF §12.5.2 null-media
+            // header (`nmhd`) for the `text` handler (tx3g/mov_text).
+            if subtitle_uses_sthd(t.stream.params.codec_id.as_str()) {
+                body.extend_from_slice(&build_sthd());
+            } else {
+                body.extend_from_slice(&build_nmhd());
+            }
+        }
         _ => body.extend_from_slice(&build_nmhd()),
     }
     body.extend_from_slice(&build_dinf());
     body.extend_from_slice(&build_stbl(t)?);
     Ok(wrap_box(b"minf", &body))
+}
+
+/// SubtitleMediaHeader box — FullBox with no payload fields.
+/// ISO/IEC 14496-12 §12.6.2.2.
+fn build_sthd() -> Vec<u8> {
+    let body = [0u8; 4]; // version + 24-bit flags, all zero.
+    wrap_box(b"sthd", &body)
 }
 
 fn build_smhd() -> Vec<u8> {

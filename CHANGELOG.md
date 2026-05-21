@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Subtitle / timed-text **muxer** support for `mov_text` (`tx3g`,
+  3GPP TS 26.245), `webvtt` (`wvtt`), `ttml` (`stpp`), `sbtt`, and
+  `stxt`. Closes the round-trip loop with the existing subtitle
+  demuxer: the muxer accepts the codec ids the demuxer surfaces and
+  carries their `extradata` (the post-preamble sample-entry payload —
+  tx3g's 18-byte default header, vttC config, stpp namespace strings,
+  sbtt/stxt MIME strings) verbatim back into the new sample entry.
+  Subtitle tracks emit the BMFF subtitle media-handler
+  (`hdlr.handler_type = 'subt'`, BMFF §12.6.1) and SubtitleMediaHeader
+  box (`sthd`, BMFF §12.6.2) for `wvtt`/`stpp`/`sbtt`/`stxt`; the
+  `mov_text` codec maps to the BMFF text handler
+  (`hdlr.handler_type = 'text'`, BMFF §12.5.1) and a null media header
+  (`nmhd`, BMFF §12.5.2) because the 3GPP/QuickTime `tx3g` carriage
+  is a text-handler form. Verified by five demux→mux→demux round-trip
+  tests (codec id + media type + extradata + packet bytes) plus a
+  routing test that scans the emitted bytes for the expected
+  `text`/`subt` handler FourCC and `nmhd`/`sthd` media-header box.
 - Track Reference Box (`tref`, ISO/IEC 14496-12 §8.3.3) demux. The
   `trak` parser now walks the `tref` container and collects each
   inner `TrackReferenceTypeBox` (whose FourCC is the reference type

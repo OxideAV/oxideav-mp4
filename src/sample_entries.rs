@@ -34,10 +34,59 @@ pub(crate) fn sample_entry_for(params: &CodecParameters) -> Result<SampleEntry> 
         "aac" => aac_entry(params),
         "h264" => h264_entry(params),
         "mjpeg" => mjpeg_entry(params),
+        // Subtitle / timed-text packagings (ISO/IEC 14496-12 §12.5–6
+        // + 3GPP TS 26.245 for tx3g/mov_text). All five accept the
+        // demuxer's `extradata` (the post-preamble body) verbatim,
+        // so a demux → mux round-trip preserves the inner config /
+        // namespace / mime declarations.
+        "mov_text" => subtitle_entry(params, *b"tx3g"),
+        "webvtt" => subtitle_entry(params, *b"wvtt"),
+        "ttml" => subtitle_entry(params, *b"stpp"),
+        "sbtt" => subtitle_entry(params, *b"sbtt"),
+        "stxt" => subtitle_entry(params, *b"stxt"),
         other => Err(Error::unsupported(format!(
             "mp4 muxer: no sample entry for codec {other}"
         ))),
     }
+}
+
+/// Pick the BMFF handler type four-char-code for a subtitle codec.
+///
+/// `tx3g` / `text` live under the QuickTime/BMFF `text` handler
+/// (3GPP TS 26.245 + ISO/IEC 14496-12 §12.5.1). `wvtt` / `stpp` /
+/// `sbtt` / `stxt` live under the BMFF `subt` handler (§12.6.1).
+pub(crate) fn subtitle_handler_for(codec_id: &str) -> [u8; 4] {
+    match codec_id {
+        "mov_text" => *b"text",
+        _ => *b"subt",
+    }
+}
+
+/// Whether the subtitle codec's media-header box should be `sthd`
+/// (BMFF §12.6.2 SubtitleMediaHeader, used by `subt` handler) rather
+/// than `nmhd` (BMFF §12.5.2 null-media-header, used by `text` handler).
+pub(crate) fn subtitle_uses_sthd(codec_id: &str) -> bool {
+    !matches!(codec_id, "mov_text")
+}
+
+/// Build a subtitle sample entry. The 8-byte preamble (6 reserved +
+/// `data_reference_index = 1`) is fixed; the body that follows comes
+/// straight from `params.extradata`. For BMFF text/subtitle entries
+/// the extradata is the post-preamble payload — see the demuxer's
+/// `parse_subtitle_sample_entry` round-trip.
+fn subtitle_entry(params: &CodecParameters, fourcc: [u8; 4]) -> Result<SampleEntry> {
+    if params.media_type != MediaType::Subtitle {
+        return Err(Error::invalid(format!(
+            "mp4 muxer: subtitle codec {} must be Subtitle media",
+            params.codec_id.as_str()
+        )));
+    }
+    let mut body = Vec::with_capacity(8 + params.extradata.len());
+    // 6 reserved bytes + 2-byte data_reference_index (= 1).
+    body.extend_from_slice(&[0u8; 6]);
+    body.extend_from_slice(&1u16.to_be_bytes());
+    body.extend_from_slice(&params.extradata);
+    Ok(SampleEntry { fourcc, body })
 }
 
 /// Motion JPEG sample entry. Modern ISOBMFF uses the `jpeg` FourCC with a
@@ -321,6 +370,103 @@ mod tests {
     #[test]
     fn unsupported_codec_errors() {
         let p = CodecParameters::audio(CodecId::new("vorbis"));
+        assert!(sample_entry_for(&p).is_err());
+    }
+
+    #[test]
+    fn mov_text_entry_shape() {
+        let mut p = CodecParameters::subtitle(CodecId::new("mov_text"));
+        // 18-byte tx3g default header (display flags + text colours +
+        // default text box + default style record). Exact contents are
+        // opaque to the muxer.
+        let tx3g_header: [u8; 18] = [
+            0x00, 0x00, 0x00, 0x00, // display_flags
+            0x01, 0x00, 0x00, 0x00, // horiz_justify + vert_justify + bg colour rgba
+            0x00, 0x00, 0x00, 0x00, // bg colour (cont.) + reserved
+            0x00, 0x00, 0x00, 0x00, // default_text_box (top,left)
+            0x00, 0x00, // default_text_box (bottom,right)
+        ];
+        p.extradata = tx3g_header.to_vec();
+        let e = sample_entry_for(&p).unwrap();
+        assert_eq!(&e.fourcc, b"tx3g");
+        // 6 reserved + 2 dri + 18 extradata = 26.
+        assert_eq!(e.body.len(), 26);
+        // data_reference_index at offset 6 is big-endian 1.
+        assert_eq!(u16::from_be_bytes([e.body[6], e.body[7]]), 1);
+        assert_eq!(&e.body[8..], &tx3g_header);
+    }
+
+    #[test]
+    fn webvtt_entry_shape() {
+        let mut p = CodecParameters::subtitle(CodecId::new("webvtt"));
+        // Minimal `vttC` config box: 4-byte size + "vttC" + "WEBVTT".
+        let mut vttc = Vec::new();
+        vttc.extend_from_slice(&14u32.to_be_bytes());
+        vttc.extend_from_slice(b"vttC");
+        vttc.extend_from_slice(b"WEBVTT");
+        p.extradata = vttc.clone();
+        let e = sample_entry_for(&p).unwrap();
+        assert_eq!(&e.fourcc, b"wvtt");
+        assert_eq!(e.body.len(), 8 + vttc.len());
+        // The inner `vttC` box header should be present at offset 12 (8 preamble + 4 size).
+        assert_eq!(&e.body[12..16], b"vttC");
+    }
+
+    #[test]
+    fn ttml_entry_shape() {
+        let mut p = CodecParameters::subtitle(CodecId::new("ttml"));
+        // stpp body: namespace + \0 + schema_location? + \0 + auxiliary_mime_types? + \0.
+        let strings = b"http://www.w3.org/ns/ttml\0\0\0";
+        p.extradata = strings.to_vec();
+        let e = sample_entry_for(&p).unwrap();
+        assert_eq!(&e.fourcc, b"stpp");
+        assert_eq!(e.body.len(), 8 + strings.len());
+        assert!(e.body[8..].starts_with(b"http://www.w3.org/ns/ttml"));
+    }
+
+    #[test]
+    fn sbtt_entry_shape() {
+        let mut p = CodecParameters::subtitle(CodecId::new("sbtt"));
+        // sbtt body: content_encoding? + \0 + mime_format + \0.
+        let strings = b"\0text/plain\0";
+        p.extradata = strings.to_vec();
+        let e = sample_entry_for(&p).unwrap();
+        assert_eq!(&e.fourcc, b"sbtt");
+        assert_eq!(e.body.len(), 8 + strings.len());
+    }
+
+    #[test]
+    fn stxt_entry_shape() {
+        let mut p = CodecParameters::subtitle(CodecId::new("stxt"));
+        let strings = b"\0text/html\0";
+        p.extradata = strings.to_vec();
+        let e = sample_entry_for(&p).unwrap();
+        assert_eq!(&e.fourcc, b"stxt");
+        assert_eq!(e.body.len(), 8 + strings.len());
+    }
+
+    #[test]
+    fn subtitle_handler_routing() {
+        // mov_text under BMFF text handler.
+        assert_eq!(&subtitle_handler_for("mov_text"), b"text");
+        // wvtt/stpp/sbtt/stxt under the subtitle (subt) handler.
+        for c in ["webvtt", "ttml", "sbtt", "stxt"] {
+            assert_eq!(&subtitle_handler_for(c), b"subt");
+        }
+    }
+
+    #[test]
+    fn subtitle_header_routing() {
+        assert!(!subtitle_uses_sthd("mov_text"));
+        for c in ["webvtt", "ttml", "sbtt", "stxt"] {
+            assert!(subtitle_uses_sthd(c));
+        }
+    }
+
+    #[test]
+    fn subtitle_rejects_wrong_media_type() {
+        // codec_id says mov_text but the params claim Audio — must error.
+        let p = CodecParameters::audio(CodecId::new("mov_text"));
         assert!(sample_entry_for(&p).is_err());
     }
 }

@@ -185,6 +185,16 @@ parentheses):
 - `aac` → `mp4a` with `esds` (requires AudioSpecificConfig extradata)
 - `h264` → `avc1` with `avcC` (requires AVCConfigurationRecord extradata)
 - `mjpeg` → `jpeg`
+- `mov_text` → `tx3g` (3GPP TS 26.245 timed text) — `text` handler + `nmhd`
+- `webvtt` → `wvtt` (BMFF §12.6.3.2 XMLSubtitleSampleEntry sibling) — `subt` handler + `sthd`
+- `ttml` → `stpp` (BMFF §12.6.3.2 XMLSubtitleSampleEntry) — `subt` + `sthd`
+- `sbtt` → `sbtt` (BMFF §12.6.3.2 TextSubtitleSampleEntry) — `subt` + `sthd`
+- `stxt` → `stxt` (BMFF §12.5.3.2 SimpleTextSampleEntry) — `subt` + `sthd`
+
+For the subtitle codecs the muxer accepts the demuxer's surfaced
+`extradata` verbatim (the post-preamble sample-entry payload: tx3g's
+18-byte header, vttC config, stpp namespace strings, sbtt/stxt MIME
+strings), so a demux → mux round-trip preserves the inner config.
 
 Other codec ids fail with `Error::Unsupported` at `open`, never at
 `write_packet` time.
@@ -204,10 +214,6 @@ whose mdat payload exceeds 4 GiB fail at `write_trailer`.
   works without it).
 - Edit lists on the muxer.
 - Sample groups (`sbgp` / `sgpd`).
-- Subtitle / timed-text **mux** — the demuxer surfaces
-  Subtitle-typed tracks but the muxer's `sample_entry_for` table
-  has no entry for `mov_text` / `webvtt` / `ttml` (would land
-  with `Error::Unsupported` at `open` time).
 - CENC decryption proper — the demuxer detects protected tracks
   (`encv` / `enca` / `enct` / `encs` → original FourCC plus the
   scheme on `params.options`) but it doesn't read `tenc`, `pssh`,
