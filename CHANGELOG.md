@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Edit-list **muxer** support (`edts`/`elst`, ISO/IEC 14496-12
+  §8.6.5–6). When a track's first packet carries a positive
+  presentation timestamp, the muxer now writes a per-track Edit Box
+  between `tkhd` and `mdia` holding a two-entry Edit List: a leading
+  **empty edit** (`media_time = -1`) whose `segment_duration` is the
+  start delay expressed in the movie timescale, followed by a normal
+  `media_time = 0` segment covering the track's media duration — the
+  §8.6.5 "An empty edit is used to offset the start time of a track"
+  idiom. The box uses version 0 (32-bit) fields, auto-promoting to
+  version 1 (64-bit) when any duration exceeds the 32-bit range. Tracks
+  whose first PTS is zero/absent emit no `edts` (implicit 1:1 timeline).
+  Controlled by the new `Mp4MuxerOptions::write_edit_list` flag
+  (default `true`); set it `false` to suppress emission. The leading
+  empty edit means the demuxer's existing leading-media-time shift
+  (which acts only on the first non-empty edit, here `media_time = 0`)
+  leaves demuxed timestamps unchanged, so a demux→mux→demux round-trip
+  preserves packet bytes. Verified by three `build_edts` unit tests
+  (absence on zero PTS, v0 layout, v1 promotion) and four integration
+  tests (emission, no-emission on zero start, option suppression, and a
+  full demuxer round-trip).
 - Subtitle / timed-text **muxer** support for `mov_text` (`tx3g`,
   3GPP TS 26.245), `webvtt` (`wvtt`), `ttml` (`stpp`), `sbtt`, and
   `stxt`. Closes the round-trip loop with the existing subtitle

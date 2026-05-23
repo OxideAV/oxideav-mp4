@@ -415,7 +415,7 @@ impl Mp4Muxer {
         }
 
         // Write moov at the end.
-        let moov = build_moov(&self.tracks)?;
+        let moov = build_moov(&self.tracks, self.options.write_edit_list)?;
         self.output.write_all(&moov)?;
         Ok(())
     }
@@ -465,7 +465,7 @@ impl Mp4Muxer {
             for (t, orig) in self.tracks.iter_mut().zip(orig_offsets.iter()) {
                 t.chunk_offsets = orig.iter().map(|o| *o + base).collect();
             }
-            let candidate = build_moov(&self.tracks)?;
+            let candidate = build_moov(&self.tracks, self.options.write_edit_list)?;
             let candidate_size = candidate.len() as u64;
             let converged = candidate_size == moov_size;
             moov_size = candidate_size;
@@ -494,7 +494,7 @@ impl Mp4Muxer {
 
 // --- Moov builders --------------------------------------------------------
 
-fn build_moov(tracks: &[TrackState]) -> Result<Vec<u8>> {
+fn build_moov(tracks: &[TrackState], write_edit_list: bool) -> Result<Vec<u8>> {
     // mvhd: use the largest media-time-scale duration as a rough movie
     // duration at timescale 1000.
     let movie_timescale: u32 = 1000;
@@ -514,7 +514,12 @@ fn build_moov(tracks: &[TrackState]) -> Result<Vec<u8>> {
     let mut moov_body = Vec::new();
     moov_body.extend_from_slice(&build_mvhd(movie_timescale, movie_duration, next_track_id));
     for (i, t) in tracks.iter().enumerate() {
-        moov_body.extend_from_slice(&build_trak(i as u32 + 1, t, movie_timescale)?);
+        moov_body.extend_from_slice(&build_trak(
+            i as u32 + 1,
+            t,
+            movie_timescale,
+            write_edit_list,
+        )?);
     }
     Ok(wrap_box(b"moov", &moov_body))
 }
@@ -554,13 +559,91 @@ pub(crate) fn build_mvhd(timescale: u32, duration: u64, next_track_id: u32) -> V
     wrap_box(b"mvhd", &body)
 }
 
-fn build_trak(track_id: u32, t: &TrackState, movie_timescale: u32) -> Result<Vec<u8>> {
+fn build_trak(
+    track_id: u32,
+    t: &TrackState,
+    movie_timescale: u32,
+    write_edit_list: bool,
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     let track_duration_movie =
         rescale_u64(t.cumulative_duration, t.media_time_scale, movie_timescale);
     body.extend_from_slice(&build_tkhd(track_id, track_duration_movie, &t.stream));
+    // edts/elst (ISO/IEC 14496-12 §8.6.5–6) goes between tkhd and mdia. Emit
+    // it only when the track has a positive start delay to offset.
+    if write_edit_list {
+        if let Some(edts) = build_edts(t, movie_timescale, track_duration_movie) {
+            body.extend_from_slice(&edts);
+        }
+    }
     body.extend_from_slice(&build_mdia(t)?);
     Ok(wrap_box(b"trak", &body))
+}
+
+/// Build an `edts/elst` (EditBox containing an EditListBox) for a track whose
+/// first presented sample has a positive PTS, per ISO/IEC 14496-12 §8.6.5–6.
+///
+/// "An empty edit is used to offset the start time of a track" (§8.6.5.1). We
+/// therefore emit a two-entry list:
+///
+/// 1. an **empty edit** (`media_time = -1`) whose `segment_duration` is the
+///    start delay expressed in the movie timescale, and
+/// 2. a normal edit (`media_time = 0`, `media_rate = 1.0`) covering the rest
+///    of the track's media duration,
+///
+/// so a player holds the timeline blank for the delay and then plays the
+/// track from its first media sample. Returns `None` when the first PTS is
+/// zero/absent or the rescaled delay is zero (no offset needed → implicit
+/// 1:1 mapping applies and no box is written).
+///
+/// `version` is chosen per §8.6.6.2: version 1 (64-bit fields) when any
+/// duration exceeds the 32-bit range, else version 0.
+fn build_edts(t: &TrackState, movie_timescale: u32, track_duration_movie: u64) -> Option<Vec<u8>> {
+    let first_pts = t.first_pts_in_ts?;
+    if first_pts <= 0 {
+        return None;
+    }
+    // Start delay in the movie timescale (elst segment_duration units).
+    let delay_movie = rescale_u64(first_pts as u64, t.media_time_scale, movie_timescale);
+    if delay_movie == 0 {
+        return None;
+    }
+
+    // version 1 if any field needs more than 32 bits.
+    let use_v1 = delay_movie > u32::MAX as u64 || track_duration_movie > u32::MAX as u64;
+    let media_rate: u32 = 0x0001_0000; // 1.0 in 16.16 (rate_integer=1, frac=0).
+
+    let mut body = Vec::new();
+    body.push(if use_v1 { 1 } else { 0 }); // version
+    body.extend_from_slice(&[0, 0, 0]); // flags
+    body.extend_from_slice(&2u32.to_be_bytes()); // entry_count
+
+    // Entry 1: empty edit (media_time = -1) for the start delay.
+    push_elst_entry(&mut body, use_v1, delay_movie, -1, media_rate);
+    // Entry 2: normal edit (media_time = 0) covering the track media duration.
+    push_elst_entry(&mut body, use_v1, track_duration_movie, 0, media_rate);
+
+    let elst = wrap_box(b"elst", &body);
+    Some(wrap_box(b"edts", &elst))
+}
+
+/// Append one EditListBox entry (`segment_duration`, `media_time`,
+/// `media_rate`) using v0 (32-bit) or v1 (64-bit) field widths per §8.6.6.2.
+fn push_elst_entry(
+    out: &mut Vec<u8>,
+    use_v1: bool,
+    segment_duration: u64,
+    media_time: i64,
+    media_rate: u32,
+) {
+    if use_v1 {
+        out.extend_from_slice(&segment_duration.to_be_bytes());
+        out.extend_from_slice(&media_time.to_be_bytes());
+    } else {
+        out.extend_from_slice(&(segment_duration as u32).to_be_bytes());
+        out.extend_from_slice(&(media_time as i32).to_be_bytes());
+    }
+    out.extend_from_slice(&media_rate.to_be_bytes());
 }
 
 pub(crate) fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> Vec<u8> {
@@ -919,6 +1002,7 @@ pub(crate) fn rescale_u64(value: u64, from_ts: u32, to_ts: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxideav_core::{CodecId, CodecParameters};
 
     #[test]
     fn wrap_box_header_layout() {
@@ -945,5 +1029,89 @@ mod tests {
     #[test]
     fn pack_language_und() {
         assert_eq!(pack_language(b"und"), ((21u16) << 10) | ((14u16) << 5) | 4);
+    }
+
+    fn track_with_first_pts(first_pts: Option<i64>, media_time_scale: u32) -> TrackState {
+        let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+        params.sample_rate = Some(media_time_scale);
+        params.channels = Some(2);
+        let stream = StreamInfo {
+            index: 0,
+            time_base: oxideav_core::TimeBase::new(1, media_time_scale as i64),
+            duration: None,
+            start_time: None,
+            params,
+        };
+        let entry = SampleEntry {
+            fourcc: *b"sowt",
+            body: Vec::new(),
+        };
+        let mut t = TrackState::new(stream, entry);
+        t.media_time_scale = media_time_scale;
+        t.first_pts_in_ts = first_pts;
+        t.cumulative_duration = media_time_scale as u64; // 1 second of media.
+        t
+    }
+
+    #[test]
+    fn edts_absent_when_first_pts_zero() {
+        let t = track_with_first_pts(Some(0), 48_000);
+        assert!(build_edts(&t, 1000, 1000).is_none());
+        let none = track_with_first_pts(None, 48_000);
+        assert!(build_edts(&none, 1000, 1000).is_none());
+    }
+
+    #[test]
+    fn edts_v0_layout_for_positive_delay() {
+        // first_pts = 24_000 ticks at 48 kHz = 0.5 s → 500 ticks at movie ts 1000.
+        let t = track_with_first_pts(Some(24_000), 48_000);
+        let track_dur_movie = 1000u64;
+        let edts = build_edts(&t, 1000, track_dur_movie).expect("edts emitted");
+        // edts wraps elst.
+        assert_eq!(&edts[4..8], b"edts");
+        let elst = &edts[8..];
+        assert_eq!(&elst[4..8], b"elst");
+        let body = &elst[8..];
+        assert_eq!(body[0], 0, "version 0 for sub-32-bit fields");
+        let entry_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+        assert_eq!(entry_count, 2);
+        // Entry 1: empty edit. v0 entry = 4+4+4 bytes.
+        let e1 = &body[8..20];
+        let seg1 = u32::from_be_bytes([e1[0], e1[1], e1[2], e1[3]]);
+        let mt1 = i32::from_be_bytes([e1[4], e1[5], e1[6], e1[7]]);
+        let rate1 = u32::from_be_bytes([e1[8], e1[9], e1[10], e1[11]]);
+        assert_eq!(seg1, 500, "0.5 s delay at movie timescale 1000");
+        assert_eq!(mt1, -1, "empty edit");
+        assert_eq!(rate1, 0x0001_0000, "media_rate 1.0");
+        // Entry 2: normal edit covering the track duration.
+        let e2 = &body[20..32];
+        let seg2 = u32::from_be_bytes([e2[0], e2[1], e2[2], e2[3]]);
+        let mt2 = i32::from_be_bytes([e2[4], e2[5], e2[6], e2[7]]);
+        assert_eq!(seg2, track_dur_movie as u32);
+        assert_eq!(mt2, 0, "non-empty edit starts at media time 0");
+    }
+
+    #[test]
+    fn edts_v1_layout_for_large_duration() {
+        // A track duration beyond u32 forces version 1 (64-bit fields).
+        let mut t = track_with_first_pts(Some(1000), 1000);
+        t.media_time_scale = 1000;
+        let big_dur = (u32::MAX as u64) + 10;
+        let edts = build_edts(&t, 1000, big_dur).expect("edts emitted");
+        let body = &edts[8..][8..];
+        assert_eq!(body[0], 1, "version 1 for >32-bit duration");
+        // v1 entry = 8+8+4 bytes; entry 2 segment_duration sits at offset 8+20.
+        let off = 8 + 20;
+        let seg2 = u64::from_be_bytes([
+            body[off],
+            body[off + 1],
+            body[off + 2],
+            body[off + 3],
+            body[off + 4],
+            body[off + 5],
+            body[off + 6],
+            body[off + 7],
+        ]);
+        assert_eq!(seg2, big_dur);
     }
 }

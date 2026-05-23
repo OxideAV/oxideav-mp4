@@ -1411,3 +1411,103 @@ fn subtitle_handler_routing_round_trip() {
 fn find_box(haystack: &[u8], needle: &[u8; 4]) -> Option<usize> {
     haystack.windows(4).position(|w| w == needle.as_slice())
 }
+
+/// Mux a single PCM track whose first packet starts at `start_pts` (in the
+/// track's 48 kHz time base), with `write_edit_list` configurable, and return
+/// the raw output bytes. Routed through a temp file because the muxer consumes
+/// the `Box<dyn WriteSeek>` and it can't be unwrapped post-drop.
+fn mux_pcm_with_start_pts_bytes(start_pts: i64, write_edit_list: bool) -> Vec<u8> {
+    let stream = pcm_stream_info();
+    let frames_per_packet: i64 = 1024;
+    let opts = Mp4MuxerOptions {
+        write_edit_list,
+        ..Mp4MuxerOptions::default()
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "oxideav-mp4-elst-{start_pts}-{write_edit_list}.mp4"
+    ));
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux =
+            oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
+        mux.write_header().unwrap();
+        for i in 0..3i64 {
+            let payload = make_pcm_payload(frames_per_packet as usize);
+            let mut pkt = Packet::new(0, stream.time_base, payload);
+            pkt.pts = Some(start_pts + i * frames_per_packet);
+            pkt.duration = Some(frames_per_packet);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    std::fs::read(&tmp).unwrap()
+}
+
+#[test]
+fn edit_list_emitted_for_positive_start_pts() {
+    // First packet at PTS 24_000 ticks @ 48 kHz = 0.5 s start delay.
+    let bytes = mux_pcm_with_start_pts_bytes(24_000, true);
+    let edts_at = find_box(&bytes, b"edts").expect("edts box present for positive start delay");
+    let elst_at = find_box(&bytes[edts_at..], b"elst").map(|p| edts_at + p);
+    let elst_at = elst_at.expect("elst inside edts");
+    // elst body starts 8 bytes after the "elst" type tag (size+type already
+    // accounted by the box header preceding the tag). FullBox: version+flags,
+    // then entry_count.
+    let body = &bytes[elst_at + 4..];
+    assert_eq!(body[0], 0, "version 0 (sub-32-bit)");
+    let entry_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    assert_eq!(entry_count, 2, "empty edit + normal edit");
+    // Entry 1 (v0, 12 bytes): empty edit.
+    let e1 = &body[8..20];
+    let seg1 = u32::from_be_bytes([e1[0], e1[1], e1[2], e1[3]]);
+    let mt1 = i32::from_be_bytes([e1[4], e1[5], e1[6], e1[7]]);
+    assert_eq!(mt1, -1, "leading entry is an empty edit");
+    // 0.5 s at the movie timescale (1000) = 500 ticks.
+    assert_eq!(seg1, 500, "start delay in movie timescale");
+    // Entry 2: normal edit at media_time 0.
+    let e2 = &body[20..32];
+    let mt2 = i32::from_be_bytes([e2[4], e2[5], e2[6], e2[7]]);
+    assert_eq!(mt2, 0, "trailing entry plays from media time 0");
+}
+
+#[test]
+fn no_edit_list_when_start_pts_zero() {
+    let bytes = mux_pcm_with_start_pts_bytes(0, true);
+    assert!(
+        find_box(&bytes, b"edts").is_none(),
+        "no edts when track starts at presentation time 0"
+    );
+}
+
+#[test]
+fn edit_list_suppressed_by_option() {
+    let bytes = mux_pcm_with_start_pts_bytes(24_000, false);
+    assert!(
+        find_box(&bytes, b"edts").is_none(),
+        "write_edit_list=false suppresses edts even with a positive start delay"
+    );
+}
+
+#[test]
+fn edit_list_roundtrips_through_demuxer() {
+    // A muxed edit list (empty edit + media_time 0) must not corrupt the
+    // demuxed packet bytes: the demuxer's leading-media-time shift only acts
+    // on the first NON-empty edit (media_time 0 here → zero shift).
+    let bytes = mux_pcm_with_start_pts_bytes(24_000, true);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let mut count = 0;
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => {
+                assert_eq!(p.data.len(), 1024 * 4, "packet {count} byte size preserved");
+                count += 1;
+            }
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    assert_eq!(count, 3, "all three samples demuxed");
+}

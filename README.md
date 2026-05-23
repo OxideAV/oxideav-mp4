@@ -199,6 +199,16 @@ strings), so a demux → mux round-trip preserves the inner config.
 Other codec ids fail with `Error::Unsupported` at `open`, never at
 `write_packet` time.
 
+Edit lists (`edts`/`elst`, ISO/IEC 14496-12 §8.6.5–6) are emitted
+per-track when the first packet has a positive presentation timestamp:
+a leading empty edit (`media_time = -1`) of the start delay (in the
+movie timescale) followed by a `media_time = 0` segment for the track
+duration, so a player offsets the track start instead of beginning at
+presentation time 0. Version 0 (32-bit) by default, auto-promoting to
+version 1 (64-bit) for over-32-bit durations. Tracks starting at PTS 0
+get no `edts`. Controlled by `Mp4MuxerOptions::write_edit_list`
+(default `true`).
+
 Chunk offsets auto-promote from `stco` (32-bit) to `co64` (64-bit) when
 any offset exceeds 4 GiB. The mdat box header stays 32-bit — files
 whose mdat payload exceeds 4 GiB fail at `write_trailer`.
@@ -212,7 +222,6 @@ whose mdat payload exceeds 4 GiB fail at `write_trailer`.
   these; sequential demux works without them).
 - `sidx` segment-index seek-time mapping (skipped; sequential demux
   works without it).
-- Edit lists on the muxer.
 - Sample groups (`sbgp` / `sgpd`).
 - CENC decryption proper — the demuxer detects protected tracks
   (`encv` / `enca` / `enct` / `encs` → original FourCC plus the

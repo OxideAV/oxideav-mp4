@@ -155,6 +155,19 @@ pub struct Mp4MuxerOptions {
     /// fragment cadence boundary emits `styp? + moof + mdat`. Mutually
     /// exclusive with `faststart`.
     pub fragmented: Option<FragmentedOptions>,
+    /// If `true` (the default), the muxer emits a per-track `edts/elst`
+    /// (EditBox/EditListBox, ISO/IEC 14496-12 §8.6.5–6) whenever a track's
+    /// first packet has a positive presentation timestamp. The edit list
+    /// carries a leading **empty edit** (`media_time = -1`) of that start
+    /// delay followed by a normal `media_time = 0` segment for the track's
+    /// duration, so a player offsets the track start instead of beginning
+    /// at presentation time 0 (the §8.6.5 "An empty edit is used to offset
+    /// the start time of a track" idiom).
+    ///
+    /// Tracks whose first PTS is zero (or absent) get no `edts` — the
+    /// implicit one-to-one timeline mapping applies. Set this to `false`
+    /// to suppress edit-list emission entirely.
+    pub write_edit_list: bool,
 }
 
 impl Default for Mp4MuxerOptions {
@@ -163,6 +176,7 @@ impl Default for Mp4MuxerOptions {
             brand: BrandPreset::Mp4,
             faststart: false,
             fragmented: None,
+            write_edit_list: true,
         }
     }
 }
