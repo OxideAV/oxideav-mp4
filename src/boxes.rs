@@ -109,6 +109,10 @@ pub const TREF: [u8; 4] = fourcc("tref");
 pub const EDTS: [u8; 4] = fourcc("edts");
 pub const MDIA: [u8; 4] = fourcc("mdia");
 pub const MDHD: [u8; 4] = fourcc("mdhd");
+/// `elng` — ExtendedLanguageBox (ISO/IEC 14496-12 §8.4.6). A peer of
+/// the media header inside `mdia`; carries a NULL-terminated BCP 47
+/// (RFC 4646) language tag string.
+pub const ELNG: [u8; 4] = fourcc("elng");
 pub const HDLR: [u8; 4] = fourcc("hdlr");
 pub const MINF: [u8; 4] = fourcc("minf");
 pub const DINF: [u8; 4] = fourcc("dinf");

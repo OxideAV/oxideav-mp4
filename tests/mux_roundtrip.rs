@@ -1423,8 +1423,14 @@ fn mux_pcm_with_start_pts_bytes(start_pts: i64, write_edit_list: bool) -> Vec<u8
         write_edit_list,
         ..Mp4MuxerOptions::default()
     };
+    // Unique per call: two tests mux with the same (start_pts,
+    // write_edit_list) args, so a name keyed only on those would let
+    // parallel runs truncate each other's file mid-read. Add a
+    // process-global atomic counter to keep paths distinct.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!(
-        "oxideav-mp4-elst-{start_pts}-{write_edit_list}.mp4"
+        "oxideav-mp4-elst-{start_pts}-{write_edit_list}-{n}.mp4"
     ));
     {
         let f = std::fs::File::create(&tmp).unwrap();

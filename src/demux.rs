@@ -303,6 +303,13 @@ struct Track {
     /// appear at most once (per spec — track-reference type boxes are
     /// keyed by their FourCC).
     tref: Vec<([u8; 4], Vec<u32>)>,
+    /// §8.4.6 — `elng` (ExtendedLanguageBox). The NULL-terminated BCP 47
+    /// (RFC 4646) language tag string (e.g. `en-US`, `fr-FR`, `zh-CN`).
+    /// `None` when the track has no `elng` box, in which case callers
+    /// should fall back to the packed 3-char language code in `mdhd`.
+    /// The extended tag overrides the `mdhd` language when present
+    /// (§8.4.6.1).
+    elng: Option<String>,
 }
 
 /// Single entry of an `elst` (EditListBox).
@@ -636,6 +643,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         trex: TrexDefaults::default(),
         protection_scheme: None,
         tref: Vec::new(),
+        elng: None,
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -884,6 +892,10 @@ fn parse_mdia(body: &[u8], t: &mut Track) -> Result<()> {
                 let b = read_bytes_vec(&mut cur, psz)?;
                 parse_mdhd(&b, t)?;
             }
+            ELNG => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                parse_elng(&b, t);
+            }
             HDLR => {
                 let b = read_bytes_vec(&mut cur, psz)?;
                 parse_hdlr(&b, t)?;
@@ -920,6 +932,32 @@ fn parse_mdhd(body: &[u8], t: &mut Track) -> Result<()> {
     t.timescale = timescale;
     t.duration = Some(duration);
     Ok(())
+}
+
+/// Parse an `elng` (ExtendedLanguageBox, ISO/IEC 14496-12 §8.4.6).
+///
+/// Layout: a `FullBox` preamble (1 version byte + 3 flag bytes, both
+/// always zero per §8.4.6.2) followed by a single NULL-terminated UTF-8
+/// C string `extended_language` holding a BCP 47 / RFC 4646 tag
+/// (`en-US`, `fr-FR`, `zh-CN`, …). The tag is read up to the first NUL
+/// (a trailing NUL is required by the spec but tolerated absent); any
+/// bytes after the NUL are ignored. A malformed (too-short or non-UTF-8)
+/// box is silently skipped rather than failing the demux — the box is
+/// optional and a player can always fall back to `mdhd`'s packed code.
+fn parse_elng(body: &[u8], t: &mut Track) {
+    // FullBox preamble is 4 bytes; anything shorter has no string.
+    if body.len() < 4 {
+        return;
+    }
+    let s = &body[4..];
+    // Take everything up to the first NUL terminator (or the whole
+    // remainder if no NUL is present).
+    let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
+    if let Ok(tag) = std::str::from_utf8(&s[..end]) {
+        if !tag.is_empty() {
+            t.elng = Some(tag.to_string());
+        }
+    }
 }
 
 fn parse_hdlr(body: &[u8], t: &mut Track) -> Result<()> {
@@ -2617,6 +2655,16 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert("protection_scheme", scheme_str);
     }
 
+    // ISO/IEC 14496-12 §8.4.6: when the track carries an `elng`
+    // ExtendedLanguageBox, surface its BCP 47 (RFC 4646) tag on
+    // `params.options["language"]` (e.g. `en-US`, `zh-Hant`). This is
+    // richer than `mdhd`'s packed 3-character ISO 639-2 code (which
+    // can't express region/script/variant subtags) and overrides it
+    // per §8.4.6.1 when the two disagree.
+    if let Some(tag) = &t.elng {
+        params.options.insert("language", tag.clone());
+    }
+
     // ISO/IEC 14496-12 §8.3.3: surface track references as
     // `tref_<type>` → space-separated track IDs. Callers use this to
     // wire up subtitle→video (`subt`), chapter (`chap`), content
@@ -3009,6 +3057,7 @@ mod tests {
             trex: super::TrexDefaults::default(),
             protection_scheme: None,
             tref: Vec::new(),
+            elng: None,
         }
     }
 
@@ -3477,6 +3526,108 @@ mod tests {
         assert_eq!(info.params.options.get("tref_subt"), Some("10 11"));
         assert_eq!(info.params.options.get("tref_font"), Some("20"));
         assert_eq!(info.params.options.get("tref_hint"), None);
+    }
+
+    /// `elng` (ExtendedLanguageBox §8.4.6): FullBox preamble + a
+    /// NULL-terminated BCP 47 tag. The parsed tag (without the NUL) is
+    /// stored on the track.
+    #[test]
+    fn parse_elng_reads_bcp47_tag() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox version+flags
+        body.extend_from_slice(b"en-US\0"); // NULL-terminated tag
+        let mut t = fresh_track();
+        super::parse_elng(&body, &mut t);
+        assert_eq!(t.elng.as_deref(), Some("en-US"));
+    }
+
+    /// A tag with region+script subtags (`zh-Hant-HK`) round-trips, and a
+    /// tag without an explicit NUL terminator (technically malformed but
+    /// tolerated) still parses.
+    #[test]
+    fn parse_elng_subtags_and_missing_nul() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(b"zh-Hant-HK\0");
+        let mut t = fresh_track();
+        super::parse_elng(&body, &mut t);
+        assert_eq!(t.elng.as_deref(), Some("zh-Hant-HK"));
+
+        // No trailing NUL: read to end of body.
+        let mut body2 = Vec::new();
+        body2.extend_from_slice(&[0u8; 4]);
+        body2.extend_from_slice(b"fr-FR");
+        let mut t2 = fresh_track();
+        super::parse_elng(&body2, &mut t2);
+        assert_eq!(t2.elng.as_deref(), Some("fr-FR"));
+    }
+
+    /// A too-short or empty-string `elng` leaves the track with no
+    /// extended language and never panics.
+    #[test]
+    fn parse_elng_malformed_is_silently_skipped() {
+        // Only 3 bytes — shorter than the FullBox preamble.
+        let mut t = fresh_track();
+        super::parse_elng(&[0, 0, 0], &mut t);
+        assert_eq!(t.elng, None);
+
+        // FullBox preamble then an immediate NUL (empty tag).
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.push(0);
+        let mut t2 = fresh_track();
+        super::parse_elng(&body, &mut t2);
+        assert_eq!(t2.elng, None);
+    }
+
+    /// The extended language tag surfaces on
+    /// `StreamInfo.params.options["language"]`.
+    #[test]
+    fn build_stream_info_surfaces_elng_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48000;
+        t.elng = Some("de-DE".to_string());
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("language"), Some("de-DE"));
+    }
+
+    /// No `elng` box → no `language` option (caller falls back to mdhd).
+    #[test]
+    fn build_stream_info_no_elng_no_language_option() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("language"), None);
+    }
+
+    /// End-to-end: an `elng` box nested inside `mdia` is picked up by
+    /// `parse_mdia` and lands on the track.
+    #[test]
+    fn parse_mdia_picks_up_nested_elng() {
+        // Minimal mdhd (v0, 24 bytes) so timescale is set, then elng.
+        let mut mdhd = Vec::new();
+        mdhd.extend_from_slice(&[0u8; 4]); // version+flags
+        mdhd.extend_from_slice(&[0u8; 8]); // creation+modification time
+        mdhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+        mdhd.extend_from_slice(&0u32.to_be_bytes()); // duration
+        mdhd.extend_from_slice(&[0u8; 4]); // language + pre_defined
+
+        let mut elng = Vec::new();
+        elng.extend_from_slice(&[0u8; 4]);
+        elng.extend_from_slice(b"es-419\0");
+
+        let mut mdia = Vec::new();
+        mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
+        mdia.extend(wrap_box_full_size(b"elng", &elng));
+
+        let mut t = fresh_track();
+        super::parse_mdia(&mdia, &mut t).unwrap();
+        assert_eq!(t.timescale, 1000);
+        assert_eq!(t.elng.as_deref(), Some("es-419"));
     }
 
     /// Build a self-contained Box (size + FourCC + payload, 32-bit

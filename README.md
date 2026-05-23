@@ -140,6 +140,13 @@ Sample-entry FourCCs resolve to these codec ids:
   (or the first keyframe of the stream if none qualify).
 - Metadata: 3GPP `udta` boxes (`titl`/`auth`/…) and iTunes-style
   `meta`/`ilst` are surfaced via `Demuxer::metadata()`.
+- Extended language tag (ISO/IEC 14496-12 §8.4.6, `elng`): a track's
+  `mdia/elng` ExtendedLanguageBox carries a NULL-terminated BCP 47
+  (RFC 4646) tag richer than `mdhd`'s packed 3-char ISO 639-2 code
+  (region / script / variant subtags). When present it is surfaced on
+  `params.options["language"]` (e.g. `en-US`, `zh-Hant-HK`,
+  `es-419`) and, per §8.4.6.1, overrides the `mdhd` language. Absent
+  `elng`, the option is omitted (callers fall back to `mdhd`).
 - Handler-type recognition (ISO/IEC 14496-12 §8.4.3): `soun` →
   Audio, `vide` → Video, `subt` / `sbtl` / `text` → Subtitle,
   `meta` → Data. Subtitle sample entries (`tx3g`, `text`, `wvtt`,

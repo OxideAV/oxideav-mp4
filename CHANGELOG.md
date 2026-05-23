@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Extended language tag (`elng`, ISO/IEC 14496-12 §8.4.6) demux. The
+  `mdia` parser now reads the optional ExtendedLanguageBox — a
+  `FullBox` (version 0, flags 0) preamble followed by a
+  NULL-terminated UTF-8 BCP 47 (RFC 4646) language tag such as
+  `en-US`, `zh-Hant-HK`, or `es-419`. The tag is surfaced on
+  `StreamInfo.params.options["language"]`; it is richer than
+  `mdhd`'s packed 3-character ISO 639-2 code (which cannot express
+  region / script / variant subtags) and overrides it per §8.4.6.1.
+  Tracks with no `elng` omit the option (callers fall back to the
+  `mdhd` language). The tag is read up to the first NUL (a missing
+  terminator is tolerated); a too-short or empty box is silently
+  skipped rather than failing the demux, since the box is optional.
+  Verified by six unit tests (BCP 47 read, region/script subtags +
+  missing-NUL tolerance, malformed/empty skip, options surfacing
+  with and without the box, and an end-to-end nested-in-`mdia`
+  pickup).
+
+### Fixed
+
+- `mux_roundtrip.rs` edit-list helper now uses a unique temp file
+  per call, fixing an intermittent failure when two tests muxing
+  with identical `(start_pts, write_edit_list)` args ran in parallel
+  and truncated each other's output mid-read.
+
 - Edit-list **muxer** support (`edts`/`elst`, ISO/IEC 14496-12
   §8.6.5–6). When a track's first packet carries a positive
   presentation timestamp, the muxer now writes a per-track Edit Box
