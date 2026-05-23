@@ -177,6 +177,17 @@ Sample-entry FourCCs resolve to these codec ids:
   depth / parallax auxiliary video (`vdep` / `vplx`), and hint
   dependency (`hind`) relationships. `track_ID = 0` entries
   (spec-prohibited) are dropped.
+- Track Kind (ISO/IEC 14496-12 §8.10.4, `kind`): each `KindBox`
+  inside a track-level `udta` is parsed as a `(schemeURI, value)`
+  pair (both NULL-terminated C strings; an absent value is allowed,
+  meaning the URI alone identifies the kind). Multiple `kind` boxes
+  per track are supported — the spec explicitly allows several
+  schemes co-labelling the same track (e.g. one DASH role
+  `urn:mpeg:dash:role:2011 main` plus one iTunes-scheme tag). Each
+  entry is surfaced on `params.options` as `kind_<n>` (0-based
+  encounter index); the value is the URI alone when no name
+  follows, or `"URI value"` (space-separated, mirroring the
+  `tref_<type>` convention) when both are present.
 
 ### Muxer
 

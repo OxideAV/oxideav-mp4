@@ -310,6 +310,16 @@ struct Track {
     /// The extended tag overrides the `mdhd` language when present
     /// (§8.4.6.1).
     elng: Option<String>,
+    /// §8.10.4 — `kind` (KindBox) entries from the track-level `udta`.
+    /// Each pair is `(schemeURI, value)`: a NULL-terminated URI followed
+    /// by a NULL-terminated value string. When `value` is empty, the URI
+    /// itself defines the kind (e.g. `urn:apple:hap:closed-captions`);
+    /// when a value is present, the URI identifies a naming scheme and
+    /// `value` is the kind name from that scheme (e.g.
+    /// `urn:mpeg:dash:role:2011`, `main`). Zero or more per track —
+    /// multiple `kind` boxes from different schemes can co-label the
+    /// same track (spec example: two schemes both declaring "subtitles").
+    kinds: Vec<(String, String)>,
 }
 
 /// Single entry of an `elst` (EditListBox).
@@ -644,6 +654,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         protection_scheme: None,
         tref: Vec::new(),
         elng: None,
+        kinds: Vec::new(),
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -672,6 +683,10 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
                 let sub = read_bytes_vec(&mut cur, psz)?;
                 parse_tref(&sub, &mut t)?;
             }
+            UDTA => {
+                let sub = read_bytes_vec(&mut cur, psz)?;
+                parse_track_udta(&sub, &mut t);
+            }
             _ => {
                 cur.set_position(cur.position() + psz as u64);
             }
@@ -682,6 +697,89 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
     } else {
         Ok(None)
     }
+}
+
+/// Walk a *track-level* `udta` body and pick up any boxes whose semantics
+/// are per-track rather than per-movie. The moov-level `udta` parser
+/// (`parse_udta`) handles file-wide 3GPP / iTunes metadata; the
+/// track-level container additionally hosts `kind` (§8.10.4) plus —
+/// historically — per-track copyright / title overrides. We only
+/// implement `kind` here because that is the box whose presence has a
+/// well-defined effect on downstream stream routing; other children are
+/// skipped so a future round can add them without changing the entry
+/// point.
+fn parse_track_udta(body: &[u8], t: &mut Track) {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur).ok().flatten() {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        if cur.position() as usize + psz > body.len() {
+            break;
+        }
+        let start = cur.position() as usize;
+        cur.set_position((start + psz) as u64);
+        if hdr.fourcc == KIND {
+            parse_kind(&body[start..start + psz], t);
+        }
+        // Other track-udta children (e.g. legacy `titl` overrides) are
+        // skipped — file-wide metadata is collected from the moov-level
+        // udta by `parse_udta`.
+    }
+}
+
+/// §8.10.4 — `kind` (KindBox). FullBox preamble (version 0, flags 0)
+/// followed by two NULL-terminated UTF-8 C strings: `schemeURI` then
+/// `value`. Per §8.10.4.3 the URI alone identifies the kind when no
+/// value follows; when a value is present the URI identifies the
+/// naming scheme and `value` is the name from that scheme.
+///
+/// Spec quirk: both strings are stored with their terminators, so a
+/// well-formed box body is at least `4 (FullBox) + 1 (URI NUL) +
+/// 1 (value NUL) = 6` bytes. A box too short to hold both terminators
+/// is tolerated by reading whatever fits — the box is informational
+/// and a malformed entry should not abort the demux. Multiple `kind`
+/// boxes may appear in a single track-level `udta`; each is appended
+/// (the spec explicitly allows "More than one of these" with different
+/// schemes — e.g. one DASH role plus one iTunes role).
+fn parse_kind(body: &[u8], t: &mut Track) {
+    // FullBox preamble (1 version + 3 flags).
+    if body.len() < 4 {
+        return;
+    }
+    let s = &body[4..];
+    // Split at first NUL: that is the schemeURI terminator. If no NUL
+    // is found, treat the entire remainder as the URI and `value` as
+    // empty (tolerant read; matches `parse_elng`'s posture).
+    let uri_end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
+    let uri = match std::str::from_utf8(&s[..uri_end]) {
+        Ok(u) => u.to_string(),
+        Err(_) => return,
+    };
+    // The value string starts immediately after the URI's NUL (if any).
+    // Take everything up to the next NUL; an absent NUL means "read to
+    // end of box". Both an explicitly-empty value (URI\0\0) and an
+    // absent value (URI\0 with nothing after) decode to "".
+    let value = if uri_end >= s.len() {
+        String::new()
+    } else {
+        let rest = &s[uri_end + 1..];
+        let val_end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        match std::str::from_utf8(&rest[..val_end]) {
+            Ok(v) => v.to_string(),
+            Err(_) => return,
+        }
+    };
+    // §8.10.4.3 — at least the URI must identify *something*. An
+    // empty URI yields a useless entry; drop it rather than surfacing
+    // a bogus kind on `params.options`.
+    if uri.is_empty() {
+        return;
+    }
+    t.kinds.push((uri, value));
 }
 
 /// §8.3.2 — `tkhd` (TrackHeaderBox). We only need `track_ID` for
@@ -2694,6 +2792,23 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert(format!("tref_{}", type_str), value);
     }
 
+    // ISO/IEC 14496-12 §8.10.4: surface each track-level `kind`
+    // (KindBox) on `params.options` as `kind_<n>` where `<n>` is the
+    // 0-based encounter index. Value is the URI alone when the box
+    // carried no name (URI uniquely identifies the kind), or
+    // "URI value" (space-separated, mirroring the `tref_<type>`
+    // surface convention) when both fields are populated. Multiple
+    // schemes (e.g. one DASH role + one iTunes role) co-label the
+    // same track with distinct keys.
+    for (i, (uri, value)) in t.kinds.iter().enumerate() {
+        let v = if value.is_empty() {
+            uri.clone()
+        } else {
+            format!("{} {}", uri, value)
+        };
+        params.options.insert(format!("kind_{}", i), v);
+    }
+
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
     StreamInfo {
         index,
@@ -3058,6 +3173,7 @@ mod tests {
             protection_scheme: None,
             tref: Vec::new(),
             elng: None,
+            kinds: Vec::new(),
         }
     }
 
@@ -3640,5 +3756,208 @@ mod tests {
         out.extend_from_slice(fourcc);
         out.extend_from_slice(payload);
         out
+    }
+
+    /// §8.10.4 — `kind` (KindBox): FullBox preamble + NULL-terminated
+    /// schemeURI + NULL-terminated value. When the value is empty
+    /// (URI alone identifies the kind) the body is `<FullBox><URI>\0\0`.
+    #[test]
+    fn parse_kind_uri_only() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox version+flags
+        body.extend_from_slice(b"urn:mpeg:dash:role:2011\0");
+        body.extend_from_slice(b"\0"); // empty value
+        let mut t = fresh_track();
+        super::parse_kind(&body, &mut t);
+        assert_eq!(t.kinds.len(), 1);
+        assert_eq!(t.kinds[0].0, "urn:mpeg:dash:role:2011");
+        assert_eq!(t.kinds[0].1, "");
+    }
+
+    /// A kind with both URI and value: the URI identifies the naming
+    /// scheme and the value is the kind name within that scheme. The
+    /// canonical DASH example: scheme = `urn:mpeg:dash:role:2011`,
+    /// value = `main`.
+    #[test]
+    fn parse_kind_uri_and_value() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(b"urn:mpeg:dash:role:2011\0");
+        body.extend_from_slice(b"main\0");
+        let mut t = fresh_track();
+        super::parse_kind(&body, &mut t);
+        assert_eq!(t.kinds.len(), 1);
+        assert_eq!(t.kinds[0].0, "urn:mpeg:dash:role:2011");
+        assert_eq!(t.kinds[0].1, "main");
+    }
+
+    /// A box that lacks the trailing value NUL is tolerated — the
+    /// value string is taken up to the end of the box. Matches the
+    /// `parse_elng` posture for optional-string boxes.
+    #[test]
+    fn parse_kind_missing_value_nul_tolerated() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(b"urn:example:role\0");
+        body.extend_from_slice(b"alt"); // no trailing NUL
+        let mut t = fresh_track();
+        super::parse_kind(&body, &mut t);
+        assert_eq!(t.kinds.len(), 1);
+        assert_eq!(t.kinds[0].0, "urn:example:role");
+        assert_eq!(t.kinds[0].1, "alt");
+    }
+
+    /// Empty URI (just two NULs) yields no kind — a kind with no URI
+    /// has nothing to identify.
+    #[test]
+    fn parse_kind_empty_uri_dropped() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(b"\0\0");
+        let mut t = fresh_track();
+        super::parse_kind(&body, &mut t);
+        assert!(t.kinds.is_empty());
+    }
+
+    /// A too-short body (smaller than the FullBox preamble) is
+    /// silently skipped — the box is informational and a malformed
+    /// entry should never abort the demux.
+    #[test]
+    fn parse_kind_too_short_is_silently_skipped() {
+        let mut t = fresh_track();
+        super::parse_kind(&[0, 0, 0], &mut t);
+        assert!(t.kinds.is_empty());
+    }
+
+    /// Track-level `udta` may carry multiple `kind` boxes from
+    /// different naming schemes — the spec note allows it ("two
+    /// schemes that both define a kind that indicates sub-titles").
+    /// Each lands as a distinct entry, preserved in encounter order.
+    #[test]
+    fn parse_track_udta_collects_multiple_kinds() {
+        // Two kinds: a DASH role and a custom scheme.
+        let mut k1 = Vec::new();
+        k1.extend_from_slice(&[0u8; 4]);
+        k1.extend_from_slice(b"urn:mpeg:dash:role:2011\0");
+        k1.extend_from_slice(b"caption\0");
+        let mut k2 = Vec::new();
+        k2.extend_from_slice(&[0u8; 4]);
+        k2.extend_from_slice(b"urn:apple:hap:subtitles\0\0");
+
+        let mut udta = Vec::new();
+        udta.extend(wrap_box_full_size(b"kind", &k1));
+        udta.extend(wrap_box_full_size(b"kind", &k2));
+
+        let mut t = fresh_track();
+        super::parse_track_udta(&udta, &mut t);
+        assert_eq!(t.kinds.len(), 2);
+        assert_eq!(t.kinds[0].0, "urn:mpeg:dash:role:2011");
+        assert_eq!(t.kinds[0].1, "caption");
+        assert_eq!(t.kinds[1].0, "urn:apple:hap:subtitles");
+        assert_eq!(t.kinds[1].1, "");
+    }
+
+    /// Non-`kind` children inside a track-level `udta` are skipped
+    /// (file-wide metadata is the moov-level `udta` parser's job).
+    #[test]
+    fn parse_track_udta_ignores_non_kind_children() {
+        // A `titl` (3GPP title) inside a track-level udta: not a kind,
+        // shouldn't crash, and shouldn't populate the kinds list.
+        let mut titl = Vec::new();
+        titl.extend_from_slice(&[0u8; 6]); // FullBox + 2-byte lang
+        titl.extend_from_slice(b"My Track\0");
+        let mut udta = Vec::new();
+        udta.extend(wrap_box_full_size(b"titl", &titl));
+
+        let mut t = fresh_track();
+        super::parse_track_udta(&udta, &mut t);
+        assert!(t.kinds.is_empty());
+    }
+
+    /// Surfacing: each parsed kind shows up as `kind_<n>` on
+    /// `params.options`. URI-only kinds emit just the URI; URI+value
+    /// kinds emit `"URI value"` (space-separated, mirroring the
+    /// `tref_<type>` value convention).
+    #[test]
+    fn build_stream_info_surfaces_kinds_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Subtitle;
+        t.codec_id_fourcc = *b"wvtt";
+        t.timescale = 1000;
+        t.kinds
+            .push(("urn:mpeg:dash:role:2011".to_string(), "caption".to_string()));
+        t.kinds
+            .push(("urn:apple:hap:subtitles".to_string(), String::new()));
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("kind_0"),
+            Some("urn:mpeg:dash:role:2011 caption")
+        );
+        assert_eq!(
+            info.params.options.get("kind_1"),
+            Some("urn:apple:hap:subtitles")
+        );
+        assert_eq!(info.params.options.get("kind_2"), None);
+    }
+
+    /// A track with no `kind` boxes surfaces no `kind_*` options.
+    #[test]
+    fn build_stream_info_no_kind_no_kind_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("kind_0"), None);
+    }
+
+    /// End-to-end: a `kind` box nested inside `trak/udta` is picked up
+    /// by `parse_trak` and lands on the track.
+    #[test]
+    fn parse_trak_picks_up_nested_kind() {
+        // Minimal tkhd (v0): FullBox (4) + created (4) + modified (4) +
+        // track_ID (4) + reserved (4) + duration (4) + reserved (8) +
+        // layer (2) + alt_group (2) + volume (2) + reserved (2) +
+        // matrix (36) + width (4) + height (4) = 84 bytes.
+        let mut tkhd = vec![0u8; 84];
+        // Set track_ID at offset 4+4+4 = 12.
+        tkhd[12..16].copy_from_slice(&7u32.to_be_bytes());
+        // Minimal mdhd (v0, 24 bytes).
+        let mut mdhd = Vec::new();
+        mdhd.extend_from_slice(&[0u8; 4]); // version+flags
+        mdhd.extend_from_slice(&[0u8; 8]); // created+modified
+        mdhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+        mdhd.extend_from_slice(&0u32.to_be_bytes()); // duration
+        mdhd.extend_from_slice(&[0u8; 4]); // language + pre_defined
+                                           // Minimal hdlr identifying a video track.
+        let mut hdlr = Vec::new();
+        hdlr.extend_from_slice(&[0u8; 4]); // FullBox
+        hdlr.extend_from_slice(&[0u8; 4]); // pre_defined
+        hdlr.extend_from_slice(b"vide"); // handler_type
+        hdlr.extend_from_slice(&[0u8; 12]); // reserved
+        hdlr.push(0); // name (empty C string)
+                      // Wrap the mdhd + hdlr into a minimal mdia.
+        let mut mdia = Vec::new();
+        mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
+        mdia.extend(wrap_box_full_size(b"hdlr", &hdlr));
+        // Minimal `kind` box: URI = "urn:mpeg:dash:role:2011", value = "main".
+        let mut kind = Vec::new();
+        kind.extend_from_slice(&[0u8; 4]);
+        kind.extend_from_slice(b"urn:mpeg:dash:role:2011\0");
+        kind.extend_from_slice(b"main\0");
+        // Wrap kind in a track-level udta.
+        let mut udta = Vec::new();
+        udta.extend(wrap_box_full_size(b"kind", &kind));
+        // Assemble the trak body.
+        let mut trak = Vec::new();
+        trak.extend(wrap_box_full_size(b"tkhd", &tkhd));
+        trak.extend(wrap_box_full_size(b"mdia", &mdia));
+        trak.extend(wrap_box_full_size(b"udta", &udta));
+
+        let t = super::parse_trak(&trak).unwrap().unwrap();
+        assert_eq!(t.track_id, 7);
+        assert_eq!(t.kinds.len(), 1);
+        assert_eq!(t.kinds[0].0, "urn:mpeg:dash:role:2011");
+        assert_eq!(t.kinds[0].1, "main");
     }
 }

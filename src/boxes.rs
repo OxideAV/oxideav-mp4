@@ -134,6 +134,12 @@ pub const UDTA: [u8; 4] = fourcc("udta");
 pub const META: [u8; 4] = fourcc("meta");
 pub const ILST: [u8; 4] = fourcc("ilst");
 pub const DATA: [u8; 4] = fourcc("data");
+/// `kind` — Track Kind Box (ISO/IEC 14496-12 §8.10.4). Sits inside a
+/// track-level `udta` and labels the track's role with a (schemeURI,
+/// value) pair. Both strings are NULL-terminated C strings; `value`
+/// may be empty (its terminator still present) when `schemeURI`
+/// alone fully identifies the kind. Zero or more per track.
+pub const KIND: [u8; 4] = fourcc("kind");
 
 // Fragmented-MP4 box types (ISO/IEC 14496-12 §8.8 — Movie Fragments).
 pub const MVEX: [u8; 4] = fourcc("mvex");

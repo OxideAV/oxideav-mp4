@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Track Kind Box (`kind`, ISO/IEC 14496-12 §8.10.4) demux. The `trak`
+  parser now walks the track-level `udta` container (previously
+  skipped — only moov-level `udta` was read) and picks up each
+  `KindBox`: a `FullBox(version = 0, flags = 0)` preamble followed
+  by two NULL-terminated UTF-8 C strings, `schemeURI` then `value`
+  (§8.10.4.2). Per §8.10.4.3 the URI alone identifies the kind when
+  no value follows; when a value is present the URI identifies a
+  naming scheme (e.g. `urn:mpeg:dash:role:2011`) and `value` is the
+  kind name (`main`, `caption`, `commentary`, …). Multiple `kind`
+  boxes per track are supported — the spec note explicitly allows
+  several schemes co-labelling the same track. Each parsed pair is
+  surfaced on `StreamInfo.params.options` as `kind_<n>` (0-based
+  encounter index); the value is the URI alone when the box carried
+  no name, or `"URI value"` (space-separated, mirroring the
+  `tref_<type>` convention) when both fields are populated. A
+  too-short / empty-URI / non-UTF-8 box is silently skipped rather
+  than failing the demux, since the box is optional. Verified by
+  ten unit tests (URI-only, URI+value, missing-value-NUL
+  tolerance, empty-URI rejection, too-short skip, multi-kind
+  collection inside one `udta`, non-kind-children skip, options
+  surfacing with and without the box, and an end-to-end
+  nested-in-`trak/udta` pickup).
 - Extended language tag (`elng`, ISO/IEC 14496-12 §8.4.6) demux. The
   `mdia` parser now reads the optional ExtendedLanguageBox — a
   `FullBox` (version 0, flags 0) preamble followed by a
