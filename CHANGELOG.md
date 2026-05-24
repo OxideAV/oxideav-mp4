@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Composition to Decode Box (`cslg`, ISO/IEC 14496-12 §8.6.1.4)
+  demux. The `stbl` parser now reads the optional
+  CompositionToDecodeBox — a `FullBox(version, 0)` whose body is
+  five signed integers (32-bit in version 0, 64-bit in version 1):
+  `compositionToDTSShift`, `leastDecodeToDisplayDelta`,
+  `greatestDecodeToDisplayDelta`, `compositionStartTime`, and
+  `compositionEndTime`. When signed (v1) `ctts` composition offsets
+  are in use, this box documents the composition↔decode timeline
+  relationship: the DTS shift that guarantees `CTS ≥ DTS` for every
+  sample (honouring the profile/level buffer model), the least and
+  greatest composition offsets, and the smallest/largest computed
+  composition times (`compositionEndTime = 0` means "unknown" per
+  §8.6.1.4.3). All five fields are widened to `i64` on read so
+  callers see one shape regardless of the on-wire version, and are
+  surfaced on `StreamInfo.params.options` as `cslg_<field>` decimal
+  strings (media timescale). A too-short or truncated box is
+  rejected as malformed rather than zero-filled; a track with no
+  `cslg` emits none of the keys. Verified by seven unit tests (v0
+  layout, v1 64-bit value past `i32::MAX`, too-short rejection,
+  mid-field truncation rejection, `stbl` pickup, options surfacing,
+  and absence-omits-options).
 - Track Kind Box (`kind`, ISO/IEC 14496-12 §8.10.4) demux. The `trak`
   parser now walks the track-level `udta` container (previously
   skipped — only moov-level `udta` was read) and picks up each

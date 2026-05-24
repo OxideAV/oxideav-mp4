@@ -320,6 +320,35 @@ struct Track {
     /// multiple `kind` boxes from different schemes can co-label the
     /// same track (spec example: two schemes both declaring "subtitles").
     kinds: Vec<(String, String)>,
+    /// §8.6.1.4 — `cslg` (CompositionToDecodeBox). Present when signed
+    /// composition offsets (a v1 `ctts`) are in use and the producer
+    /// chose to document the composition↔decode timeline relationship.
+    /// `None` when the track has no `cslg` (the common case for files
+    /// without B-frame reordering, or files that simply omit the box).
+    cslg: Option<CslgBox>,
+}
+
+/// Parsed `cslg` (CompositionToDecodeBox, ISO/IEC 14496-12 §8.6.1.4).
+///
+/// All five fields are signed; version 0 stores them as 32-bit, version
+/// 1 as 64-bit. We widen v0 to `i64` on read so callers handle one
+/// shape. The values are in the track media timescale.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CslgBox {
+    /// Add this to every computed CTS to guarantee CTS ≥ DTS for all
+    /// samples (honouring the profile/level buffer model). When
+    /// `leastDecodeToDisplayDelta` is ≥ 0 this may be 0; otherwise it
+    /// should be at least `-leastDecodeToDisplayDelta`.
+    composition_to_dts_shift: i64,
+    /// The smallest composition offset in the track's `ctts`.
+    least_decode_to_display_delta: i64,
+    /// The largest composition offset in the track's `ctts`.
+    greatest_decode_to_display_delta: i64,
+    /// The smallest computed CTS for any sample in this track's media.
+    composition_start_time: i64,
+    /// The CTS-plus-duration of the sample with the largest computed
+    /// CTS; `0` means "composition end time unknown" (§8.6.1.4.3).
+    composition_end_time: i64,
 }
 
 /// Single entry of an `elst` (EditListBox).
@@ -655,6 +684,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         tref: Vec::new(),
         elng: None,
         kinds: Vec::new(),
+        cslg: None,
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -1122,6 +1152,7 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             CO64 => t.chunk_offsets = parse_co64(&b)?,
             STSS => t.stss = parse_stss(&b)?,
             CTTS => t.ctts = parse_ctts(&b)?,
+            CSLG => t.cslg = Some(parse_cslg(&b)?),
             _ => {}
         }
     }
@@ -1758,6 +1789,52 @@ fn parse_ctts(body: &[u8]) -> Result<Vec<(u32, i32)>> {
         off += 8;
     }
     Ok(out)
+}
+
+/// Parse `cslg` (CompositionToDecodeBox, ISO/IEC 14496-12 §8.6.1.4).
+///
+/// `FullBox(version, 0)` whose body is five signed integers. Version 0
+/// stores them as 32-bit, version 1 as 64-bit (used only when at least
+/// one value exceeds the 32-bit range, per §8.6.1.4.1). The fields are,
+/// in order: `compositionToDTSShift`, `leastDecodeToDisplayDelta`,
+/// `greatestDecodeToDisplayDelta`, `compositionStartTime`,
+/// `compositionEndTime`. All five are widened to `i64` so callers see
+/// one shape regardless of the on-wire version.
+fn parse_cslg(body: &[u8]) -> Result<CslgBox> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: cslg too short"));
+    }
+    let version = body[0];
+    let mut off = 4;
+    let mut take = |width: usize, b: &[u8]| -> Result<i64> {
+        if off + width > b.len() {
+            return Err(Error::invalid("MP4: cslg truncated"));
+        }
+        let v = if width == 4 {
+            i32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]) as i64
+        } else {
+            i64::from_be_bytes([
+                b[off],
+                b[off + 1],
+                b[off + 2],
+                b[off + 3],
+                b[off + 4],
+                b[off + 5],
+                b[off + 6],
+                b[off + 7],
+            ])
+        };
+        off += width;
+        Ok(v)
+    };
+    let w = if version == 0 { 4 } else { 8 };
+    Ok(CslgBox {
+        composition_to_dts_shift: take(w, body)?,
+        least_decode_to_display_delta: take(w, body)?,
+        greatest_decode_to_display_delta: take(w, body)?,
+        composition_start_time: take(w, body)?,
+        composition_end_time: take(w, body)?,
+    })
 }
 
 fn parse_stco(body: &[u8]) -> Result<Vec<u64>> {
@@ -2809,6 +2886,38 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert(format!("kind_{}", i), v);
     }
 
+    // ISO/IEC 14496-12 §8.6.1.4: when the track carries a `cslg`
+    // (CompositionToDecodeBox), surface its five timeline-relation
+    // fields on `params.options` as `cslg_<field>`. These document the
+    // composition↔decode relationship implied by a signed (v1) `ctts`:
+    // the DTS shift that guarantees CTS ≥ DTS, the least/greatest
+    // composition offsets, and the composition start/end times. Callers
+    // building an accurate presentation timeline (e.g. to size an output
+    // edit or clamp the leading gap) can read these instead of scanning
+    // the whole `ctts`. All values are in the track media timescale.
+    if let Some(c) = &t.cslg {
+        params.options.insert(
+            "cslg_composition_to_dts_shift",
+            c.composition_to_dts_shift.to_string(),
+        );
+        params.options.insert(
+            "cslg_least_decode_to_display_delta",
+            c.least_decode_to_display_delta.to_string(),
+        );
+        params.options.insert(
+            "cslg_greatest_decode_to_display_delta",
+            c.greatest_decode_to_display_delta.to_string(),
+        );
+        params.options.insert(
+            "cslg_composition_start_time",
+            c.composition_start_time.to_string(),
+        );
+        params.options.insert(
+            "cslg_composition_end_time",
+            c.composition_end_time.to_string(),
+        );
+    }
+
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
     StreamInfo {
         index,
@@ -3174,6 +3283,7 @@ mod tests {
             tref: Vec::new(),
             elng: None,
             kinds: Vec::new(),
+            cslg: None,
         }
     }
 
@@ -3959,5 +4069,148 @@ mod tests {
         assert_eq!(t.kinds.len(), 1);
         assert_eq!(t.kinds[0].0, "urn:mpeg:dash:role:2011");
         assert_eq!(t.kinds[0].1, "main");
+    }
+
+    /// §8.6.1.4 — `cslg` version 0: five signed 32-bit fields after the
+    /// FullBox preamble. Exercises a typical Apple-style negative
+    /// composition shift (`compositionToDTSShift` positive, least delta
+    /// negative).
+    #[test]
+    fn parse_cslg_v0() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+        body.extend_from_slice(&512i32.to_be_bytes()); // compositionToDTSShift
+        body.extend_from_slice(&(-512i32).to_be_bytes()); // leastDecodeToDisplayDelta
+        body.extend_from_slice(&1024i32.to_be_bytes()); // greatestDecodeToDisplayDelta
+        body.extend_from_slice(&0i32.to_be_bytes()); // compositionStartTime
+        body.extend_from_slice(&48000i32.to_be_bytes()); // compositionEndTime
+        let c = super::parse_cslg(&body).unwrap();
+        assert_eq!(c.composition_to_dts_shift, 512);
+        assert_eq!(c.least_decode_to_display_delta, -512);
+        assert_eq!(c.greatest_decode_to_display_delta, 1024);
+        assert_eq!(c.composition_start_time, 0);
+        assert_eq!(c.composition_end_time, 48000);
+    }
+
+    /// §8.6.1.4 — `cslg` version 1: five signed 64-bit fields. Used when
+    /// at least one value exceeds the 32-bit range. Verifies a value
+    /// past `i32::MAX` round-trips, and that signed 64-bit is honoured.
+    #[test]
+    fn parse_cslg_v1_64bit() {
+        let big = (i32::MAX as i64) + 1_000; // > 2^31, needs 64 bits
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1u8, 0, 0, 0]); // version 1 + flags 0
+        body.extend_from_slice(&0i64.to_be_bytes()); // compositionToDTSShift
+        body.extend_from_slice(&(-1_000i64).to_be_bytes()); // leastDecodeToDisplayDelta
+        body.extend_from_slice(&2_000i64.to_be_bytes()); // greatestDecodeToDisplayDelta
+        body.extend_from_slice(&0i64.to_be_bytes()); // compositionStartTime
+        body.extend_from_slice(&big.to_be_bytes()); // compositionEndTime
+        let c = super::parse_cslg(&body).unwrap();
+        assert_eq!(c.composition_to_dts_shift, 0);
+        assert_eq!(c.least_decode_to_display_delta, -1_000);
+        assert_eq!(c.greatest_decode_to_display_delta, 2_000);
+        assert_eq!(c.composition_start_time, 0);
+        assert_eq!(c.composition_end_time, big);
+    }
+
+    /// A `cslg` with no room for even the FullBox preamble is rejected.
+    #[test]
+    fn parse_cslg_too_short() {
+        assert!(super::parse_cslg(&[0u8, 0, 0]).is_err());
+    }
+
+    /// A `cslg` whose body is cut off mid-field (here a v0 box missing
+    /// its last 32-bit field) is rejected rather than silently zero-filled.
+    #[test]
+    fn parse_cslg_truncated() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version 0 + flags
+        body.extend_from_slice(&0i32.to_be_bytes()); // 1/5
+        body.extend_from_slice(&0i32.to_be_bytes()); // 2/5
+        body.extend_from_slice(&0i32.to_be_bytes()); // 3/5
+        body.extend_from_slice(&0i32.to_be_bytes()); // 4/5 — 5th missing
+        assert!(super::parse_cslg(&body).is_err());
+    }
+
+    /// `parse_stbl` lands the `cslg` on the track alongside the other
+    /// sample-table boxes.
+    #[test]
+    fn parse_stbl_picks_up_cslg() {
+        let mut cslg = Vec::new();
+        cslg.extend_from_slice(&[0u8; 4]); // v0
+        cslg.extend_from_slice(&100i32.to_be_bytes());
+        cslg.extend_from_slice(&(-100i32).to_be_bytes());
+        cslg.extend_from_slice(&200i32.to_be_bytes());
+        cslg.extend_from_slice(&0i32.to_be_bytes());
+        cslg.extend_from_slice(&5000i32.to_be_bytes());
+        let mut stbl = Vec::new();
+        stbl.extend(wrap_box_full_size(b"cslg", &cslg));
+
+        let mut t = fresh_track();
+        super::parse_stbl(&stbl, &mut t).unwrap();
+        let c = t.cslg.expect("cslg should be parsed");
+        assert_eq!(c.composition_to_dts_shift, 100);
+        assert_eq!(c.least_decode_to_display_delta, -100);
+        assert_eq!(c.greatest_decode_to_display_delta, 200);
+        assert_eq!(c.composition_start_time, 0);
+        assert_eq!(c.composition_end_time, 5000);
+    }
+
+    /// Surfacing: a parsed `cslg` exposes its five fields on
+    /// `params.options` as `cslg_<field>` decimal strings.
+    #[test]
+    fn build_stream_info_surfaces_cslg_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.cslg = Some(super::CslgBox {
+            composition_to_dts_shift: 512,
+            least_decode_to_display_delta: -512,
+            greatest_decode_to_display_delta: 1024,
+            composition_start_time: 0,
+            composition_end_time: 90000,
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("cslg_composition_to_dts_shift"),
+            Some("512")
+        );
+        assert_eq!(
+            info.params
+                .options
+                .get("cslg_least_decode_to_display_delta"),
+            Some("-512")
+        );
+        assert_eq!(
+            info.params
+                .options
+                .get("cslg_greatest_decode_to_display_delta"),
+            Some("1024")
+        );
+        assert_eq!(
+            info.params.options.get("cslg_composition_start_time"),
+            Some("0")
+        );
+        assert_eq!(
+            info.params.options.get("cslg_composition_end_time"),
+            Some("90000")
+        );
+    }
+
+    /// Absence: a track with no `cslg` emits none of the `cslg_*`
+    /// options keys.
+    #[test]
+    fn build_stream_info_no_cslg_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("cslg_composition_to_dts_shift"),
+            None
+        );
+        assert_eq!(info.params.options.get("cslg_composition_end_time"), None);
     }
 }

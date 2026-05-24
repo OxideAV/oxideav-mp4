@@ -188,6 +188,20 @@ Sample-entry FourCCs resolve to these codec ids:
   encounter index); the value is the URI alone when no name
   follows, or `"URI value"` (space-separated, mirroring the
   `tref_<type>` convention) when both are present.
+- Composition-to-decode (ISO/IEC 14496-12 §8.6.1.4, `cslg`): a
+  track's `stbl/cslg` CompositionToDecodeBox documents the
+  composition↔decode timeline relationship implied by a signed
+  (v1) `ctts` — the DTS shift that guarantees `CTS ≥ DTS`, the
+  least / greatest composition offsets, and the composition
+  start / end times. Both v0 (32-bit) and v1 (64-bit) layouts are
+  read (widened to `i64`). The five fields are surfaced on
+  `params.options` as `cslg_composition_to_dts_shift`,
+  `cslg_least_decode_to_display_delta`,
+  `cslg_greatest_decode_to_display_delta`,
+  `cslg_composition_start_time`, and `cslg_composition_end_time`
+  (decimal strings in the media timescale; `composition_end_time = 0`
+  means "unknown" per §8.6.1.4.3). Absent `cslg`, none of the keys
+  are emitted.
 
 ### Muxer
 

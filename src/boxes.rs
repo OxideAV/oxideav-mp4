@@ -125,6 +125,10 @@ pub const STSZ: [u8; 4] = fourcc("stsz");
 pub const STZ2: [u8; 4] = fourcc("stz2");
 pub const STCO: [u8; 4] = fourcc("stco");
 pub const CTTS: [u8; 4] = fourcc("ctts");
+/// `cslg` — CompositionToDecodeBox (ISO/IEC 14496-12 §8.6.1.4). Sits
+/// inside `stbl` (or `trep`); relates the composition and decoding
+/// timelines when signed composition offsets (a v1 `ctts`) are in use.
+pub const CSLG: [u8; 4] = fourcc("cslg");
 pub const CO64: [u8; 4] = fourcc("co64");
 pub const ELST: [u8; 4] = fourcc("elst");
 pub const MDAT: [u8; 4] = fourcc("mdat");
