@@ -212,6 +212,27 @@ Sample-entry FourCCs resolve to these codec ids:
   table is purely a seek optimisation — it is ignored in normal
   forward play and a track decodes correctly without it. Absent
   `stsh`, none of the keys are emitted.
+- Sample groups (ISO/IEC 14496-12 §8.9, `sbgp` + `sgpd`): a track's
+  `stbl/sbgp` (SampleToGroupBox §8.9.2) run-length map and
+  `stbl/sgpd` (SampleGroupDescriptionBox §8.9.3) per-group entries
+  are parsed. Several of each are accumulated — one pair per
+  `grouping_type` (`roll`, `rap `, `sync`, `alst`, `prol`, …). Each
+  `sbgp` is surfaced on `params.options` as `sbgp_<n>` (0-based
+  encounter index): the grouping type, an optional `param=<P>` (v1
+  `grouping_type_parameter`), then space-separated `count:index`
+  run-length pairs (`group_description_index` 0 = "no group of this
+  type"; an index ≥ 0x10001 is a movie-fragment-local reference per
+  §8.9.4, kept verbatim — the demuxer does not resolve fragment-local
+  groups). Each `sgpd` is surfaced as `sgpd_<n>`: the grouping type,
+  an optional `default=<D>` (v2 `default_sample_description_index`),
+  then the per-group entry payloads as lowercase hex. Entry sizing
+  honours §8.9.3.2 (v1 fixed `default_length`, v1 per-entry
+  `description_length`, or the v0 deprecated no-length-signalling case
+  captured as one combined blob). The entry payloads are
+  grouping-type-specific and **not** interpreted by the container —
+  they are surfaced verbatim for a layer that knows the
+  `grouping_type` semantics. Absent both boxes, none of the keys are
+  emitted.
 
 ### Muxer
 
@@ -264,7 +285,9 @@ whose mdat payload exceeds 4 GiB fail at `write_trailer`.
   these; sequential demux works without them).
 - `sidx` segment-index seek-time mapping (skipped; sequential demux
   works without it).
-- Sample groups (`sbgp` / `sgpd`).
+- Sample-group *muxing* — the demuxer reads `sbgp` / `sgpd` and
+  surfaces them on `params.options`, but the muxer does not emit
+  sample-group boxes.
 - CENC decryption proper — the demuxer detects protected tracks
   (`encv` / `enca` / `enct` / `encs` → original FourCC plus the
   scheme on `params.options`) but it doesn't read `tenc`, `pssh`,

@@ -136,6 +136,17 @@ pub const CTTS: [u8; 4] = fourcc("ctts");
 /// timelines when signed composition offsets (a v1 `ctts`) are in use.
 pub const CSLG: [u8; 4] = fourcc("cslg");
 pub const CO64: [u8; 4] = fourcc("co64");
+/// `sbgp` — SampleToGroupBox (ISO/IEC 14496-12 §8.9.2). Sits inside
+/// `stbl` (or `traf`); a run-length table mapping samples to a sample
+/// group description index for a given `grouping_type`. Purely
+/// descriptive metadata — the sample-group entries it indexes carry
+/// codec/grouping-specific properties parsed by an upper layer.
+pub const SBGP: [u8; 4] = fourcc("sbgp");
+/// `sgpd` — SampleGroupDescriptionBox (ISO/IEC 14496-12 §8.9.3). Sits
+/// inside `stbl` (or `traf`); the table of per-group descriptive
+/// entries that an `sbgp` of the same `grouping_type` indexes. Entry
+/// payloads are grouping-type-specific and opaque to the container.
+pub const SGPD: [u8; 4] = fourcc("sgpd");
 pub const ELST: [u8; 4] = fourcc("elst");
 pub const MDAT: [u8; 4] = fourcc("mdat");
 pub const FREE: [u8; 4] = fourcc("free");

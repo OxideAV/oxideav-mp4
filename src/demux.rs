@@ -336,6 +336,54 @@ struct Track {
     /// forward play and a track decodes correctly without it. Empty
     /// when the box is absent (the common case).
     stsh: Vec<(u32, u32)>,
+    /// §8.9.2 — `sbgp` (SampleToGroupBox) instances. A track may carry
+    /// several, one per `grouping_type`. Each entry records the grouping
+    /// type, the optional v1 `grouping_type_parameter`, and the
+    /// run-length `(sample_count, group_description_index)` table that
+    /// maps decode-order sample runs to a sample-group description index.
+    /// Empty when the track has no `sbgp` (the common case).
+    sbgp: Vec<SbgpBox>,
+    /// §8.9.3 — `sgpd` (SampleGroupDescriptionBox) instances. One per
+    /// `grouping_type`, each holding the per-group descriptive entries
+    /// that an `sbgp` of the same type indexes. The entry payloads are
+    /// grouping-type-specific blobs that the container surfaces verbatim
+    /// (as hex) without interpreting them. Empty when the track has no
+    /// `sgpd` (the common case).
+    sgpd: Vec<SgpdBox>,
+}
+
+/// Parsed `sbgp` (SampleToGroupBox, ISO/IEC 14496-12 §8.9.2).
+#[derive(Clone, Debug, Default)]
+struct SbgpBox {
+    /// Four-byte grouping type identifying which `sgpd` (same type) this
+    /// box indexes — e.g. `rap `, `roll`, `sync`, `tele`, `alst`.
+    grouping_type: [u8; 4],
+    /// `grouping_type_parameter` — present only in version 1, selecting
+    /// one of several alternative groupings of the same type. `None` for
+    /// version 0.
+    grouping_type_parameter: Option<u32>,
+    /// Run-length `(sample_count, group_description_index)` pairs. A
+    /// `group_description_index` of 0 means "member of no group of this
+    /// type"; an index ≥ 0x10001 (movie-fragment-local) is preserved
+    /// verbatim — the demuxer does not resolve fragment-local groups.
+    entries: Vec<(u32, u32)>,
+}
+
+/// Parsed `sgpd` (SampleGroupDescriptionBox, ISO/IEC 14496-12 §8.9.3).
+#[derive(Clone, Debug, Default)]
+struct SgpdBox {
+    /// Four-byte grouping type linking this description table to the
+    /// `sbgp` of the same type.
+    grouping_type: [u8; 4],
+    /// `default_sample_description_index` (version ≥ 2): the group entry
+    /// applied to samples not mapped by any `sbgp`. 0 (the default)
+    /// means "no group of this type"; absent in versions 0/1.
+    default_sample_description_index: Option<u32>,
+    /// Per-group descriptive entries, each a grouping-type-specific
+    /// opaque payload preserved verbatim. The container does not
+    /// interpret them — interpretation belongs to the layer that knows
+    /// the `grouping_type` semantics.
+    entries: Vec<Vec<u8>>,
 }
 
 /// Parsed `cslg` (CompositionToDecodeBox, ISO/IEC 14496-12 §8.6.1.4).
@@ -696,6 +744,8 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         kinds: Vec::new(),
         cslg: None,
         stsh: Vec::new(),
+        sbgp: Vec::new(),
+        sgpd: Vec::new(),
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -1165,6 +1215,8 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             STSH => t.stsh = parse_stsh(&b)?,
             CTTS => t.ctts = parse_ctts(&b)?,
             CSLG => t.cslg = Some(parse_cslg(&b)?),
+            SBGP => t.sbgp.push(parse_sbgp(&b)?),
+            SGPD => t.sgpd.push(parse_sgpd(&b)?),
             _ => {}
         }
     }
@@ -1791,6 +1843,185 @@ fn parse_stsh(body: &[u8]) -> Result<Vec<(u32, u32)>> {
         off += 8;
     }
     Ok(out)
+}
+
+/// Parse `sbgp` (SampleToGroupBox, ISO/IEC 14496-12 §8.9.2).
+///
+/// `FullBox(version, 0)`:
+///
+/// ```text
+///     unsigned int(32) grouping_type
+///     if (version == 1) unsigned int(32) grouping_type_parameter
+///     unsigned int(32) entry_count
+///     entry_count × {
+///         unsigned int(32) sample_count
+///         unsigned int(32) group_description_index
+///     }
+/// ```
+///
+/// The table is a run-length map: each entry covers `sample_count`
+/// consecutive decode-order samples that all share
+/// `group_description_index`. An index of 0 means "member of no group of
+/// this type" (§8.9.2.3); indices ≥ 0x10001 are movie-fragment-local
+/// references (§8.9.4) and are preserved verbatim — the demuxer does not
+/// resolve them against a fragment's own `sgpd`.
+///
+/// `with_capacity` is bounded by the byte budget so an adversarial
+/// `entry_count` cannot trigger a giant up-front allocation; the
+/// per-entry bounds check rejects a truncated body.
+fn parse_sbgp(body: &[u8]) -> Result<SbgpBox> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: sbgp too short"));
+    }
+    let version = body[0];
+    let mut off = 4;
+    let read_u32 = |b: &[u8], o: usize| -> Option<u32> {
+        b.get(o..o + 4)
+            .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let grouping_type_raw =
+        read_u32(body, off).ok_or_else(|| Error::invalid("MP4: sbgp grouping_type truncated"))?;
+    let grouping_type = grouping_type_raw.to_be_bytes();
+    off += 4;
+    let grouping_type_parameter = if version == 1 {
+        let p = read_u32(body, off)
+            .ok_or_else(|| Error::invalid("MP4: sbgp grouping_type_parameter truncated"))?;
+        off += 4;
+        Some(p)
+    } else {
+        None
+    };
+    let count = read_u32(body, off)
+        .ok_or_else(|| Error::invalid("MP4: sbgp entry_count truncated"))? as usize;
+    off += 4;
+    let max_entries = body.len().saturating_sub(off) / 8;
+    let mut entries = Vec::with_capacity(count.min(max_entries));
+    for _ in 0..count {
+        if off + 8 > body.len() {
+            return Err(Error::invalid("MP4: sbgp entries truncated"));
+        }
+        let sample_count =
+            u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        let gdi = u32::from_be_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
+        entries.push((sample_count, gdi));
+        off += 8;
+    }
+    Ok(SbgpBox {
+        grouping_type,
+        grouping_type_parameter,
+        entries,
+    })
+}
+
+/// Parse `sgpd` (SampleGroupDescriptionBox, ISO/IEC 14496-12 §8.9.3).
+///
+/// `FullBox(version, 0)`:
+///
+/// ```text
+///     unsigned int(32) grouping_type
+///     if (version == 1) unsigned int(32) default_length
+///     if (version >= 2) unsigned int(32) default_sample_description_index
+///     unsigned int(32) entry_count
+///     entry_count × {
+///         if (version == 1 && default_length == 0)
+///             unsigned int(32) description_length
+///         SampleGroupEntry(grouping_type)   // grouping-type-specific blob
+///     }
+/// ```
+///
+/// The per-entry `SampleGroupEntry` payload is grouping-type-specific and
+/// opaque to the container — we capture its raw bytes verbatim and leave
+/// interpretation to the layer that knows the `grouping_type` semantics.
+///
+/// Entry sizing follows §8.9.3.2:
+/// * version 1 with `default_length > 0`: every entry is `default_length`
+///   bytes.
+/// * version 1 with `default_length == 0`: each entry is preceded by a
+///   `u32` `description_length`.
+/// * version 0 / version ≥ 2 with no per-entry length: the spec notes
+///   version-0 entries carry no signalled size (§8.9.3.3 NOTE — their use
+///   is deprecated precisely because they cannot be scanned). When the
+///   box gives us no length to chunk by, we fall back to treating the
+///   remaining body as a single combined entry blob rather than guessing
+///   a fixed entry size we cannot know — callers that recognise the
+///   `grouping_type` can re-split it.
+fn parse_sgpd(body: &[u8]) -> Result<SgpdBox> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: sgpd too short"));
+    }
+    let version = body[0];
+    let mut off = 4;
+    let read_u32 = |b: &[u8], o: usize| -> Option<u32> {
+        b.get(o..o + 4)
+            .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let grouping_type_raw =
+        read_u32(body, off).ok_or_else(|| Error::invalid("MP4: sgpd grouping_type truncated"))?;
+    let grouping_type = grouping_type_raw.to_be_bytes();
+    off += 4;
+    let default_length = if version == 1 {
+        let dl = read_u32(body, off)
+            .ok_or_else(|| Error::invalid("MP4: sgpd default_length truncated"))?;
+        off += 4;
+        dl
+    } else {
+        0
+    };
+    let default_sample_description_index = if version >= 2 {
+        let d = read_u32(body, off).ok_or_else(|| {
+            Error::invalid("MP4: sgpd default_sample_description_index truncated")
+        })?;
+        off += 4;
+        Some(d)
+    } else {
+        None
+    };
+    let count = read_u32(body, off)
+        .ok_or_else(|| Error::invalid("MP4: sgpd entry_count truncated"))? as usize;
+    off += 4;
+
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    if version == 1 && default_length == 0 {
+        // Each entry prefixed with its own u32 description_length.
+        for _ in 0..count {
+            let len = read_u32(body, off)
+                .ok_or_else(|| Error::invalid("MP4: sgpd description_length truncated"))?
+                as usize;
+            off += 4;
+            if off + len > body.len() {
+                return Err(Error::invalid("MP4: sgpd variable entry truncated"));
+            }
+            entries.push(body[off..off + len].to_vec());
+            off += len;
+        }
+    } else if default_length > 0 {
+        // Fixed-size entries (version 1 with a non-zero default, or any
+        // version that supplied a default_length). Every entry is
+        // `default_length` bytes.
+        let len = default_length as usize;
+        for _ in 0..count {
+            if off + len > body.len() {
+                return Err(Error::invalid("MP4: sgpd fixed entry truncated"));
+            }
+            entries.push(body[off..off + len].to_vec());
+            off += len;
+        }
+    } else {
+        // No per-entry length available (version 0, or version ≥ 2 with no
+        // default_length field): we cannot determine per-entry boundaries
+        // from the container alone. Capture the remaining body as one
+        // combined blob so no bytes are lost; a grouping-type-aware caller
+        // can re-split it. Empty when entry_count is 0.
+        if count > 0 && off < body.len() {
+            entries.push(body[off..].to_vec());
+        }
+    }
+
+    Ok(SgpdBox {
+        grouping_type,
+        default_sample_description_index,
+        entries,
+    })
 }
 
 /// Parse `ctts` (CompositionOffsetBox, ISO/IEC 14496-12 §8.6.1.3).
@@ -2978,6 +3209,50 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             .insert(format!("stsh_{}", i), format!("{} {}", shadowed, sync));
     }
 
+    // ISO/IEC 14496-12 §8.9.2/§8.9.3: surface sample groupings. Each
+    // `sbgp` (SampleToGroupBox) becomes one `sbgp_<n>` key (0-based
+    // encounter index) whose value is the grouping type, an optional
+    // `param=<P>` (v1 grouping_type_parameter), then the run-length
+    // `count:index` pairs (`group_description_index` 0 = "no group";
+    // ≥ 0x10001 = movie-fragment-local index, kept verbatim). Each
+    // `sgpd` (SampleGroupDescriptionBox) becomes one `sgpd_<n>` key
+    // whose value is the grouping type, an optional `default=<D>`
+    // (v2 default_sample_description_index), then the per-group entry
+    // payloads rendered as lowercase hex (grouping-type-specific blobs
+    // the container does not interpret). The two share `grouping_type`
+    // so a caller can pair an `sbgp_<n>` with the `sgpd_<m>` of the
+    // same type. Absent both boxes, none of the keys are emitted.
+    let render_grouping_type = |gt: &[u8; 4]| -> String {
+        std::str::from_utf8(gt)
+            .ok()
+            .filter(|s| s.chars().all(|c| !c.is_control()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{:02x}{:02x}{:02x}{:02x}", gt[0], gt[1], gt[2], gt[3]))
+    };
+    for (i, sb) in t.sbgp.iter().enumerate() {
+        let mut v = render_grouping_type(&sb.grouping_type);
+        if let Some(p) = sb.grouping_type_parameter {
+            v.push_str(&format!(" param={}", p));
+        }
+        for (count, idx) in &sb.entries {
+            v.push_str(&format!(" {}:{}", count, idx));
+        }
+        params.options.insert(format!("sbgp_{}", i), v);
+    }
+    for (i, sg) in t.sgpd.iter().enumerate() {
+        let mut v = render_grouping_type(&sg.grouping_type);
+        if let Some(d) = sg.default_sample_description_index {
+            v.push_str(&format!(" default={}", d));
+        }
+        for entry in &sg.entries {
+            v.push(' ');
+            for byte in entry {
+                v.push_str(&format!("{:02x}", byte));
+            }
+        }
+        params.options.insert(format!("sgpd_{}", i), v);
+    }
+
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
     StreamInfo {
         index,
@@ -3345,6 +3620,8 @@ mod tests {
             kinds: Vec::new(),
             cslg: None,
             stsh: Vec::new(),
+            sbgp: Vec::new(),
+            sgpd: Vec::new(),
         }
     }
 
@@ -4374,5 +4651,246 @@ mod tests {
         t.timescale = 1000;
         let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
         assert_eq!(info.params.options.get("stsh_0"), None);
+    }
+
+    // --- §8.9 sample groups (sbgp / sgpd) ---------------------------------
+
+    /// §8.9.2 — `sbgp` version 0: grouping_type + entry_count + run-length
+    /// `(sample_count, group_description_index)` pairs. No
+    /// grouping_type_parameter in v0.
+    #[test]
+    fn parse_sbgp_v0_two_runs() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+        body.extend_from_slice(b"roll"); // grouping_type
+        body.extend_from_slice(&2u32.to_be_bytes()); // entry_count
+        body.extend_from_slice(&10u32.to_be_bytes()); // sample_count
+        body.extend_from_slice(&1u32.to_be_bytes()); // group_description_index
+        body.extend_from_slice(&5u32.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes()); // index 0 = "no group"
+        let sb = super::parse_sbgp(&body).unwrap();
+        assert_eq!(&sb.grouping_type, b"roll");
+        assert_eq!(sb.grouping_type_parameter, None);
+        assert_eq!(sb.entries, vec![(10, 1), (5, 0)]);
+    }
+
+    /// §8.9.2 — `sbgp` version 1 carries an extra grouping_type_parameter
+    /// between grouping_type and entry_count.
+    #[test]
+    fn parse_sbgp_v1_with_parameter() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1u8, 0, 0, 0]); // version 1 + flags 0
+        body.extend_from_slice(b"rap "); // grouping_type
+        body.extend_from_slice(&7u32.to_be_bytes()); // grouping_type_parameter
+        body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        body.extend_from_slice(&3u32.to_be_bytes()); // sample_count
+        body.extend_from_slice(&2u32.to_be_bytes()); // group_description_index
+        let sb = super::parse_sbgp(&body).unwrap();
+        assert_eq!(&sb.grouping_type, b"rap ");
+        assert_eq!(sb.grouping_type_parameter, Some(7));
+        assert_eq!(sb.entries, vec![(3, 2)]);
+    }
+
+    /// A movie-fragment-local group index (≥ 0x10001, §8.9.4) is preserved
+    /// verbatim — the demuxer does not resolve it.
+    #[test]
+    fn parse_sbgp_keeps_fragment_local_index() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(b"sync");
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes()); // sample_count
+        body.extend_from_slice(&0x1_0001u32.to_be_bytes()); // fragment-local idx
+        let sb = super::parse_sbgp(&body).unwrap();
+        assert_eq!(sb.entries, vec![(1, 0x1_0001)]);
+    }
+
+    /// A zero-entry `sbgp` (header only) parses to an empty table.
+    #[test]
+    fn parse_sbgp_empty_table() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(b"roll");
+        body.extend_from_slice(&0u32.to_be_bytes()); // entry_count = 0
+        let sb = super::parse_sbgp(&body).unwrap();
+        assert!(sb.entries.is_empty());
+    }
+
+    /// An `sbgp` cut off mid-entry is rejected rather than truncated.
+    #[test]
+    fn parse_sbgp_truncated_entry_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(b"roll");
+        body.extend_from_slice(&2u32.to_be_bytes()); // claims 2 entries
+        body.extend_from_slice(&1u32.to_be_bytes()); // only one full pair
+        body.extend_from_slice(&1u32.to_be_bytes());
+        assert!(super::parse_sbgp(&body).is_err());
+    }
+
+    /// An `sbgp` too short for the grouping_type is rejected.
+    #[test]
+    fn parse_sbgp_too_short() {
+        assert!(super::parse_sbgp(&[0u8, 0, 0, 0, b'r']).is_err());
+    }
+
+    /// §8.9.3 — `sgpd` version 1 with a fixed `default_length`: every
+    /// entry is `default_length` bytes; no per-entry length prefix.
+    #[test]
+    fn parse_sgpd_v1_fixed_length() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1u8, 0, 0, 0]); // version 1 + flags 0
+        body.extend_from_slice(b"roll"); // grouping_type
+        body.extend_from_slice(&2u32.to_be_bytes()); // default_length = 2
+        body.extend_from_slice(&2u32.to_be_bytes()); // entry_count = 2
+        body.extend_from_slice(&[0xFF, 0xFB]); // entry 0 (roll_distance)
+        body.extend_from_slice(&[0x00, 0x05]); // entry 1
+        let sg = super::parse_sgpd(&body).unwrap();
+        assert_eq!(&sg.grouping_type, b"roll");
+        assert_eq!(sg.default_sample_description_index, None);
+        assert_eq!(sg.entries, vec![vec![0xFF, 0xFB], vec![0x00, 0x05]]);
+    }
+
+    /// §8.9.3 — `sgpd` version 1 with `default_length == 0`: each entry is
+    /// preceded by its own `u32` description_length.
+    #[test]
+    fn parse_sgpd_v1_variable_length() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1u8, 0, 0, 0]); // version 1 + flags 0
+        body.extend_from_slice(b"prol"); // grouping_type
+        body.extend_from_slice(&0u32.to_be_bytes()); // default_length = 0
+        body.extend_from_slice(&2u32.to_be_bytes()); // entry_count = 2
+        body.extend_from_slice(&3u32.to_be_bytes()); // description_length 0 = 3
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        body.extend_from_slice(&1u32.to_be_bytes()); // description_length 1 = 1
+        body.extend_from_slice(&[0xDD]);
+        let sg = super::parse_sgpd(&body).unwrap();
+        assert_eq!(&sg.grouping_type, b"prol");
+        assert_eq!(sg.entries, vec![vec![0xAA, 0xBB, 0xCC], vec![0xDD]]);
+    }
+
+    /// §8.9.3 — `sgpd` version 2 supplies a
+    /// `default_sample_description_index` before entry_count.
+    #[test]
+    fn parse_sgpd_v2_default_index() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[2u8, 0, 0, 0]); // version 2 + flags 0
+        body.extend_from_slice(b"alst"); // grouping_type
+        body.extend_from_slice(&1u32.to_be_bytes()); // default_sample_description_index
+        body.extend_from_slice(&0u32.to_be_bytes()); // entry_count = 0
+        let sg = super::parse_sgpd(&body).unwrap();
+        assert_eq!(&sg.grouping_type, b"alst");
+        assert_eq!(sg.default_sample_description_index, Some(1));
+        assert!(sg.entries.is_empty());
+    }
+
+    /// §8.9.3 — `sgpd` version 0 carries no per-entry length signalling
+    /// (§8.9.3.3 NOTE). With no length to chunk by, the remaining body is
+    /// captured as a single combined blob so no bytes are lost.
+    #[test]
+    fn parse_sgpd_v0_combined_blob_fallback() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+        body.extend_from_slice(b"roll"); // grouping_type
+        body.extend_from_slice(&2u32.to_be_bytes()); // entry_count = 2
+        body.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]); // opaque tail
+        let sg = super::parse_sgpd(&body).unwrap();
+        assert_eq!(sg.entries, vec![vec![0x11, 0x22, 0x33, 0x44]]);
+    }
+
+    /// A variable-length `sgpd` whose declared description_length runs past
+    /// the body is rejected.
+    #[test]
+    fn parse_sgpd_variable_truncated_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1u8, 0, 0, 0]);
+        body.extend_from_slice(b"roll");
+        body.extend_from_slice(&0u32.to_be_bytes()); // default_length = 0
+        body.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1
+        body.extend_from_slice(&8u32.to_be_bytes()); // claims 8 bytes
+        body.extend_from_slice(&[0x01, 0x02]); // only 2 present
+        assert!(super::parse_sgpd(&body).is_err());
+    }
+
+    /// `parse_stbl` accumulates multiple `sbgp`/`sgpd` instances (one per
+    /// grouping type) on the track rather than overwriting.
+    #[test]
+    fn parse_stbl_accumulates_sample_groups() {
+        // sbgp(roll)
+        let mut sbgp = Vec::new();
+        sbgp.extend_from_slice(&[0u8; 4]);
+        sbgp.extend_from_slice(b"roll");
+        sbgp.extend_from_slice(&1u32.to_be_bytes());
+        sbgp.extend_from_slice(&4u32.to_be_bytes());
+        sbgp.extend_from_slice(&1u32.to_be_bytes());
+        // sgpd(roll) v1 fixed length 2
+        let mut sgpd = Vec::new();
+        sgpd.extend_from_slice(&[1u8, 0, 0, 0]);
+        sgpd.extend_from_slice(b"roll");
+        sgpd.extend_from_slice(&2u32.to_be_bytes()); // default_length
+        sgpd.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        sgpd.extend_from_slice(&[0xFF, 0xFB]);
+
+        let mut stbl = Vec::new();
+        stbl.extend(wrap_box_full_size(b"sbgp", &sbgp));
+        stbl.extend(wrap_box_full_size(b"sgpd", &sgpd));
+
+        let mut t = fresh_track();
+        super::parse_stbl(&stbl, &mut t).unwrap();
+        assert_eq!(t.sbgp.len(), 1);
+        assert_eq!(&t.sbgp[0].grouping_type, b"roll");
+        assert_eq!(t.sbgp[0].entries, vec![(4, 1)]);
+        assert_eq!(t.sgpd.len(), 1);
+        assert_eq!(&t.sgpd[0].grouping_type, b"roll");
+        assert_eq!(t.sgpd[0].entries, vec![vec![0xFF, 0xFB]]);
+    }
+
+    /// Surfacing: a parsed `sbgp` exposes its run-length map on
+    /// `params.options` as `sbgp_<n>` (grouping type, optional `param=`,
+    /// then `count:index` pairs); `sgpd` exposes `sgpd_<n>` (grouping
+    /// type, optional `default=`, then hex entry payloads).
+    #[test]
+    fn build_stream_info_surfaces_sample_groups_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48000;
+        t.sbgp = vec![
+            super::SbgpBox {
+                grouping_type: *b"roll",
+                grouping_type_parameter: None,
+                entries: vec![(10, 1), (5, 0)],
+            },
+            super::SbgpBox {
+                grouping_type: *b"rap ",
+                grouping_type_parameter: Some(7),
+                entries: vec![(3, 2)],
+            },
+        ];
+        t.sgpd = vec![super::SgpdBox {
+            grouping_type: *b"roll",
+            default_sample_description_index: Some(1),
+            entries: vec![vec![0xFF, 0xFB], vec![0x00, 0x05]],
+        }];
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("sbgp_0"), Some("roll 10:1 5:0"));
+        assert_eq!(info.params.options.get("sbgp_1"), Some("rap  param=7 3:2"));
+        assert_eq!(
+            info.params.options.get("sgpd_0"),
+            Some("roll default=1 fffb 0005")
+        );
+    }
+
+    /// Absence: a track with no sample groups emits none of the
+    /// `sbgp_*` / `sgpd_*` keys.
+    #[test]
+    fn build_stream_info_no_sample_groups_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("sbgp_0"), None);
+        assert_eq!(info.params.options.get("sgpd_0"), None);
     }
 }

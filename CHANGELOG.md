@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sample Group structures (`sbgp` + `sgpd`, ISO/IEC 14496-12 §8.9)
+  demux. The `stbl` parser now reads the SampleToGroupBox (`sbgp`,
+  §8.9.2) and SampleGroupDescriptionBox (`sgpd`, §8.9.3). A track may
+  carry several of each — one pair per `grouping_type` (e.g. `roll`,
+  `rap `, `sync`, `alst`, `prol`) — so both are accumulated rather than
+  overwritten. The `sbgp` is a `FullBox(version, 0)`: `grouping_type`,
+  an optional `grouping_type_parameter` (version 1 only), then a
+  run-length table of `(sample_count, group_description_index)` pairs
+  mapping decode-order sample runs to a description index (index 0 =
+  "member of no group of this type"; an index ≥ 0x10001 is a
+  movie-fragment-local reference per §8.9.4 and is preserved verbatim —
+  the demuxer does not resolve fragment-local groups). The `sgpd` is a
+  `FullBox(version, 0)`: `grouping_type`, an optional `default_length`
+  (version 1), an optional `default_sample_description_index`
+  (version ≥ 2), then per-group descriptive entries. Entry sizing
+  follows §8.9.3.2: version 1 with a non-zero `default_length` gives
+  fixed-size entries; version 1 with `default_length == 0` prefixes
+  each entry with a `u32` `description_length`; version 0 carries no
+  per-entry length signalling (§8.9.3.3 NOTE — its use is deprecated
+  precisely because entries can't be scanned), so the remaining body is
+  captured as one combined blob rather than guessing a fixed entry
+  size. The entry payloads are grouping-type-specific blobs the
+  container does not interpret — they are surfaced verbatim. Each
+  `sbgp` is exposed on `StreamInfo.params.options` as `sbgp_<n>`
+  (0-based encounter index): the grouping type, an optional `param=<P>`,
+  then space-separated `count:index` pairs. Each `sgpd` is exposed as
+  `sgpd_<n>`: the grouping type, an optional `default=<D>`, then the
+  per-group entry payloads rendered as lowercase hex. The two share
+  `grouping_type` so a caller can pair an `sbgp` with the `sgpd` of the
+  same type. Truncated, too-short, or over-claimed boxes are rejected
+  as malformed; a track with no sample groups emits none of the keys.
+  Verified by 14 unit tests (sbgp v0 / v1-with-parameter /
+  fragment-local-index / empty / truncated / too-short; sgpd v1-fixed /
+  v1-variable / v2-default-index / v0-combined-blob / variable-truncated;
+  `stbl` accumulation; options surfacing; absence-omits-options).
 - Shadow Sync Sample Box (`stsh`, ISO/IEC 14496-12 §8.6.3) demux.
   The `stbl` parser now reads the optional ShadowSyncSampleBox — a
   `FullBox(version = 0, flags = 0)` whose body is a `u32` `entry_count`
