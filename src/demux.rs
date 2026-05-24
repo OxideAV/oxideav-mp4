@@ -350,6 +350,54 @@ struct Track {
     /// (as hex) without interpreting them. Empty when the track has no
     /// `sgpd` (the common case).
     sgpd: Vec<SgpdBox>,
+    /// §8.6.4 — `sdtp` (SampleDependencyTypeBox). Per-sample dependency
+    /// hints in decode order: one entry per sample, four 2-bit fields
+    /// `(is_leading, sample_depends_on, sample_is_depended_on,
+    /// sample_has_redundancy)` packed into a single byte each on disk.
+    /// Empty when the track has no `sdtp` (the common case); a present
+    /// table whose length is shorter than the track's sample_count
+    /// is preserved verbatim (truncation is the producer's bug, not
+    /// ours to invent zeros for).
+    sdtp: Vec<SdtpEntry>,
+}
+
+/// One entry of an `sdtp` (SampleDependencyTypeBox, §8.6.4) — decoded
+/// from the on-wire `unsigned int(2) is_leading; unsigned int(2)
+/// sample_depends_on; unsigned int(2) sample_is_depended_on;
+/// unsigned int(2) sample_has_redundancy;` 8-bit packing.
+///
+/// Each field uses the spec's four-valued enum (0 = "unknown", a
+/// reserved value 3 in some fields). We surface the raw small ints
+/// rather than a typed enum to stay format-agnostic — callers that
+/// care about the named values consult §8.6.4.3 themselves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SdtpEntry {
+    /// 2 bits — see §8.6.4.3. Values:
+    /// `0` = leading nature unknown,
+    /// `1` = leading with dependency before referenced I-picture (not
+    /// decodable),
+    /// `2` = not a leading sample,
+    /// `3` = leading without dependency before referenced I-picture
+    /// (decodable).
+    is_leading: u8,
+    /// 2 bits — see §8.6.4.3. Values:
+    /// `0` = dependency unknown,
+    /// `1` = depends on others (not an I-picture),
+    /// `2` = does not depend on others (I-picture),
+    /// `3` = reserved.
+    sample_depends_on: u8,
+    /// 2 bits — see §8.6.4.3. Values:
+    /// `0` = whether others depend on this sample is unknown,
+    /// `1` = other samples may depend on this one (not disposable),
+    /// `2` = no other sample depends on this one (disposable),
+    /// `3` = reserved.
+    sample_is_depended_on: u8,
+    /// 2 bits — see §8.6.4.3. Values:
+    /// `0` = unknown whether there is redundant coding,
+    /// `1` = there is redundant coding,
+    /// `2` = there is no redundant coding,
+    /// `3` = reserved.
+    sample_has_redundancy: u8,
 }
 
 /// Parsed `sbgp` (SampleToGroupBox, ISO/IEC 14496-12 §8.9.2).
@@ -746,6 +794,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         stsh: Vec::new(),
         sbgp: Vec::new(),
         sgpd: Vec::new(),
+        sdtp: Vec::new(),
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -1213,6 +1262,7 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             CO64 => t.chunk_offsets = parse_co64(&b)?,
             STSS => t.stss = parse_stss(&b)?,
             STSH => t.stsh = parse_stsh(&b)?,
+            SDTP => t.sdtp = parse_sdtp(&b)?,
             CTTS => t.ctts = parse_ctts(&b)?,
             CSLG => t.cslg = Some(parse_cslg(&b)?),
             SBGP => t.sbgp.push(parse_sbgp(&b)?),
@@ -1841,6 +1891,50 @@ fn parse_stsh(body: &[u8]) -> Result<Vec<(u32, u32)>> {
         let sync = u32::from_be_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
         out.push((shadowed, sync));
         off += 8;
+    }
+    Ok(out)
+}
+
+/// Parse `sdtp` (SampleDependencyTypeBox, ISO/IEC 14496-12 §8.6.4).
+///
+/// `FullBox(version = 0, flags = 0)` whose body, after the 4-byte
+/// FullBox preamble, is one byte per sample. The `sample_count` is
+/// taken from `stsz` / `stz2` and is *not* re-stated in the box, so
+/// the table's length is simply `body.len() - 4`. Each byte is four
+/// 2-bit fields packed MSB-first per §8.6.4.2:
+///
+/// ```text
+///     unsigned int(2) is_leading;
+///     unsigned int(2) sample_depends_on;
+///     unsigned int(2) sample_is_depended_on;
+///     unsigned int(2) sample_has_redundancy;
+/// ```
+///
+/// Each 2-bit value's permitted set is in §8.6.4.3 (e.g.
+/// `sample_depends_on = 2` → "I-picture"; `sample_is_depended_on = 2`
+/// → "disposable"). The container preserves the raw small ints; a
+/// trick-mode renderer or seek heuristic interprets them.
+///
+/// If the producer wrote a table longer than the track's
+/// `sample_count`, the trailing bytes are still parsed — callers
+/// that care about alignment between the table and the sample list
+/// cross-check the lengths themselves.
+fn parse_sdtp(body: &[u8]) -> Result<Vec<SdtpEntry>> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: sdtp too short"));
+    }
+    // §8.6.4.2 fixes version = 0 and the FullBox preamble carries no
+    // useful flags; tolerate both rather than rejecting a wrong-version
+    // table, since the byte format is unambiguous.
+    let payload = &body[4..];
+    let mut out = Vec::with_capacity(payload.len());
+    for &byte in payload {
+        out.push(SdtpEntry {
+            is_leading: (byte >> 6) & 0x03,
+            sample_depends_on: (byte >> 4) & 0x03,
+            sample_is_depended_on: (byte >> 2) & 0x03,
+            sample_has_redundancy: byte & 0x03,
+        });
     }
     Ok(out)
 }
@@ -3253,6 +3347,60 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert(format!("sgpd_{}", i), v);
     }
 
+    // ISO/IEC 14496-12 §8.6.4: surface the optional SampleDependencyTypeBox
+    // (`sdtp`) as a small summary on `params.options` rather than
+    // per-sample (per-sample would flood the map for a typical track).
+    // Five keys per track-with-sdtp:
+    //   * `sdtp_count` — total per-sample entries.
+    //   * `sdtp_leading_count` — samples flagged as a leading sample
+    //     (is_leading ∈ {1, 3} — value 1 = leading-with-prior-dependency,
+    //     not decodable from this point; value 3 = leading without prior
+    //     dependency, decodable).
+    //   * `sdtp_independent_count` — samples with sample_depends_on = 2
+    //     (an I-picture per dependency hint — does not depend on others).
+    //   * `sdtp_disposable_count` — samples with sample_is_depended_on = 2
+    //     (no other sample depends on this; safe to drop during fast
+    //     forward).
+    //   * `sdtp_redundant_count` — samples with sample_has_redundancy = 1
+    //     (the sample carries redundant coding).
+    // Absent `sdtp`, none of the keys are emitted.
+    if !t.sdtp.is_empty() {
+        let mut leading = 0u32;
+        let mut independent = 0u32;
+        let mut disposable = 0u32;
+        let mut redundant = 0u32;
+        for e in &t.sdtp {
+            if e.is_leading == 1 || e.is_leading == 3 {
+                leading += 1;
+            }
+            if e.sample_depends_on == 2 {
+                independent += 1;
+            }
+            if e.sample_is_depended_on == 2 {
+                disposable += 1;
+            }
+            if e.sample_has_redundancy == 1 {
+                redundant += 1;
+            }
+        }
+        params
+            .options
+            .insert("sdtp_count".to_string(), t.sdtp.len().to_string());
+        params
+            .options
+            .insert("sdtp_leading_count".to_string(), leading.to_string());
+        params.options.insert(
+            "sdtp_independent_count".to_string(),
+            independent.to_string(),
+        );
+        params
+            .options
+            .insert("sdtp_disposable_count".to_string(), disposable.to_string());
+        params
+            .options
+            .insert("sdtp_redundant_count".to_string(), redundant.to_string());
+    }
+
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
     StreamInfo {
         index,
@@ -3622,6 +3770,7 @@ mod tests {
             stsh: Vec::new(),
             sbgp: Vec::new(),
             sgpd: Vec::new(),
+            sdtp: Vec::new(),
         }
     }
 
@@ -4892,5 +5041,174 @@ mod tests {
         let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
         assert_eq!(info.params.options.get("sbgp_0"), None);
         assert_eq!(info.params.options.get("sgpd_0"), None);
+    }
+
+    // --- §8.6.4 sdtp (SampleDependencyTypeBox) ------------------------------
+
+    /// Helper: pack the four 2-bit dependency fields into the on-wire
+    /// `sdtp` byte layout (MSB-first per §8.6.4.2).
+    fn pack_sdtp(is_leading: u8, depends_on: u8, depended_on: u8, redundancy: u8) -> u8 {
+        ((is_leading & 0x03) << 6)
+            | ((depends_on & 0x03) << 4)
+            | ((depended_on & 0x03) << 2)
+            | (redundancy & 0x03)
+    }
+
+    /// §8.6.4 — `sdtp` round-trip: an I-picture (depends_on=2,
+    /// depended_on=1, redundancy=2, not leading) and a disposable
+    /// B-frame (depends_on=1, depended_on=2, redundancy=2, leading
+    /// with prior dependency=1) both decode to the expected per-field
+    /// 2-bit values.
+    #[test]
+    fn parse_sdtp_two_entries() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox preamble (version 0 + flags 0)
+        body.push(pack_sdtp(2, 2, 1, 2)); // I-picture
+        body.push(pack_sdtp(1, 1, 2, 2)); // disposable leading
+        let v = super::parse_sdtp(&body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].is_leading, 2);
+        assert_eq!(v[0].sample_depends_on, 2);
+        assert_eq!(v[0].sample_is_depended_on, 1);
+        assert_eq!(v[0].sample_has_redundancy, 2);
+        assert_eq!(v[1].is_leading, 1);
+        assert_eq!(v[1].sample_depends_on, 1);
+        assert_eq!(v[1].sample_is_depended_on, 2);
+        assert_eq!(v[1].sample_has_redundancy, 2);
+    }
+
+    /// A zero-sample `sdtp` (FullBox preamble only) parses to an empty
+    /// table rather than failing — implied `sample_count` from `stsz`
+    /// may legitimately be zero (an empty track).
+    #[test]
+    fn parse_sdtp_empty_table() {
+        let body = vec![0u8; 4]; // FullBox preamble only
+        let v = super::parse_sdtp(&body).unwrap();
+        assert!(v.is_empty());
+    }
+
+    /// An `sdtp` too short for even the FullBox preamble is rejected.
+    #[test]
+    fn parse_sdtp_too_short() {
+        assert!(super::parse_sdtp(&[0u8, 0, 0]).is_err());
+    }
+
+    /// Bit-packing decode: a single byte `0b11_10_01_00` must unpack
+    /// to (3, 2, 1, 0) — MSB pair first per §8.6.4.2. This is the
+    /// pivot test for getting the shift order right.
+    #[test]
+    fn parse_sdtp_field_order() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox preamble
+        body.push(0b11_10_01_00); // is_leading=3 depends_on=2 depended_on=1 redundancy=0
+        let v = super::parse_sdtp(&body).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].is_leading, 3);
+        assert_eq!(v[0].sample_depends_on, 2);
+        assert_eq!(v[0].sample_is_depended_on, 1);
+        assert_eq!(v[0].sample_has_redundancy, 0);
+    }
+
+    /// Every field in a single byte that's all zeros parses to all-zero
+    /// "unknown" entries (the default state when a producer fills the
+    /// table but has no real information per §8.6.4.3 value `0`).
+    #[test]
+    fn parse_sdtp_all_unknowns() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox preamble
+        body.push(0u8);
+        body.push(0u8);
+        body.push(0u8);
+        let v = super::parse_sdtp(&body).unwrap();
+        assert_eq!(v.len(), 3);
+        for e in &v {
+            assert_eq!(e.is_leading, 0);
+            assert_eq!(e.sample_depends_on, 0);
+            assert_eq!(e.sample_is_depended_on, 0);
+            assert_eq!(e.sample_has_redundancy, 0);
+        }
+    }
+
+    /// `parse_stbl` lands the `sdtp` on the track alongside the other
+    /// sample-table boxes (proves the dispatch arm is wired).
+    #[test]
+    fn parse_stbl_picks_up_sdtp() {
+        let mut sdtp = Vec::new();
+        sdtp.extend_from_slice(&[0u8; 4]); // FullBox preamble
+        sdtp.push(pack_sdtp(2, 2, 1, 2)); // I-picture
+        sdtp.push(pack_sdtp(0, 1, 2, 0)); // disposable
+        let mut stbl = Vec::new();
+        stbl.extend(wrap_box_full_size(b"sdtp", &sdtp));
+
+        let mut t = fresh_track();
+        super::parse_stbl(&stbl, &mut t).unwrap();
+        assert_eq!(t.sdtp.len(), 2);
+        assert_eq!(t.sdtp[0].sample_depends_on, 2);
+        assert_eq!(t.sdtp[1].sample_is_depended_on, 2);
+    }
+
+    /// Surfacing: a parsed `sdtp` exposes its summary counts on
+    /// `params.options` as the five `sdtp_*_count` keys. We construct
+    /// a 4-entry table covering one I-picture (independent), one
+    /// disposable B-frame, one leading B-frame, and one sample with
+    /// redundant coding so every counter increments at least once.
+    #[test]
+    fn build_stream_info_surfaces_sdtp_summary_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.sdtp = vec![
+            // I-picture: depends_on=2 (independent), depended_on=1 (not
+            // disposable), not leading, no redundancy.
+            super::SdtpEntry {
+                is_leading: 2,
+                sample_depends_on: 2,
+                sample_is_depended_on: 1,
+                sample_has_redundancy: 0,
+            },
+            // Disposable B-frame: depended_on=2.
+            super::SdtpEntry {
+                is_leading: 2,
+                sample_depends_on: 1,
+                sample_is_depended_on: 2,
+                sample_has_redundancy: 0,
+            },
+            // Leading decodable B-frame: is_leading=3.
+            super::SdtpEntry {
+                is_leading: 3,
+                sample_depends_on: 1,
+                sample_is_depended_on: 2,
+                sample_has_redundancy: 0,
+            },
+            // Sample with redundant coding: has_redundancy=1.
+            super::SdtpEntry {
+                is_leading: 2,
+                sample_depends_on: 1,
+                sample_is_depended_on: 1,
+                sample_has_redundancy: 1,
+            },
+        ];
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("sdtp_count"), Some("4"));
+        assert_eq!(info.params.options.get("sdtp_leading_count"), Some("1"));
+        assert_eq!(info.params.options.get("sdtp_independent_count"), Some("1"));
+        assert_eq!(info.params.options.get("sdtp_disposable_count"), Some("2"));
+        assert_eq!(info.params.options.get("sdtp_redundant_count"), Some("1"));
+    }
+
+    /// Absence: a track with no `sdtp` emits none of the summary keys.
+    #[test]
+    fn build_stream_info_no_sdtp_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("sdtp_count"), None);
+        assert_eq!(info.params.options.get("sdtp_leading_count"), None);
+        assert_eq!(info.params.options.get("sdtp_independent_count"), None);
+        assert_eq!(info.params.options.get("sdtp_disposable_count"), None);
+        assert_eq!(info.params.options.get("sdtp_redundant_count"), None);
     }
 }

@@ -212,6 +212,23 @@ Sample-entry FourCCs resolve to these codec ids:
   table is purely a seek optimisation — it is ignored in normal
   forward play and a track decodes correctly without it. Absent
   `stsh`, none of the keys are emitted.
+- Sample dependency hints (ISO/IEC 14496-12 §8.6.4, `sdtp`): a
+  track's `stbl/sdtp` SampleDependencyTypeBox is a per-sample table
+  of four 2-bit fields — `is_leading`, `sample_depends_on`,
+  `sample_is_depended_on`, `sample_has_redundancy` — packed one
+  byte per sample (the `sample_count` is implicit from `stsz` /
+  `stz2`). The table feeds trick-mode playback (drop disposable
+  samples on fast-forward) and refines random-access roll-forward
+  (a sample marked `sample_depends_on = 2` is an I-picture without
+  needing the `stss` to mark it). The raw per-sample 2-bit values
+  are decoded and stored on the track; the demuxer surfaces a small
+  summary on `params.options` as five keys — `sdtp_count`,
+  `sdtp_leading_count` (samples with `is_leading ∈ {1, 3}`),
+  `sdtp_independent_count` (samples with `sample_depends_on = 2`),
+  `sdtp_disposable_count` (samples with `sample_is_depended_on = 2`),
+  and `sdtp_redundant_count` (samples with `sample_has_redundancy =
+  1`). Absent `sdtp`, none of the keys are emitted (the demuxer
+  falls back to `stss` for keyframe detection, as before).
 - Sample groups (ISO/IEC 14496-12 §8.9, `sbgp` + `sgpd`): a track's
   `stbl/sbgp` (SampleToGroupBox §8.9.2) run-length map and
   `stbl/sgpd` (SampleGroupDescriptionBox §8.9.3) per-group entries

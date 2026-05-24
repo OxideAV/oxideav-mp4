@@ -130,6 +130,14 @@ pub const STCO: [u8; 4] = fourcc("stco");
 /// use when seeking to a non-sync sample. Ignored in normal forward
 /// play.
 pub const STSH: [u8; 4] = fourcc("stsh");
+/// `sdtp` — SampleDependencyTypeBox (ISO/IEC 14496-12 §8.6.4). Sits
+/// inside `stbl`; an optional per-sample table of dependency hints —
+/// `is_leading`, `sample_depends_on`, `sample_is_depended_on`,
+/// `sample_has_redundancy` — useful for trick-mode playback (fast
+/// forward / random-access roll-forward) and for dropping disposable
+/// samples without decoding them. One byte per sample;
+/// `sample_count` is implicit from `stsz` / `stz2`.
+pub const SDTP: [u8; 4] = fourcc("sdtp");
 pub const CTTS: [u8; 4] = fourcc("ctts");
 /// `cslg` — CompositionToDecodeBox (ISO/IEC 14496-12 §8.6.1.4). Sits
 /// inside `stbl` (or `trep`); relates the composition and decoding

@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sample Dependency Type Box (`sdtp`, ISO/IEC 14496-12 §8.6.4) demux.
+  The `stbl` parser now reads the optional SampleDependencyTypeBox —
+  a `FullBox(version = 0, flags = 0)` whose body, after the FullBox
+  preamble, is one byte per sample carrying four 2-bit fields packed
+  MSB-first (`is_leading`, `sample_depends_on`,
+  `sample_is_depended_on`, `sample_has_redundancy`). The
+  `sample_count` is implicit from `stsz` / `stz2` so the table's
+  length is simply `body.len() - 4` bytes — no entry count is
+  re-stated. Each per-sample 2-bit field uses the spec's four-valued
+  enum (§8.6.4.3 — e.g. `sample_depends_on = 2` → "I-picture";
+  `sample_is_depended_on = 2` → "no other sample depends on this,
+  safe to drop in trick mode"; `is_leading = 3` → "leading sample
+  decodable from the prior referenced I-picture"). The raw values
+  are stored on the track for downstream renderers and seek
+  heuristics. Surfaced on `StreamInfo.params.options` as a small
+  summary rather than per-sample (per-sample would flood the map for
+  a typical track): five keys — `sdtp_count` (total entries),
+  `sdtp_leading_count` (samples with `is_leading ∈ {1, 3}`),
+  `sdtp_independent_count` (samples with `sample_depends_on = 2`,
+  i.e. I-pictures per the dependency hint), `sdtp_disposable_count`
+  (samples with `sample_is_depended_on = 2`, safe to drop), and
+  `sdtp_redundant_count` (samples with `sample_has_redundancy = 1`).
+  A too-short box (less than the FullBox preamble) is rejected as
+  malformed; a track with no `sdtp` emits none of the keys (the
+  demuxer falls back to `stss` for keyframe detection). Verified by
+  eight unit tests (two-entry decode, empty-table acceptance,
+  too-short rejection, MSB-first bit-packing-order pivot, all-zero
+  "unknown" entries, `stbl` pickup, options surfacing with counts,
+  and absence-omits-options).
 - Sample Group structures (`sbgp` + `sgpd`, ISO/IEC 14496-12 §8.9)
   demux. The `stbl` parser now reads the SampleToGroupBox (`sbgp`,
   §8.9.2) and SampleGroupDescriptionBox (`sgpd`, §8.9.3). A track may
