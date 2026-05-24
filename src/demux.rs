@@ -326,6 +326,16 @@ struct Track {
     /// `None` when the track has no `cslg` (the common case for files
     /// without B-frame reordering, or files that simply omit the box).
     cslg: Option<CslgBox>,
+    /// §8.6.3 — `stsh` (ShadowSyncSampleBox) entries. Each pair is
+    /// `(shadowed_sample_number, sync_sample_number)`, both 1-based
+    /// sample indices: when seeking to (or before) the non-sync
+    /// `shadowed_sample_number`, the named `sync_sample_number` may be
+    /// decoded in its place to recover a usable starting point. The
+    /// table is sorted by `shadowed_sample_number` per spec and is
+    /// purely an optional seek optimisation — it is ignored in normal
+    /// forward play and a track decodes correctly without it. Empty
+    /// when the box is absent (the common case).
+    stsh: Vec<(u32, u32)>,
 }
 
 /// Parsed `cslg` (CompositionToDecodeBox, ISO/IEC 14496-12 §8.6.1.4).
@@ -685,6 +695,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         elng: None,
         kinds: Vec::new(),
         cslg: None,
+        stsh: Vec::new(),
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -1151,6 +1162,7 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             STCO => t.chunk_offsets = parse_stco(&b)?,
             CO64 => t.chunk_offsets = parse_co64(&b)?,
             STSS => t.stss = parse_stss(&b)?,
+            STSH => t.stsh = parse_stsh(&b)?,
             CTTS => t.ctts = parse_ctts(&b)?,
             CSLG => t.cslg = Some(parse_cslg(&b)?),
             _ => {}
@@ -1742,6 +1754,41 @@ fn parse_stss(body: &[u8]) -> Result<Vec<u32>> {
             body[off + 3],
         ]));
         off += 4;
+    }
+    Ok(out)
+}
+
+/// Parse `stsh` (ShadowSyncSampleBox, ISO/IEC 14496-12 §8.6.3).
+///
+/// `FullBox(version = 0, flags = 0)` whose body is a `u32` `entry_count`
+/// followed by that many `(shadowed_sample_number, sync_sample_number)`
+/// pairs, each a big-endian `u32`. The first member names a (normally
+/// non-sync) sample; the second names a sync sample that can be decoded
+/// in its place when seeking to or before the shadowed sample. The
+/// table is ordered by `shadowed_sample_number` per §8.6.3.1, but we
+/// keep on-wire order so the bytes round-trip without assuming the
+/// producer honoured the ordering recommendation.
+///
+/// `with_capacity` is bounded by the byte budget (`(len - 8) / 8`) so an
+/// adversarial `entry_count` can't trigger a giant up-front allocation;
+/// the per-entry bounds check rejects a body that is shorter than the
+/// claimed count.
+fn parse_stsh(body: &[u8]) -> Result<Vec<(u32, u32)>> {
+    if body.len() < 8 {
+        return Err(Error::invalid("MP4: stsh too short"));
+    }
+    let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let max_entries = (body.len() - 8) / 8;
+    let mut out = Vec::with_capacity(count.min(max_entries));
+    let mut off = 8;
+    for _ in 0..count {
+        if off + 8 > body.len() {
+            return Err(Error::invalid("MP4: stsh truncated"));
+        }
+        let shadowed = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        let sync = u32::from_be_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
+        out.push((shadowed, sync));
+        off += 8;
     }
     Ok(out)
 }
@@ -2918,6 +2965,19 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         );
     }
 
+    // ISO/IEC 14496-12 §8.6.3: surface the optional ShadowSyncSampleBox
+    // (`stsh`) as `stsh_<n>` options keys (0-based encounter index),
+    // each `"shadowed sync"` — the 1-based shadowed sample number and
+    // the 1-based sync sample that may replace it when seeking to (or
+    // before) that sample. The convention mirrors `tref_<type>` /
+    // `kind_<n>`. The table is a seek optimisation only; a track with no
+    // `stsh` emits none of the keys.
+    for (i, (shadowed, sync)) in t.stsh.iter().enumerate() {
+        params
+            .options
+            .insert(format!("stsh_{}", i), format!("{} {}", shadowed, sync));
+    }
+
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
     StreamInfo {
         index,
@@ -3284,6 +3344,7 @@ mod tests {
             elng: None,
             kinds: Vec::new(),
             cslg: None,
+            stsh: Vec::new(),
         }
     }
 
@@ -4212,5 +4273,106 @@ mod tests {
             None
         );
         assert_eq!(info.params.options.get("cslg_composition_end_time"), None);
+    }
+
+    /// §8.6.3 — `stsh` with two `(shadowed, sync)` pairs. Verifies both
+    /// big-endian u32 members of each entry are read in order.
+    #[test]
+    fn parse_stsh_two_entries() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+        body.extend_from_slice(&2u32.to_be_bytes()); // entry_count
+        body.extend_from_slice(&7u32.to_be_bytes()); // shadowed_sample_number
+        body.extend_from_slice(&1u32.to_be_bytes()); // sync_sample_number
+        body.extend_from_slice(&13u32.to_be_bytes());
+        body.extend_from_slice(&10u32.to_be_bytes());
+        let v = super::parse_stsh(&body).unwrap();
+        assert_eq!(v, vec![(7, 1), (13, 10)]);
+    }
+
+    /// A zero-entry `stsh` (header only) parses to an empty table rather
+    /// than failing.
+    #[test]
+    fn parse_stsh_empty_table() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+        body.extend_from_slice(&0u32.to_be_bytes()); // entry_count = 0
+        let v = super::parse_stsh(&body).unwrap();
+        assert!(v.is_empty());
+    }
+
+    /// An `stsh` with no room for even the FullBox + count preamble is
+    /// rejected.
+    #[test]
+    fn parse_stsh_too_short() {
+        assert!(super::parse_stsh(&[0u8, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    /// An `stsh` whose body is cut off mid-entry (here a count of 2 but
+    /// only one full pair of bytes) is rejected rather than truncated to
+    /// the bytes present.
+    #[test]
+    fn parse_stsh_truncated() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version 0 + flags
+        body.extend_from_slice(&2u32.to_be_bytes()); // claims 2 entries
+        body.extend_from_slice(&7u32.to_be_bytes()); // shadowed (entry 1)
+        body.extend_from_slice(&1u32.to_be_bytes()); // sync (entry 1)
+        body.extend_from_slice(&13u32.to_be_bytes()); // shadowed (entry 2) — sync missing
+        assert!(super::parse_stsh(&body).is_err());
+    }
+
+    /// An adversarial `entry_count` far larger than the body cannot
+    /// trigger a giant up-front allocation: `with_capacity` is clamped to
+    /// the byte budget and the per-entry bounds check rejects the box.
+    #[test]
+    fn parse_stsh_huge_count_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version 0 + flags
+        body.extend_from_slice(&u32::MAX.to_be_bytes()); // claims ~4 billion entries
+        body.extend_from_slice(&1u32.to_be_bytes()); // only one u32 of payload
+        assert!(super::parse_stsh(&body).is_err());
+    }
+
+    /// `parse_stbl` lands the `stsh` on the track alongside the other
+    /// sample-table boxes.
+    #[test]
+    fn parse_stbl_picks_up_stsh() {
+        let mut stsh = Vec::new();
+        stsh.extend_from_slice(&[0u8; 4]); // v0
+        stsh.extend_from_slice(&1u32.to_be_bytes()); // one entry
+        stsh.extend_from_slice(&5u32.to_be_bytes()); // shadowed
+        stsh.extend_from_slice(&2u32.to_be_bytes()); // sync
+        let mut stbl = Vec::new();
+        stbl.extend(wrap_box_full_size(b"stsh", &stsh));
+
+        let mut t = fresh_track();
+        super::parse_stbl(&stbl, &mut t).unwrap();
+        assert_eq!(t.stsh, vec![(5, 2)]);
+    }
+
+    /// Surfacing: a parsed `stsh` exposes its pairs on `params.options`
+    /// as `stsh_<n>` = `"shadowed sync"` decimal strings.
+    #[test]
+    fn build_stream_info_surfaces_stsh_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.stsh = vec![(7, 1), (13, 10)];
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("stsh_0"), Some("7 1"));
+        assert_eq!(info.params.options.get("stsh_1"), Some("13 10"));
+    }
+
+    /// Absence: a track with no `stsh` emits none of the `stsh_*` keys.
+    #[test]
+    fn build_stream_info_no_stsh_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("stsh_0"), None);
     }
 }

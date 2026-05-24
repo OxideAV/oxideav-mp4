@@ -202,6 +202,16 @@ Sample-entry FourCCs resolve to these codec ids:
   (decimal strings in the media timescale; `composition_end_time = 0`
   means "unknown" per §8.6.1.4.3). Absent `cslg`, none of the keys
   are emitted.
+- Shadow sync samples (ISO/IEC 14496-12 §8.6.3, `stsh`): a track's
+  `stbl/stsh` ShadowSyncSampleBox is an optional seek hint — a table
+  of `(shadowed_sample_number, sync_sample_number)` pairs naming a
+  sync sample (key frame) that can be decoded in place of a non-sync
+  sample when seeking to or before it. Each pair is surfaced on
+  `params.options` as `stsh_<n>` (0-based encounter index) with value
+  `"shadowed sync"` (both 1-based sample numbers, space-separated). The
+  table is purely a seek optimisation — it is ignored in normal
+  forward play and a track decodes correctly without it. Absent
+  `stsh`, none of the keys are emitted.
 
 ### Muxer
 

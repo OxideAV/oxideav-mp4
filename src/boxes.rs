@@ -124,6 +124,12 @@ pub const STSC: [u8; 4] = fourcc("stsc");
 pub const STSZ: [u8; 4] = fourcc("stsz");
 pub const STZ2: [u8; 4] = fourcc("stz2");
 pub const STCO: [u8; 4] = fourcc("stco");
+/// `stsh` — ShadowSyncSampleBox (ISO/IEC 14496-12 §8.6.3). Sits inside
+/// `stbl`; an optional table of `(shadowed_sample_number,
+/// sync_sample_number)` pairs that name an alternative sync sample to
+/// use when seeking to a non-sync sample. Ignored in normal forward
+/// play.
+pub const STSH: [u8; 4] = fourcc("stsh");
 pub const CTTS: [u8; 4] = fourcc("ctts");
 /// `cslg` — CompositionToDecodeBox (ISO/IEC 14496-12 §8.6.1.4). Sits
 /// inside `stbl` (or `trep`); relates the composition and decoding

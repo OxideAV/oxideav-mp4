@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Shadow Sync Sample Box (`stsh`, ISO/IEC 14496-12 §8.6.3) demux.
+  The `stbl` parser now reads the optional ShadowSyncSampleBox — a
+  `FullBox(version = 0, flags = 0)` whose body is a `u32` `entry_count`
+  followed by that many `(shadowed_sample_number, sync_sample_number)`
+  pairs (each a big-endian `u32`). The first member names a (normally
+  non-sync) sample; the second names a sync sample (key frame) that can
+  be decoded in its place when seeking to or before the shadowed
+  sample (§8.6.3.1). The table is a pure seek optimisation — it is
+  ignored in normal forward play and a track decodes correctly without
+  it. Each pair is surfaced on `StreamInfo.params.options` as
+  `stsh_<n>` (0-based encounter index) with value `"shadowed sync"`
+  (both 1-based sample numbers, space-separated, mirroring the
+  `tref_<type>` / `kind_<n>` convention). A too-short or truncated box
+  is rejected as malformed; an adversarial `entry_count` cannot trigger
+  a giant up-front allocation (capacity is clamped to the body's byte
+  budget) and the per-entry bounds check rejects an over-claimed count.
+  A track with no `stsh` emits none of the keys. Verified by eight unit
+  tests (two-entry read, empty table, too-short rejection, mid-entry
+  truncation rejection, huge-count rejection, `stbl` pickup, options
+  surfacing, and absence-omits-options).
 - Composition to Decode Box (`cslg`, ISO/IEC 14496-12 §8.6.1.4)
   demux. The `stbl` parser now reads the optional
   CompositionToDecodeBox — a `FullBox(version, 0)` whose body is
