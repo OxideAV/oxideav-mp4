@@ -293,6 +293,26 @@ Chunk offsets auto-promote from `stco` (32-bit) to `co64` (64-bit) when
 any offset exceeds 4 GiB. The mdat box header stays 32-bit — files
 whose mdat payload exceeds 4 GiB fail at `write_trailer`.
 
+#### Fragmented / DASH / CMAF segment writing
+
+The `dash`, `cmaf`, and `ismv` registry entries select the fragmented
+muxer (`oxideav_mp4::frag::open_fragmented_typed`). It emits an init
+segment (`ftyp` + `moov` with `mvex`/`trex` per track) followed by one
+`styp? + sidx? + moof + mdat` segment per fragment cadence boundary, and
+a trailing `mfra`/`tfra`/`mfro` random-access index. The per-segment
+`styp` (ISO/IEC 14496-12 §8.16.2 Segment Type Box) is controlled by
+`FragmentedOptions::styp`.
+
+For caller-driven per-segment control, the
+`FragmentedMuxer::write_fragmented_segment_with_styp(major_brand,
+compat_brands)` inherent method marks the *next* emitted segment's
+`styp` to use the given DASH/CMAF `(major, compat)` pair, overriding the
+preset for one segment (then consumed). The stateless byte builder is
+also exposed via the public `oxideav_mp4::styp` module —
+`build_styp(major, compat)` / `write_styp(writer, major, compat)` —
+mirroring the read-side `parse_styp` in oxideav-mov so a producer
+round-tripping a parsed `Styp` can emit the same byte sequence.
+
 ### Not (yet) supported
 
 - Fragmented-MP4 *muxing* — the demuxer reads `moof`+`mdat`

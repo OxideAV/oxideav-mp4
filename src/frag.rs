@@ -143,6 +143,25 @@ pub(crate) fn open_fragmented(
     options: Mp4MuxerOptions,
     frag_options: FragmentedOptions,
 ) -> Result<Box<dyn Muxer>> {
+    let m = open_fragmented_typed(output, streams, options, frag_options)?;
+    Ok(Box::new(m))
+}
+
+/// Build a [`FragmentedMuxer`] directly — same construction as
+/// [`open_fragmented`] but returns the concrete type so callers can
+/// reach the inherent methods (notably
+/// [`FragmentedMuxer::write_fragmented_segment_with_styp`]) that aren't
+/// part of the [`Muxer`] trait.
+///
+/// The `Box<dyn Muxer>` form returned by [`open_fragmented`] is what the
+/// registry uses; this typed form is for callers driving CMAF / DASH
+/// segment emission themselves.
+pub fn open_fragmented_typed(
+    output: Box<dyn WriteSeek>,
+    streams: &[StreamInfo],
+    options: Mp4MuxerOptions,
+    frag_options: FragmentedOptions,
+) -> Result<FragmentedMuxer> {
     if streams.is_empty() {
         return Err(Error::invalid("mp4 muxer: need at least one stream"));
     }
@@ -156,7 +175,7 @@ pub(crate) fn open_fragmented(
         base.samples_per_chunk_target = default_samples_per_chunk(&base.stream);
         tracks.push(FragTrackState::new(base, (i as u32) + 1));
     }
-    Ok(Box::new(FragmentedMuxer {
+    Ok(FragmentedMuxer {
         output,
         tracks,
         options,
@@ -164,10 +183,18 @@ pub(crate) fn open_fragmented(
         sequence_number: 0,
         header_written: false,
         trailer_written: false,
-    }))
+        styp_override: None,
+    })
 }
 
-struct FragmentedMuxer {
+/// Fragmented-MP4 (DASH / CMAF / HLS-fMP4 / Smooth-Streaming) muxer.
+///
+/// Constructed via [`open_fragmented_typed`]. Exposes the `Muxer` trait
+/// (`write_header` / `write_packet` / `write_trailer`) plus an inherent
+/// [`Self::write_fragmented_segment_with_styp`] method for write-side
+/// control over the per-segment `styp` brand list (CMAF / DASH segment
+/// type marker — ISO/IEC 14496-12 §8.16.2).
+pub struct FragmentedMuxer {
     output: Box<dyn WriteSeek>,
     tracks: Vec<FragTrackState>,
     options: Mp4MuxerOptions,
@@ -176,6 +203,11 @@ struct FragmentedMuxer {
     sequence_number: u32,
     header_written: bool,
     trailer_written: bool,
+    /// When `Some`, the next emitted segment's `styp` uses these explicit
+    /// `(major_brand, compatible_brands)` values; consumed (cleared) on
+    /// the next `flush_fragment`. Set via
+    /// [`Self::write_fragmented_segment_with_styp`].
+    styp_override: Option<([u8; 4], Vec<[u8; 4]>)>,
 }
 
 impl Muxer for FragmentedMuxer {
@@ -314,6 +346,41 @@ impl Muxer for FragmentedMuxer {
 }
 
 impl FragmentedMuxer {
+    /// Mark the next emitted fragment's `styp` (ISO/IEC 14496-12 §8.16.2
+    /// Segment Type Box) to use the given `(major_brand, compat_brands)`,
+    /// overriding the `Mp4MuxerOptions::fragmented::styp` preset for one
+    /// segment.
+    ///
+    /// Use this when driving DASH/CMAF segment emission segment-by-segment
+    /// from your own code — e.g. to switch from an init-segment-style
+    /// `styp(msdh)` to an intermediate `styp(msix)` (indexed media
+    /// segment) or `styp(cmfs)` (CMAF segment) without rebuilding the
+    /// muxer. The override is consumed (cleared) when the next fragment
+    /// is flushed; subsequent fragments fall back to the configured
+    /// preset.
+    ///
+    /// Per §8.16.2 the box is structurally identical to `ftyp` (§4.3):
+    /// 4-byte `major_brand`, 4-byte `minor_version` (always 0 here),
+    /// then a run of 4-byte `compatible_brands` to end of box. Empty
+    /// `compat_brands` is legal — §4.3 (inherited by §8.16.2) permits a
+    /// zero-length list. See [`crate::styp::build_styp`] for the
+    /// stateless byte-builder this method threads through.
+    ///
+    /// Errors only when [`Self::has_random_access_indexes_enabled`] is
+    /// false **and** the configured `frag_options.styp` is also `None`
+    /// **and** the writer hasn't been told to emit a styp — i.e. when
+    /// emitting a styp would still leave the segment without one of the
+    /// surrounding boxes the override implies. Today the method never
+    /// errors: it merely records the override and the next flush emits
+    /// the styp unconditionally.
+    pub fn write_fragmented_segment_with_styp(
+        &mut self,
+        major_brand: [u8; 4],
+        compat_brands: &[[u8; 4]],
+    ) {
+        self.styp_override = Some((major_brand, compat_brands.to_vec()));
+    }
+
     /// Return true when the cadence policy says it's time to emit a
     /// fragment after the current packet.
     ///
@@ -427,12 +494,15 @@ impl FragmentedMuxer {
         // the optional styp lands. The single referenced subsegment is
         // `styp? + moof + mdat`, sized accordingly. `first_offset = 0`.
         if self.frag_options.emit_random_access_indexes {
-            let styp_size: u64 = self
-                .frag_options
-                .styp
-                .as_ref()
-                .map(|b| build_styp(b).len() as u64)
-                .unwrap_or(0);
+            let styp_size: u64 = if let Some((major, compat)) = &self.styp_override {
+                crate::styp::build_styp(*major, compat).len() as u64
+            } else {
+                self.frag_options
+                    .styp
+                    .as_ref()
+                    .map(|b| build_styp(b).len() as u64)
+                    .unwrap_or(0)
+            };
             let subsegment_size = styp_size + moof_size + mdat_size;
             // EPT for this fragment on the anchor (first contributing) track
             // is the bmdt the track entered the fragment with.
@@ -469,8 +539,13 @@ impl FragmentedMuxer {
             self.output.write_all(&sidx)?;
         }
 
-        // Optional styp.
-        if let Some(brand) = &self.frag_options.styp {
+        // Optional styp. A per-segment override set via
+        // `write_fragmented_segment_with_styp` wins over `frag_options.styp`
+        // for this single segment, then is cleared so subsequent segments
+        // fall back to the configured preset (or no styp at all).
+        if let Some((major, compat)) = self.styp_override.take() {
+            crate::styp::write_styp(&mut self.output, major, &compat)?;
+        } else if let Some(brand) = &self.frag_options.styp {
             let styp = build_styp(brand);
             self.output.write_all(&styp)?;
         }

@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Public `styp` module — write-side Segment Type Box (`styp`,
+  ISO/IEC 14496-12 §8.16.2) byte emitter mirroring the read-side
+  `parse_styp` landed in oxideav-mov. `build_styp(major, compat) →
+  Vec<u8>` and the streaming dual `write_styp(writer, major, compat)`
+  produce the spec layout `[size:u32][type:'styp'][major:4]
+  [minor:u32=0][compat:4]*N`; `build_styp_with_minor` / `write_styp_with_minor`
+  preserve a non-zero `minor_version` for parity with the §4.3 `ftyp`
+  shape. Caller-driven per-segment control is wired through
+  `FragmentedMuxer::write_fragmented_segment_with_styp(major_brand,
+  compat_brands)` — an inherent method that marks the *next* emitted
+  segment's `styp` to use the given DASH/CMAF `(major, compat)` pair,
+  overriding the configured `FragmentedOptions::styp` preset for one
+  segment (the override is consumed on use and subsequent segments fall
+  back to the preset). A new `open_fragmented_typed` factory returns the
+  concrete `FragmentedMuxer` (instead of the trait-object form used by
+  the registry) so callers can reach the inherent method. Seven byte-
+  exact integration tests in `tests/styp_write.rs` cover the byte
+  layout, the override semantics, segment placement (`styp` immediately
+  precedes `moof`), the empty-compat 16-byte form, and the
+  preset-vs-override interaction.
+
 - `cargo-fuzz` target `demux` over the BMFF box-tree walker. Feeds
   arbitrary bytes through `demux::open` (with `NullCodecResolver`),
   exercises `streams()` / `metadata()` / `duration_micros()`, drains

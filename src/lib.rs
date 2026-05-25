@@ -8,10 +8,11 @@
 pub mod boxes;
 pub mod codec_id;
 pub mod demux;
-pub(crate) mod frag;
+pub mod frag;
 pub mod muxer;
 pub mod options;
 mod sample_entries;
+pub mod styp;
 
 pub use options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
 
