@@ -136,6 +136,29 @@ impl Default for FragmentedOptions {
     }
 }
 
+/// Per-track sample-group emission request.
+///
+/// Each entry attaches an `sbgp` (SampleToGroupBox) and / or `sgpd`
+/// (SampleGroupDescriptionBox) pair into one track's `stbl`. The two
+/// halves share `grouping_type`; the writer simply serialises whatever
+/// the caller supplies — content interpretation belongs to a layer
+/// that knows the grouping-type semantics (per ISO/IEC 14496-12 §8.9).
+///
+/// Multiple `TrackSampleGroups` entries may target the same
+/// `stream_index`; they accumulate in encounter order. The muxer
+/// emits all `sgpd` boxes first, then all `sbgp` boxes, after the
+/// chunk-offset table inside each track's `stbl`.
+#[derive(Clone, Debug, Default)]
+pub struct TrackSampleGroups {
+    /// Index into the muxer's `streams` slice (the stream slot that
+    /// owns these groups).
+    pub stream_index: usize,
+    /// `sbgp` boxes to emit for this track. Order is preserved.
+    pub sbgp: Vec<crate::sample_groups::SampleToGroup>,
+    /// `sgpd` boxes to emit for this track. Order is preserved.
+    pub sgpd: Vec<crate::sample_groups::SampleGroupDescription>,
+}
+
 /// Runtime options controlling how the MP4 muxer shapes its output.
 ///
 /// Call [`Mp4MuxerOptions::default`] for the historical behavior of the
@@ -168,6 +191,12 @@ pub struct Mp4MuxerOptions {
     /// implicit one-to-one timeline mapping applies. Set this to `false`
     /// to suppress edit-list emission entirely.
     pub write_edit_list: bool,
+    /// Per-track sample-group declarations (`sbgp` + `sgpd`, ISO/IEC
+    /// 14496-12 §8.9.2 / §8.9.3). Empty by default — most muxed files
+    /// don't need sample groups. When non-empty, each
+    /// [`TrackSampleGroups`] entry's `sbgp` / `sgpd` boxes are emitted
+    /// into the target track's `stbl` after the chunk-offset table.
+    pub track_sample_groups: Vec<TrackSampleGroups>,
 }
 
 impl Default for Mp4MuxerOptions {
@@ -177,6 +206,7 @@ impl Default for Mp4MuxerOptions {
             faststart: false,
             fragmented: None,
             write_edit_list: true,
+            track_sample_groups: Vec::new(),
         }
     }
 }

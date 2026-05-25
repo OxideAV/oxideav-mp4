@@ -306,6 +306,7 @@ fn tfra_drives_seek_to_correct_keyframe() {
             emit_random_access_indexes: false,
         }),
         write_edit_list: true,
+        track_sample_groups: Vec::new(),
     };
     let path = std::env::temp_dir().join("oxideav-mp4-tfra-seek.mp4");
 
@@ -406,6 +407,7 @@ fn mfra_in_fragmented_file_does_not_break_demux() {
             emit_random_access_indexes: false,
         }),
         write_edit_list: true,
+        track_sample_groups: Vec::new(),
     };
     let path = std::env::temp_dir().join("oxideav-mp4-mfra-smoke.mp4");
     {

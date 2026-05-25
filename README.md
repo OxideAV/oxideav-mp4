@@ -313,6 +313,31 @@ also exposed via the public `oxideav_mp4::styp` module —
 mirroring the read-side `parse_styp` in oxideav-mov so a producer
 round-tripping a parsed `Styp` can emit the same byte sequence.
 
+#### Sample-group muxing
+
+Sample groups (`sbgp` / `sgpd`, ISO/IEC 14496-12 §8.9.2 / §8.9.3) are
+emitted per track via `Mp4MuxerOptions::track_sample_groups`. Each
+entry's `sbgp` and `sgpd` Vecs are placed at the end of the target
+track's `stbl` body after the chunk-offset table; `sgpd` is written
+before `sbgp` so the description table the per-sample index references
+is declared first (§8.5.1 ordering). The
+`oxideav_mp4::sample_groups::{SampleToGroup, SampleGroupDescription,
+build_sbgp, build_sgpd}` API also stands alone for callers that want
+to assemble the raw boxes themselves.
+
+The version pick for `sgpd` is automatic per §8.9.3.2: a `Some(_)`
+`default_sample_description_index` with shared-length entries → v2
+(no per-entry length); shared-length entries alone → v1 with fixed
+`default_length`; mixed-length entries → v1 with per-entry
+`description_length`. The deprecated version-0 "no length signalling"
+form is not emitted. The grouping-type-specific entry payload itself
+is opaque to the container — callers supply already-serialised
+`Vec<u8>` per entry.
+
+`sbgp` chooses v0 (no `grouping_type_parameter`) or v1 (`Some(_)`) per
+§8.9.2; a `group_description_index` ≥ `0x10001` (movie-fragment-local
+per §8.9.4) is written verbatim, the muxer does not resolve it.
+
 ### Not (yet) supported
 
 - Fragmented-MP4 *muxing* — the demuxer reads `moof`+`mdat`
@@ -322,9 +347,6 @@ round-tripping a parsed `Styp` can emit the same byte sequence.
   these; sequential demux works without them).
 - `sidx` segment-index seek-time mapping (skipped; sequential demux
   works without it).
-- Sample-group *muxing* — the demuxer reads `sbgp` / `sgpd` and
-  surfaces them on `params.options`, but the muxer does not emit
-  sample-group boxes.
 - CENC decryption proper — the demuxer detects protected tracks
   (`encv` / `enca` / `enct` / `encs` → original FourCC plus the
   scheme on `params.options`) but it doesn't read `tenc`, `pssh`,

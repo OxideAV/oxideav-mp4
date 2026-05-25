@@ -35,10 +35,11 @@ use std::io::{Cursor, Seek, SeekFrom, Write};
 use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
-use crate::options::{BrandPreset, FragmentedOptions, Mp4MuxerOptions};
+use crate::options::{BrandPreset, FragmentedOptions, Mp4MuxerOptions, TrackSampleGroups};
 use crate::sample_entries::{
     sample_entry_for, subtitle_handler_for, subtitle_uses_sthd, SampleEntry,
 };
+use crate::sample_groups::{build_sbgp, build_sgpd, SampleGroupDescription, SampleToGroup};
 
 /// Per-track state kept between `write_packet` calls.
 pub(crate) struct TrackState {
@@ -415,7 +416,11 @@ impl Mp4Muxer {
         }
 
         // Write moov at the end.
-        let moov = build_moov(&self.tracks, self.options.write_edit_list)?;
+        let moov = build_moov(
+            &self.tracks,
+            self.options.write_edit_list,
+            &self.options.track_sample_groups,
+        )?;
         self.output.write_all(&moov)?;
         Ok(())
     }
@@ -465,7 +470,11 @@ impl Mp4Muxer {
             for (t, orig) in self.tracks.iter_mut().zip(orig_offsets.iter()) {
                 t.chunk_offsets = orig.iter().map(|o| *o + base).collect();
             }
-            let candidate = build_moov(&self.tracks, self.options.write_edit_list)?;
+            let candidate = build_moov(
+                &self.tracks,
+                self.options.write_edit_list,
+                &self.options.track_sample_groups,
+            )?;
             let candidate_size = candidate.len() as u64;
             let converged = candidate_size == moov_size;
             moov_size = candidate_size;
@@ -494,7 +503,11 @@ impl Mp4Muxer {
 
 // --- Moov builders --------------------------------------------------------
 
-fn build_moov(tracks: &[TrackState], write_edit_list: bool) -> Result<Vec<u8>> {
+fn build_moov(
+    tracks: &[TrackState],
+    write_edit_list: bool,
+    track_sample_groups: &[TrackSampleGroups],
+) -> Result<Vec<u8>> {
     // mvhd: use the largest media-time-scale duration as a rough movie
     // duration at timescale 1000.
     let movie_timescale: u32 = 1000;
@@ -514,11 +527,22 @@ fn build_moov(tracks: &[TrackState], write_edit_list: bool) -> Result<Vec<u8>> {
     let mut moov_body = Vec::new();
     moov_body.extend_from_slice(&build_mvhd(movie_timescale, movie_duration, next_track_id));
     for (i, t) in tracks.iter().enumerate() {
+        // Gather all sample-group directives that target this stream index.
+        // Multiple directives for the same stream accumulate in encounter
+        // order.
+        let mut track_sbgp: Vec<&SampleToGroup> = Vec::new();
+        let mut track_sgpd: Vec<&SampleGroupDescription> = Vec::new();
+        for tsg in track_sample_groups.iter().filter(|g| g.stream_index == i) {
+            track_sbgp.extend(tsg.sbgp.iter());
+            track_sgpd.extend(tsg.sgpd.iter());
+        }
         moov_body.extend_from_slice(&build_trak(
             i as u32 + 1,
             t,
             movie_timescale,
             write_edit_list,
+            &track_sbgp,
+            &track_sgpd,
         )?);
     }
     Ok(wrap_box(b"moov", &moov_body))
@@ -564,6 +588,8 @@ fn build_trak(
     t: &TrackState,
     movie_timescale: u32,
     write_edit_list: bool,
+    sbgp: &[&SampleToGroup],
+    sgpd: &[&SampleGroupDescription],
 ) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     let track_duration_movie =
@@ -576,7 +602,7 @@ fn build_trak(
             body.extend_from_slice(&edts);
         }
     }
-    body.extend_from_slice(&build_mdia(t)?);
+    body.extend_from_slice(&build_mdia_with_sample_groups(t, sbgp, sgpd)?);
     Ok(wrap_box(b"trak", &body))
 }
 
@@ -697,10 +723,18 @@ pub(crate) fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> V
 }
 
 pub(crate) fn build_mdia(t: &TrackState) -> Result<Vec<u8>> {
+    build_mdia_with_sample_groups(t, &[], &[])
+}
+
+fn build_mdia_with_sample_groups(
+    t: &TrackState,
+    sbgp: &[&SampleToGroup],
+    sgpd: &[&SampleGroupDescription],
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     body.extend_from_slice(&build_mdhd(t));
     body.extend_from_slice(&build_hdlr(&t.stream));
-    body.extend_from_slice(&build_minf(t)?);
+    body.extend_from_slice(&build_minf_with_sample_groups(t, sbgp, sgpd)?);
     Ok(wrap_box(b"mdia", &body))
 }
 
@@ -764,7 +798,11 @@ fn build_hdlr(stream: &StreamInfo) -> Vec<u8> {
     wrap_box(b"hdlr", &body)
 }
 
-fn build_minf(t: &TrackState) -> Result<Vec<u8>> {
+fn build_minf_with_sample_groups(
+    t: &TrackState,
+    sbgp: &[&SampleToGroup],
+    sgpd: &[&SampleGroupDescription],
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     match t.stream.params.media_type {
         MediaType::Audio => body.extend_from_slice(&build_smhd()),
@@ -782,7 +820,7 @@ fn build_minf(t: &TrackState) -> Result<Vec<u8>> {
         _ => body.extend_from_slice(&build_nmhd()),
     }
     body.extend_from_slice(&build_dinf());
-    body.extend_from_slice(&build_stbl(t)?);
+    body.extend_from_slice(&build_stbl_with_sample_groups(t, sbgp, sgpd)?);
     Ok(wrap_box(b"minf", &body))
 }
 
@@ -828,7 +866,21 @@ fn build_dinf() -> Vec<u8> {
     wrap_box(b"dinf", &dref)
 }
 
-fn build_stbl(t: &TrackState) -> Result<Vec<u8>> {
+/// `build_stbl` variant that appends optional `sbgp` / `sgpd` boxes
+/// (ISO/IEC 14496-12 §8.9.2 / §8.9.3) after the chunk-offset table.
+///
+/// Order inside `stbl` follows the §8.5.1 "These tables… should
+/// appear in the order shown" recommendation: media metadata first
+/// (`stsd`, `stts`, `stss`, `stsc`, `stsz`, `stco`/`co64`), then the
+/// optional sample-group pair. We emit all `sgpd` boxes before any
+/// `sbgp` so the description tables that an `sbgp` references are
+/// declared first; this is not mandated by §8.9 but is the
+/// recommended order in §8.5.1 and what every spec example uses.
+fn build_stbl_with_sample_groups(
+    t: &TrackState,
+    sbgp: &[&SampleToGroup],
+    sgpd: &[&SampleGroupDescription],
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     body.extend_from_slice(&build_stsd(t));
     body.extend_from_slice(&build_stts(&t.stts));
@@ -838,6 +890,14 @@ fn build_stbl(t: &TrackState) -> Result<Vec<u8>> {
     body.extend_from_slice(&build_stsc(&t.stsc));
     body.extend_from_slice(&build_stsz(&t.sample_sizes));
     body.extend_from_slice(&build_chunk_offset_box(&t.chunk_offsets));
+    // ISO/IEC 14496-12 §8.9: sample groups. `sgpd` first (description
+    // table), then `sbgp` (per-sample index into the description).
+    for sg in sgpd {
+        body.extend_from_slice(&build_sgpd(sg));
+    }
+    for sb in sbgp {
+        body.extend_from_slice(&build_sbgp(sb));
+    }
     Ok(wrap_box(b"stbl", &body))
 }
 

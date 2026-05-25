@@ -12,6 +12,7 @@ pub mod frag;
 pub mod muxer;
 pub mod options;
 mod sample_entries;
+pub mod sample_groups;
 pub mod styp;
 
 pub use options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};

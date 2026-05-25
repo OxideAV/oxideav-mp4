@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sample-group muxing (ISO/IEC 14496-12 §8.9.2 SampleToGroupBox +
+  §8.9.3 SampleGroupDescriptionBox) — write-side dual of the
+  pre-existing `sbgp` / `sgpd` demux. New `oxideav_mp4::sample_groups`
+  module exposes `SampleToGroup` and `SampleGroupDescription` types
+  plus stateless byte builders `build_sbgp(&SampleToGroup) → Vec<u8>`
+  and `build_sgpd(&SampleGroupDescription) → Vec<u8>`. `Mp4MuxerOptions`
+  gains a `track_sample_groups: Vec<TrackSampleGroups>` field — each
+  entry binds a `stream_index` to lists of `sbgp` / `sgpd` boxes to
+  emit on that track's `stbl` (after the chunk-offset table; `sgpd`
+  before `sbgp` per §8.5.1). The grouping-type-specific entry payload
+  is opaque to the container — callers supply already-serialised
+  `Vec<u8>` per entry. Version pick for `sgpd` is automatic per
+  §8.9.3.2: v2 when `default_sample_description_index = Some(_)` with
+  shared-length entries, v1 with fixed `default_length` for
+  shared-length entries, v1 with per-entry `description_length` for
+  mixed-length entries (the deprecated v0 no-length-signalling form
+  is not emitted). `sbgp` picks v0 (no `grouping_type_parameter`) or
+  v1 (`Some(_)`) per §8.9.2; movie-fragment-local indices ≥ `0x10001`
+  (§8.9.4) are written verbatim, the muxer does not resolve them.
+  Ten unit tests in `src/sample_groups.rs` cover the byte layout
+  (sbgp v0 / v1, sgpd v1 fixed / v1 variable / v2, zero-entry boxes,
+  fragment-local index preservation, v2-fallback-to-v1 when entries
+  differ); five integration tests in `tests/sample_groups_mux.rs` mux
+  a PCM track with caller-supplied groups and re-demux to verify the
+  surfaced `params.options` keys round-trip exactly as encoded.
+
 - Public `styp` module — write-side Segment Type Box (`styp`,
   ISO/IEC 14496-12 §8.16.2) byte emitter mirroring the read-side
   `parse_styp` landed in oxideav-mov. `build_styp(major, compat) →
