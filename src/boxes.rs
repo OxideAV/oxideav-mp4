@@ -52,13 +52,26 @@ pub fn read_box_header<R: Read + ?Sized>(r: &mut R) -> Result<Option<BoxHeader>>
     let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
     let mut fourcc = [0u8; 4];
     fourcc.copy_from_slice(&hdr[4..8]);
+    // ISO/IEC 14496-12 §4.2: `size` is the total box length including
+    // the header. `size == 0` ⇒ extends to EOF; `size == 1` ⇒ a 64-bit
+    // `largesize` follows; otherwise the value must be at least the
+    // header length itself (8 bytes for the 32-bit form, 16 bytes once
+    // largesize has been consumed). Any other small value would make
+    // the body length negative; reject it here so every caller that
+    // computes `payload = total_size - header_len` is safe.
     let (total_size, header_len) = match size32 {
         0 => (None, 8u64),
         1 => {
             let mut ext = [0u8; 8];
             r.read_exact(&mut ext)?;
             let large = u64::from_be_bytes(ext);
+            if large < 16 {
+                return Err(Error::invalid("MP4: box largesize < 16"));
+            }
             (Some(large), 16u64)
+        }
+        n if n < 8 => {
+            return Err(Error::invalid("MP4: box size < 8"));
         }
         n => (Some(n as u64), 8u64),
     };
@@ -69,13 +82,25 @@ pub fn read_box_header<R: Read + ?Sized>(r: &mut R) -> Result<Option<BoxHeader>>
     }))
 }
 
-/// Read the full payload of a box as bytes. Fails if the box size is unknown.
+/// Read the full payload of a box as bytes. Fails if the box size is
+/// unknown OR if the input ends before the declared payload size.
+///
+/// The size field is attacker-controlled (a 4 GiB+ `size32` field
+/// fits in 32 bits), so we must not pre-allocate the declared length
+/// before we know the input can supply it. `Read::take` + grow-as-we-go
+/// caps both the allocation and the read budget at whatever the input
+/// actually delivers; a partial read then trips the `payload as
+/// usize` length check and we return `Error::invalid` instead of
+/// `read_exact`'s `UnexpectedEof`.
 pub fn read_box_body<R: Read + ?Sized>(r: &mut R, h: &BoxHeader) -> Result<Vec<u8>> {
     let payload = h
         .payload_size()
         .ok_or_else(|| Error::invalid("MP4: cannot read open-ended box body"))?;
-    let mut buf = vec![0u8; payload as usize];
-    r.read_exact(&mut buf)?;
+    let mut buf = Vec::new();
+    r.take(payload).read_to_end(&mut buf)?;
+    if buf.len() as u64 != payload {
+        return Err(Error::invalid("MP4: truncated box body"));
+    }
     Ok(buf)
 }
 
@@ -219,3 +244,59 @@ pub const ENCV: [u8; 4] = fourcc("encv");
 pub const ENCA: [u8; 4] = fourcc("enca");
 pub const ENCT: [u8; 4] = fourcc("enct");
 pub const ENCS: [u8; 4] = fourcc("encs");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn box_size_below_eight_is_rejected_not_underflow() {
+        // ISO/IEC 14496-12 §4.2: `size` is the total box length
+        // including the 8-byte header. A non-sentinel value < 8
+        // would imply a negative body length and used to overflow
+        // `payload_size = total_size - header_len`. Every value
+        // from 2..=7 must return Err rather than panic.
+        for bad in 2u32..=7 {
+            let mut buf = Vec::with_capacity(8);
+            buf.extend_from_slice(&bad.to_be_bytes());
+            buf.extend_from_slice(b"junk");
+            let err = read_box_header(&mut Cursor::new(buf)).expect_err("size < 8 must be invalid");
+            assert!(format!("{err}").contains("MP4"), "{err}");
+        }
+    }
+
+    #[test]
+    fn box_largesize_below_sixteen_is_rejected_not_underflow() {
+        // `size32 == 1` means a 64-bit largesize follows; the
+        // total length must then be at least the 16-byte header
+        // (size32 + fourcc + largesize). A largesize of 0..=15
+        // would underflow `payload_size`.
+        for bad in 0u64..=15 {
+            let mut buf = Vec::with_capacity(16);
+            buf.extend_from_slice(&1u32.to_be_bytes());
+            buf.extend_from_slice(b"junk");
+            buf.extend_from_slice(&bad.to_be_bytes());
+            let err =
+                read_box_header(&mut Cursor::new(buf)).expect_err("largesize < 16 must be invalid");
+            assert!(format!("{err}").contains("MP4"), "{err}");
+        }
+    }
+
+    #[test]
+    fn box_size_eight_is_a_valid_empty_box() {
+        // The minimum legal non-sentinel size — header only, zero
+        // body — must still parse cleanly and report a payload of
+        // zero.
+        let mut buf = Vec::with_capacity(8);
+        buf.extend_from_slice(&8u32.to_be_bytes());
+        buf.extend_from_slice(b"free");
+        let hdr = read_box_header(&mut Cursor::new(buf))
+            .unwrap()
+            .expect("size = 8 must parse");
+        assert_eq!(hdr.total_size, Some(8));
+        assert_eq!(hdr.header_len, 8);
+        assert_eq!(hdr.payload_size(), Some(0));
+        assert_eq!(&hdr.fourcc, b"free");
+    }
+}

@@ -521,7 +521,7 @@ fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
                 parse_mvex(&body, &mut out.tracks)?;
             }
             _ => {
-                cur.set_position(cur.position() + psz as u64);
+                skip_cursor_bytes(&mut cur, psz);
             }
         }
     }
@@ -547,7 +547,7 @@ fn parse_mvex(body: &[u8], tracks: &mut [Track]) -> Result<()> {
             // mehd (movie-extends-header) carries an overall fragment
             // duration we don't consume — the per-fragment tfdt + trun
             // are authoritative.
-            _ => cur.set_position(cur.position() + psz as u64),
+            _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
     Ok(())
@@ -828,7 +828,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
                 parse_track_udta(&sub, &mut t);
             }
             _ => {
-                cur.set_position(cur.position() + psz as u64);
+                skip_cursor_bytes(&mut cur, psz);
             }
         }
     }
@@ -1014,7 +1014,7 @@ fn parse_edts(body: &[u8], t: &mut Track) -> Result<()> {
                 let b = read_bytes_vec(&mut cur, psz)?;
                 parse_elst(&b, t)?;
             }
-            _ => cur.set_position(cur.position() + psz as u64),
+            _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
     Ok(())
@@ -1142,7 +1142,7 @@ fn parse_mdia(body: &[u8], t: &mut Track) -> Result<()> {
                 let b = read_bytes_vec(&mut cur, psz)?;
                 parse_minf(&b, t)?;
             }
-            _ => cur.set_position(cur.position() + psz as u64),
+            _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
     Ok(())
@@ -1236,7 +1236,7 @@ fn parse_minf(body: &[u8], t: &mut Track) -> Result<()> {
                 let sub = read_bytes_vec(&mut cur, psz)?;
                 parse_stbl(&sub, t)?;
             }
-            _ => cur.set_position(cur.position() + psz as u64),
+            _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
     Ok(())
@@ -2281,12 +2281,12 @@ fn parse_moof(
             // monotonically-increasing sequence_number; useful for
             // multi-source diagnostics but not required for sample
             // resolution. Skip.
-            MFHD => cur.set_position(cur.position() + psz as u64),
+            MFHD => skip_cursor_bytes(&mut cur, psz),
             TRAF => {
                 let body = read_bytes_vec(&mut cur, psz)?;
                 parse_traf(&body, moof.moof_start, tracks, samples, next_dts)?;
             }
-            _ => cur.set_position(cur.position() + psz as u64),
+            _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
     Ok(())
@@ -2375,8 +2375,8 @@ fn parse_traf(
                 state.base_media_decode_time = Some(parse_tfdt(&b)?);
             }
             // We only resolve trun's in the second pass; skip here.
-            TRUN => cur.set_position(cur.position() + psz as u64),
-            _ => cur.set_position(cur.position() + psz as u64),
+            TRUN => skip_cursor_bytes(&mut cur, psz),
+            _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
 
@@ -2407,7 +2407,7 @@ fn parse_traf(
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         if hdr.fourcc != TRUN {
-            cur.set_position(cur.position() + psz as u64);
+            skip_cursor_bytes(&mut cur, psz);
             continue;
         }
         let b = read_bytes_vec(&mut cur, psz)?;
@@ -2846,9 +2846,9 @@ fn parse_mfra(body: &[u8], out: &mut Vec<TfraRecord>) -> Result<()> {
             MFRO => {
                 // mfro: FullBox + size (u32). We've already read the
                 // outer mfra box header so the size is redundant here.
-                cur.set_position(cur.position() + psz as u64);
+                skip_cursor_bytes(&mut cur, psz);
             }
-            _ => cur.set_position(cur.position() + psz as u64),
+            _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
     Ok(())
@@ -3620,9 +3620,34 @@ pub fn parse_mfra_box(body: &[u8]) -> Result<Vec<TfraRecord>> {
 use std::io::Read;
 
 fn read_bytes_vec<R: Read + ?Sized>(r: &mut R, n: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; n];
-    r.read_exact(&mut buf)?;
+    // `n` derives from a box size field that is attacker-controlled
+    // (`size32` is up to 4 GiB, `largesize` up to 2^64 − 1). Don't
+    // pre-allocate against an unverified declared length; let
+    // `Read::take` cap the read at whatever the input can deliver and
+    // grow the buffer to match, then surface a truncation as
+    // `Error::invalid`.
+    let mut buf = Vec::new();
+    r.take(n as u64).read_to_end(&mut buf)?;
+    if buf.len() != n {
+        return Err(Error::invalid("MP4: truncated box payload"));
+    }
     Ok(buf)
+}
+
+/// Advance an in-memory `Cursor` by `psz` bytes, clamped at the
+/// cursor's end. The intra-box walkers in this module repeatedly do
+/// `cur.set_position(cur.position() + psz)` to skip an unknown box's
+/// payload, where `psz` derives from an attacker-controlled box-size
+/// field. A raw `+` panics on overflow when `psz` is u32::MAX-class
+/// and the cursor is already several gigabytes in; a saturating clamp
+/// to the buffer end keeps the loop bounded and lets the surrounding
+/// `while cur.position() < end` terminate cleanly on the next
+/// iteration without dereferencing past the buffer.
+fn skip_cursor_bytes<T: AsRef<[u8]>>(cur: &mut std::io::Cursor<T>, psz: usize) {
+    let end = cur.get_ref().as_ref().len() as u64;
+    let pos = cur.position();
+    let next = pos.saturating_add(psz as u64).min(end);
+    cur.set_position(next);
 }
 
 // Silence unused-import warnings for HashSet / SeekFrom if they become unused later.

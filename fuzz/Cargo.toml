@@ -1,0 +1,74 @@
+[package]
+name = "oxideav-mp4-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The MP4 / ISO Base Media File Format demuxer is the rich fuzz
+# surface for this crate: every container nesting level is a
+# `size:u32 / type:FourCC [/ largesize:u64]` length-prefixed box,
+# and the parser has to recurse into `moov > trak > mdia > minf >
+# stbl > ...` (plus the fragmented `moof > traf > trun` parallel
+# tree) entirely driven by attacker-controlled length and count
+# fields. Classic attacker primitives this target exercises:
+#
+#   * Box size overflow / underflow — a `size:u32 = 0` means
+#     "extends to EOF"; `size:u32 = 1` means "read a 64-bit
+#     `largesize` next"; any other value < 8 is malformed; and a
+#     well-formed `largesize` can encode values larger than the
+#     remaining file. The walker's child-vs-parent arithmetic has
+#     to bound every recursion.
+#   * Nested-box recursion depth (`moov > trak > edts > elst`,
+#     `meta > ilst > item > data`, fragmented `moof > traf`,
+#     `udta > meta > ilst`, etc.) — unbounded recursion across a
+#     pathological deep nest is a stack-blow vector.
+#   * Sample-table allocation arithmetic — `stsz.sample_size = 0`
+#     means "see per-sample table of length `sample_count`"; the
+#     `stsc` run-length form can describe billions of samples in a
+#     handful of bytes; `stco`/`co64` chunk offsets must each be
+#     in-file. A naive `Vec::with_capacity(sample_count as usize)`
+#     here would OOM on a tiny crafted input.
+#   * `tfhd` / `trun` arithmetic — the trun loop reads per-sample
+#     size, duration, flags and composition-time-offset from the
+#     fragment body, all bounded only by attacker-supplied counts.
+#   * Edit-list arithmetic — `elst` `media_time` is signed and
+#     `media_rate` is a fixed-point fraction; segment durations are
+#     in the movie timescale, which can be zero (divide-by-zero
+#     vector for any presentation-time math).
+#   * Sample-entry inner parsers — `avcC` / `hvcC` / `dOps` /
+#     `dfLa` / `esds` BER-encoded descriptors are recursively
+#     length-prefixed and live inside an outer sample entry whose
+#     `data_reference_index` is attacker-controlled.
+#   * Fragmented MP4 — `mvex.trex` defaults bind to per-fragment
+#     `traf.tfhd`; `default-base-is-moof`, `base_data_offset`
+#     overrides, and `tfdt.baseMediaDecodeTime` all participate in
+#     the file-offset arithmetic that locates sample bytes.
+#
+# There is no external system library worth pulling in as a
+# cross-decode oracle (the clean-room wall bars every libisobmff /
+# mp4v2 / Bento4 / GPAC / libavformat as a reference anyway), so
+# this fuzz crate is **demux-only**: feed arbitrary bytes through
+# `demux::open` and then drain `next_packet()` for a bounded number
+# of steps, asserting nothing panics, aborts, or OOMs.
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-mp4]
+path = ".."
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "demux"
+path = "fuzz_targets/demux.rs"
+test = false
+doc = false

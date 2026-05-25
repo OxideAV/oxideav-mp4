@@ -331,6 +331,21 @@ Registers:
 - Muxers `"mp4"`, `"mov"`, `"ismv"`.
 - A content probe that recognises `ftyp` / `wide`+`ftyp` / `moov`.
 
+## Fuzzing
+
+A `cargo-fuzz` target exercises the BMFF box-tree walker on
+arbitrary bytes:
+
+```sh
+cd fuzz
+cargo +nightly fuzz run demux
+```
+
+The target opens, drains up to 256 packets, and re-seeks; it asserts
+nothing panics, aborts, or OOMs. Seed corpus + regression artefacts
+live at `fuzz/corpus/demux/`. The fuzz crate has its own `[workspace]`
+and a committed `Cargo.lock` for reproducibility.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cargo-fuzz` target `demux` over the BMFF box-tree walker. Feeds
+  arbitrary bytes through `demux::open` (with `NullCodecResolver`),
+  exercises `streams()` / `metadata()` / `duration_micros()`, drains
+  up to 256 packets via `next_packet()`, and re-runs the sample-table
+  walker via `seek_to(0, 0)`. Bounded so a pathological-but-legitimate
+  stream cannot dominate fuzz time. Lives in its own `[workspace]` so
+  it does not interfere with the umbrella; `fuzz/Cargo.lock` is
+  committed for reproducibility while the library root keeps
+  `Cargo.lock` ignored. A small seed corpus (minimal ftyp+moov, ftyp
+  alone, empty moov, plus two regression artefacts for the fixes
+  below) lives at `fuzz/corpus/demux/`.
+
 - Sample Dependency Type Box (`sdtp`, ISO/IEC 14496-12 §8.6.4) demux.
   The `stbl` parser now reads the optional SampleDependencyTypeBox —
   a `FullBox(version = 0, flags = 0)` whose body, after the FullBox
@@ -154,6 +166,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pickup).
 
 ### Fixed
+
+- DoS — three classes of attacker-controlled crash in the box-tree
+  walker, caught by the new `demux` fuzz target:
+  - `read_box_header` panicked on `size = 2..=7` with a `total_size −
+    header_len` subtraction overflow (size 2..=7 is malformed —
+    smaller than the header itself, implying a negative body), and
+    on `size = 1` + `largesize = 0..=15` (the largesize form's
+    16-byte header has the same minimum) with the same underflow.
+    Both now return `Error::invalid("MP4: box size < 8")` /
+    `Error::invalid("MP4: box largesize < 16")` before the math.
+  - `read_box_body` did `vec![0u8; payload_size as usize]` against an
+    unverified declared size, OOMing on a 9-byte input whose declared
+    body length was ~4 GiB. Now uses `Read::take` + `read_to_end` so
+    the allocation matches what the input actually delivers, surfacing
+    a truncation as `Error::invalid("MP4: truncated box body")`. The
+    sibling helper `read_bytes_vec` (used by the intra-`moov` walker
+    for `trak`/`mvhd`/`udta`/`meta`/`mvex` payloads and the `moof`
+    capture path) got the same treatment.
+  - `parse_moov` and its sibling walkers (`parse_mvex`,
+    `parse_track_udta`, `parse_minf`, `parse_stbl`, the fragmented
+    `traf`/`trun` parsers) advanced the in-memory cursor with
+    `cur.set_position(cur.position() + psz as u64)` over an unknown
+    box, which panicked with `attempt to add with overflow` when
+    `psz` was 32-bit-max-class. Replaced all 13 call sites with a
+    new `skip_cursor_bytes` helper that does `saturating_add` and
+    clamps to the buffer end, letting the surrounding `while
+    cur.position() < end` loop terminate cleanly on the next
+    iteration.
 
 - `mux_roundtrip.rs` edit-list helper now uses a unique temp file
   per call, fixing an intermittent failure when two tests muxing
