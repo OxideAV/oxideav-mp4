@@ -30,6 +30,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     let mut moofs: Vec<MoofRecord> = Vec::new();
     let mut sidxes: Vec<SidxRecord> = Vec::new();
     let mut tfras: Vec<TfraRecord> = Vec::new();
+    let mut prfts: Vec<PrftRecord> = Vec::new();
     while let Some(hdr) = read_box_header(&mut *input)? {
         match hdr.fourcc {
             FTYP => {
@@ -81,6 +82,18 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                 let body = read_box_body(&mut *input, &hdr)?;
                 parse_mfra(&body, &mut tfras)?;
             }
+            // §8.16.5 — `prft` ProducerReferenceTimeBox. Top-level
+            // FullBox correlating wall-clock NTP time with a media
+            // time on one reference track. Multiple instances are
+            // allowed; each is associated with the following moof in
+            // file order. We collect them all; callers walk the
+            // returned list / metadata channel.
+            PRFT => {
+                let body = read_box_body(&mut *input, &hdr)?;
+                if let Some(r) = parse_prft(&body)? {
+                    prfts.push(r);
+                }
+            }
             _ => skip_box_body(&mut *input, &hdr)?,
         }
     }
@@ -126,15 +139,34 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         0
     };
 
+    // Surface any parsed `prft` ProducerReferenceTimeBoxes through the
+    // container metadata channel as `prft_<n>` (0-based file order)
+    // with value "reference_track_ID ntp_timestamp media_time" — three
+    // decimal integers, space-separated, mirroring the
+    // `tref_<type>` / `sgpd_<n>` conventions used elsewhere in this
+    // crate. Callers wanting the structured record can use the public
+    // `parse_prft_box` entry point. Absent prft, no keys are emitted.
+    let mut metadata = parsed.metadata;
+    for (n, p) in prfts.iter().enumerate() {
+        metadata.push((
+            format!("prft_{n}"),
+            format!(
+                "{} {} {}",
+                p.reference_track_id, p.ntp_timestamp, p.media_time
+            ),
+        ));
+    }
+
     Ok(Box::new(Mp4Demuxer {
         input,
         streams,
         samples,
         cursor: 0,
-        metadata: parsed.metadata,
+        metadata,
         duration_micros,
         sidxes,
         tfras,
+        prfts,
         movie_timescale: parsed.movie_timescale,
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
@@ -214,6 +246,34 @@ pub struct TfraEntry {
     pub trun_number: u32,
     /// 1-based sample index within that trun.
     pub sample_number: u32,
+}
+
+/// Decoded `prft` (ProducerReferenceTimeBox, ISO/IEC 14496-12 §8.16.5).
+///
+/// A producer reference time correlates a UTC wall-clock instant (in
+/// NTP 64-bit format, RFC 5905 — high 32 bits = seconds since 1900-01-01,
+/// low 32 bits = fractional seconds) with a media time on one reference
+/// track. The box appears at file scope and relates to the NEXT `moof`
+/// box that follows it in bitstream order (§8.16.5.1 placement rule),
+/// so a low-latency DASH/CMAF live consumer can match production
+/// wall-clock to media presentation time.
+#[derive(Clone, Copy, Debug)]
+pub struct PrftRecord {
+    /// `track_ID` of the reference track whose `media_time` this box
+    /// annotates (§8.16.5.3 reference_track_ID).
+    pub reference_track_id: u32,
+    /// UTC time in NTP 64-bit format. Caller decomposes into seconds
+    /// (`(ntp_timestamp >> 32) - 2_208_988_800` for Unix epoch) and
+    /// fractional seconds (`(ntp_timestamp & 0xFFFF_FFFF) / 2^32`).
+    pub ntp_timestamp: u64,
+    /// Same instant expressed in the reference track's media timescale
+    /// (decoding time). Promoted from u32 → u64 for the v0 layout so
+    /// callers see one type regardless of box version.
+    pub media_time: u64,
+    /// Box version (0 → 32-bit `media_time`, 1 → 64-bit `media_time`).
+    /// Surfaced so callers can validate against `media_time`'s
+    /// representable range when round-tripping.
+    pub version: u8,
 }
 
 #[derive(Default)]
@@ -2823,6 +2883,54 @@ fn parse_sidx(body: &[u8], sidx_end_offset: u64) -> Result<Option<SidxRecord>> {
     }))
 }
 
+/// §8.16.5 — `prft` ProducerReferenceTimeBox.
+///
+/// Layout (FullBox 4 bytes already consumed by caller):
+///   reference_track_ID (u32),
+///   ntp_timestamp (u64 — NTP-format UTC time, RFC 5905),
+///   if version == 0: media_time (u32)
+///   if version == 1: media_time (u64)
+///
+/// Total body length: 16 bytes (v0) or 20 bytes (v1).
+///
+/// Per §8.16.5.3, `media_time` is on the reference track's media
+/// clock and corresponds to the same instant as `ntp_timestamp`. The
+/// box is associated with the NEXT `moof` in file order (§8.16.5.1
+/// placement rule); we don't enforce that ordering at parse time —
+/// callers correlate by file position.
+fn parse_prft(body: &[u8]) -> Result<Option<PrftRecord>> {
+    if body.len() < 16 {
+        return Err(Error::invalid("MP4: prft too short"));
+    }
+    let version = body[0];
+    // skip 3-byte flags (always 0 per §8.16.5.2)
+    let reference_track_id = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    let ntp_timestamp = u64::from_be_bytes([
+        body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
+    ]);
+    let media_time: u64 = if version == 0 {
+        if body.len() < 20 {
+            return Err(Error::invalid("MP4: prft v0 truncated"));
+        }
+        u32::from_be_bytes([body[16], body[17], body[18], body[19]]) as u64
+    } else {
+        // Per §8.16.5.2, version 1 widens media_time to 64-bit. Any
+        // version != 0 we treat as v1 (no other version is defined).
+        if body.len() < 24 {
+            return Err(Error::invalid("MP4: prft v1 truncated"));
+        }
+        u64::from_be_bytes([
+            body[16], body[17], body[18], body[19], body[20], body[21], body[22], body[23],
+        ])
+    };
+    Ok(Some(PrftRecord {
+        reference_track_id,
+        ntp_timestamp,
+        media_time,
+        version,
+    }))
+}
+
 /// §8.8.10 — `mfra` MovieFragmentRandomAccessBox. Container for one
 /// `tfra` per track-with-random-access plus the size-of-mfra `mfro`
 /// trailer. We collect the tfra entries; mfro is not consumed (we
@@ -3433,6 +3541,13 @@ struct Mp4Demuxer {
     /// for keyframes — `seek_to` walks these to land directly on a moof
     /// boundary instead of scanning every sample.
     tfras: Vec<TfraRecord>,
+    /// Parsed `prft` ProducerReferenceTimeBoxes (§8.16.5), in file
+    /// order. Each is also surfaced as a `prft_<n>` flat-metadata entry;
+    /// the structured list is kept for downstream tooling (low-latency
+    /// DASH live edge tracking, wall-clock-to-pts mapping). Currently
+    /// not consulted by `next_packet` / `seek_to`.
+    #[allow(dead_code)]
+    prfts: Vec<PrftRecord>,
     /// Per-track media timescale (1-based parallel to `track_ids`),
     /// needed to translate `tfra.time` (track timescale) to the seek-to
     /// caller's pts (also track timescale, but this lets us add unit
@@ -3615,6 +3730,22 @@ pub fn parse_mfra_box(body: &[u8]) -> Result<Vec<TfraRecord>> {
     let mut out = Vec::new();
     parse_mfra(body, &mut out)?;
     Ok(out)
+}
+
+/// Parse a standalone `prft` (ProducerReferenceTimeBox, §8.16.5) body
+/// from `body` (the bytes after the 8/16-byte box header).
+///
+/// Exposed as a public entry point so low-latency DASH / CMAF tooling
+/// can correlate wall-clock NTP timestamps with media decoding time
+/// for one reference track without re-running `open()`.
+///
+/// Returns `Err` for a truncated body (less than 16 bytes for v0 or
+/// 20 bytes for v1). Multiple `prft` boxes may appear in one file
+/// (each annotates the following moof per §8.16.5.1), in which case
+/// callers should walk the top-level box list themselves and call
+/// this entry per occurrence.
+pub fn parse_prft_box(body: &[u8]) -> Result<Option<PrftRecord>> {
+    parse_prft(body)
 }
 
 use std::io::Read;

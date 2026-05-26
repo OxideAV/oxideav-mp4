@@ -206,6 +206,14 @@ pub const TFDT: [u8; 4] = fourcc("tfdt");
 pub const TRUN: [u8; 4] = fourcc("trun");
 pub const SIDX: [u8; 4] = fourcc("sidx");
 pub const STYP: [u8; 4] = fourcc("styp");
+/// `prft` — ProducerReferenceTimeBox (ISO/IEC 14496-12 §8.16.5). A
+/// top-level FullBox (file scope) that supplies a wall-clock time
+/// (NTP-format) correlated with a media time for one track. Used by
+/// low-latency DASH/CMAF live streaming so a consumer can match
+/// production wall-clock against media presentation time. Spec
+/// placement: must follow `styp`/`sidx` (if any) and precede the
+/// `moof` it refers to.
+pub const PRFT: [u8; 4] = fourcc("prft");
 // Random-access boxes (§8.8.10–12 + §8.16.3).
 pub const MFRA: [u8; 4] = fourcc("mfra");
 pub const TFRA: [u8; 4] = fourcc("tfra");

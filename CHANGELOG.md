@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Producer Reference Time Box demux (`prft`, ISO/IEC 14496-12 §8.16.5).
+  A top-level FullBox carrying a UTC wall-clock instant in NTP-64
+  format (RFC 5905) correlated with a media time on one reference
+  track — used by low-latency DASH / CMAF live streaming so a
+  consumer can match production wall-clock against media presentation
+  time. The demuxer parses every `prft` it encounters during the
+  top-level box walk and surfaces them as `prft_<n>` (0-based file
+  order) container-metadata entries; each value is three
+  space-separated decimal integers `"reference_track_ID
+  ntp_timestamp media_time"`. Both v0 (32-bit `media_time`) and v1
+  (64-bit `media_time`) layouts are read; absent `prft`, no keys are
+  emitted. Public `oxideav_mp4::demux::parse_prft_box(&[u8]) →
+  Result<Option<PrftRecord>>` entry point exposes the structured
+  record (`reference_track_id`, `ntp_timestamp`, `media_time`,
+  `version`) for tooling that wants the parsed type directly. Six
+  tests in `tests/random_access.rs` cover v0 round-trip, v1
+  round-trip with 48-bit `media_time`, truncation error paths (below
+  16-byte floor, v0-missing-media_time, v1-partial-media_time), and
+  an end-to-end integration that splices two `prft` boxes into a
+  real fragmented MP4 and confirms the demuxer's `metadata()`
+  surfaces both `prft_0` and `prft_1` with their expected values.
+
 - Sample-group muxing (ISO/IEC 14496-12 §8.9.2 SampleToGroupBox +
   §8.9.3 SampleGroupDescriptionBox) — write-side dual of the
   pre-existing `sbgp` / `sgpd` demux. New `oxideav_mp4::sample_groups`

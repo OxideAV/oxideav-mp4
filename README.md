@@ -250,6 +250,24 @@ Sample-entry FourCCs resolve to these codec ids:
   they are surfaced verbatim for a layer that knows the
   `grouping_type` semantics. Absent both boxes, none of the keys are
   emitted.
+- Producer reference time (ISO/IEC 14496-12 §8.16.5, `prft`): a
+  top-level FullBox carrying a UTC wall-clock instant in NTP 64-bit
+  format (RFC 5905 — high 32 bits = seconds since 1900-01-01 UTC,
+  low 32 bits = fractional seconds) correlated with a media time on
+  one reference track's media clock. Used by low-latency DASH / CMAF
+  live streams so a consumer can match production wall-clock against
+  media presentation time (and bound buffer occupancy without
+  out-of-band timing signals). Each `prft` encountered during the
+  top-level walk is surfaced on `Demuxer::metadata()` as `prft_<n>`
+  (0-based file order); the value is three space-separated decimal
+  integers `"reference_track_ID ntp_timestamp media_time"`. Both v0
+  (32-bit `media_time`) and v1 (64-bit `media_time`) layouts are
+  read; v1 `media_time` is widened to `u64` so callers see one type
+  regardless. Absent `prft`, no keys are emitted. The structured
+  record is also reachable via the public
+  `oxideav_mp4::demux::parse_prft_box(&[u8])` entry point for tooling
+  that wants the typed `PrftRecord` (`reference_track_id`,
+  `ntp_timestamp`, `media_time`, `version`) directly.
 
 ### Muxer
 

@@ -5,7 +5,7 @@
 //! public `parse_sidx_box` / `parse_mfra_box` entry points, assert the
 //! parsed structure matches what we wrote.
 
-use oxideav_mp4::demux::{parse_mfra_box, parse_sidx_box};
+use oxideav_mp4::demux::{parse_mfra_box, parse_prft_box, parse_sidx_box};
 
 // --- Box-builder helpers --------------------------------------------------
 
@@ -451,4 +451,203 @@ fn mfra_in_fragmented_file_does_not_break_demux() {
         count += 1;
     }
     assert_eq!(count, 3, "still demuxes 3 packets with mfra appended");
+}
+
+// --- prft tests -----------------------------------------------------------
+
+/// Build a `prft` v0 body (FullBox + track_ID + 64-bit NTP + 32-bit media_time).
+fn build_prft_v0(track_id: u32, ntp: u64, media_time: u32) -> Vec<u8> {
+    let mut body = vec![0u8; 4]; // FullBox version=0 flags=0
+    body.extend_from_slice(&track_id.to_be_bytes());
+    body.extend_from_slice(&ntp.to_be_bytes());
+    body.extend_from_slice(&media_time.to_be_bytes());
+    body
+}
+
+/// Build a `prft` v1 body (FullBox + track_ID + 64-bit NTP + 64-bit media_time).
+fn build_prft_v1(track_id: u32, ntp: u64, media_time: u64) -> Vec<u8> {
+    let mut body = vec![0u8; 4];
+    body[0] = 1; // version 1
+    body.extend_from_slice(&track_id.to_be_bytes());
+    body.extend_from_slice(&ntp.to_be_bytes());
+    body.extend_from_slice(&media_time.to_be_bytes());
+    body
+}
+
+#[test]
+fn prft_v0_round_trips() {
+    // NTP-format: high 32 bits = seconds since 1900-01-01,
+    // low 32 bits = fractional seconds. Pick a value well inside u32
+    // media_time range.
+    let ntp: u64 = (3_900_000_000u64 << 32) | 0x8000_0000;
+    let body = build_prft_v0(1, ntp, 48_000);
+    let r = parse_prft_box(&body).unwrap().unwrap();
+    assert_eq!(r.reference_track_id, 1);
+    assert_eq!(r.ntp_timestamp, ntp);
+    assert_eq!(r.media_time, 48_000);
+    assert_eq!(r.version, 0);
+}
+
+#[test]
+fn prft_v1_64bit_media_time_round_trips() {
+    let ntp: u64 = 0x0123_4567_89AB_CDEF;
+    let mt: u64 = 0xFEDC_BA98_7654_3210;
+    let body = build_prft_v1(7, ntp, mt);
+    let r = parse_prft_box(&body).unwrap().unwrap();
+    assert_eq!(r.reference_track_id, 7);
+    assert_eq!(r.ntp_timestamp, ntp);
+    assert_eq!(r.media_time, mt);
+    assert_eq!(r.version, 1);
+}
+
+#[test]
+fn prft_truncated_v0_returns_invalid() {
+    // FullBox + track_id + ntp but no media_time (only 16 of 20 bytes).
+    let mut body = vec![0u8; 4];
+    body.extend_from_slice(&1u32.to_be_bytes());
+    body.extend_from_slice(&0u64.to_be_bytes());
+    // body.len() == 16; v0 needs 20
+    assert!(parse_prft_box(&body).is_err());
+}
+
+#[test]
+fn prft_truncated_below_floor_returns_invalid() {
+    // 12 bytes — not even the floor (FullBox + track_id + ntp = 16).
+    let body = vec![0u8; 12];
+    assert!(parse_prft_box(&body).is_err());
+}
+
+#[test]
+fn prft_truncated_v1_returns_invalid() {
+    // v1 needs 24 bytes; provide 20.
+    let mut body = vec![0u8; 4];
+    body[0] = 1; // version 1
+    body.extend_from_slice(&1u32.to_be_bytes()); // track_id
+    body.extend_from_slice(&0u64.to_be_bytes()); // ntp
+    body.extend_from_slice(&0u32.to_be_bytes()); // partial media_time (4 of 8)
+    assert!(parse_prft_box(&body).is_err());
+}
+
+#[test]
+fn prft_in_file_is_surfaced_as_metadata() {
+    use oxideav_core::{
+        CodecId, CodecParameters, Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase, WriteSeek,
+    };
+    use oxideav_mp4::muxer::open_with_options;
+    use oxideav_mp4::options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
+    use std::io::Cursor;
+
+    // Build a minimal fragmented mp4 (so a top-level prft has somewhere
+    // to live before the moof), then splice TWO prft boxes — one v0 and
+    // one v1 — into the file between the init segment and the first
+    // segment marker (`moof` / `styp`).
+    let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+    params.channels = Some(1);
+    params.sample_rate = Some(48_000);
+    params.sample_format = Some(SampleFormat::S16);
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 48_000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+    let opts = Mp4MuxerOptions {
+        brand: BrandPreset::Mp4,
+        faststart: false,
+        fragmented: Some(FragmentedOptions {
+            cadence: FragmentCadence::EveryNPackets(2),
+            styp: None,
+            emit_random_access_indexes: false,
+        }),
+        write_edit_list: true,
+        track_sample_groups: Vec::new(),
+    };
+    let path = std::env::temp_dir().join("oxideav-mp4-prft-meta.mp4");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
+        mux.write_header().unwrap();
+        for i in 0..4i64 {
+            let mut pkt = Packet::new(0, stream.time_base, vec![i as u8; 4]);
+            pkt.pts = Some(i);
+            pkt.dts = Some(i);
+            pkt.duration = Some(1);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+
+    let prft0_body = build_prft_v0(1, 0x1234_5678_9ABC_DEF0, 12_345);
+    let prft0_box = boxed(b"prft", &prft0_body);
+    let prft1_body = build_prft_v1(1, 0x1122_3344_5566_7788, 0xFFFF_FFFF_FFFFu64);
+    let prft1_box = boxed(b"prft", &prft1_body);
+
+    let splice_off = find_first_box_offset(&bytes, &[b"moof", b"styp"])
+        .expect("fragmented file must have a moof / styp");
+    let mut spliced = Vec::with_capacity(bytes.len() + prft0_box.len() + prft1_box.len());
+    spliced.extend_from_slice(&bytes[..splice_off]);
+    spliced.extend_from_slice(&prft0_box);
+    spliced.extend_from_slice(&prft1_box);
+    spliced.extend_from_slice(&bytes[splice_off..]);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(spliced));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let md = dmx.metadata();
+    let prft0 = md
+        .iter()
+        .find(|(k, _)| k == "prft_0")
+        .expect("prft_0 metadata key missing");
+    assert_eq!(
+        prft0.1,
+        format!("1 {} {}", 0x1234_5678_9ABC_DEF0u64, 12_345)
+    );
+    let prft1 = md
+        .iter()
+        .find(|(k, _)| k == "prft_1")
+        .expect("prft_1 metadata key missing");
+    assert_eq!(
+        prft1.1,
+        format!("1 {} {}", 0x1122_3344_5566_7788u64, 0xFFFF_FFFF_FFFFu64)
+    );
+}
+
+/// Scan top-level boxes; return the absolute offset of the FIRST box
+/// whose FourCC is in `wanted`, or `None`.
+fn find_first_box_offset(bytes: &[u8], wanted: &[&[u8; 4]]) -> Option<usize> {
+    let mut off = 0usize;
+    while off + 8 <= bytes.len() {
+        let size = u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        let fourcc = &bytes[off + 4..off + 8];
+        if wanted.iter().any(|w| fourcc == w.as_slice()) {
+            return Some(off);
+        }
+        let advance = match size {
+            0 => return None, // EOF box
+            1 => {
+                if off + 16 > bytes.len() {
+                    return None;
+                }
+                u64::from_be_bytes([
+                    bytes[off + 8],
+                    bytes[off + 9],
+                    bytes[off + 10],
+                    bytes[off + 11],
+                    bytes[off + 12],
+                    bytes[off + 13],
+                    bytes[off + 14],
+                    bytes[off + 15],
+                ]) as usize
+            }
+            n => n as usize,
+        };
+        if advance < 8 {
+            return None;
+        }
+        off += advance;
+    }
+    None
 }
