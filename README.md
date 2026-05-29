@@ -250,6 +250,28 @@ Sample-entry FourCCs resolve to these codec ids:
   they are surfaced verbatim for a layer that knows the
   `grouping_type` semantics. Absent both boxes, none of the keys are
   emitted.
+- Sub-sample information (ISO/IEC 14496-12 §8.7.7, `subs`): a track's
+  `stbl/subs` SubSampleInformationBox is an optional sparse table
+  describing how selected samples decompose into smaller,
+  semantically-meaningful sub-samples (e.g. NAL units / parameter sets
+  for H.264 per ISO/IEC 14496-15, or arbitrary segment boundaries for
+  codecs that define their own sub-sample contract). Each entry carries
+  a sample-number delta from the previous entry, then a list of
+  `(subsample_size, subsample_priority, discardable,
+  codec_specific_parameters)` rows. Version 0 stores `subsample_size`
+  as 16-bit; version 1 widens it to 32-bit (both layouts are read and
+  normalised to `u32`). `flags` distinguishes co-resident `subs` boxes
+  with different per-codec semantics (§8.7.7.1). The container
+  preserves the carried codec's interpretation of
+  `subsample_priority` / `discardable` / `codec_specific_parameters`
+  verbatim — those small ints are opaque at this layer. Each `subs`
+  encountered on a track is surfaced on `params.options` as
+  `subs_<n>` (0-based encounter index); the value starts with
+  `"v<version> flags=<f>"` and is followed by one space-separated
+  `delta=<d>[:size,priority,discardable,csp[;...]]` block per entry
+  (decimal for everything except `csp`, which is lowercase 8-digit
+  hex). The trailing colon and per-sub-sample list are omitted when an
+  entry has `subsample_count = 0`. Absent `subs`, no keys are emitted.
 - Producer reference time (ISO/IEC 14496-12 §8.16.5, `prft`): a
   top-level FullBox carrying a UTC wall-clock instant in NTP 64-bit
   format (RFC 5905 — high 32 bits = seconds since 1900-01-01 UTC,

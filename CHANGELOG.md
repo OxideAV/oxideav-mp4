@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sub-Sample Information Box demux (`subs`, ISO/IEC 14496-12 §8.7.7).
+  The optional per-track sparse table that describes how selected
+  samples decompose into smaller, semantically-meaningful sub-samples
+  (NAL units, slices, parameter sets per the codec binding — e.g.
+  ISO/IEC 14496-15 for H.264). Each entry carries a `sample_delta`
+  from the previous entry (the table is sparse — samples without
+  sub-sample structure produce no row) plus a list of
+  `(subsample_size, subsample_priority, discardable,
+  codec_specific_parameters)` rows. Both v0 (16-bit `subsample_size`)
+  and v1 (32-bit) layouts are read and normalised to `u32`; the
+  FullBox `flags` is preserved verbatim so co-resident `subs` boxes
+  with codec-specific `flags` semantics (§8.7.7.1) can be told apart.
+  Each `subs` is surfaced on `params.options` as `subs_<n>` (0-based
+  encounter index); the value starts with `"v<version> flags=<f>"`
+  and is followed by one space-separated
+  `delta=<d>[:size,priority,discardable,csp[;...]]` block per entry
+  (`csp` rendered as lowercase 8-digit hex). The container does not
+  interpret `subsample_priority` / `discardable` /
+  `codec_specific_parameters` — those small ints are codec-specific
+  and the spec hands them to a layer that knows the carried
+  encoding. Absent `subs`, no keys are emitted. Ten unit tests in
+  `demux::tests` cover v0 round-trip with three sub-samples + a
+  delta-2 follow-up entry, v1 32-bit `subsample_size` widening
+  (0x0001_2345 sentinel above the 16-bit ceiling), the legal
+  `subsample_count = 0` shape (an addressed sample with no
+  sub-sample structure), 24-bit `flags` preservation, both
+  truncation error paths (FullBox-preamble underflow and
+  mid-sub-sample cutoff), `parse_stbl` dispatch wiring,
+  multi-`subs`-per-track accumulation (distinct `flags` per
+  §8.7.7.1), the `subs_<n>` options surfacing (full byte-exact
+  expected string), and the absence-no-keys path.
+
 - Producer Reference Time Box demux (`prft`, ISO/IEC 14496-12 §8.16.5).
   A top-level FullBox carrying a UTC wall-clock instant in NTP-64
   format (RFC 5905) correlated with a media time on one reference

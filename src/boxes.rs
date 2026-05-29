@@ -180,6 +180,17 @@ pub const SBGP: [u8; 4] = fourcc("sbgp");
 /// entries that an `sbgp` of the same `grouping_type` indexes. Entry
 /// payloads are grouping-type-specific and opaque to the container.
 pub const SGPD: [u8; 4] = fourcc("sgpd");
+/// `subs` — SubSampleInformationBox (ISO/IEC 14496-12 §8.7.7). Sits
+/// inside `stbl` (or `traf`); an optional sparse table describing how
+/// selected samples decompose into smaller, semantically meaningful
+/// sub-samples (e.g. NAL units, slices, parameter sets for H.264 per
+/// ISO/IEC 14496-15). Per-sub-sample fields: `subsample_size`
+/// (16-bit at version 0, 32-bit at version 1), `subsample_priority`,
+/// `discardable`, and a `codec_specific_parameters` blob whose
+/// semantics are owned by the carried codec. Purely descriptive — a
+/// track decodes correctly without it; the table feeds trick modes,
+/// CENC sub-sample encryption mapping, and selective-discard pipelines.
+pub const SUBS: [u8; 4] = fourcc("subs");
 pub const ELST: [u8; 4] = fourcc("elst");
 pub const MDAT: [u8; 4] = fourcc("mdat");
 pub const FREE: [u8; 4] = fourcc("free");

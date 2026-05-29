@@ -419,6 +419,12 @@ struct Track {
     /// is preserved verbatim (truncation is the producer's bug, not
     /// ours to invent zeros for).
     sdtp: Vec<SdtpEntry>,
+    /// §8.7.7 — `subs` (SubSampleInformationBox) instances. The spec
+    /// allows more than one per container provided they differ in `flags`
+    /// (the carried codec's semantics for `flags` distinguish them); we
+    /// collect them in order of encounter. Empty when the track has no
+    /// `subs` (the common case).
+    subs: Vec<SubsBox>,
 }
 
 /// One entry of an `sdtp` (SampleDependencyTypeBox, §8.6.4) — decoded
@@ -492,6 +498,71 @@ struct SgpdBox {
     /// interpret them — interpretation belongs to the layer that knows
     /// the `grouping_type` semantics.
     entries: Vec<Vec<u8>>,
+}
+
+/// One sub-sample of a `subs` (SubSampleInformationBox, §8.7.7) entry.
+///
+/// Fields decoded from the on-wire `unsigned int(16 or 32) subsample_size;
+/// unsigned int(8) subsample_priority; unsigned int(8) discardable;
+/// unsigned int(32) codec_specific_parameters;` layout. The
+/// `subsample_size` field is 16-bit at version 0 and widens to 32-bit at
+/// version 1; we always store as `u32` so callers handle one shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SubSampleEntry {
+    /// §8.7.7.3 — size in bytes of the sub-sample.
+    subsample_size: u32,
+    /// §8.7.7.3 — degradation priority. Higher = more important to
+    /// decoded quality. Codec-specific scale; the container does not
+    /// interpret it.
+    subsample_priority: u8,
+    /// §8.7.7.3 — `0` = required to decode the current sample; non-zero
+    /// = optional (e.g. an SEI message that only enhances output).
+    discardable: u8,
+    /// §8.7.7.3 — opaque codec-specific blob (4 bytes). For AVC
+    /// (ISO/IEC 14496-15) this encodes NAL-unit role / dependency
+    /// information; absent a codec-specific binding the field is `0`.
+    codec_specific_parameters: u32,
+}
+
+/// One entry of a `subs` (SubSampleInformationBox, §8.7.7) — a single
+/// sample's sub-sample table together with the sparse delta that
+/// addresses it.
+#[derive(Clone, Debug, Default)]
+struct SubsEntry {
+    /// §8.7.7.3 — sample-number delta from the previous entry's sample
+    /// (or from sample 0 for the first entry). The decoded absolute
+    /// sample numbers are *not* materialised — callers walking the table
+    /// can accumulate them themselves.
+    sample_delta: u32,
+    /// The sub-samples of this entry's sample, in disk order. May be
+    /// empty (`subsample_count == 0`) per §8.7.7.1 — in that case the
+    /// addressed sample has no sub-sample structure but is still
+    /// enumerated by the table (the spec permits this shape so a
+    /// producer can document "this sample is monolithic" alongside
+    /// genuinely sub-divided neighbours).
+    subsamples: Vec<SubSampleEntry>,
+}
+
+/// Parsed `subs` (SubSampleInformationBox, ISO/IEC 14496-12 §8.7.7).
+///
+/// The box has been a `FullBox(version, flags)` since the original 2003
+/// edition. `version` selects the on-wire width of `subsample_size`
+/// (16-bit at v0, 32-bit at v1); `flags` is owned by the carried codec
+/// — when more than one `subs` is present in the same container, the
+/// spec mandates that each carry a distinct `flags` value (§8.7.7.1).
+/// We preserve both as-recorded so codec-specific consumers can pick
+/// the table whose semantics they understand.
+#[derive(Clone, Debug, Default)]
+struct SubsBox {
+    /// FullBox version (0 or 1) — determines `subsample_size` width on
+    /// disk. We normalise to `u32` in `SubSampleEntry::subsample_size`.
+    version: u8,
+    /// FullBox flags — codec-specific. Distinguishes co-resident `subs`
+    /// boxes per §8.7.7.1.
+    flags: u32,
+    /// One entry per *addressed* sample (the table is sparse — samples
+    /// with no `subs` row contribute nothing here).
+    entries: Vec<SubsEntry>,
 }
 
 /// Parsed `cslg` (CompositionToDecodeBox, ISO/IEC 14496-12 §8.6.1.4).
@@ -855,6 +926,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         sbgp: Vec::new(),
         sgpd: Vec::new(),
         sdtp: Vec::new(),
+        subs: Vec::new(),
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -1327,6 +1399,7 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             CSLG => t.cslg = Some(parse_cslg(&b)?),
             SBGP => t.sbgp.push(parse_sbgp(&b)?),
             SGPD => t.sgpd.push(parse_sgpd(&b)?),
+            SUBS => t.subs.push(parse_subs(&b)?),
             _ => {}
         }
     }
@@ -2221,6 +2294,110 @@ fn parse_ctts(body: &[u8]) -> Result<Vec<(u32, i32)>> {
         off += 8;
     }
     Ok(out)
+}
+
+/// Parse `subs` (SubSampleInformationBox, ISO/IEC 14496-12 §8.7.7).
+///
+/// `FullBox(version, flags)`:
+///
+/// ```text
+///     unsigned int(32) entry_count
+///     entry_count × {
+///         unsigned int(32) sample_delta
+///         unsigned int(16) subsample_count
+///         subsample_count × {
+///             if (version == 1) unsigned int(32) subsample_size
+///             else              unsigned int(16) subsample_size
+///             unsigned int(8)  subsample_priority
+///             unsigned int(8)  discardable
+///             unsigned int(32) codec_specific_parameters
+///         }
+///     }
+/// ```
+///
+/// Per §8.7.7.1 the table is *sparse*: each entry's `sample_delta` is
+/// the difference between this entry's target sample and the previous
+/// entry's (or sample 0 for the first entry), so a `subs` documents only
+/// the samples that genuinely have sub-sample structure. A
+/// `subsample_count` of 0 is legal: the entry still consumes one row
+/// (advances the delta cursor) but produces no per-sub-sample fields.
+///
+/// The codec-specific semantics of `subsample_priority`, `discardable`,
+/// `codec_specific_parameters`, and `flags` are deliberately preserved
+/// verbatim — the container does not interpret them. For H.264
+/// (ISO/IEC 14496-15) `codec_specific_parameters` encodes per-NAL-unit
+/// dependency information; we surface the raw u32 so a codec-aware
+/// layer can decode it.
+///
+/// `with_capacity` is bounded by the byte budget so an adversarial
+/// `entry_count` cannot force a giant up-front allocation; per-entry
+/// bounds checks reject a truncated body.
+fn parse_subs(body: &[u8]) -> Result<SubsBox> {
+    if body.len() < 8 {
+        return Err(Error::invalid("MP4: subs too short"));
+    }
+    let version = body[0];
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    let entry_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    // Minimum bytes per row, used as a guard on `with_capacity`:
+    //   sample_delta (4) + subsample_count (2) = 6 even for an
+    //   empty-subsample entry.
+    let max_entries = body.len().saturating_sub(8) / 6;
+    let mut entries: Vec<SubsEntry> = Vec::with_capacity(entry_count.min(max_entries));
+    let size_width = if version == 1 { 4 } else { 2 };
+    let per_sub_min = size_width + 1 + 1 + 4; // size + priority + discardable + csp
+    let mut off = 8;
+    for _ in 0..entry_count {
+        if off + 6 > body.len() {
+            return Err(Error::invalid("MP4: subs entry header truncated"));
+        }
+        let sample_delta =
+            u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        off += 4;
+        let subsample_count = u16::from_be_bytes([body[off], body[off + 1]]) as usize;
+        off += 2;
+        // Cap per-entry capacity by remaining byte budget so an inflated
+        // `subsample_count` can't allocate ahead of the available bytes.
+        let max_subs = (body.len().saturating_sub(off)) / per_sub_min;
+        let mut subs_vec: Vec<SubSampleEntry> = Vec::with_capacity(subsample_count.min(max_subs));
+        for _ in 0..subsample_count {
+            if off + per_sub_min > body.len() {
+                return Err(Error::invalid("MP4: subs subsample truncated"));
+            }
+            let subsample_size = if version == 1 {
+                let v =
+                    u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+                off += 4;
+                v
+            } else {
+                let v = u16::from_be_bytes([body[off], body[off + 1]]) as u32;
+                off += 2;
+                v
+            };
+            let subsample_priority = body[off];
+            off += 1;
+            let discardable = body[off];
+            off += 1;
+            let codec_specific_parameters =
+                u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+            off += 4;
+            subs_vec.push(SubSampleEntry {
+                subsample_size,
+                subsample_priority,
+                discardable,
+                codec_specific_parameters,
+            });
+        }
+        entries.push(SubsEntry {
+            sample_delta,
+            subsamples: subs_vec,
+        });
+    }
+    Ok(SubsBox {
+        version,
+        flags,
+        entries,
+    })
 }
 
 /// Parse `cslg` (CompositionToDecodeBox, ISO/IEC 14496-12 §8.6.1.4).
@@ -3509,6 +3686,47 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             .insert("sdtp_redundant_count".to_string(), redundant.to_string());
     }
 
+    // ISO/IEC 14496-12 §8.7.7: surface each `subs` (SubSampleInformationBox)
+    // present on the track. Each `subs` becomes one `subs_<n>` key whose
+    // value starts with `"v<version> flags=<f>"` (the FullBox preamble —
+    // version selects `subsample_size` width on disk; `flags` distinguishes
+    // co-resident `subs` boxes per §8.7.7.1) followed by space-separated
+    // per-sample blocks of the form
+    //   `delta=<d>[:size,priority,discardable,csp[;size,priority,discardable,csp ...]]`
+    // (the trailing colon and per-sub-sample list are omitted when the
+    // entry has zero sub-samples). Decimal for `delta`, `size`,
+    // `priority`, `discardable`; lowercase 8-digit hex for
+    // `codec_specific_parameters` (it is a codec-defined u32 blob).
+    //
+    // Sub-sample semantics (e.g. which NAL unit a row indexes for H.264
+    // per ISO/IEC 14496-15) belong to the codec layer; the container
+    // surfaces the raw rows so a codec-aware consumer can decode them.
+    // Absent `subs`, no keys are emitted.
+    for (i, sb) in t.subs.iter().enumerate() {
+        let mut v = format!("v{} flags={}", sb.version, sb.flags);
+        for ent in &sb.entries {
+            v.push_str(&format!(" delta={}", ent.sample_delta));
+            if !ent.subsamples.is_empty() {
+                v.push(':');
+                let mut first = true;
+                for s in &ent.subsamples {
+                    if !first {
+                        v.push(';');
+                    }
+                    first = false;
+                    v.push_str(&format!(
+                        "{},{},{},{:08x}",
+                        s.subsample_size,
+                        s.subsample_priority,
+                        s.discardable,
+                        s.codec_specific_parameters
+                    ));
+                }
+            }
+        }
+        params.options.insert(format!("subs_{}", i), v);
+    }
+
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
     StreamInfo {
         index,
@@ -3927,6 +4145,7 @@ mod tests {
             sbgp: Vec::new(),
             sgpd: Vec::new(),
             sdtp: Vec::new(),
+            subs: Vec::new(),
         }
     }
 
@@ -5366,5 +5585,232 @@ mod tests {
         assert_eq!(info.params.options.get("sdtp_independent_count"), None);
         assert_eq!(info.params.options.get("sdtp_disposable_count"), None);
         assert_eq!(info.params.options.get("sdtp_redundant_count"), None);
+    }
+
+    /// `(subsample_size16, priority, discardable, csp)` — one v0 sub-sample.
+    type SubsV0Row = (u16, u8, u8, u32);
+    /// `(subsample_size32, priority, discardable, csp)` — one v1 sub-sample.
+    type SubsV1Row = (u32, u8, u8, u32);
+
+    /// Build a v0 `subs` body: FullBox preamble + entry_count + N entries.
+    /// Each entry: `(sample_delta, [(size16, priority, discardable, csp), ...])`.
+    fn build_subs_v0(flags: u32, entries: &[(u32, &[SubsV0Row])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0u8); // version
+        body.extend_from_slice(&flags.to_be_bytes()[1..]); // 24-bit flags
+        body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (sample_delta, subs) in entries {
+            body.extend_from_slice(&sample_delta.to_be_bytes());
+            body.extend_from_slice(&(subs.len() as u16).to_be_bytes());
+            for (size, prio, disc, csp) in subs.iter() {
+                body.extend_from_slice(&size.to_be_bytes());
+                body.push(*prio);
+                body.push(*disc);
+                body.extend_from_slice(&csp.to_be_bytes());
+            }
+        }
+        body
+    }
+
+    /// Build a v1 `subs` body — `subsample_size` widens to 32-bit.
+    fn build_subs_v1(flags: u32, entries: &[(u32, &[SubsV1Row])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(1u8);
+        body.extend_from_slice(&flags.to_be_bytes()[1..]);
+        body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (sample_delta, subs) in entries {
+            body.extend_from_slice(&sample_delta.to_be_bytes());
+            body.extend_from_slice(&(subs.len() as u16).to_be_bytes());
+            for (size, prio, disc, csp) in subs.iter() {
+                body.extend_from_slice(&size.to_be_bytes());
+                body.push(*prio);
+                body.push(*disc);
+                body.extend_from_slice(&csp.to_be_bytes());
+            }
+        }
+        body
+    }
+
+    /// §8.7.7 — v0 round-trip with two entries: one sample (delta=1) split
+    /// into three sub-samples with varied priority/discardable/csp, plus
+    /// a second sample (delta=2 → sample 3) with one sub-sample. Verifies
+    /// field order, the 16-bit `subsample_size` width at v0, and the
+    /// sparse `sample_delta` accumulation contract.
+    #[test]
+    fn parse_subs_v0_round_trip() {
+        let body = build_subs_v0(
+            0,
+            &[
+                (
+                    1,
+                    &[
+                        (100, 5, 0, 0x0000_0001),
+                        (50, 4, 1, 0x0000_0002),
+                        (25, 3, 0, 0),
+                    ],
+                ),
+                (2, &[(80, 6, 0, 0xdead_beef)]),
+            ],
+        );
+        let s = super::parse_subs(&body).unwrap();
+        assert_eq!(s.version, 0);
+        assert_eq!(s.flags, 0);
+        assert_eq!(s.entries.len(), 2);
+        assert_eq!(s.entries[0].sample_delta, 1);
+        assert_eq!(s.entries[0].subsamples.len(), 3);
+        assert_eq!(s.entries[0].subsamples[0].subsample_size, 100);
+        assert_eq!(s.entries[0].subsamples[0].subsample_priority, 5);
+        assert_eq!(s.entries[0].subsamples[0].discardable, 0);
+        assert_eq!(s.entries[0].subsamples[0].codec_specific_parameters, 1);
+        assert_eq!(s.entries[0].subsamples[2].subsample_size, 25);
+        assert_eq!(s.entries[1].sample_delta, 2);
+        assert_eq!(s.entries[1].subsamples.len(), 1);
+        assert_eq!(
+            s.entries[1].subsamples[0].codec_specific_parameters,
+            0xdead_beef
+        );
+    }
+
+    /// §8.7.7 — v1 widens `subsample_size` to 32-bit. Use a payload above
+    /// the 16-bit ceiling (0x0001_0000) to prove the widening took effect
+    /// and the parser didn't truncate to u16.
+    #[test]
+    fn parse_subs_v1_size_is_32bit() {
+        let body = build_subs_v1(0, &[(1, &[(0x0001_2345, 0, 0, 0)])]);
+        let s = super::parse_subs(&body).unwrap();
+        assert_eq!(s.version, 1);
+        assert_eq!(s.entries[0].subsamples[0].subsample_size, 0x0001_2345);
+    }
+
+    /// §8.7.7.1 — a `subsample_count` of 0 is legal: the entry still
+    /// consumes one row (advances the sparse delta cursor) but produces
+    /// no per-sub-sample fields. Verifies the parser allows the
+    /// degenerate shape rather than rejecting it.
+    #[test]
+    fn parse_subs_empty_subsample_count() {
+        let body = build_subs_v0(0, &[(5, &[])]);
+        let s = super::parse_subs(&body).unwrap();
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(s.entries[0].sample_delta, 5);
+        assert!(s.entries[0].subsamples.is_empty());
+    }
+
+    /// `flags` is preserved verbatim (codec-specific per §8.7.7.1). Use a
+    /// non-trivial 24-bit value to confirm the FullBox preamble parser
+    /// didn't mask the field.
+    #[test]
+    fn parse_subs_preserves_flags() {
+        let body = build_subs_v0(0x00_aa_55, &[(1, &[])]);
+        let s = super::parse_subs(&body).unwrap();
+        assert_eq!(s.flags, 0x00_aa_55);
+    }
+
+    /// A body too short to hold even the FullBox preamble + entry_count
+    /// is rejected.
+    #[test]
+    fn parse_subs_too_short() {
+        assert!(super::parse_subs(&[0u8; 7]).is_err());
+    }
+
+    /// A truncated sub-sample row (entry_count promises 1 entry, but the
+    /// body runs out mid-sub-sample) is rejected rather than silently
+    /// returning the partial table.
+    #[test]
+    fn parse_subs_truncated_subsample() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox preamble
+        body.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1
+        body.extend_from_slice(&1u32.to_be_bytes()); // sample_delta
+        body.extend_from_slice(&1u16.to_be_bytes()); // subsample_count = 1
+        body.extend_from_slice(&[0u8; 3]); // truncated subsample (need 8)
+        assert!(super::parse_subs(&body).is_err());
+    }
+
+    /// `parse_stbl` lands the `subs` on the track alongside the other
+    /// sample-table boxes (proves the dispatch arm is wired).
+    #[test]
+    fn parse_stbl_picks_up_subs() {
+        let subs_body = build_subs_v0(0, &[(1, &[(42, 0, 0, 0)])]);
+        let mut stbl = Vec::new();
+        stbl.extend(wrap_box_full_size(b"subs", &subs_body));
+        let mut t = fresh_track();
+        super::parse_stbl(&stbl, &mut t).unwrap();
+        assert_eq!(t.subs.len(), 1);
+        assert_eq!(t.subs[0].entries[0].subsamples[0].subsample_size, 42);
+    }
+
+    /// Multiple `subs` boxes (distinct `flags` per §8.7.7.1) accumulate
+    /// in encounter order on the track — we don't fail on, deduplicate,
+    /// or otherwise touch the count: the spec explicitly permits several.
+    #[test]
+    fn parse_stbl_accumulates_multiple_subs() {
+        let s1 = build_subs_v0(0, &[(1, &[(10, 0, 0, 0)])]);
+        let s2 = build_subs_v0(1, &[(2, &[(20, 0, 0, 0)])]);
+        let mut stbl = Vec::new();
+        stbl.extend(wrap_box_full_size(b"subs", &s1));
+        stbl.extend(wrap_box_full_size(b"subs", &s2));
+        let mut t = fresh_track();
+        super::parse_stbl(&stbl, &mut t).unwrap();
+        assert_eq!(t.subs.len(), 2);
+        assert_eq!(t.subs[0].flags, 0);
+        assert_eq!(t.subs[1].flags, 1);
+    }
+
+    /// Surfacing: a parsed `subs` becomes one `subs_<n>` key on
+    /// `params.options`. Verifies the `"v<version> flags=<f>"` prefix,
+    /// the `delta=<d>:size,priority,discardable,csp` per-entry shape
+    /// (with sub-samples joined by `;` and `csp` rendered as 8-digit
+    /// hex), and the omission of the colon when an entry has zero
+    /// sub-samples.
+    #[test]
+    fn build_stream_info_surfaces_subs_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.subs.push(super::SubsBox {
+            version: 0,
+            flags: 0x42,
+            entries: vec![
+                super::SubsEntry {
+                    sample_delta: 1,
+                    subsamples: vec![
+                        super::SubSampleEntry {
+                            subsample_size: 100,
+                            subsample_priority: 5,
+                            discardable: 0,
+                            codec_specific_parameters: 0x0000_0001,
+                        },
+                        super::SubSampleEntry {
+                            subsample_size: 50,
+                            subsample_priority: 0,
+                            discardable: 1,
+                            codec_specific_parameters: 0x0000_0002,
+                        },
+                    ],
+                },
+                super::SubsEntry {
+                    sample_delta: 3,
+                    subsamples: Vec::new(),
+                },
+            ],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        let got = info.params.options.get("subs_0").unwrap();
+        assert_eq!(
+            got,
+            "v0 flags=66 delta=1:100,5,0,00000001;50,0,1,00000002 delta=3"
+        );
+    }
+
+    /// Absence: a track with no `subs` emits no `subs_<n>` keys.
+    #[test]
+    fn build_stream_info_no_subs_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("subs_0"), None);
     }
 }
