@@ -3747,12 +3747,14 @@ struct Mp4Demuxer {
     metadata: Vec<(String, String)>,
     duration_micros: i64,
     /// Parsed `sidx` SegmentIndexBoxes; one per top-level sidx encountered.
-    /// Currently not consulted by `next_packet` / `seek_to` — the moofs
-    /// already carry the same information (per-fragment time + byte
-    /// offset). We keep the parsed table for downstream tooling that
-    /// wants the higher-level segment-index abstraction (DASH MPD
-    /// generation, byte-range index for on-demand profile, etc.).
-    #[allow(dead_code)]
+    /// Consulted by `seek_to` as a secondary fast-path when no `tfra`
+    /// covers the requested track: a `sidx` carries per-subsegment
+    /// `(earliest_presentation_time, subsegment_duration, byte size)`
+    /// triples (ISO/IEC 14496-12 §8.16.3), which lets us pick the
+    /// subsegment whose decode-time range contains `pts` in O(log N)
+    /// without expanding the moofs. The hit is converted to a file
+    /// offset; the sample-list scan then snaps to the first keyframe
+    /// at or after that offset, bounded by one subsegment.
     sidxes: Vec<SidxRecord>,
     /// Parsed `tfra` random-access tables, one per track that the file's
     /// `mfra` indexes. Each holds (presentation time, moof offset) pairs
@@ -3844,6 +3846,27 @@ impl Demuxer for Mp4Demuxer {
             // resolve cleanly (e.g. mdat layout the file lied about).
         }
 
+        // Secondary fast-path: if `tfra` didn't apply (no mfra in the
+        // file, or none of the file's tfras index this track), but the
+        // file carries a `sidx` (typical for DASH on-demand profile,
+        // §8.16.3), use it to find the subsegment whose decode-time
+        // range contains `pts` and snap to the first keyframe at or
+        // after that subsegment's byte offset. The sample-list scan is
+        // bounded by one subsegment's samples.
+        if let Some(target_offset) = self.sidx_seek_target(stream_index, pts) {
+            for (i, s) in self.samples.iter().enumerate() {
+                if s.track_idx != stream_index {
+                    continue;
+                }
+                if s.offset >= target_offset && s.keyframe {
+                    self.cursor = i;
+                    return Ok(s.pts);
+                }
+            }
+            // Fall through to the linear scan if no keyframe lands at
+            // or after the sidx-pointed offset (corrupt sidx, etc.).
+        }
+
         // Default linear scan: find the last keyframe of this stream
         // with pts <= target.
         let mut best_cursor: Option<usize> = None;
@@ -3925,6 +3948,85 @@ impl Mp4Demuxer {
                 }
             }
         }
+    }
+
+    /// Look up the byte offset of the subsegment that covers `pts` for
+    /// this track, using parsed `sidx` (ISO/IEC 14496-12 §8.16.3) records.
+    ///
+    /// Two on-the-wire shapes are handled, both spec-conformant:
+    ///
+    /// 1. **Single `sidx` indexing N subsegments** (DASH on-demand
+    ///    profile). One sidx record at the start of the file lists
+    ///    every fragment's `(EPT, duration, size)`. We binary-search
+    ///    that table by decode time.
+    ///
+    /// 2. **One `sidx` per fragment, each indexing one subsegment**
+    ///    (DASH live profile / our own muxer's output). Each sidx
+    ///    immediately precedes a `(styp? + moof + mdat)` and reports
+    ///    `EPT` = that fragment's `tfdt`. We pick the latest sidx
+    ///    whose EPT ≤ `pts`.
+    ///
+    /// Both shapes converge on the same return: a byte offset the
+    /// `seek_to` caller can match against `SampleRef::offset` to find
+    /// the first keyframe at-or-after that fragment's first byte. The
+    /// sample-list scan that follows is bounded by one subsegment.
+    ///
+    /// Hierarchical (nested) sidx references are skipped — we keep
+    /// walking media references only. Returns `None` when no sidx
+    /// covers this track, or no reference is at or before `pts`.
+    fn sidx_seek_target(&self, stream_index: u32, pts: i64) -> Option<u64> {
+        if self.sidxes.is_empty() {
+            return None;
+        }
+        let track_id = *self.track_ids.get(stream_index as usize)?;
+        let track_ts = *self.track_timescales.get(stream_index as usize)? as u64;
+        if track_ts == 0 {
+            return None;
+        }
+        let pts_u = if pts < 0 { 0u64 } else { pts as u64 };
+
+        // Walk every sidx whose reference_id matches the track. For
+        // each one, expand its reference list into virtual
+        // `(time_in_sidx_scale, byte_offset)` anchors and remember the
+        // latest anchor whose time ≤ pts (translated into sidx scale).
+        let mut best: Option<u64> = None;
+        let mut first_media_offset: Option<u64> = None;
+        for sidx in self.sidxes.iter().filter(|s| s.reference_id == track_id) {
+            if sidx.references.is_empty() || sidx.timescale == 0 {
+                continue;
+            }
+            let target_sidx_time = if track_ts == sidx.timescale as u64 {
+                pts_u
+            } else {
+                // Multiply with u128 to avoid overflow on long durations.
+                ((pts_u as u128) * (sidx.timescale as u128) / (track_ts as u128)) as u64
+            };
+            let mut cur_time = sidx.earliest_presentation_time;
+            let mut cur_offset = sidx.first_byte_offset;
+            for r in &sidx.references {
+                if r.is_sidx {
+                    // Hierarchical sidx: consumes byte range, no
+                    // media-time anchor to land on.
+                    cur_offset = cur_offset.saturating_add(r.referenced_size as u64);
+                    continue;
+                }
+                if first_media_offset.is_none() {
+                    first_media_offset = Some(cur_offset);
+                }
+                if cur_time <= target_sidx_time {
+                    // Later anchors override earlier ones (we're picking
+                    // the LAST subsegment whose start ≤ pts).
+                    best = Some(cur_offset);
+                }
+                cur_time = cur_time.saturating_add(r.subsegment_duration as u64);
+                cur_offset = cur_offset.saturating_add(r.referenced_size as u64);
+            }
+        }
+        // If pts predates every sidx-indexed subsegment, snap to the
+        // first media reference's offset so the caller still lands on
+        // a keyframe boundary rather than falling through to the slow
+        // path.
+        best.or(first_media_offset)
     }
 }
 

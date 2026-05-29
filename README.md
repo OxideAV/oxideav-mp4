@@ -378,15 +378,44 @@ is opaque to the container — callers supply already-serialised
 §8.9.2; a `group_description_index` ≥ `0x10001` (movie-fragment-local
 per §8.9.4) is written verbatim, the muxer does not resolve it.
 
+### Seek strategy
+
+`seek_to(stream, pts)` tries three strategies in order, picking the
+first that applies:
+
+1. **`tfra` fast-path (ISO/IEC 14496-12 §8.8.11).** If the file has
+   a trailing `mfra` whose `tfra` indexes the requested track, the
+   demuxer binary-searches the `tfra` time table for the largest
+   `time ≤ pts`, translates the result to a `moof_offset`, and
+   snaps to the first keyframe at-or-after that offset. O(log N) on
+   `tfra` + a one-fragment-bounded sample-list scan.
+2. **`sidx` fast-path (ISO/IEC 14496-12 §8.16.3).** If no `tfra`
+   covers the track but the file carries one or more `sidx` boxes
+   whose `reference_id` matches the track's `track_ID`, the demuxer
+   walks every matching `sidx`, expands its references into virtual
+   `(EPT, byte_offset)` anchors, and picks the latest anchor whose
+   decode-time start is at-or-before `pts` (translated from the
+   track's media timescale into the sidx timescale per §8.16.3).
+   Both on-the-wire shapes are handled: a single `sidx` indexing
+   every subsegment (DASH on-demand profile) and one `sidx` per
+   subsegment (DASH live profile / what our own muxer emits).
+   Hierarchical (nested) sidx references are walked for byte-range
+   accounting only — they don't carry a media-time anchor we can
+   land on. Timescale conversion uses `u128` arithmetic so the
+   multiply doesn't overflow for long-duration tracks even when the
+   track's media timescale and the sidx's timescale differ (per the
+   spec-permitted but DASH-IF-deprecated case).
+3. **Linear scan fallback.** Walks the sample table picking the
+   last keyframe at-or-before `pts`. This is the unconditional
+   safety net — when neither index applies, or when the indexed
+   offset doesn't resolve cleanly (corrupt index, mdat layout the
+   file lied about), `seek_to` still returns a correct cursor.
+
 ### Not (yet) supported
 
 - Fragmented-MP4 *muxing* — the demuxer reads `moof`+`mdat`
   segments, but the muxer only emits a single moov-at-end (or
   faststart) shape.
-- `mfra`/`tfra` random-access index consumption (the demuxer skips
-  these; sequential demux works without them).
-- `sidx` segment-index seek-time mapping (skipped; sequential demux
-  works without it).
 - CENC decryption proper — the demuxer detects protected tracks
   (`encv` / `enca` / `enct` / `encs` → original FourCC plus the
   scheme on `params.options`) but it doesn't read `tenc`, `pssh`,

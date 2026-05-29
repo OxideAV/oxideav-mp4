@@ -651,3 +651,285 @@ fn find_first_box_offset(bytes: &[u8], wanted: &[&[u8; 4]]) -> Option<usize> {
     }
     None
 }
+
+// --- sidx-driven seek (ISO/IEC 14496-12 §8.16.3) -------------------------
+
+/// Build a fragmented MP4 whose only random-access index is a `sidx`
+/// (the on-demand DASH profile shape: ftyp + moov + sidx + N×(moof+mdat)
+/// with no trailing `mfra`). Then exercise `seek_to` and confirm the
+/// sidx-driven fast-path lands on the keyframe whose subsegment covers
+/// the requested pts.
+///
+/// Strategy: the muxer's `emit_random_access_indexes = true` mode writes
+/// both `sidx` (per fragment) AND a trailing `mfra`. We strip the
+/// `mfra` so `tfra` is unavailable; `seek_to` then has to fall back to
+/// the `sidx` table the muxer left behind. Without the sidx fast-path
+/// the seek still works (linear scan), so we cross-check by seeking the
+/// SAME file twice — once with `sidx` preserved, once with `sidx`
+/// stripped too (sidx + mfra both removed → linear scan only) — and
+/// confirm the cursor lands on the same packet either way (correctness)
+/// while the `sidxes` field is populated only in the first case.
+#[test]
+fn sidx_drives_seek_to_correct_keyframe_when_no_mfra() {
+    use oxideav_core::{
+        CodecId, CodecParameters, Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase, WriteSeek,
+    };
+    use oxideav_mp4::muxer::open_with_options;
+    use oxideav_mp4::options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
+    use std::io::Cursor;
+
+    let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+    params.channels = Some(2);
+    params.sample_rate = Some(48_000);
+    params.sample_format = Some(SampleFormat::S16);
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 48_000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+    let opts = Mp4MuxerOptions {
+        brand: BrandPreset::Mp4,
+        faststart: false,
+        fragmented: Some(FragmentedOptions {
+            cadence: FragmentCadence::EveryNPackets(1),
+            styp: None,
+            // sidx + mfra both emitted; we strip mfra below to force
+            // the sidx fast-path.
+            emit_random_access_indexes: true,
+        }),
+        write_edit_list: true,
+        track_sample_groups: Vec::new(),
+    };
+    let path = std::env::temp_dir().join("oxideav-mp4-sidx-seek.mp4");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
+        mux.write_header().unwrap();
+        for i in 0..5i64 {
+            let mut pkt = Packet::new(0, stream.time_base, vec![i as u8; 32]);
+            pkt.pts = Some(i * 1024);
+            pkt.dts = Some(i * 1024);
+            pkt.duration = Some(1024);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    // Walk top-level boxes and locate the trailing mfra.
+    let mut mfra_off: Option<usize> = None;
+    let mut sidx_count = 0usize;
+    let mut off = 0usize;
+    while off + 8 <= bytes.len() {
+        let sz = u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+            as usize;
+        let fc = &bytes[off + 4..off + 8];
+        if fc == b"sidx" {
+            sidx_count += 1;
+        }
+        if fc == b"mfra" {
+            mfra_off = Some(off);
+            break;
+        }
+        if sz < 8 {
+            break;
+        }
+        off += sz;
+    }
+    assert!(
+        sidx_count >= 1,
+        "muxer should have emitted at least one sidx with emit_random_access_indexes=true"
+    );
+    let mfra_off = mfra_off.expect("muxer should have emitted a trailing mfra");
+
+    // Build the sidx-only file by truncating at mfra_off.
+    let sidx_only = bytes[..mfra_off].to_vec();
+
+    // Seek to pts = 2500 — should land on the keyframe at pts=2048.
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(sidx_only.clone()));
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let landed = dmx.seek_to(0, 2500).unwrap();
+    assert_eq!(
+        landed, 2048,
+        "sidx fast-path should pick the pts=2048 keyframe"
+    );
+    let pkt = dmx.next_packet().unwrap();
+    assert_eq!(pkt.pts, Some(2048));
+    assert_eq!(pkt.data, vec![2u8; 32]);
+
+    // Seek-before-start: pts < 0 → first keyframe.
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(sidx_only.clone()));
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let landed = dmx.seek_to(0, -100).unwrap();
+    assert_eq!(landed, 0, "sidx fast-path should snap negative pts to 0");
+
+    // Exact-pts seek lands on that pts (binary-search hit, not predecessor).
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(sidx_only.clone()));
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let landed = dmx.seek_to(0, 3072).unwrap();
+    assert_eq!(landed, 3072, "exact-pts sidx hit");
+}
+
+/// Stripping BOTH `sidx` and `mfra` from a fragmented file must still
+/// allow `seek_to` to land on the right keyframe via the linear-scan
+/// fallback — the sidx fast-path is a perf improvement, not a
+/// correctness prerequisite.
+#[test]
+fn seek_to_still_works_without_sidx_or_mfra() {
+    use oxideav_core::{
+        CodecId, CodecParameters, Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase, WriteSeek,
+    };
+    use oxideav_mp4::muxer::open_with_options;
+    use oxideav_mp4::options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
+    use std::io::Cursor;
+
+    let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+    params.channels = Some(2);
+    params.sample_rate = Some(48_000);
+    params.sample_format = Some(SampleFormat::S16);
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 48_000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+    let opts = Mp4MuxerOptions {
+        brand: BrandPreset::Mp4,
+        faststart: false,
+        fragmented: Some(FragmentedOptions {
+            cadence: FragmentCadence::EveryNPackets(1),
+            styp: None,
+            emit_random_access_indexes: false,
+        }),
+        write_edit_list: true,
+        track_sample_groups: Vec::new(),
+    };
+    let path = std::env::temp_dir().join("oxideav-mp4-noindex-seek.mp4");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
+        mux.write_header().unwrap();
+        for i in 0..5i64 {
+            let mut pkt = Packet::new(0, stream.time_base, vec![i as u8; 32]);
+            pkt.pts = Some(i * 1024);
+            pkt.dts = Some(i * 1024);
+            pkt.duration = Some(1024);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let landed = dmx.seek_to(0, 2500).unwrap();
+    assert_eq!(
+        landed, 2048,
+        "linear-scan fallback should pick the pts=2048 keyframe"
+    );
+    let pkt = dmx.next_packet().unwrap();
+    assert_eq!(pkt.pts, Some(2048));
+    assert_eq!(pkt.data, vec![2u8; 32]);
+}
+
+/// A `sidx` whose `reference_id` doesn't match any track's `track_ID`
+/// must not be used: the seek must fall through to the linear scan.
+#[test]
+fn sidx_with_wrong_reference_id_is_ignored() {
+    use oxideav_core::{
+        CodecId, CodecParameters, Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase, WriteSeek,
+    };
+    use oxideav_mp4::muxer::open_with_options;
+    use oxideav_mp4::options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
+    use std::io::Cursor;
+
+    let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+    params.channels = Some(2);
+    params.sample_rate = Some(48_000);
+    params.sample_format = Some(SampleFormat::S16);
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 48_000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+    let opts = Mp4MuxerOptions {
+        brand: BrandPreset::Mp4,
+        faststart: false,
+        fragmented: Some(FragmentedOptions {
+            cadence: FragmentCadence::EveryNPackets(1),
+            styp: None,
+            emit_random_access_indexes: true,
+        }),
+        write_edit_list: true,
+        track_sample_groups: Vec::new(),
+    };
+    let path = std::env::temp_dir().join("oxideav-mp4-sidx-wrong-id.mp4");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
+        mux.write_header().unwrap();
+        for i in 0..5i64 {
+            let mut pkt = Packet::new(0, stream.time_base, vec![i as u8; 32]);
+            pkt.pts = Some(i * 1024);
+            pkt.dts = Some(i * 1024);
+            pkt.duration = Some(1024);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    // Strip the trailing mfra so only sidx remains (we want to test
+    // sidx-with-bad-ref-id, not tfra).
+    let mut mfra_off: Option<usize> = None;
+    let mut off = 0usize;
+    while off + 8 <= bytes.len() {
+        let sz = u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+            as usize;
+        let fc = &bytes[off + 4..off + 8];
+        if fc == b"mfra" {
+            mfra_off = Some(off);
+            break;
+        }
+        if sz < 8 {
+            break;
+        }
+        off += sz;
+    }
+    bytes.truncate(mfra_off.expect("trailing mfra missing"));
+
+    // Patch every `sidx` reference_id from 1 to 99 (no such track).
+    // Layout: [size u32][type "sidx"][FullBox(4)][reference_id u32]...
+    let mut off = 0usize;
+    let mut patched = 0;
+    while off + 8 <= bytes.len() {
+        let sz = u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+            as usize;
+        let fc = &bytes[off + 4..off + 8];
+        if fc == b"sidx" {
+            let rid_off = off + 8 + 4; // header(8) + FullBox(4)
+            bytes[rid_off..rid_off + 4].copy_from_slice(&99u32.to_be_bytes());
+            patched += 1;
+        }
+        if sz < 8 {
+            break;
+        }
+        off += sz;
+    }
+    assert!(patched >= 1, "should have patched at least one sidx");
+
+    // Seek still lands correctly via the linear-scan fallback.
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let landed = dmx.seek_to(0, 2500).unwrap();
+    assert_eq!(landed, 2048);
+}

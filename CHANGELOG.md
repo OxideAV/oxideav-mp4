@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sidx`-driven seek fast-path (ISO/IEC 14496-12 §8.16.3
+  SegmentIndexBox). The demuxer already parsed `sidx` records into a
+  `Vec<SidxRecord>`; until now they were kept for downstream tooling
+  only and `seek_to` ignored them. This change adds a secondary
+  fast-path between the existing `tfra` walk and the linear-scan
+  fallback: when no `tfra` covers the requested track (typical for
+  DASH on-demand profile files, which carry `sidx` but no `mfra`),
+  `seek_to` walks every `sidx` whose `reference_id` matches the
+  track, expands each one's references into virtual
+  `(time, byte_offset)` anchors, and picks the latest anchor whose
+  decode-time start is at or before the requested pts (translated
+  from track-media-timescale into sidx-timescale per §8.16.3). The
+  returned byte offset feeds the same "scan forward to the first
+  keyframe at-or-after this offset" loop the `tfra` path uses, so
+  the sample-list scan is bounded by one subsegment instead of the
+  whole file. Both on-the-wire shapes are handled: a single `sidx`
+  indexing N subsegments (on-demand profile) and one `sidx` per
+  fragment indexing one subsegment each (live profile, which is
+  what our own muxer emits). Hierarchical (nested) sidx references
+  are walked for byte-range accounting only — they don't carry a
+  media-time anchor we can land on. A `sidx` whose `reference_id`
+  doesn't match any track's `track_ID` is ignored (with the linear
+  scan as the safe fallback), and a pts that predates every indexed
+  subsegment snaps to the first media reference's offset so the
+  seek still lands on a real keyframe boundary instead of falling
+  through to O(N) over the whole sample table. Three new integration
+  tests in `tests/random_access.rs`:
+  `sidx_drives_seek_to_correct_keyframe_when_no_mfra` mux-then-strip
+  the trailing `mfra` and confirm `seek_to(pts=2500)` lands on the
+  `pts=2048` keyframe (exact-pts seek + negative-pts snap-to-zero
+  also covered); `seek_to_still_works_without_sidx_or_mfra`
+  cross-checks the linear-scan fallback still gets the right
+  keyframe when neither index is present (correctness, not perf);
+  `sidx_with_wrong_reference_id_is_ignored` patches every `sidx`'s
+  reference_id to a nonexistent track and confirms the demuxer
+  falls through to the linear scan and still lands on the correct
+  pts. Closes the README "Not yet supported — `sidx`
+  segment-index seek-time mapping (skipped; sequential demux works
+  without it)" item.
 - Sub-Sample Information Box demux (`subs`, ISO/IEC 14496-12 §8.7.7).
   The optional per-track sparse table that describes how selected
   samples decompose into smaller, semantically-meaningful sub-samples
