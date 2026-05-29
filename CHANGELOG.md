@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.7...v0.0.8) - 2026-05-29
+
+### Other
+
+- Round 189 — reject extended-size boxes that overflow u64
+- use parsed sidx for seek when no tfra is available (§8.16.3)
+- parse subs SubSampleInformationBox (ISO/IEC 14496-12 §8.7.7)
+- parse prft ProducerReferenceTimeBox (ISO/IEC 14496-12 §8.16.5)
+- Sample-group muxing — write side of sbgp + sgpd (ISO/IEC 14496-12 §8.9)
+- DASH/CMAF-friendly write-side Segment Type Box emitter
+- add cargo-fuzz demux target + fix 3 DoS classes it found
+- parse sdtp (SampleDependencyTypeBox §8.6.4)
+- demux Sample Group structures (sbgp + sgpd, ISO/IEC 14496-12 §8.9)
+- demux Shadow Sync Sample Box (stsh, ISO/IEC 14496-12 §8.6.3)
+- demux Composition to Decode Box (cslg, ISO/IEC 14496-12 §8.6.1.4)
+- demux Track Kind Box (kind, ISO/IEC 14496-12 §8.10.4)
+- demux ExtendedLanguageBox (elng, ISO/IEC 14496-12 §8.4.6)
+- emit edts/elst edit list for positive start delay (§8.6.5–6)
+- mp4 muxer: subtitle / timed-text track support (mov_text, webvtt, ttml, sbtt, stxt)
+- parse tref + surface track references as tref_<type> options
+- subtitle-handler dispatch + sinf protection unwrap
+
 ### Fixed
 
 - Reject extended-size (`size=1 largesize=u64::MAX`) boxes that overflow
