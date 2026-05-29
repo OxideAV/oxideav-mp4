@@ -32,7 +32,9 @@ impl BoxHeader {
     }
 }
 
-pub fn read_box_header<R: Read + ?Sized>(r: &mut R) -> Result<Option<BoxHeader>> {
+pub fn read_box_header<R: Read + Seek + ?Sized>(r: &mut R) -> Result<Option<BoxHeader>> {
+    let start = r.stream_position()?;
+
     let mut hdr = [0u8; 8];
     let mut got = 0;
     while got < 8 {
@@ -75,6 +77,30 @@ pub fn read_box_header<R: Read + ?Sized>(r: &mut R) -> Result<Option<BoxHeader>>
         }
         n => (Some(n as u64), 8u64),
     };
+
+    // Reject any header whose declared end byte would overflow `u64`.
+    // This is the single point that bounds every downstream
+    // `body_start + payload_size` / `box_end` computation: once we have
+    // proven `start + total_size <= u64::MAX`, the equivalent form
+    // `(start + header_len) + (total_size - header_len)` also fits, so
+    // the top-level walker in `demux.rs` (the `sidx` `body_start +
+    // payload_size` site and every `cur.position() + payload` site
+    // under it) can no longer integer-overflow on a forged extended
+    // size near `u64::MAX`. Companion to round 187 in `oxideav-mov`,
+    // which closed the same shape on the QTFF atom walker for fuzz
+    // crash `353fbd8c…`: an 8-byte placeholder box followed by a
+    // `size=1` extended box whose `largesize = u64::MAX` overflows
+    // every downstream `start + total_size` arithmetic site in debug
+    // builds (panic) and silently wraps in release builds.
+    if let Some(t) = total_size {
+        if start.checked_add(t).is_none() {
+            return Err(Error::invalid(format!(
+                "MP4: box '{}' declared size {t} from offset {start} overflows u64",
+                std::str::from_utf8(&fourcc).unwrap_or("????"),
+            )));
+        }
+    }
+
     Ok(Some(BoxHeader {
         fourcc,
         total_size,
@@ -300,6 +326,65 @@ mod tests {
                 read_box_header(&mut Cursor::new(buf)).expect_err("largesize < 16 must be invalid");
             assert!(format!("{err}").contains("MP4"), "{err}");
         }
+    }
+
+    #[test]
+    fn box_largesize_overflowing_u64_from_nonzero_start_is_rejected() {
+        // Companion to round 187 in `oxideav-mov`: an 8-byte placeholder
+        // box at offset 0 followed by a `size=1 largesize=u64::MAX`
+        // box at offset 8 used to overflow every downstream
+        // `body_start + payload_size` computation (the §8.16.3 `sidx`
+        // body-end anchor in `demux.rs` line 53 is the closest
+        // analogue to mov's `body_end` arithmetic). At `start = 8`
+        // and `total_size = u64::MAX`, `start + total_size = u64::MAX + 8`
+        // — debug builds panic with "attempt to add with overflow";
+        // release builds silently wrap. The header-level
+        // `checked_add` guard rejects the box before any caller
+        // touches the arithmetic.
+        let mut buf = Vec::new();
+        // Box #1: size=8, fourcc=free. Pushes the next box's start to 8.
+        buf.extend_from_slice(&8u32.to_be_bytes());
+        buf.extend_from_slice(b"free");
+        // Box #2: size=1 (extended), largesize=u64::MAX. Anchored at
+        // offset 8, so `start + total_size` overflows.
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(b"mdat");
+        buf.extend_from_slice(&u64::MAX.to_be_bytes());
+
+        let mut cur = Cursor::new(buf);
+        // First box must parse cleanly: start=0 + total_size=8 fits.
+        let h1 = read_box_header(&mut cur)
+            .expect("first box parses")
+            .expect("first box present");
+        assert_eq!(h1.total_size, Some(8));
+        // Second box: u64-overflow must surface as Err, not panic / wrap.
+        let err =
+            read_box_header(&mut cur).expect_err("u64 overflow must be rejected at header read");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("overflow") && msg.contains("mdat"),
+            "expected u64-overflow rejection naming the box, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn box_largesize_one_below_overflow_is_accepted() {
+        // Boundary case: `start + largesize == u64::MAX` is still
+        // representable, so `checked_add` returns `Some(_)` and the
+        // header is accepted. Drive `read_box_header` directly — the
+        // body would extend past the 16-byte cursor but the framing
+        // itself must be returned to the caller intact.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(b"mdat");
+        buf.extend_from_slice(&u64::MAX.to_be_bytes());
+        let mut cur = Cursor::new(buf);
+        let hdr = read_box_header(&mut cur)
+            .expect("header at start=0 with largesize=u64::MAX does not overflow")
+            .expect("a 16-byte header is present");
+        assert_eq!(hdr.fourcc, *b"mdat");
+        assert_eq!(hdr.total_size, Some(u64::MAX));
+        assert_eq!(hdr.header_len, 16);
     }
 
     #[test]

@@ -457,6 +457,18 @@ nothing panics, aborts, or OOMs. Seed corpus + regression artefacts
 live at `fuzz/corpus/demux/`. The fuzz crate has its own `[workspace]`
 and a committed `Cargo.lock` for reproducibility.
 
+Pinned regressions worth calling out:
+
+* **Extended-size u64 overflow** — a `size=1 largesize=u64::MAX`
+  extended box anchored at a non-zero file offset used to overflow
+  every downstream `body_start + payload_size` arithmetic site
+  (the §8.16.3 `sidx` end-anchor computation is the most exposed
+  example). `read_box_header` now `checked_add`s `start + total_size`
+  and rejects the header before any caller computes a derived end
+  byte. Replayed by `tests/largesize_overflow.rs` and two boundary
+  unit tests in `src/boxes.rs`. Companion to oxideav-mov's round 187
+  fix on the QTFF atom walker.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

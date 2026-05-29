@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject extended-size (`size=1 largesize=u64::MAX`) boxes that overflow
+  `u64` at the header reader rather than at every downstream
+  `body_start + payload_size` arithmetic site. The `read_box_header`
+  signature is now `Read + Seek + ?Sized` (every existing caller already
+  passes a `Cursor` or `Box<dyn ReadSeek>`, so this is API-source
+  compatible) and captures the start offset of each box. After the
+  size32 / largesize discrimination it `checked_add`s `start +
+  total_size` and rejects any header whose declared end byte would
+  overflow `u64`. Without the guard, an 8-byte placeholder box at
+  offset 0 followed by a `size=1` extended box whose `largesize =
+  u64::MAX` panics debug builds with `attempt to add with overflow` at
+  `demux.rs:53` (the `sidx` body-end anchor `body_start +
+  payload_size`); release builds silently wrap to a tiny value and
+  pass the past-EOF guard, propagating corrupted offsets into the
+  sample-table walker. Companion to round 187 in `oxideav-mov` which
+  closed the same shape on the QTFF atom walker for fuzz crash
+  `353fbd8c…`. Three new tests: two unit tests in `src/boxes.rs`
+  pin the boundary (header at `start + largesize = u64::MAX` is
+  accepted; `start + largesize > u64::MAX` is rejected with an error
+  message naming the offending fourcc), and one integration test in
+  `tests/largesize_overflow.rs` replays the crash shape end-to-end
+  through `demux::open` and asserts a clean `Err` surfaces.
+
 ### Added
 
 - `sidx`-driven seek fast-path (ISO/IEC 14496-12 §8.16.3
