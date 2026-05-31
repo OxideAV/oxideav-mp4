@@ -18,6 +18,7 @@ use oxideav_core::{
 use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::boxes::*;
+use crate::cenc::{parse_pssh, parse_senc, parse_tenc, PsshBox, SencBox, TencBox};
 use crate::codec_id::{from_sample_entry, from_sample_entry_with_oti};
 
 pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
@@ -126,8 +127,15 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         }
     }
 
+    let mut senc_records: Vec<SencRecord> = Vec::new();
     for moof in &moofs {
-        parse_moof(moof, &parsed.tracks, &mut samples, &mut next_dts)?;
+        parse_moof(
+            moof,
+            &parsed.tracks,
+            &mut samples,
+            &mut next_dts,
+            &mut senc_records,
+        )?;
     }
 
     samples.sort_by_key(|s| s.offset);
@@ -157,6 +165,32 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         ));
     }
 
+    // Surface ISO/IEC 23001-7 §8.1 pssh boxes as `pssh_<n>` keys with
+    // value `"<system_id_hex> <kid_count> <data_len>"`. Callers wanting
+    // the structured record use the public `Mp4Demuxer::psshes` accessor.
+    for (n, p) in parsed.psshes.iter().enumerate() {
+        let sysid_hex: String = p.system_id.iter().map(|b| format!("{b:02x}")).collect();
+        metadata.push((
+            format!("pssh_{n}"),
+            format!("{} {} {}", sysid_hex, p.kids.len(), p.data.len()),
+        ));
+    }
+
+    // Aggregate counter for §7.2 senc — one key per (track_idx,
+    // moof_sequence) record with summary "<sample_count> <flags_hex>".
+    for (n, r) in senc_records.iter().enumerate() {
+        metadata.push((
+            format!("senc_{n}"),
+            format!(
+                "track={} seq={} samples={} flags=0x{:08x}",
+                r.track_idx,
+                r.moof_sequence,
+                r.senc.samples.len(),
+                r.senc.flags,
+            ),
+        ));
+    }
+
     Ok(Box::new(Mp4Demuxer {
         input,
         streams,
@@ -167,6 +201,8 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         sidxes,
         tfras,
         prfts,
+        psshes: parsed.psshes,
+        senc_records,
         movie_timescale: parsed.movie_timescale,
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
@@ -282,6 +318,14 @@ struct ParsedMoov {
     movie_timescale: u32,
     movie_duration: u64,
     metadata: Vec<(String, String)>,
+    /// §8.1 (ISO/IEC 23001-7) — `pssh`
+    /// ProtectionSystemSpecificHeaderBox entries collected at moov
+    /// level. Each entry corresponds to one DRM system signalled in
+    /// the file by SystemID UUID. moof-level `pssh` instances are
+    /// also permitted by the spec but the surface here is moov-only;
+    /// fragment-level pssh can be added without changing the demuxer
+    /// API.
+    psshes: Vec<PsshBox>,
 }
 
 /// Per-track info collected from moov.
@@ -354,6 +398,16 @@ struct Track {
     /// they just won't get plaintext bytes until something else
     /// decrypts them.
     protection_scheme: Option<[u8; 4]>,
+    /// ISO/IEC 23001-7 §8.2 — `tenc` TrackEncryptionBox payload, when
+    /// present. Lives inside `schi` inside `sinf` of an `enc*` sample
+    /// entry. Carries the track-level defaults (KID, per-sample IV
+    /// size, isProtected flag, plus v1 pattern-encryption block
+    /// counts + constant IV) consumed by a downstream CENC decryptor.
+    /// `None` when the track is unprotected or when the protected
+    /// sample entry omits `tenc` (the spec marks it "Mandatory: No
+    /// (Yes, for protected tracks)", so a missing tenc on an `enc*`
+    /// entry is still parseable but the file is non-conforming).
+    tenc: Option<TencBox>,
     /// §8.3.3 — `tref` (TrackReferenceBox) entries. Each pair is
     /// `(reference_type, track_IDs)` where `reference_type` is the FourCC
     /// of an inner `TrackReferenceTypeBox` (e.g. `chap`, `subt`, `cdsc`,
@@ -651,6 +705,21 @@ fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
                 let body = read_bytes_vec(&mut cur, psz)?;
                 parse_mvex(&body, &mut out.tracks)?;
             }
+            PSSH => {
+                // ISO/IEC 23001-7 §8.1 — ProtectionSystemSpecificHeaderBox.
+                // Zero or more per moov; each is keyed by a 16-byte
+                // SystemID UUID identifying a DRM. Parsed structurally
+                // and surfaced through the demuxer's metadata channel
+                // (no decryption — this crate only carries the box).
+                // A malformed pssh is non-fatal: drop it but keep the
+                // file parseable (DRM-free playback may still be
+                // intended, and an opaque DRM box should not brick the
+                // demuxer).
+                let body = read_bytes_vec(&mut cur, psz)?;
+                if let Ok(p) = parse_pssh(&body) {
+                    out.psshes.push(p);
+                }
+            }
             _ => {
                 skip_cursor_bytes(&mut cur, psz);
             }
@@ -918,6 +987,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         elst: Vec::new(),
         trex: TrexDefaults::default(),
         protection_scheme: None,
+        tenc: None,
         tref: Vec::new(),
         elng: None,
         kinds: Vec::new(),
@@ -1434,20 +1504,44 @@ fn parse_stsd(body: &[u8], t: &mut Track) -> Result<()> {
     // 78 for video) then codec config boxes — which is exactly what
     // §8.12.0 mandates ("leaving all other boxes unmodified").
     if matches!(hdr.fourcc, ENCV | ENCA | ENCT | ENCS) {
-        let (orig, scheme) = parse_sinf_for_original_format(&entry, t.media_type)?;
-        if let Some(fourcc) = orig {
+        let unwrap = parse_sinf_for_original_format(&entry, t.media_type)?;
+        if let Some(fourcc) = unwrap.original_format {
             t.codec_id_fourcc = fourcc;
         }
-        t.protection_scheme = scheme;
+        t.protection_scheme = unwrap.scheme_type;
+        t.tenc = unwrap.tenc;
     }
     parse_sample_entry(&entry, t)?;
     Ok(())
 }
 
-/// Result of unwrapping an `enc*` sample entry: `(original_fourcc,
-/// scheme_type)`. Either field may be `None` when the corresponding
-/// child box is absent in the sinf.
-type SinfUnwrap = (Option<[u8; 4]>, Option<[u8; 4]>);
+/// Result of unwrapping an `enc*` sample entry. Each field is
+/// independently `None` when the corresponding child box was absent
+/// from the sinf:
+///
+/// * `original_format` — un-transformed sample-entry FourCC from
+///   `sinf/frma` (§8.12.2).
+/// * `scheme_type` — protection scheme FourCC from `sinf/schm`
+///   (§8.12.5). Per spec a `sinf` may carry `frma` without `schm` in
+///   IPMP-only signalling.
+/// * `tenc` — parsed CENC TrackEncryptionBox payload from
+///   `sinf/schi/tenc` (ISO/IEC 23001-7 §8.2). Absent when the file
+///   uses a non-CENC scheme or omits the (CENC-mandatory) tenc.
+struct SinfUnwrap {
+    original_format: Option<[u8; 4]>,
+    scheme_type: Option<[u8; 4]>,
+    tenc: Option<TencBox>,
+}
+
+impl SinfUnwrap {
+    fn empty() -> Self {
+        SinfUnwrap {
+            original_format: None,
+            scheme_type: None,
+            tenc: None,
+        }
+    }
+}
 
 /// Walk a protected sample entry (`enc*`) to find its `sinf` child
 /// container, then pull out the original (un-transformed) FourCC from
@@ -1467,10 +1561,10 @@ fn parse_sinf_for_original_format(entry: &[u8], media_type: MediaType) -> Result
         MediaType::Video => 78,
         // Other media types we don't currently surface as `enc*`; bail
         // gracefully without claiming anything.
-        _ => return Ok((None, None)),
+        _ => return Ok(SinfUnwrap::empty()),
     };
     if entry.len() <= preamble {
-        return Ok((None, None));
+        return Ok(SinfUnwrap::empty());
     }
     let mut cur = std::io::Cursor::new(&entry[preamble..]);
     let end = (entry.len() - preamble) as u64;
@@ -1485,14 +1579,17 @@ fn parse_sinf_for_original_format(entry: &[u8], media_type: MediaType) -> Result
             return parse_sinf_body(&body);
         }
     }
-    Ok((None, None))
+    Ok(SinfUnwrap::empty())
 }
 
-/// Inner sinf walker — same shape, but at the sinf level we're looking
-/// for `frma` (original_format, §8.12.2) and `schm` (scheme_type, §8.12.5).
+/// Inner sinf walker — at the sinf level we're looking for `frma`
+/// (original_format, §8.12.2), `schm` (scheme_type, §8.12.5), and
+/// `schi` (SchemeInformationBox, §8.12.6). Per ISO/IEC 23001-7 §4.1
+/// the `schi` of a CENC-protected track contains a `tenc`
+/// TrackEncryptionBox; we descend one level into `schi` to pick that
+/// up alongside the §8.12 fields.
 fn parse_sinf_body(body: &[u8]) -> Result<SinfUnwrap> {
-    let mut original: Option<[u8; 4]> = None;
-    let mut scheme: Option<[u8; 4]> = None;
+    let mut out = SinfUnwrap::empty();
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
     while cur.position() < end {
@@ -1504,18 +1601,45 @@ fn parse_sinf_body(body: &[u8]) -> Result<SinfUnwrap> {
         let inner = read_bytes_vec(&mut cur, psz)?;
         match hdr.fourcc {
             FRMA if inner.len() >= 4 => {
-                original = Some([inner[0], inner[1], inner[2], inner[3]]);
+                out.original_format = Some([inner[0], inner[1], inner[2], inner[3]]);
             }
             SCHM if inner.len() >= 8 => {
                 // FullBox header (4 bytes) + scheme_type (4 bytes) +
                 // scheme_version (4 bytes) + optional URI. We only need
                 // scheme_type at offset 4.
-                scheme = Some([inner[4], inner[5], inner[6], inner[7]]);
+                out.scheme_type = Some([inner[4], inner[5], inner[6], inner[7]]);
+            }
+            SCHI => {
+                // ISO/IEC 23001-7 §4.1 — descend into schi to find
+                // `tenc`. A malformed tenc inside an otherwise valid
+                // schi should not abort sinf parsing (it still has
+                // structural meaning via frma + schm), so we swallow
+                // a TencBox parse error and leave `out.tenc = None`.
+                out.tenc = walk_schi_for_tenc(&inner);
             }
             _ => {}
         }
     }
-    Ok((original, scheme))
+    Ok(out)
+}
+
+/// Walk a `schi` (SchemeInformationBox, ISO/IEC 14496-12 §8.12.6)
+/// body looking for a `tenc` (TrackEncryptionBox, ISO/IEC 23001-7
+/// §8.2) child. Returns the parsed payload, or `None` if no tenc was
+/// present (or it was malformed — schi can legitimately carry other
+/// scheme-specific children).
+fn walk_schi_for_tenc(body: &[u8]) -> Option<TencBox> {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = read_box_header(&mut cur).ok().flatten()?;
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let inner = read_bytes_vec(&mut cur, psz).ok()?;
+        if hdr.fourcc == TENC {
+            return parse_tenc(&inner).ok();
+        }
+    }
+    None
 }
 
 fn parse_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
@@ -2493,20 +2617,44 @@ fn parse_co64(body: &[u8]) -> Result<Vec<u64>> {
 
 // --- Movie-fragment parsing (ISO/IEC 14496-12 §8.8) ----------------------
 
+/// One per-fragment CENC SampleEncryptionBox record. Collected during
+/// the moof walk so a downstream layer can replay per-sample IVs and
+/// subsample maps without re-parsing the file. `track_idx` is the
+/// 0-based index into the demuxer's `streams()`; `senc` carries the
+/// payload exactly as parsed.
+#[derive(Clone, Debug)]
+pub struct SencRecord {
+    /// `track_idx` of the matching stream in the demuxer's
+    /// `streams()` list (0-based).
+    pub track_idx: u32,
+    /// `mfhd.sequence_number` of the containing `moof`. Surfaced so a
+    /// caller that interleaves multiple sources or replays out of
+    /// order can re-key.
+    pub moof_sequence: u32,
+    /// Parsed CENC SampleEncryptionBox.
+    pub senc: SencBox,
+}
+
 /// Walk one `moof` box, locating its `traf` children and stitching the
 /// fragmented samples into the per-track sample list.
 ///
 /// `next_dts` carries each track's running base_media_decode_time so a
 /// `traf` without `tfdt` continues seamlessly from the previous
 /// fragment (or from the moov-derived sample tail).
+///
+/// `senc_records` accumulates per-fragment ISO/IEC 23001-7 §7.2 senc
+/// payloads keyed by `(track_idx, moof_sequence)` so a decrypting
+/// layer can recover them without re-parsing the file.
 fn parse_moof(
     moof: &MoofRecord,
     tracks: &[Track],
     samples: &mut Vec<SampleRef>,
     next_dts: &mut [i64],
+    senc_records: &mut Vec<SencRecord>,
 ) -> Result<()> {
     let mut cur = std::io::Cursor::new(&moof.body);
     let end = moof.body.len() as u64;
+    let mut moof_sequence: u32 = 0;
     while cur.position() < end {
         let hdr = match read_box_header(&mut cur)? {
             Some(h) => h,
@@ -2515,13 +2663,26 @@ fn parse_moof(
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         match hdr.fourcc {
             // §8.8.5 — `mfhd` MovieFragmentHeaderBox. Carries the
-            // monotonically-increasing sequence_number; useful for
-            // multi-source diagnostics but not required for sample
-            // resolution. Skip.
-            MFHD => skip_cursor_bytes(&mut cur, psz),
+            // monotonically-increasing sequence_number. Capture it
+            // so per-traf SencRecords get an ordering key.
+            MFHD => {
+                let body = read_bytes_vec(&mut cur, psz)?;
+                // FullBox header (4 bytes) + sequence_number (u32).
+                if body.len() >= 8 {
+                    moof_sequence = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+                }
+            }
             TRAF => {
                 let body = read_bytes_vec(&mut cur, psz)?;
-                parse_traf(&body, moof.moof_start, tracks, samples, next_dts)?;
+                parse_traf(
+                    &body,
+                    moof.moof_start,
+                    tracks,
+                    samples,
+                    next_dts,
+                    moof_sequence,
+                    senc_records,
+                )?;
             }
             _ => skip_cursor_bytes(&mut cur, psz),
         }
@@ -2587,11 +2748,17 @@ fn parse_traf(
     tracks: &[Track],
     samples: &mut Vec<SampleRef>,
     next_dts: &mut [i64],
+    moof_sequence: u32,
+    senc_records: &mut Vec<SencRecord>,
 ) -> Result<()> {
     // First pass: read tfhd + tfdt before the trun(s) so each trun
-    // has the full default context.
+    // has the full default context. Also pick up senc (ISO/IEC 23001-7
+    // §7.2) — it has no on-wire ordering dependency on tfhd/tfdt, but
+    // parsing it needs the matching track's tenc.default_Per_Sample_IV_Size
+    // to know how many IV bytes to consume per sample.
     let mut state = TrafState::default();
     let mut tfhd_seen = false;
+    let mut senc_body: Option<Vec<u8>> = None;
 
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
@@ -2611,6 +2778,12 @@ fn parse_traf(
                 let b = read_bytes_vec(&mut cur, psz)?;
                 state.base_media_decode_time = Some(parse_tfdt(&b)?);
             }
+            // §7.2 senc — keep the bytes; we need the track's tenc
+            // first (via state.track_idx, populated by tfhd) before we
+            // can interpret the per-sample IV width.
+            SENC => {
+                senc_body = Some(read_bytes_vec(&mut cur, psz)?);
+            }
             // We only resolve trun's in the second pass; skip here.
             TRUN => skip_cursor_bytes(&mut cur, psz),
             _ => skip_cursor_bytes(&mut cur, psz),
@@ -2622,6 +2795,25 @@ fn parse_traf(
     }
 
     let track = &tracks[state.track_idx];
+
+    // ISO/IEC 23001-7 §7.2 — now that we know which track this traf
+    // refers to, we can recover the per-sample IV width from the
+    // track's tenc default and parse the captured senc body. Tracks
+    // without tenc (non-CENC protection scheme, or no protection at
+    // all) drop the senc on the floor — a malformed file may carry
+    // it without the matching scheme box, but there's nothing the
+    // demuxer can do with it without an IV-size key.
+    if let Some(body) = senc_body {
+        if let Some(tenc) = &track.tenc {
+            if let Ok(senc) = parse_senc(&body, tenc.default_per_sample_iv_size) {
+                senc_records.push(SencRecord {
+                    track_idx: state.track_idx as u32,
+                    moof_sequence,
+                    senc,
+                });
+            }
+        }
+    }
 
     // Each trun walks samples from its own data_offset relative to
     // base_data_offset. Track running data offset across multiple
@@ -3487,6 +3679,56 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert("protection_scheme", scheme_str);
     }
 
+    // ISO/IEC 23001-7 §8.2: when a CENC TrackEncryptionBox was
+    // present inside `sinf/schi`, surface its defaults on
+    // `params.options` so a downstream decryption layer can recover
+    // them without a second pass. Keys:
+    //
+    //   cenc_default_kid               16-byte KID, lowercase hex
+    //   cenc_default_is_protected      "0" or "1"
+    //   cenc_default_iv_size           0 / 8 / 16
+    //   cenc_default_crypt_byte_block  v1 only, decimal (omitted on v0)
+    //   cenc_default_skip_byte_block   v1 only, decimal (omitted on v0)
+    //   cenc_default_constant_iv       lowercase hex, only when
+    //                                  isProtected==1 && iv_size==0
+    //   cenc_tenc_version              "0" or "1"
+    //
+    // All keys are absent for unprotected (or non-CENC-protected)
+    // tracks. Hex encoding mirrors the `pssh_<n>` SystemID surface.
+    if let Some(tenc) = &t.tenc {
+        let kid_hex: String = tenc
+            .default_kid
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        params.options.insert("cenc_default_kid", kid_hex);
+        params.options.insert(
+            "cenc_default_is_protected",
+            tenc.default_is_protected.to_string(),
+        );
+        params.options.insert(
+            "cenc_default_iv_size",
+            tenc.default_per_sample_iv_size.to_string(),
+        );
+        params
+            .options
+            .insert("cenc_tenc_version", tenc.version.to_string());
+        if tenc.version >= 1 {
+            params.options.insert(
+                "cenc_default_crypt_byte_block",
+                tenc.default_crypt_byte_block.to_string(),
+            );
+            params.options.insert(
+                "cenc_default_skip_byte_block",
+                tenc.default_skip_byte_block.to_string(),
+            );
+        }
+        if let Some(civ) = &tenc.default_constant_iv {
+            let iv_hex: String = civ.iter().map(|b| format!("{b:02x}")).collect();
+            params.options.insert("cenc_default_constant_iv", iv_hex);
+        }
+    }
+
     // ISO/IEC 14496-12 §8.4.6: when the track carries an `elng`
     // ExtendedLanguageBox, surface its BCP 47 (RFC 4646) tag on
     // `params.options["language"]` (e.g. `en-US`, `zh-Hant`). This is
@@ -3768,6 +4010,19 @@ struct Mp4Demuxer {
     /// not consulted by `next_packet` / `seek_to`.
     #[allow(dead_code)]
     prfts: Vec<PrftRecord>,
+    /// ISO/IEC 23001-7 §8.1 pssh entries collected from moov. One per
+    /// DRM system signalled in the file; the demuxer does not consume
+    /// them but a downstream decryption layer can look up its
+    /// SystemID match here.
+    #[allow(dead_code)]
+    psshes: Vec<PsshBox>,
+    /// ISO/IEC 23001-7 §7.2 senc records, one per `traf` that carried
+    /// a SampleEncryptionBox. Each holds the parsed per-sample IVs
+    /// and (when `UseSubSampleEncryption` was set) the subsample map,
+    /// keyed by `(track_idx, moof_sequence)` for downstream
+    /// reassembly. Empty in non-CENC files (the common case).
+    #[allow(dead_code)]
+    senc_records: Vec<SencRecord>,
     /// Per-track media timescale (1-based parallel to `track_ids`),
     /// needed to translate `tfra.time` (track timescale) to the seek-to
     /// caller's pts (also track timescale, but this lets us add unit
@@ -3776,6 +4031,35 @@ struct Mp4Demuxer {
     movie_timescale: u32,
     track_timescales: Vec<u32>,
     track_ids: Vec<u32>,
+}
+
+impl Mp4Demuxer {
+    /// ISO/IEC 23001-7 §8.1 — all `pssh`
+    /// ProtectionSystemSpecificHeaderBox entries discovered at moov
+    /// level, in file order. Each is keyed by a 16-byte SystemID UUID;
+    /// a downstream DRM layer that matches the SystemID consumes the
+    /// `data` blob (and v1 `kids` list). Empty for unprotected files.
+    ///
+    /// `pssh` entries inside individual `moof` boxes are also permitted
+    /// by the spec — they are not yet collected here; an r197 follow-up
+    /// can extend `SencRecord` / `parse_moof` to surface them.
+    #[allow(dead_code)]
+    pub fn psshes(&self) -> &[PsshBox] {
+        &self.psshes
+    }
+
+    /// ISO/IEC 23001-7 §7.2 — per-fragment `senc`
+    /// SampleEncryptionBox records collected from every `traf` whose
+    /// matching track carried a `tenc` default (so the per-sample IV
+    /// width was recoverable). Indexed in moof-encounter order; the
+    /// `track_idx` field references this demuxer's `streams()` list,
+    /// and `moof_sequence` is the `mfhd.sequence_number` of the
+    /// containing movie fragment. Empty for unfragmented files and
+    /// for fragmented files without per-fragment encryption metadata.
+    #[allow(dead_code)]
+    pub fn senc_records(&self) -> &[SencRecord] {
+        &self.senc_records
+    }
 }
 
 impl Demuxer for Mp4Demuxer {
@@ -4239,6 +4523,7 @@ mod tests {
             elst: Vec::new(),
             trex: super::TrexDefaults::default(),
             protection_scheme: None,
+            tenc: None,
             tref: Vec::new(),
             elng: None,
             kinds: Vec::new(),
@@ -4363,6 +4648,200 @@ mod tests {
         assert_eq!(t.protection_scheme, Some(*b"cbcs"));
         assert_eq!(t.width, Some(1280));
         assert_eq!(t.height, Some(720));
+    }
+
+    /// Build a `tenc` box (ISO/IEC 23001-7 §8.2) including its 8-byte
+    /// box header (size + `tenc` fourcc).
+    fn build_tenc_box_v0(kid: &[u8; 16], iv_size: u8) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version=0 + flags
+        body.push(0); // reserved
+        body.push(0); // reserved
+        body.push(1); // default_isProtected
+        body.push(iv_size);
+        body.extend_from_slice(kid);
+        let mut out = Vec::with_capacity(8 + body.len());
+        out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+        out.extend_from_slice(b"tenc");
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn build_tenc_box_v1_constant_iv(
+        kid: &[u8; 16],
+        crypt: u8,
+        skip: u8,
+        const_iv: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1u8, 0, 0, 0]); // version=1 + flags
+        body.push(0); // reserved
+        body.push((crypt << 4) | (skip & 0x0F));
+        body.push(1); // default_isProtected
+        body.push(0); // default_Per_Sample_IV_Size = 0 ⇒ constant IV
+        body.extend_from_slice(kid);
+        body.push(const_iv.len() as u8);
+        body.extend_from_slice(const_iv);
+        let mut out = Vec::with_capacity(8 + body.len());
+        out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+        out.extend_from_slice(b"tenc");
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Build a `schi` box containing the given child box bytes
+    /// (already framed with their own 8-byte header).
+    fn build_schi_box(child: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + child.len());
+        out.extend_from_slice(&((8 + child.len()) as u32).to_be_bytes());
+        out.extend_from_slice(b"schi");
+        out.extend_from_slice(child);
+        out
+    }
+
+    /// Build a sinf body with frma + schm + schi (where schi contains
+    /// `schi_child` — typically a `tenc`). Mirrors the on-disk shape
+    /// for a CENC-protected sample entry's protection scheme info.
+    fn build_sinf_body_with_schi(
+        original: &[u8; 4],
+        scheme: &[u8; 4],
+        schi_child: &[u8],
+    ) -> Vec<u8> {
+        let mut sinf_body = Vec::new();
+        // frma
+        sinf_body.extend_from_slice(&12u32.to_be_bytes());
+        sinf_body.extend_from_slice(b"frma");
+        sinf_body.extend_from_slice(original);
+        // schm
+        sinf_body.extend_from_slice(&20u32.to_be_bytes());
+        sinf_body.extend_from_slice(b"schm");
+        sinf_body.extend_from_slice(&[0u8; 4]);
+        sinf_body.extend_from_slice(scheme);
+        sinf_body.extend_from_slice(&[0u8; 4]);
+        // schi (containing tenc)
+        let schi = build_schi_box(schi_child);
+        sinf_body.extend_from_slice(&schi);
+        sinf_body
+    }
+
+    fn build_enca_with_full_sinf(original: &[u8; 4], scheme: &[u8; 4], tenc_box: &[u8]) -> Vec<u8> {
+        // 28-byte audio preamble.
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 6]);
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&[0u8; 8]);
+        out.extend_from_slice(&2u16.to_be_bytes());
+        out.extend_from_slice(&16u16.to_be_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&((48_000u32) << 16).to_be_bytes());
+        let sinf_body = build_sinf_body_with_schi(original, scheme, tenc_box);
+        let sinf_total = (8 + sinf_body.len()) as u32;
+        out.extend_from_slice(&sinf_total.to_be_bytes());
+        out.extend_from_slice(b"sinf");
+        out.extend_from_slice(&sinf_body);
+        out
+    }
+
+    #[test]
+    fn enca_sample_entry_with_sinf_schi_tenc_populates_track_tenc_v0() {
+        // Outer FourCC `enca`, original `mp4a`, scheme `cenc`, with a
+        // v0 tenc carrying a 16-byte IV and a synthetic KID.
+        let kid: [u8; 16] = [
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99,
+        ];
+        let tenc_box = build_tenc_box_v0(&kid, 16);
+        let entry_body = build_enca_with_full_sinf(b"mp4a", b"cenc", &tenc_box);
+        let mut stsd = Vec::new();
+        stsd.extend_from_slice(&[0u8; 4]);
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        let total = (8 + entry_body.len()) as u32;
+        stsd.extend_from_slice(&total.to_be_bytes());
+        stsd.extend_from_slice(b"enca");
+        stsd.extend_from_slice(&entry_body);
+
+        let mut t = fresh_track();
+        super::parse_stsd(&stsd, &mut t).unwrap();
+        assert_eq!(&t.codec_id_fourcc, b"mp4a");
+        assert_eq!(t.protection_scheme, Some(*b"cenc"));
+        let tenc = t.tenc.expect("tenc parsed from sinf/schi/tenc");
+        assert_eq!(tenc.version, 0);
+        assert_eq!(tenc.default_is_protected, 1);
+        assert_eq!(tenc.default_per_sample_iv_size, 16);
+        assert_eq!(tenc.default_kid, kid);
+        assert!(tenc.default_constant_iv.is_none());
+    }
+
+    #[test]
+    fn encv_sample_entry_v1_pattern_with_constant_iv_lands_on_track() {
+        // Build a v1 tenc with pattern 1:9 and an 8-byte constant IV,
+        // wrap it in schi/sinf and an `encv` sample entry with scheme
+        // `cbcs` (the typical CBC-S + pattern-encryption configuration).
+        let kid = [0x01u8; 16];
+        let civ = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+        let tenc_box = build_tenc_box_v1_constant_iv(&kid, 1, 9, &civ);
+
+        // 78-byte video preamble.
+        let mut entry_body = Vec::new();
+        entry_body.extend_from_slice(&[0u8; 6]);
+        entry_body.extend_from_slice(&1u16.to_be_bytes());
+        entry_body.extend_from_slice(&[0u8; 16]);
+        entry_body.extend_from_slice(&1280u16.to_be_bytes());
+        entry_body.extend_from_slice(&720u16.to_be_bytes());
+        entry_body.extend_from_slice(&((72u32) << 16).to_be_bytes());
+        entry_body.extend_from_slice(&((72u32) << 16).to_be_bytes());
+        entry_body.extend_from_slice(&[0u8; 4]);
+        entry_body.extend_from_slice(&1u16.to_be_bytes());
+        entry_body.extend_from_slice(&[0u8; 32]);
+        entry_body.extend_from_slice(&0x0018u16.to_be_bytes());
+        entry_body.extend_from_slice(&(-1i16).to_be_bytes());
+        assert_eq!(entry_body.len(), 78);
+
+        let sinf_body = build_sinf_body_with_schi(b"avc1", b"cbcs", &tenc_box);
+        let sinf_total = (8 + sinf_body.len()) as u32;
+        entry_body.extend_from_slice(&sinf_total.to_be_bytes());
+        entry_body.extend_from_slice(b"sinf");
+        entry_body.extend_from_slice(&sinf_body);
+
+        let mut stsd = Vec::new();
+        stsd.extend_from_slice(&[0u8; 4]);
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        let total = (8 + entry_body.len()) as u32;
+        stsd.extend_from_slice(&total.to_be_bytes());
+        stsd.extend_from_slice(b"encv");
+        stsd.extend_from_slice(&entry_body);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        super::parse_stsd(&stsd, &mut t).unwrap();
+        assert_eq!(&t.codec_id_fourcc, b"avc1");
+        assert_eq!(t.protection_scheme, Some(*b"cbcs"));
+        let tenc = t.tenc.expect("tenc parsed from sinf/schi/tenc");
+        assert_eq!(tenc.version, 1);
+        assert_eq!(tenc.default_crypt_byte_block, 1);
+        assert_eq!(tenc.default_skip_byte_block, 9);
+        assert_eq!(tenc.default_per_sample_iv_size, 0);
+        assert_eq!(tenc.default_constant_iv.as_deref(), Some(&civ[..]));
+    }
+
+    #[test]
+    fn enca_sample_entry_without_tenc_leaves_track_tenc_none() {
+        // Original frma+schm shape (no schi/tenc) — must still parse,
+        // and `track.tenc` stays None.
+        let entry_body = build_enca_with_sinf(b"mp4a", b"cenc");
+        let mut stsd = Vec::new();
+        stsd.extend_from_slice(&[0u8; 4]);
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        let total = (8 + entry_body.len()) as u32;
+        stsd.extend_from_slice(&total.to_be_bytes());
+        stsd.extend_from_slice(b"enca");
+        stsd.extend_from_slice(&entry_body);
+
+        let mut t = fresh_track();
+        super::parse_stsd(&stsd, &mut t).unwrap();
+        assert_eq!(&t.codec_id_fourcc, b"mp4a");
+        assert_eq!(t.protection_scheme, Some(*b"cenc"));
+        assert!(t.tenc.is_none());
     }
 
     #[test]

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- CENC metadata parsing (ISO/IEC 23001-7:2016 — round 196). Three
+  new structured parsers in `crate::cenc`:
+  - `parse_tenc` for the §8.2 TrackEncryptionBox (v0 + v1 with
+    pattern-encryption block counts and the constant-IV variant
+    used by `cbcs` / `cens`),
+  - `parse_pssh` for the §8.1 ProtectionSystemSpecificHeaderBox
+    (v0 SystemID + Data; v1 adds the KID list, with `KID_count == 0`
+    surfaced as an empty `kids` Vec per §8.1.3's "apply to all
+    KIDs" rule),
+  - `parse_senc` for the §7.2 SampleEncryptionBox (per-sample IVs
+    with the spec-required `per_sample_iv_size` recovered from the
+    matching `tenc`, plus the optional `UseSubSampleEncryption`
+    `{BytesOfClearData, BytesOfProtectedData}` table).
+  Demux integration: `tenc` is auto-discovered inside `sinf/schi`
+  during sample-entry parsing and surfaced on `params.options` as
+  `cenc_default_kid` / `cenc_default_iv_size` / `cenc_tenc_version`
+  / (v1) `cenc_default_crypt_byte_block` /
+  `cenc_default_skip_byte_block` / `cenc_default_constant_iv`;
+  `pssh` is collected at moov level and surfaced as `pssh_<n>`
+  metadata; per-fragment `senc` is collected during the moof walk
+  and surfaced as `senc_<n>` metadata. Parse-only — no AES /
+  decryption op runs in this crate.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.7...v0.0.8) - 2026-05-29
 
 ### Other

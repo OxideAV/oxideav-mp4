@@ -290,6 +290,20 @@ pub const ENCA: [u8; 4] = fourcc("enca");
 pub const ENCT: [u8; 4] = fourcc("enct");
 pub const ENCS: [u8; 4] = fourcc("encs");
 
+// CENC boxes (ISO/IEC 23001-7). Parsed via the structured types in
+// `crate::cenc`; the bare FourCC constants here let the demux walker
+// dispatch on them.
+//
+// * `tenc` — TrackEncryptionBox (§8.2); per-track defaults, sits inside
+//   `schi` inside `sinf`.
+// * `pssh` — ProtectionSystemSpecificHeaderBox (§8.1); a DRM-system
+//   opaque header, sits at moov level (and optionally moof level).
+// * `senc` — SampleEncryptionBox (§7.2); per-sample IVs and an optional
+//   subsample map, sits in `traf` (or `trak`).
+pub const TENC: [u8; 4] = fourcc("tenc");
+pub const PSSH: [u8; 4] = fourcc("pssh");
+pub const SENC: [u8; 4] = fourcc("senc");
+
 #[cfg(test)]
 mod tests {
     use super::*;

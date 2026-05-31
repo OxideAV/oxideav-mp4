@@ -6,6 +6,7 @@
 //! share one implementation and only differ in their `ftyp` preset.
 
 pub mod boxes;
+pub mod cenc;
 pub mod codec_id;
 pub mod demux;
 pub mod frag;

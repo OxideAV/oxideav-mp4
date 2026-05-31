@@ -162,10 +162,44 @@ Sample-entry FourCCs resolve to these codec ids:
   surfaces the un-transformed codec id so downstream decoders can
   be set up normally; `params.options["protection_scheme"]`
   carries the four-char scheme type (e.g. `cenc`, `cbcs`) so
-  callers know packet payloads are still ciphertext. CENC key
-  management (`tenc`, `pssh`, `senc`, `saiz` / `saio`) is **not**
-  implemented — the demuxer surfaces packets verbatim and leaves
-  decryption to a layer with key material.
+  callers know packet payloads are still ciphertext.
+- CENC metadata parsing (ISO/IEC 23001-7:2016): the three boxes
+  that carry encryption framing on top of the §8.12 envelope are
+  parsed structurally and surfaced to callers (no decryption — the
+  AES key/decrypt op is left to a downstream layer with key
+  material).
+  - `tenc` (§8.2 TrackEncryptionBox) — discovered inside
+    `sinf/schi`. v0 captures `default_isProtected`,
+    `default_Per_Sample_IV_Size`, and `default_KID`; v1 adds the
+    `default_crypt_byte_block` / `default_skip_byte_block` pattern
+    pair (for `cens` / `cbcs` schemes) and the
+    `default_constant_IV` used when `isProtected==1 && IV_size==0`.
+    Surfaced on `params.options` as `cenc_default_kid` (lowercase
+    hex), `cenc_default_is_protected`, `cenc_default_iv_size`,
+    `cenc_tenc_version`, and (v1 only) `cenc_default_crypt_byte_block`
+    / `cenc_default_skip_byte_block` / `cenc_default_constant_iv`.
+  - `pssh` (§8.1 ProtectionSystemSpecificHeaderBox) — collected at
+    moov level. Each entry captures the 16-byte SystemID UUID,
+    optional v1 KID list, and the DRM-system-specific opaque
+    `Data` blob. Surfaced via `Demuxer::metadata()` as `pssh_<n>`
+    keys with value `"<system_id_hex> <kid_count> <data_len>"`;
+    structured records are reachable through the public
+    `cenc::PsshBox` type for callers that downcast.
+  - `senc` (§7.2 SampleEncryptionBox) — collected from every `traf`
+    whose matching track carried a `tenc` default (so the
+    per-sample IV width is recoverable per §7.2.3). Captures
+    `flags`, the per-sample `InitializationVector`, and (when
+    `UseSubSampleEncryption` is set) the
+    `{BytesOfClearData, BytesOfProtectedData}` subsample map.
+    Surfaced via `Demuxer::metadata()` as `senc_<n>` keys with
+    value `"track=<idx> seq=<mfhd_seq> samples=<n>
+    flags=0x<hex>"`; structured records are reachable through the
+    public `cenc::SencBox` type.
+
+  The standalone parsers (`cenc::parse_tenc` / `cenc::parse_pssh`
+  / `cenc::parse_senc`) are public for callers that already have
+  the box body in hand from another path (e.g. a non-MP4 carrier
+  of CENC framing).
 - Track references (ISO/IEC 14496-12 §8.3.3, `tref`): each typed
   `TrackReferenceTypeBox` inside `trak/tref` is parsed and the
   resulting `(reference_type → track_IDs)` pairs are surfaced on
@@ -416,12 +450,16 @@ first that applies:
 - Fragmented-MP4 *muxing* — the demuxer reads `moof`+`mdat`
   segments, but the muxer only emits a single moov-at-end (or
   faststart) shape.
-- CENC decryption proper — the demuxer detects protected tracks
-  (`encv` / `enca` / `enct` / `encs` → original FourCC plus the
-  scheme on `params.options`) but it doesn't read `tenc`, `pssh`,
-  `senc`, or `saiz` / `saio` and it doesn't decrypt sample bytes.
-  Adding that needs the base ISO/IEC 23001-7 spec (currently only
-  AMD1 / 2019 is in `docs/container/cenc/`).
+- CENC decryption proper — the demuxer **parses** the CENC framing
+  (`tenc` defaults, `pssh` per-DRM headers, per-fragment `senc`
+  per-sample IVs + subsample maps; see "CENC metadata parsing" in
+  the demuxer feature list above) and surfaces the metadata, but
+  it does not run the AES-128 CTR / CBC decryption step. That
+  belongs to a downstream layer with key material from the named
+  `pssh.SystemID`. `saiz` / `saio` (Sample Auxiliary Information
+  Sizes / Offsets, ISO/IEC 14496-12 §8.7.8–9) wiring as an
+  alternative IV-carriage path is also still a follow-up; for now
+  `senc` is the only IV source consumed.
 - Multiple sample descriptions per track (only the first entry of
   `stsd` is used; `tfhd.sample_description_index` overrides are
   ignored).
