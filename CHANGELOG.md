@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sample Auxiliary Information Sizes / Offsets parsing (ISO/IEC
+  14496-12 §8.7.8 / §8.7.9, `saiz` / `saio` — round 203). Both boxes
+  are read inside `stbl` (track-level absolute offsets) and inside
+  `traf` (movie-fragment, `tfhd.base_data_offset`-relative offsets per
+  §8.8.14). The optional `(aux_info_type, aux_info_type_parameter)`
+  key block (gated by FullBox `flags & 1`) is captured when present
+  and left as `None`/`None` otherwise so callers can apply §8.7.8.3's
+  implied-value rule themselves. `saio` v0 (32-bit) and v1 (64-bit)
+  offsets are both read and widened to `u64`; `version` is preserved.
+  Truncation guards mirror the existing `subs` parser — a forged
+  `sample_count` / `entry_count` is caught before the per-sample /
+  per-entry alloc. Track-level boxes surface as `saiz_<n>` /
+  `saio_<n>` keys on `params.options`; fragment-level pairs surface
+  as `frag_sai_<n>` keys through `Demuxer::metadata()` plus a public
+  `Mp4Demuxer::sai_records()` accessor that returns the structured
+  per-fragment records (`SaiRecord` with `track_idx`,
+  `moof_sequence`, `Vec<TrafSaiz>`, `Vec<TrafSaio>`) for a CENC layer
+  consuming the spec-permitted `senc` alternative IV-carriage path
+  (ISO/IEC 23001-7 §7.3). Parse-only — the auxiliary-information
+  bytes themselves stay in the mdat at the offsets the `saio` names.
 - CENC metadata parsing (ISO/IEC 23001-7:2016 — round 196). Three
   new structured parsers in `crate::cenc`:
   - `parse_tenc` for the §8.2 TrackEncryptionBox (v0 + v1 with

@@ -217,6 +217,24 @@ pub const SGPD: [u8; 4] = fourcc("sgpd");
 /// track decodes correctly without it; the table feeds trick modes,
 /// CENC sub-sample encryption mapping, and selective-discard pipelines.
 pub const SUBS: [u8; 4] = fourcc("subs");
+/// `saiz` — SampleAuxiliaryInformationSizesBox (ISO/IEC 14496-12 §8.7.8).
+/// Sits inside `stbl` or `traf`. Per-sample sizes for one stream of
+/// sample auxiliary information identified by an `(aux_info_type,
+/// aux_info_type_parameter)` key. The matching `saio` of the same key
+/// supplies the byte offsets where each chunk's auxiliary info lives.
+/// One common consumer is CENC: the per-sample IV + subsample map
+/// (ISO/IEC 23001-7) is an auxiliary-information stream of type
+/// `cenc` / `cbc1` / `cens` / `cbcs`, and the `saiz`+`saio` pair is the
+/// spec-permitted alternative to a `senc` box for IV carriage.
+pub const SAIZ: [u8; 4] = fourcc("saiz");
+/// `saio` — SampleAuxiliaryInformationOffsetsBox (ISO/IEC 14496-12 §8.7.9).
+/// Sits inside `stbl` or `traf`. Provides byte-offset position
+/// information for one stream of sample auxiliary information whose
+/// per-sample sizes are recorded in the matching `saiz`. Versions 0 / 1
+/// select 32-bit / 64-bit offsets. In a `traf` the offsets are
+/// relative to the base_data_offset established by `tfhd` (or the
+/// `moof` start when `default-base-is-moof` is set, per §8.8.14).
+pub const SAIO: [u8; 4] = fourcc("saio");
 pub const ELST: [u8; 4] = fourcc("elst");
 pub const MDAT: [u8; 4] = fourcc("mdat");
 pub const FREE: [u8; 4] = fourcc("free");

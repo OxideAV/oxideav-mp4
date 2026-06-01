@@ -128,6 +128,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     }
 
     let mut senc_records: Vec<SencRecord> = Vec::new();
+    let mut sai_records: Vec<SaiRecord> = Vec::new();
     for moof in &moofs {
         parse_moof(
             moof,
@@ -135,6 +136,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
             &mut samples,
             &mut next_dts,
             &mut senc_records,
+            &mut sai_records,
         )?;
     }
 
@@ -191,6 +193,25 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         ));
     }
 
+    // §8.7.8–9 — per-fragment `(saiz, saio)` summary, one key per
+    // SaiRecord (one per `traf` that carried at least one box).
+    // Format: "track=<t> seq=<s> saiz=<n> saio=<m>" so a caller knows
+    // the box counts on this fragment without consuming the public
+    // SaiRecord vector. Structured records remain accessible via
+    // `Mp4Demuxer::sai_records()`.
+    for (n, r) in sai_records.iter().enumerate() {
+        metadata.push((
+            format!("frag_sai_{n}"),
+            format!(
+                "track={} seq={} saiz={} saio={}",
+                r.track_idx,
+                r.moof_sequence,
+                r.saiz.len(),
+                r.saio.len(),
+            ),
+        ));
+    }
+
     Ok(Box::new(Mp4Demuxer {
         input,
         streams,
@@ -203,6 +224,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         prfts,
         psshes: parsed.psshes,
         senc_records,
+        sai_records,
         movie_timescale: parsed.movie_timescale,
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
@@ -479,6 +501,18 @@ struct Track {
     /// collect them in order of encounter. Empty when the track has no
     /// `subs` (the common case).
     subs: Vec<SubsBox>,
+    /// §8.7.8 — `saiz` (SampleAuxiliaryInformationSizesBox) instances
+    /// found inside `stbl`. The spec allows multiple, keyed by
+    /// `(aux_info_type, aux_info_type_parameter)`. Each `saiz` pairs
+    /// with a `saio` of the matching key in `saio`. Empty when the
+    /// track has no `saiz` in `stbl` (the common case for
+    /// non-protected, non-fragmented content).
+    saiz: Vec<SaizBox>,
+    /// §8.7.9 — `saio` (SampleAuxiliaryInformationOffsetsBox) instances
+    /// found inside `stbl`. One per matching `saiz`; offsets are
+    /// absolute file positions when read from `stbl`. Empty in the
+    /// common case.
+    saio: Vec<SaioBox>,
 }
 
 /// One entry of an `sdtp` (SampleDependencyTypeBox, §8.6.4) — decoded
@@ -617,6 +651,80 @@ struct SubsBox {
     /// One entry per *addressed* sample (the table is sparse — samples
     /// with no `subs` row contribute nothing here).
     entries: Vec<SubsEntry>,
+}
+
+/// Parsed `saiz` (SampleAuxiliaryInformationSizesBox, ISO/IEC 14496-12
+/// §8.7.8).
+///
+/// The `aux_info_type` / `aux_info_type_parameter` pair is the lookup
+/// key that pairs a `saiz` with its matching `saio` of the same key
+/// (§8.7.8.1: "there must be a matching SampleAuxiliaryInformationOffsetsBox
+/// with the same values of aux_info_type and aux_info_type_parameter").
+/// Both fields are present on disk only when `flags & 1` is set; when
+/// absent the implied value of `aux_info_type` is (a) the protection
+/// scheme type for protected content (transformed sample entries) or
+/// (b) the sample entry FourCC otherwise (§8.7.8.3 — that fallback is
+/// not materialised here; we surface `None`/`None` so callers can
+/// apply the rule themselves with the surrounding sinf/sample-entry
+/// context).
+///
+/// `default_sample_info_size` is the constant-size shortcut: when
+/// non-zero, every sample in the table has that size and `per_sample`
+/// is empty. When zero, `per_sample[i]` holds the size for the i-th
+/// sample. `sample_count` is stored so an over-long table (the spec
+/// permits `sample_count` < total stsz/stz2 count — auxiliary info
+/// supplied for the initial samples only) is preserved verbatim.
+#[derive(Clone, Debug, Default)]
+struct SaizBox {
+    /// §8.7.8.3 `aux_info_type` — present only when `flags & 1` is set.
+    aux_info_type: Option<[u8; 4]>,
+    /// §8.7.8.3 `aux_info_type_parameter` — present only when
+    /// `flags & 1` is set; defaults to 0 when omitted.
+    aux_info_type_parameter: Option<u32>,
+    /// §8.7.8.3 `default_sample_info_size`; non-zero means a
+    /// constant-size table and `per_sample` is empty.
+    default_sample_info_size: u8,
+    /// §8.7.8.3 `sample_count` — the declared number of samples this
+    /// `saiz` covers (may be smaller than the track's full sample count
+    /// per §8.7.8.3).
+    sample_count: u32,
+    /// §8.7.8.2 `sample_info_size[]` — populated only when
+    /// `default_sample_info_size == 0`; otherwise empty.
+    per_sample: Vec<u8>,
+}
+
+/// Parsed `saio` (SampleAuxiliaryInformationOffsetsBox, ISO/IEC 14496-12
+/// §8.7.9).
+///
+/// Same key shape as `SaizBox`: `(aux_info_type,
+/// aux_info_type_parameter)` selects which auxiliary-information stream
+/// these offsets belong to. The table itself is `entry_count` chunk
+/// (or fragment-run) offsets; per §8.7.9.3 the count must be 1 (a
+/// single contiguous chunk) or equal to the count of chunks (in `stbl`)
+/// / `trun`s (in `traf`). When the box appears inside `stbl` the
+/// offsets are absolute file positions; in `traf` they are relative to
+/// the base_data_offset established by the surrounding `tfhd` (or to
+/// the `moof` start when `default-base-is-moof` is set, per §8.8.14).
+///
+/// Both v0 (32-bit offsets) and v1 (64-bit offsets) are read and
+/// widened to `u64` so callers handle one shape. `version` is preserved
+/// so a producer round-tripping back to disk can re-emit the same
+/// width.
+#[derive(Clone, Debug, Default)]
+struct SaioBox {
+    /// FullBox version (0 or 1) — selects 32-bit / 64-bit on-disk
+    /// offset width. Preserved so a round-trip can match the original
+    /// layout.
+    version: u8,
+    /// §8.7.9.3 `aux_info_type` — present only when `flags & 1` is set.
+    aux_info_type: Option<[u8; 4]>,
+    /// §8.7.9.3 `aux_info_type_parameter` — present only when
+    /// `flags & 1` is set; defaults to 0 when omitted.
+    aux_info_type_parameter: Option<u32>,
+    /// §8.7.9.2 `offset[entry_count]` — widened to u64 regardless of
+    /// box version. Semantics depend on container: absolute file
+    /// position inside `stbl`, base_data_offset-relative inside `traf`.
+    offsets: Vec<u64>,
 }
 
 /// Parsed `cslg` (CompositionToDecodeBox, ISO/IEC 14496-12 §8.6.1.4).
@@ -997,6 +1105,8 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         sgpd: Vec::new(),
         sdtp: Vec::new(),
         subs: Vec::new(),
+        saiz: Vec::new(),
+        saio: Vec::new(),
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -1470,6 +1580,8 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             SBGP => t.sbgp.push(parse_sbgp(&b)?),
             SGPD => t.sgpd.push(parse_sgpd(&b)?),
             SUBS => t.subs.push(parse_subs(&b)?),
+            SAIZ => t.saiz.push(parse_saiz(&b)?),
+            SAIO => t.saio.push(parse_saio(&b)?),
             _ => {}
         }
     }
@@ -2524,6 +2636,161 @@ fn parse_subs(body: &[u8]) -> Result<SubsBox> {
     })
 }
 
+/// Parse `saiz` (SampleAuxiliaryInformationSizesBox, ISO/IEC 14496-12
+/// §8.7.8).
+///
+/// On-wire layout (§8.7.8.2):
+///
+/// ```text
+/// FullBox header  : 4 bytes  (version + flags)
+/// if (flags & 1) {
+///     aux_info_type           : u32   (FourCC)
+///     aux_info_type_parameter : u32
+/// }
+/// default_sample_info_size : u8
+/// sample_count             : u32
+/// if (default_sample_info_size == 0) {
+///     sample_info_size[sample_count] : u8 each
+/// }
+/// ```
+///
+/// The `aux_info_type` block is gated by the FullBox `flags`'s low bit;
+/// when absent the implied value is the protection scheme type (for
+/// transformed sample entries) or the sample-entry FourCC (§8.7.8.3).
+/// We surface `Option`s rather than materialise the fallback so the
+/// caller's higher-level context (sinf/sample-entry FourCC) decides.
+fn parse_saiz(body: &[u8]) -> Result<SaizBox> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: saiz too short"));
+    }
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    let mut off = 4usize;
+    let mut aux_info_type: Option<[u8; 4]> = None;
+    let mut aux_info_type_parameter: Option<u32> = None;
+    if flags & 1 != 0 {
+        if off + 8 > body.len() {
+            return Err(Error::invalid("MP4: saiz aux_info_type truncated"));
+        }
+        aux_info_type = Some([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        off += 4;
+        aux_info_type_parameter = Some(u32::from_be_bytes([
+            body[off],
+            body[off + 1],
+            body[off + 2],
+            body[off + 3],
+        ]));
+        off += 4;
+    }
+    if off + 5 > body.len() {
+        return Err(Error::invalid("MP4: saiz header truncated"));
+    }
+    let default_sample_info_size = body[off];
+    off += 1;
+    let sample_count = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    off += 4;
+    let mut per_sample: Vec<u8> = Vec::new();
+    if default_sample_info_size == 0 {
+        let want = sample_count as usize;
+        // Cap allocation by the remaining byte budget so a forged
+        // `sample_count` cannot pre-allocate ahead of the truncated body.
+        let avail = body.len().saturating_sub(off);
+        per_sample = Vec::with_capacity(want.min(avail));
+        if off + want > body.len() {
+            return Err(Error::invalid("MP4: saiz sample_info_size truncated"));
+        }
+        per_sample.extend_from_slice(&body[off..off + want]);
+    }
+    Ok(SaizBox {
+        aux_info_type,
+        aux_info_type_parameter,
+        default_sample_info_size,
+        sample_count,
+        per_sample,
+    })
+}
+
+/// Parse `saio` (SampleAuxiliaryInformationOffsetsBox, ISO/IEC 14496-12
+/// §8.7.9).
+///
+/// On-wire layout (§8.7.9.2):
+///
+/// ```text
+/// FullBox header  : 4 bytes  (version + flags)
+/// if (flags & 1) {
+///     aux_info_type           : u32   (FourCC)
+///     aux_info_type_parameter : u32
+/// }
+/// entry_count : u32
+/// if (version == 0) { offset[entry_count] : u32 each }
+/// else             { offset[entry_count] : u64 each }
+/// ```
+///
+/// All offsets are widened to `u64` so callers handle one shape.
+/// `version` is preserved so a producer can re-emit the original width.
+fn parse_saio(body: &[u8]) -> Result<SaioBox> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: saio too short"));
+    }
+    let version = body[0];
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    let mut off = 4usize;
+    let mut aux_info_type: Option<[u8; 4]> = None;
+    let mut aux_info_type_parameter: Option<u32> = None;
+    if flags & 1 != 0 {
+        if off + 8 > body.len() {
+            return Err(Error::invalid("MP4: saio aux_info_type truncated"));
+        }
+        aux_info_type = Some([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        off += 4;
+        aux_info_type_parameter = Some(u32::from_be_bytes([
+            body[off],
+            body[off + 1],
+            body[off + 2],
+            body[off + 3],
+        ]));
+        off += 4;
+    }
+    if off + 4 > body.len() {
+        return Err(Error::invalid("MP4: saio entry_count truncated"));
+    }
+    let entry_count =
+        u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]) as usize;
+    off += 4;
+    let off_width = if version == 1 { 8 } else { 4 };
+    // Cap capacity by remaining byte budget so a forged `entry_count`
+    // cannot pre-allocate ahead of the truncated body.
+    let avail = body.len().saturating_sub(off);
+    let max_entries = avail / off_width;
+    let mut offsets: Vec<u64> = Vec::with_capacity(entry_count.min(max_entries));
+    for _ in 0..entry_count {
+        if off + off_width > body.len() {
+            return Err(Error::invalid("MP4: saio offset truncated"));
+        }
+        let v = if version == 1 {
+            u64::from_be_bytes([
+                body[off],
+                body[off + 1],
+                body[off + 2],
+                body[off + 3],
+                body[off + 4],
+                body[off + 5],
+                body[off + 6],
+                body[off + 7],
+            ])
+        } else {
+            u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]) as u64
+        };
+        offsets.push(v);
+        off += off_width;
+    }
+    Ok(SaioBox {
+        version,
+        aux_info_type,
+        aux_info_type_parameter,
+        offsets,
+    })
+}
+
 /// Parse `cslg` (CompositionToDecodeBox, ISO/IEC 14496-12 §8.6.1.4).
 ///
 /// `FullBox(version, 0)` whose body is five signed integers. Version 0
@@ -2635,6 +2902,72 @@ pub struct SencRecord {
     pub senc: SencBox,
 }
 
+/// One per-fragment ISO/IEC 14496-12 §8.7.8 / §8.7.9 record. Each
+/// `traf` may carry zero or more `(saiz, saio)` pairs (keyed by
+/// `(aux_info_type, aux_info_type_parameter)`); the demuxer collects
+/// them as `SaiRecord` so a downstream layer can replay per-sample
+/// auxiliary-info pointers (most commonly CENC IV / subsample-map
+/// material when `senc` is absent and the IV stream is carried via
+/// auxiliary-info pointers per §8.8.14 + ISO/IEC 23001-7 §7.3) without
+/// re-parsing the file. `aux_info_type` semantics determine pairing;
+/// the demuxer does not interpret the bytes the offsets point at.
+#[derive(Clone, Debug)]
+pub struct SaiRecord {
+    /// `track_idx` of the matching stream in the demuxer's
+    /// `streams()` list (0-based).
+    pub track_idx: u32,
+    /// `mfhd.sequence_number` of the containing `moof`. Surfaced so a
+    /// caller that interleaves multiple sources or replays out of
+    /// order can re-key.
+    pub moof_sequence: u32,
+    /// Parsed `(saiz, saio)` pairs from this `traf`, in disk order.
+    /// The spec permits multiple pairs per `traf` keyed by
+    /// `(aux_info_type, aux_info_type_parameter)`; a caller pairs
+    /// each `saiz` with the `saio` of the matching key. We do not
+    /// pre-pair here so an unmatched box (a producer slip) is
+    /// preserved verbatim for inspection.
+    pub saiz: Vec<TrafSaiz>,
+    pub saio: Vec<TrafSaio>,
+}
+
+/// One `saiz` (SampleAuxiliaryInformationSizesBox) found in a `traf`.
+/// The on-wire layout matches the stbl-level box; the only semantic
+/// difference is that the matching `saio.offset[]` is base_data_offset
+/// relative (per §8.8.14) rather than absolute.
+#[derive(Clone, Debug, Default)]
+pub struct TrafSaiz {
+    /// §8.7.8.3 — `aux_info_type` (present only when `flags & 1`).
+    pub aux_info_type: Option<[u8; 4]>,
+    /// §8.7.8.3 — `aux_info_type_parameter` (present only when
+    /// `flags & 1`).
+    pub aux_info_type_parameter: Option<u32>,
+    /// §8.7.8.3 — `default_sample_info_size`.
+    pub default_sample_info_size: u8,
+    /// §8.7.8.3 — `sample_count`.
+    pub sample_count: u32,
+    /// §8.7.8.2 — `sample_info_size[]` (populated only when
+    /// `default_sample_info_size == 0`).
+    pub per_sample: Vec<u8>,
+}
+
+/// One `saio` (SampleAuxiliaryInformationOffsetsBox) found in a `traf`.
+/// `version` selects 32-bit / 64-bit on-disk offset width. Offsets are
+/// widened to `u64` and are *relative* to the `tfhd.base_data_offset`
+/// established for this traf (or the `moof` start when
+/// `default-base-is-moof` is set, per §8.8.14).
+#[derive(Clone, Debug, Default)]
+pub struct TrafSaio {
+    /// FullBox version.
+    pub version: u8,
+    /// §8.7.9.3 — `aux_info_type`.
+    pub aux_info_type: Option<[u8; 4]>,
+    /// §8.7.9.3 — `aux_info_type_parameter`.
+    pub aux_info_type_parameter: Option<u32>,
+    /// §8.7.9.2 — `offset[]` widened to u64; base_data_offset relative
+    /// inside a traf per §8.8.14.
+    pub offsets: Vec<u64>,
+}
+
 /// Walk one `moof` box, locating its `traf` children and stitching the
 /// fragmented samples into the per-track sample list.
 ///
@@ -2645,12 +2978,19 @@ pub struct SencRecord {
 /// `senc_records` accumulates per-fragment ISO/IEC 23001-7 §7.2 senc
 /// payloads keyed by `(track_idx, moof_sequence)` so a decrypting
 /// layer can recover them without re-parsing the file.
+///
+/// `sai_records` accumulates per-fragment ISO/IEC 14496-12 §8.7.8–9
+/// `(saiz, saio)` pairs, keyed the same way. The auxiliary-information
+/// bytes themselves remain in the mdat at the offsets the `saio`
+/// names; the demuxer doesn't fetch them (their semantics belong to
+/// the carried `aux_info_type`, e.g. CENC `cenc`/`cbcs`).
 fn parse_moof(
     moof: &MoofRecord,
     tracks: &[Track],
     samples: &mut Vec<SampleRef>,
     next_dts: &mut [i64],
     senc_records: &mut Vec<SencRecord>,
+    sai_records: &mut Vec<SaiRecord>,
 ) -> Result<()> {
     let mut cur = std::io::Cursor::new(&moof.body);
     let end = moof.body.len() as u64;
@@ -2682,6 +3022,7 @@ fn parse_moof(
                     next_dts,
                     moof_sequence,
                     senc_records,
+                    sai_records,
                 )?;
             }
             _ => skip_cursor_bytes(&mut cur, psz),
@@ -2742,6 +3083,7 @@ const TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT: u32 = 0x000800;
 /// (ISO/IEC 14496-12 §8.8.3.1, byte 3 bit 0 of the 32-bit field).
 const SAMPLE_IS_NON_SYNC: u32 = 0x0001_0000;
 
+#[allow(clippy::too_many_arguments)] // tfhd / tfdt / senc / saiz / saio inputs are independent state carried through the same walk; bundling them into a struct hides the per-box ownership and obscures the moof→traf data flow
 fn parse_traf(
     body: &[u8],
     moof_start: u64,
@@ -2750,6 +3092,7 @@ fn parse_traf(
     next_dts: &mut [i64],
     moof_sequence: u32,
     senc_records: &mut Vec<SencRecord>,
+    sai_records: &mut Vec<SaiRecord>,
 ) -> Result<()> {
     // First pass: read tfhd + tfdt before the trun(s) so each trun
     // has the full default context. Also pick up senc (ISO/IEC 23001-7
@@ -2759,6 +3102,8 @@ fn parse_traf(
     let mut state = TrafState::default();
     let mut tfhd_seen = false;
     let mut senc_body: Option<Vec<u8>> = None;
+    let mut frag_saiz: Vec<TrafSaiz> = Vec::new();
+    let mut frag_saio: Vec<TrafSaio> = Vec::new();
 
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
@@ -2783,6 +3128,34 @@ fn parse_traf(
             // can interpret the per-sample IV width.
             SENC => {
                 senc_body = Some(read_bytes_vec(&mut cur, psz)?);
+            }
+            // §8.7.8 / §8.7.9 — `saiz` / `saio` inside `traf`.
+            // Promote the parsed `SaizBox` / `SaioBox` to the public
+            // fragment-record shape (`TrafSaiz` / `TrafSaio`) so the
+            // demuxer surface exposes the per-fragment auxiliary-info
+            // table to a downstream CENC layer that needs it as a
+            // `senc` alternative (per §8.8.14: in a `traf`, `saio`
+            // offsets are relative to `tfhd.base_data_offset`).
+            SAIZ => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                let sb = parse_saiz(&b)?;
+                frag_saiz.push(TrafSaiz {
+                    aux_info_type: sb.aux_info_type,
+                    aux_info_type_parameter: sb.aux_info_type_parameter,
+                    default_sample_info_size: sb.default_sample_info_size,
+                    sample_count: sb.sample_count,
+                    per_sample: sb.per_sample,
+                });
+            }
+            SAIO => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                let sb = parse_saio(&b)?;
+                frag_saio.push(TrafSaio {
+                    version: sb.version,
+                    aux_info_type: sb.aux_info_type,
+                    aux_info_type_parameter: sb.aux_info_type_parameter,
+                    offsets: sb.offsets,
+                });
             }
             // We only resolve trun's in the second pass; skip here.
             TRUN => skip_cursor_bytes(&mut cur, psz),
@@ -2813,6 +3186,22 @@ fn parse_traf(
                 });
             }
         }
+    }
+
+    // §8.7.8–9 — if this `traf` carried any auxiliary-information
+    // boxes, record them as one `SaiRecord` keyed by the same
+    // `(track_idx, moof_sequence)` pair as the senc record. The
+    // demuxer leaves pairing (`saiz` ↔ `saio` by `(aux_info_type,
+    // aux_info_type_parameter)`) to the consumer, so even an
+    // unmatched box (a producer slip — `saiz` without `saio` or vice
+    // versa) is preserved verbatim for inspection.
+    if !frag_saiz.is_empty() || !frag_saio.is_empty() {
+        sai_records.push(SaiRecord {
+            track_idx: state.track_idx as u32,
+            moof_sequence,
+            saiz: frag_saiz,
+            saio: frag_saio,
+        });
     }
 
     // Each trun walks samples from its own data_offset relative to
@@ -3969,6 +4358,82 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert(format!("subs_{}", i), v);
     }
 
+    // ISO/IEC 14496-12 §8.7.8 / §8.7.9 — surface each `saiz` /
+    // `saio` (Sample Auxiliary Information Sizes / Offsets) found
+    // inside `stbl` on `params.options`. Each `saiz` becomes one
+    // `saiz_<n>` key (0-based encounter index); each `saio` becomes
+    // one `saio_<n>` key. The pair is keyed by `(aux_info_type,
+    // aux_info_type_parameter)` — a caller pairs an `saiz_<n>` with
+    // the `saio_<m>` whose key matches. The most common consumer is
+    // CENC: when `senc` is absent, the per-sample IV + subsample map
+    // is carried in an auxiliary-information stream of type `cenc` /
+    // `cbc1` / `cens` / `cbcs`, and the `saiz`+`saio` pair points to
+    // the bytes in the mdat (ISO/IEC 23001-7 §7.3).
+    //
+    // Format conventions (decimal unless noted, mirroring the
+    // sbgp/sgpd/subs surface):
+    //
+    //   saiz_<n> = "[type=<fourcc>] [param=<P>] default_size=<D> count=<N> [sizes=<s0>,<s1>,…]"
+    //   saio_<n> = "v<version> [type=<fourcc>] [param=<P>] offsets=<o0>,<o1>,…"
+    //
+    // The `type=` / `param=` blocks are omitted when the FullBox
+    // `flags & 1` bit was zero on disk (implied type is the scheme
+    // type for protected content or the sample-entry FourCC
+    // otherwise — see §8.7.8.3). The `sizes=` block is omitted when
+    // `default_sample_info_size != 0` (every sample has size
+    // `default_size`). Offsets are decimal; in `stbl` they are
+    // absolute file positions.
+    for (i, sz) in t.saiz.iter().enumerate() {
+        let mut v = String::new();
+        if let Some(t4) = &sz.aux_info_type {
+            v.push_str(&format!(
+                "type={} ",
+                std::str::from_utf8(t4).unwrap_or("????")
+            ));
+        }
+        if let Some(p) = sz.aux_info_type_parameter {
+            v.push_str(&format!("param={p} "));
+        }
+        v.push_str(&format!(
+            "default_size={} count={}",
+            sz.default_sample_info_size, sz.sample_count
+        ));
+        if !sz.per_sample.is_empty() {
+            v.push_str(" sizes=");
+            let mut first = true;
+            for s in &sz.per_sample {
+                if !first {
+                    v.push(',');
+                }
+                first = false;
+                v.push_str(&format!("{s}"));
+            }
+        }
+        params.options.insert(format!("saiz_{}", i), v);
+    }
+    for (i, so) in t.saio.iter().enumerate() {
+        let mut v = format!("v{}", so.version);
+        if let Some(t4) = &so.aux_info_type {
+            v.push_str(&format!(
+                " type={}",
+                std::str::from_utf8(t4).unwrap_or("????")
+            ));
+        }
+        if let Some(p) = so.aux_info_type_parameter {
+            v.push_str(&format!(" param={p}"));
+        }
+        v.push_str(" offsets=");
+        let mut first = true;
+        for o in &so.offsets {
+            if !first {
+                v.push(',');
+            }
+            first = false;
+            v.push_str(&format!("{o}"));
+        }
+        params.options.insert(format!("saio_{}", i), v);
+    }
+
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
     StreamInfo {
         index,
@@ -4023,6 +4488,14 @@ struct Mp4Demuxer {
     /// reassembly. Empty in non-CENC files (the common case).
     #[allow(dead_code)]
     senc_records: Vec<SencRecord>,
+    /// ISO/IEC 14496-12 §8.7.8–9 per-fragment auxiliary-information
+    /// records. One per `traf` that carried at least one `saiz` or
+    /// `saio` box, keyed by `(track_idx, moof_sequence)`. Empty in
+    /// files that don't use auxiliary-information offsets (the common
+    /// case — most CENC files use `senc` instead, and unprotected
+    /// files have no aux-info at all).
+    #[allow(dead_code)]
+    sai_records: Vec<SaiRecord>,
     /// Per-track media timescale (1-based parallel to `track_ids`),
     /// needed to translate `tfra.time` (track timescale) to the seek-to
     /// caller's pts (also track timescale, but this lets us add unit
@@ -4059,6 +4532,23 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn senc_records(&self) -> &[SencRecord] {
         &self.senc_records
+    }
+
+    /// ISO/IEC 14496-12 §8.7.8–9 — per-fragment Sample Auxiliary
+    /// Information records. One per `traf` that carried at least one
+    /// `saiz` or `saio` box; the `track_idx` references this
+    /// demuxer's `streams()` list and `moof_sequence` is the
+    /// containing `mfhd.sequence_number`. The auxiliary-information
+    /// bytes themselves stay in the mdat at the offsets the `saio`
+    /// names (base_data_offset relative inside a traf per §8.8.14) —
+    /// the demuxer doesn't fetch or interpret them; their semantics
+    /// belong to the carried `aux_info_type` (e.g. CENC `cenc` /
+    /// `cbc1` / `cens` / `cbcs` per ISO/IEC 23001-7 §7.3, or any
+    /// other registered aux-info type). Empty for files without
+    /// auxiliary-info offsets (which is most of the corpus).
+    #[allow(dead_code)]
+    pub fn sai_records(&self) -> &[SaiRecord] {
+        &self.sai_records
     }
 }
 
@@ -4533,6 +5023,8 @@ mod tests {
             sgpd: Vec::new(),
             sdtp: Vec::new(),
             subs: Vec::new(),
+            saiz: Vec::new(),
+            saio: Vec::new(),
         }
     }
 
@@ -6393,5 +6885,229 @@ mod tests {
         t.timescale = 1000;
         let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
         assert_eq!(info.params.options.get("subs_0"), None);
+    }
+
+    // ISO/IEC 14496-12 §8.7.8 — `saiz` parsing. Body layout (after the
+    // 4-byte FullBox header):
+    //
+    //   if (flags & 1) { u32 aux_info_type; u32 aux_info_type_parameter }
+    //   u8  default_sample_info_size
+    //   u32 sample_count
+    //   if (default_sample_info_size == 0) { u8 sample_info_size[sample_count] }
+
+    /// §8.7.8.2 with `flags & 1 == 0` and a non-zero
+    /// `default_sample_info_size`: the per-sample table is omitted on
+    /// disk (every sample has the constant size) and the
+    /// `aux_info_type` block is absent (the implied value is the
+    /// sample-entry FourCC or the protection scheme type — caller's
+    /// job to apply that rule).
+    #[test]
+    fn parse_saiz_constant_size_no_aux_type_key() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version=0, flags=0
+        body.push(16u8); // default_sample_info_size = 16
+        body.extend_from_slice(&5u32.to_be_bytes()); // sample_count = 5
+        let sz = super::parse_saiz(&body).expect("saiz parses");
+        assert_eq!(sz.aux_info_type, None);
+        assert_eq!(sz.aux_info_type_parameter, None);
+        assert_eq!(sz.default_sample_info_size, 16);
+        assert_eq!(sz.sample_count, 5);
+        assert!(sz.per_sample.is_empty());
+    }
+
+    /// §8.7.8.2 with `flags & 1 == 1` (aux_info_type key present) and
+    /// `default_sample_info_size == 0` (per-sample table populated).
+    /// Matches the CENC case where each sample has a distinct IV +
+    /// subsample-map record size.
+    #[test]
+    fn parse_saiz_variable_size_with_aux_type_key() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 1]); // version=0, flags=1
+        body.extend_from_slice(b"cenc"); // aux_info_type
+        body.extend_from_slice(&0u32.to_be_bytes()); // aux_info_type_parameter
+        body.push(0u8); // default_sample_info_size = 0 → per-sample table
+        body.extend_from_slice(&3u32.to_be_bytes()); // sample_count = 3
+        body.extend_from_slice(&[12u8, 24u8, 36u8]); // sample_info_size[]
+        let sz = super::parse_saiz(&body).expect("saiz parses");
+        assert_eq!(sz.aux_info_type, Some(*b"cenc"));
+        assert_eq!(sz.aux_info_type_parameter, Some(0));
+        assert_eq!(sz.default_sample_info_size, 0);
+        assert_eq!(sz.sample_count, 3);
+        assert_eq!(sz.per_sample, vec![12, 24, 36]);
+    }
+
+    /// Truncation: a `sample_count` that names more bytes than the
+    /// body actually carries must surface as `Error::invalid` (not a
+    /// panic, not a partial vec). This is the same anti-DoS shape the
+    /// fuzzer pinned for `subs`.
+    #[test]
+    fn parse_saiz_truncated_per_sample_returns_err() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version=0, flags=0
+        body.push(0u8); // default_sample_info_size = 0 → per-sample table
+        body.extend_from_slice(&100u32.to_be_bytes()); // claims 100 samples
+        body.extend_from_slice(&[1u8, 2u8, 3u8]); // only 3 bytes follow
+        let err = super::parse_saiz(&body).expect_err("truncation must err");
+        assert!(format!("{err}").contains("MP4: saiz"));
+    }
+
+    // ISO/IEC 14496-12 §8.7.9 — `saio` parsing. Body layout (after the
+    // 4-byte FullBox header):
+    //
+    //   if (flags & 1) { u32 aux_info_type; u32 aux_info_type_parameter }
+    //   u32 entry_count
+    //   if (version == 0) { u32 offset[entry_count] }
+    //   else              { u64 offset[entry_count] }
+
+    /// §8.7.9.2 v0 with `flags & 1 == 0` and a single offset entry —
+    /// the common DASH/CMAF shape ("all aux-info for the segment is
+    /// contiguous", per §8.7.9.3 + §8.8.14).
+    #[test]
+    fn parse_saio_v0_single_offset_no_aux_type() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version=0, flags=0
+        body.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1
+        body.extend_from_slice(&0xdead_beefu32.to_be_bytes()); // offset
+        let so = super::parse_saio(&body).expect("saio v0 parses");
+        assert_eq!(so.version, 0);
+        assert_eq!(so.aux_info_type, None);
+        assert_eq!(so.aux_info_type_parameter, None);
+        assert_eq!(so.offsets, vec![0xdead_beef]);
+    }
+
+    /// §8.7.9.2 v1 with the aux_info_type key + two 64-bit offsets.
+    /// v1 is used when at least one offset exceeds 32 bits (typical
+    /// for large mdat content).
+    #[test]
+    fn parse_saio_v1_two_64bit_offsets_with_aux_type() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1u8, 0, 0, 1]); // version=1, flags=1
+        body.extend_from_slice(b"cenc");
+        body.extend_from_slice(&7u32.to_be_bytes());
+        body.extend_from_slice(&2u32.to_be_bytes()); // entry_count = 2
+        body.extend_from_slice(&0x0000_0001_0000_0000u64.to_be_bytes());
+        body.extend_from_slice(&0xffff_ffff_ffff_0000u64.to_be_bytes());
+        let so = super::parse_saio(&body).expect("saio v1 parses");
+        assert_eq!(so.version, 1);
+        assert_eq!(so.aux_info_type, Some(*b"cenc"));
+        assert_eq!(so.aux_info_type_parameter, Some(7));
+        assert_eq!(
+            so.offsets,
+            vec![0x0000_0001_0000_0000, 0xffff_ffff_ffff_0000]
+        );
+    }
+
+    /// Truncation: a forged `entry_count` that exceeds the body size
+    /// must err rather than panic / wrap. Confirms the anti-DoS budget
+    /// cap (per_entry width × entry_count) holds.
+    #[test]
+    fn parse_saio_truncated_offsets_returns_err() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // v0, flags=0
+        body.extend_from_slice(&100u32.to_be_bytes()); // claims 100 entries
+        body.extend_from_slice(&1u32.to_be_bytes()); // only 1 follows
+        let err = super::parse_saio(&body).expect_err("truncation must err");
+        assert!(format!("{err}").contains("MP4: saio"));
+    }
+
+    /// `parse_stbl` dispatch wires both boxes onto the Track. Build a
+    /// minimal `stbl` carrying one `saiz` (constant-size) + one
+    /// `saio` (single absolute offset) and verify the Track captures
+    /// both with their fields intact.
+    #[test]
+    fn parse_stbl_collects_saiz_and_saio() {
+        // saiz body: flags=0, default_sample_info_size=8, sample_count=4.
+        let mut saiz_body = Vec::new();
+        saiz_body.extend_from_slice(&[0u8; 4]);
+        saiz_body.push(8u8);
+        saiz_body.extend_from_slice(&4u32.to_be_bytes());
+
+        // saio body: v0, flags=0, entry_count=1, offset=0x1000.
+        let mut saio_body = Vec::new();
+        saio_body.extend_from_slice(&[0u8; 4]);
+        saio_body.extend_from_slice(&1u32.to_be_bytes());
+        saio_body.extend_from_slice(&0x1000u32.to_be_bytes());
+
+        let mut stbl = Vec::new();
+        stbl.extend(wrap_box_full_size(b"saiz", &saiz_body));
+        stbl.extend(wrap_box_full_size(b"saio", &saio_body));
+
+        let mut t = fresh_track();
+        super::parse_stbl(&stbl, &mut t).unwrap();
+        assert_eq!(t.saiz.len(), 1);
+        assert_eq!(t.saiz[0].default_sample_info_size, 8);
+        assert_eq!(t.saiz[0].sample_count, 4);
+        assert_eq!(t.saio.len(), 1);
+        assert_eq!(t.saio[0].version, 0);
+        assert_eq!(t.saio[0].offsets, vec![0x1000]);
+    }
+
+    /// `build_stream_info` surfaces both boxes on `params.options`.
+    /// Pair: a `saiz` carrying a `(cenc, 0)` key + variable per-sample
+    /// table; a `saio` with the same key + two 64-bit offsets. The
+    /// formatted strings follow the documented format.
+    #[test]
+    fn build_stream_info_surfaces_saiz_and_saio_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"encv";
+        t.timescale = 1000;
+        t.saiz.push(super::SaizBox {
+            aux_info_type: Some(*b"cenc"),
+            aux_info_type_parameter: Some(0),
+            default_sample_info_size: 0,
+            sample_count: 3,
+            per_sample: vec![18, 18, 26],
+        });
+        t.saio.push(super::SaioBox {
+            version: 1,
+            aux_info_type: Some(*b"cenc"),
+            aux_info_type_parameter: Some(0),
+            offsets: vec![0x1_0000, 0x2_0000],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("saiz_0").unwrap(),
+            "type=cenc param=0 default_size=0 count=3 sizes=18,18,26"
+        );
+        assert_eq!(
+            info.params.options.get("saio_0").unwrap(),
+            "v1 type=cenc param=0 offsets=65536,131072"
+        );
+    }
+
+    /// Absence: a track with no `saiz` / `saio` emits no `saiz_<n>` or
+    /// `saio_<n>` keys (mirrors the `no_subs_no_options` shape).
+    #[test]
+    fn build_stream_info_no_saiz_saio_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("saiz_0"), None);
+        assert_eq!(info.params.options.get("saio_0"), None);
+    }
+
+    /// `saiz` with no aux_info_type key + constant size: surfaced
+    /// without the `type=` / `param=` prefix and without `sizes=`.
+    #[test]
+    fn build_stream_info_surfaces_saiz_constant_no_key() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48_000;
+        t.saiz.push(super::SaizBox {
+            aux_info_type: None,
+            aux_info_type_parameter: None,
+            default_sample_info_size: 22,
+            sample_count: 100,
+            per_sample: Vec::new(),
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("saiz_0").unwrap(),
+            "default_size=22 count=100"
+        );
     }
 }

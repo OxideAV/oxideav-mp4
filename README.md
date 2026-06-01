@@ -306,6 +306,37 @@ Sample-entry FourCCs resolve to these codec ids:
   (decimal for everything except `csp`, which is lowercase 8-digit
   hex). The trailing colon and per-sub-sample list are omitted when an
   entry has `subsample_count = 0`. Absent `subs`, no keys are emitted.
+- Sample auxiliary information sizes + offsets (ISO/IEC 14496-12
+  §8.7.8–9, `saiz` + `saio`): a track's `stbl/saiz` + `stbl/saio` pair
+  documents where per-sample auxiliary-information records live in the
+  file, keyed by `(aux_info_type, aux_info_type_parameter)`. The most
+  common consumer is CENC: when `senc` is absent, per-sample IVs +
+  subsample maps (ISO/IEC 23001-7) are carried as an
+  auxiliary-information stream of type `cenc` / `cbc1` / `cens` /
+  `cbcs`, and the `saiz`+`saio` pair points to the bytes in the mdat.
+  Both versions (v0 32-bit / v1 64-bit `saio` offsets) are read; the
+  optional `aux_info_type` block (gated by `flags & 1`) is captured
+  when present and surfaced as `None`/`None` otherwise so callers can
+  apply §8.7.8.3's implied-value rule against the sample-entry FourCC
+  / sinf scheme themselves. `saiz.default_sample_info_size` non-zero
+  collapses the per-sample table; v1 `saio` offsets that exceed 32
+  bits round-trip as `u64`. Each `saiz` / `saio` encountered on a
+  track is surfaced on `params.options` as `saiz_<n>` / `saio_<n>`
+  (0-based encounter index):
+  - `saiz_<n> = "[type=<fourcc>] [param=<P>] default_size=<D> count=<N> [sizes=<s0>,<s1>,…]"`
+  - `saio_<n> = "v<version> [type=<fourcc>] [param=<P>] offsets=<o0>,<o1>,…"`
+
+  The `type=` / `param=` blocks are omitted when the FullBox `flags &
+  1` bit was zero on disk; the `sizes=` block is omitted when
+  `default_sample_info_size != 0`. Offsets are decimal; in `stbl` they
+  are absolute file positions. For movie-fragment carriage (§8.8.14)
+  the parser also surfaces a per-`traf` summary as `frag_sai_<n>`
+  through `Demuxer::metadata()` (`"track=<t> seq=<s> saiz=<n>
+  saio=<m>"`), and the structured per-fragment records (with offsets
+  preserved as `tfhd.base_data_offset`-relative per §8.8.14) are
+  reachable through the public `Mp4Demuxer::sai_records()` accessor on
+  the demuxer (downcast). Absent `saiz` / `saio`, no keys are emitted
+  and `sai_records()` is empty.
 - Producer reference time (ISO/IEC 14496-12 §8.16.5, `prft`): a
   top-level FullBox carrying a UTC wall-clock instant in NTP 64-bit
   format (RFC 5905 — high 32 bits = seconds since 1900-01-01 UTC,
@@ -453,13 +484,15 @@ first that applies:
 - CENC decryption proper — the demuxer **parses** the CENC framing
   (`tenc` defaults, `pssh` per-DRM headers, per-fragment `senc`
   per-sample IVs + subsample maps; see "CENC metadata parsing" in
-  the demuxer feature list above) and surfaces the metadata, but
-  it does not run the AES-128 CTR / CBC decryption step. That
+  the demuxer feature list above; plus the spec-permitted
+  alternative IV-carriage path via `saiz` / `saio` — see "Sample
+  auxiliary information sizes + offsets") and surfaces the metadata,
+  but it does not run the AES-128 CTR / CBC decryption step. That
   belongs to a downstream layer with key material from the named
-  `pssh.SystemID`. `saiz` / `saio` (Sample Auxiliary Information
-  Sizes / Offsets, ISO/IEC 14496-12 §8.7.8–9) wiring as an
-  alternative IV-carriage path is also still a follow-up; for now
-  `senc` is the only IV source consumed.
+  `pssh.SystemID`. The mdat-resident auxiliary-information bytes
+  that the `saio` offsets name are not pre-fetched — a CENC
+  consumer reading them seeks the input itself using the surfaced
+  offsets.
 - Multiple sample descriptions per track (only the first entry of
   `stsd` is used; `tfhd.sample_description_index` overrides are
   ignored).
