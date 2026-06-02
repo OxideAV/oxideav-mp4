@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Track Group Box parsing (ISO/IEC 14496-12 §8.3.4, `trgr` — round
+  210). Each typed `TrackGroupTypeBox` child inside `trak/trgr` is
+  parsed as a `(track_group_type, track_group_id)` pair. The child's
+  FourCC is the grouping type (`msrc` is the spec-named example, for
+  multi-source presentations); its body is a 4-byte FullBox preamble
+  (`version = 0`, `flags = 0`) followed by the 32-bit
+  `track_group_id`. Tracks sharing the same `(type, id)` pair belong
+  to the same group per §8.3.4.3. Track groups are a membership
+  signal, **not** a dependency relationship — that role belongs to
+  `tref` (§8.3.3). Surfaced on `params.options` as `trgr_<n>`
+  (0-based encounter index) with value `"<type> <id>"`, mirroring the
+  `kind_<n>` two-field shape. The spec does not forbid two children
+  of the same `track_group_type` on one track, so both encounter-order
+  entries are preserved (unlike `tref`, which caps at one per
+  `reference_type`). Trailing bytes inside a child are reserved for
+  derived-spec extensions and ignored; a non-zero `version` (the spec
+  pins it to 0) is silently skipped so unknown extensions never
+  mis-parse. Absent `trgr`, no keys are emitted.
 - Sample Auxiliary Information Sizes / Offsets parsing (ISO/IEC
   14496-12 §8.7.8 / §8.7.9, `saiz` / `saio` — round 203). Both boxes
   are read inside `stbl` (track-level absolute offsets) and inside

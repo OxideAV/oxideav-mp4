@@ -157,6 +157,16 @@ pub const TRAK: [u8; 4] = fourcc("trak");
 pub const TKHD: [u8; 4] = fourcc("tkhd");
 /// `tref` — TrackReferenceBox (ISO/IEC 14496-12 §8.3.3).
 pub const TREF: [u8; 4] = fourcc("tref");
+/// `trgr` — TrackGroupBox (ISO/IEC 14496-12 §8.3.4). Sits inside `trak`
+/// as a plain container of zero or more `TrackGroupTypeBox` children
+/// (each a FullBox whose FourCC is the `track_group_type` — `msrc` is
+/// the spec-named example for multi-source presentations). Each child
+/// body starts with a 32-bit `track_group_id`; the `(track_group_type,
+/// track_group_id)` pair uniquely identifies a track group within the
+/// file, and tracks carrying that same pair belong to the same group.
+/// Track groups do **not** indicate dependency relationships — that's
+/// what `tref` is for (§8.3.3).
+pub const TRGR: [u8; 4] = fourcc("trgr");
 pub const EDTS: [u8; 4] = fourcc("edts");
 pub const MDIA: [u8; 4] = fourcc("mdia");
 pub const MDHD: [u8; 4] = fourcc("mdhd");

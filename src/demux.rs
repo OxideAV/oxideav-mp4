@@ -439,6 +439,20 @@ struct Track {
     /// appear at most once (per spec — track-reference type boxes are
     /// keyed by their FourCC).
     tref: Vec<([u8; 4], Vec<u32>)>,
+    /// §8.3.4 — `trgr` (TrackGroupBox) child entries. Each pair is
+    /// `(track_group_type, track_group_id)`: the `TrackGroupTypeBox`
+    /// FourCC names the grouping (`msrc` is the spec-named example for
+    /// multi-source presentations) and the 32-bit `track_group_id` is
+    /// the in-file identifier — two tracks sharing the same
+    /// `(track_group_type, track_group_id)` pair belong to the same
+    /// group. The outer `TrackGroupBox` itself is "Zero or one" per
+    /// track but can hold an arbitrary list of typed child boxes; the
+    /// spec does not forbid two children with the same
+    /// `track_group_type` on the same track, so we preserve encounter
+    /// order and surface each entry separately rather than
+    /// de-duplicating by type. Track groups are **not** dependency
+    /// relationships — that role belongs to `tref` (§8.3.3).
+    trgr: Vec<([u8; 4], u32)>,
     /// §8.4.6 — `elng` (ExtendedLanguageBox). The NULL-terminated BCP 47
     /// (RFC 4646) language tag string (e.g. `en-US`, `fr-FR`, `zh-CN`).
     /// `None` when the track has no `elng` box, in which case callers
@@ -1097,6 +1111,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         protection_scheme: None,
         tenc: None,
         tref: Vec::new(),
+        trgr: Vec::new(),
         elng: None,
         kinds: Vec::new(),
         cslg: None,
@@ -1134,6 +1149,10 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
             TREF => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
                 parse_tref(&sub, &mut t)?;
+            }
+            TRGR => {
+                let sub = read_bytes_vec(&mut cur, psz)?;
+                parse_trgr(&sub, &mut t)?;
             }
             UDTA => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
@@ -1305,6 +1324,72 @@ fn parse_tref(body: &[u8], t: &mut Track) -> Result<()> {
         if !t.tref.iter().any(|(ty, _)| *ty == hdr.fourcc) {
             t.tref.push((hdr.fourcc, ids));
         }
+    }
+    Ok(())
+}
+
+/// §8.3.4 — `trgr` (TrackGroupBox).
+///
+/// Spec syntax (§8.3.4.2):
+/// ```text
+/// aligned(8) class TrackGroupBox('trgr') {
+/// }
+/// aligned(8) class TrackGroupTypeBox (unsigned int(32) track_group_type)
+///     extends FullBox(track_group_type, version = 0, flags = 0) {
+///   unsigned int(32) track_group_id;
+///   // the remaining data may be specified for a particular
+///   // track_group_type
+/// }
+/// ```
+///
+/// The outer `trgr` is a plain container whose children are typed
+/// FullBoxes — each child's FourCC IS the `track_group_type` (the
+/// spec-named example is `msrc`, for multi-source presentations).
+/// Each child body is a 4-byte `FullBox` preamble (version + 24-bit
+/// flags, both fixed to zero per §8.3.4.2) followed by the 32-bit
+/// `track_group_id`. Any trailing bytes are reserved for a
+/// per-`track_group_type` extension and silently ignored at this
+/// layer — a future derived spec adding fields can land here without
+/// changing the parse contract.
+///
+/// Two tracks sharing the same `(track_group_type, track_group_id)`
+/// pair belong to the same group (§8.3.4.3). Per §8.3.4.1 a group is
+/// **not** a dependency relationship — that role belongs to `tref`
+/// (§8.3.3).
+///
+/// The spec does not forbid two children of the same `track_group_type`
+/// on the same track, so we preserve encounter order in `t.trgr` rather
+/// than de-duplicating by type. A child whose body is shorter than the
+/// 8-byte preamble + id is a structural error and aborts the parse
+/// (the file is malformed); a child whose preamble has non-zero
+/// version is silently skipped (the spec pins version = 0, so a
+/// non-zero value is a forward-compatible extension we cannot interpret
+/// safely).
+fn parse_trgr(body: &[u8], t: &mut Track) -> Result<()> {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let child = read_bytes_vec(&mut cur, psz)?;
+        // FullBox preamble (4) + track_group_id (4) = 8 bytes minimum.
+        if child.len() < 8 {
+            return Err(Error::invalid(
+                "MP4: trgr child too short for FullBox + track_group_id",
+            ));
+        }
+        // §8.3.4.2 pins version = 0. A different version means a
+        // forward-compatible extension we cannot decode safely; skip
+        // the child rather than mis-parsing it.
+        let version = child[0];
+        if version != 0 {
+            continue;
+        }
+        let track_group_id = u32::from_be_bytes([child[4], child[5], child[6], child[7]]);
+        t.trgr.push((hdr.fourcc, track_group_id));
     }
     Ok(())
 }
@@ -4157,6 +4242,30 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert(format!("tref_{}", type_str), value);
     }
 
+    // ISO/IEC 14496-12 §8.3.4: surface each `trgr` (TrackGroupBox)
+    // child as `trgr_<n>` where `<n>` is the 0-based encounter index.
+    // Value is `"<track_group_type> <track_group_id>"` — the FourCC
+    // type and the 32-bit identifier, space-separated, mirroring the
+    // `kind_<n>` two-field shape. Tracks sharing the same
+    // `(type, id)` pair belong to the same group (§8.3.4.3); this is
+    // a track-group membership signal, not a dependency relationship
+    // (use `tref_<type>` for the latter). Reference types whose
+    // FourCC contains non-printable bytes fall back to an 8-digit hex
+    // representation, matching the `tref_<type>` convention.
+    for (i, (group_type, group_id)) in t.trgr.iter().enumerate() {
+        let type_str = std::str::from_utf8(group_type)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| {
+                format!(
+                    "{:02x}{:02x}{:02x}{:02x}",
+                    group_type[0], group_type[1], group_type[2], group_type[3]
+                )
+            });
+        params
+            .options
+            .insert(format!("trgr_{}", i), format!("{} {}", type_str, group_id));
+    }
+
     // ISO/IEC 14496-12 §8.10.4: surface each track-level `kind`
     // (KindBox) on `params.options` as `kind_<n>` where `<n>` is the
     // 0-based encounter index. Value is the URI alone when the box
@@ -5015,6 +5124,7 @@ mod tests {
             protection_scheme: None,
             tenc: None,
             tref: Vec::new(),
+            trgr: Vec::new(),
             elng: None,
             kinds: Vec::new(),
             cslg: None,
@@ -5687,6 +5797,191 @@ mod tests {
         assert_eq!(info.params.options.get("tref_subt"), Some("10 11"));
         assert_eq!(info.params.options.get("tref_font"), Some("20"));
         assert_eq!(info.params.options.get("tref_hint"), None);
+    }
+
+    /// §8.3.4 — `trgr` carrying a single `msrc` TrackGroupTypeBox child
+    /// produces one `(track_group_type, track_group_id)` entry on the
+    /// track. The FullBox preamble is 4 bytes of zeros (version + 24-bit
+    /// flags, both spec-pinned to 0), followed by the 32-bit
+    /// `track_group_id`.
+    #[test]
+    fn parse_trgr_msrc_single_child() {
+        // Inner TrackGroupTypeBox: size(16) "msrc" [v+flags=0] track_group_id=42
+        let mut inner_body = Vec::new();
+        inner_body.extend_from_slice(&[0u8; 4]); // FullBox v0 + flags=0
+        inner_body.extend_from_slice(&42u32.to_be_bytes());
+        let body = wrap_box_full_size(b"msrc", &inner_body);
+        let mut t = fresh_track();
+        super::parse_trgr(&body, &mut t).unwrap();
+        assert_eq!(t.trgr.len(), 1);
+        assert_eq!(&t.trgr[0].0, b"msrc");
+        assert_eq!(t.trgr[0].1, 42);
+    }
+
+    /// Multiple typed children inside one `trgr` are surfaced in
+    /// encounter order. Different types coexist: `msrc` (spec-named) plus
+    /// a hypothetical derived-spec FourCC.
+    #[test]
+    fn parse_trgr_multiple_types() {
+        let mut body = Vec::new();
+        let mut msrc_payload = Vec::new();
+        msrc_payload.extend_from_slice(&[0u8; 4]); // FullBox
+        msrc_payload.extend_from_slice(&7u32.to_be_bytes());
+        body.extend(wrap_box_full_size(b"msrc", &msrc_payload));
+        let mut foo_payload = Vec::new();
+        foo_payload.extend_from_slice(&[0u8; 4]); // FullBox
+        foo_payload.extend_from_slice(&99u32.to_be_bytes());
+        body.extend(wrap_box_full_size(b"foo ", &foo_payload));
+        let mut t = fresh_track();
+        super::parse_trgr(&body, &mut t).unwrap();
+        assert_eq!(t.trgr.len(), 2);
+        assert_eq!(&t.trgr[0].0, b"msrc");
+        assert_eq!(t.trgr[0].1, 7);
+        assert_eq!(&t.trgr[1].0, b"foo ");
+        assert_eq!(t.trgr[1].1, 99);
+    }
+
+    /// Spec leaves the door open for two children of the same
+    /// `track_group_type` on the same track; we preserve both rather
+    /// than de-duplicating (unlike `tref` where the spec explicitly
+    /// caps at one entry per type).
+    #[test]
+    fn parse_trgr_repeated_type_kept_in_order() {
+        let mut body = Vec::new();
+        let mut p1 = Vec::new();
+        p1.extend_from_slice(&[0u8; 4]);
+        p1.extend_from_slice(&1u32.to_be_bytes());
+        body.extend(wrap_box_full_size(b"msrc", &p1));
+        let mut p2 = Vec::new();
+        p2.extend_from_slice(&[0u8; 4]);
+        p2.extend_from_slice(&2u32.to_be_bytes());
+        body.extend(wrap_box_full_size(b"msrc", &p2));
+        let mut t = fresh_track();
+        super::parse_trgr(&body, &mut t).unwrap();
+        assert_eq!(t.trgr.len(), 2);
+        assert_eq!(t.trgr[0].1, 1);
+        assert_eq!(t.trgr[1].1, 2);
+    }
+
+    /// A child whose body is shorter than the 8-byte preamble + id is a
+    /// structural error. We surface it as `Error::InvalidData` rather
+    /// than silently skipping (which would mask corruption).
+    #[test]
+    fn parse_trgr_short_child_rejected() {
+        // 7-byte body: FullBox preamble + only 3 bytes where the id
+        // should go.
+        let body = wrap_box_full_size(b"msrc", &[0u8, 0, 0, 0, 0, 0, 0]);
+        let mut t = fresh_track();
+        let err = super::parse_trgr(&body, &mut t).unwrap_err();
+        assert!(matches!(err, oxideav_core::Error::InvalidData(_)));
+    }
+
+    /// §8.3.4.2 pins `version = 0`. A non-zero version is a
+    /// forward-compatible extension we cannot decode safely — skip the
+    /// child rather than mis-parsing it. The remaining children of the
+    /// same `trgr` continue to be processed.
+    #[test]
+    fn parse_trgr_skips_unknown_version_child() {
+        let mut body = Vec::new();
+        // Child 1: version = 1, skip.
+        let mut p1 = Vec::new();
+        p1.extend_from_slice(&[1u8, 0, 0, 0]); // version = 1
+        p1.extend_from_slice(&5u32.to_be_bytes());
+        body.extend(wrap_box_full_size(b"msrc", &p1));
+        // Child 2: version = 0, kept.
+        let mut p2 = Vec::new();
+        p2.extend_from_slice(&[0u8; 4]);
+        p2.extend_from_slice(&8u32.to_be_bytes());
+        body.extend(wrap_box_full_size(b"msrc", &p2));
+        let mut t = fresh_track();
+        super::parse_trgr(&body, &mut t).unwrap();
+        assert_eq!(t.trgr.len(), 1);
+        assert_eq!(t.trgr[0].1, 8);
+    }
+
+    /// Trailing bytes beyond `track_group_id` are reserved for derived
+    /// specs. We ignore them at this layer — the file is still valid and
+    /// the id is still recovered.
+    #[test]
+    fn parse_trgr_ignores_trailing_extension_bytes() {
+        let mut inner_body = Vec::new();
+        inner_body.extend_from_slice(&[0u8; 4]); // FullBox
+        inner_body.extend_from_slice(&13u32.to_be_bytes());
+        inner_body.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]); // extension
+        let body = wrap_box_full_size(b"msrc", &inner_body);
+        let mut t = fresh_track();
+        super::parse_trgr(&body, &mut t).unwrap();
+        assert_eq!(t.trgr.len(), 1);
+        assert_eq!(t.trgr[0].1, 13);
+    }
+
+    /// Empty outer `trgr` (no inner boxes) parses cleanly and yields no
+    /// entries.
+    #[test]
+    fn parse_trgr_empty_body_is_ok() {
+        let mut t = fresh_track();
+        super::parse_trgr(&[], &mut t).unwrap();
+        assert!(t.trgr.is_empty());
+    }
+
+    /// `parse_trak` accepts a `trgr` box nested under `trak` and lands
+    /// its child entries on the resulting Track. Confirms the routing
+    /// glue inside `parse_trak`'s box match (not just the standalone
+    /// parser).
+    #[test]
+    fn parse_trak_picks_up_nested_trgr() {
+        // Build a minimal trak: tkhd + mdia (mdhd + hdlr + minf/stbl
+        // pre-baked elsewhere is not needed — parse_trak only requires
+        // an mdia to consider the track "has_media", and parse_mdia
+        // walks its own children). Mirror the kind-nested test setup.
+        let mut tkhd = vec![0u8; 92]; // FullBox v0 + 84 bytes
+        tkhd[12..16].copy_from_slice(&1u32.to_be_bytes()); // track_id = 1
+
+        let mut mdhd = vec![0u8; 24];
+        mdhd[12..16].copy_from_slice(&1000u32.to_be_bytes()); // timescale
+
+        let mut hdlr = Vec::new();
+        hdlr.extend_from_slice(&[0u8; 8]); // FullBox + pre_defined
+        hdlr.extend_from_slice(b"vide"); // handler_type
+        hdlr.extend_from_slice(&[0u8; 12]); // reserved[3]
+        hdlr.extend_from_slice(b"\0"); // name (empty C string)
+
+        let mut mdia = Vec::new();
+        mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
+        mdia.extend(wrap_box_full_size(b"hdlr", &hdlr));
+
+        // trgr containing one msrc child with track_group_id = 555.
+        let mut trgr_body = Vec::new();
+        let mut msrc_body = Vec::new();
+        msrc_body.extend_from_slice(&[0u8; 4]); // FullBox
+        msrc_body.extend_from_slice(&555u32.to_be_bytes());
+        trgr_body.extend(wrap_box_full_size(b"msrc", &msrc_body));
+
+        let mut trak = Vec::new();
+        trak.extend(wrap_box_full_size(b"tkhd", &tkhd));
+        trak.extend(wrap_box_full_size(b"mdia", &mdia));
+        trak.extend(wrap_box_full_size(b"trgr", &trgr_body));
+
+        let t = super::parse_trak(&trak).unwrap().unwrap();
+        assert_eq!(t.trgr.len(), 1);
+        assert_eq!(&t.trgr[0].0, b"msrc");
+        assert_eq!(t.trgr[0].1, 555);
+    }
+
+    /// Track groups surface on `StreamInfo.params.options` as
+    /// `trgr_<n>` keys whose value is `"<type> <id>"`. Mirrors the
+    /// `kind_<n>` two-field convention.
+    #[test]
+    fn build_stream_info_surfaces_trgr_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 90_000;
+        t.trgr.push((*b"msrc", 7));
+        t.trgr.push((*b"msrc", 42)); // second of same type still surfaced.
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("trgr_0"), Some("msrc 7"));
+        assert_eq!(info.params.options.get("trgr_1"), Some("msrc 42"));
     }
 
     /// `elng` (ExtendedLanguageBox §8.4.6): FullBox preamble + a

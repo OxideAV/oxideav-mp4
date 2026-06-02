@@ -211,6 +211,27 @@ Sample-entry FourCCs resolve to these codec ids:
   depth / parallax auxiliary video (`vdep` / `vplx`), and hint
   dependency (`hind`) relationships. `track_ID = 0` entries
   (spec-prohibited) are dropped.
+- Track groups (ISO/IEC 14496-12 §8.3.4, `trgr`): each
+  `TrackGroupTypeBox` child inside `trak/trgr` is parsed as a
+  `(track_group_type, track_group_id)` pair — the child's FourCC
+  names the grouping (`msrc` is the spec-named example, for
+  multi-source presentations: tracks sharing a `track_group_id`
+  under the `msrc` type originate from the same source, e.g. one
+  participant's audio + video in a recorded video call) and the
+  32-bit `track_group_id` identifies the group within the file.
+  Two tracks carrying the same `(type, id)` pair belong to the
+  same group (§8.3.4.3); track groups are **not** dependency
+  relationships (use `tref` for those). Each child is surfaced on
+  `params.options` as `trgr_<n>` (0-based encounter index) with
+  value `"<type> <id>"`. The spec leaves the door open for two
+  children of the same type on one track (unlike `tref` which
+  caps at one per `reference_type`) so both encounter-order copies
+  are preserved. Bytes trailing the 32-bit id inside a child are
+  reserved for per-`track_group_type` extensions in derived specs
+  and silently ignored at this layer; a child whose `version` field
+  is non-zero (§8.3.4.2 pins it to 0) is also silently skipped, so
+  unknown extensions never mis-parse. Absent `trgr`, none of the
+  keys are emitted.
 - Track Kind (ISO/IEC 14496-12 §8.10.4, `kind`): each `KindBox`
   inside a track-level `udta` is parsed as a `(schemeURI, value)`
   pair (both NULL-terminated C strings; an absent value is allowed,
