@@ -136,6 +136,23 @@ Sample-entry FourCCs resolve to these codec ids:
   `tfhd.base_data_offset` are all honoured. `styp`, `sidx`, and `mfra`
   segment-index boxes are skipped (segment-precision seek hint
   consumption is a follow-up).
+- Movie extends header (ISO/IEC 14496-12 §8.8.2, `mehd`): a sealed
+  fragmented file's `mvex/mehd` MovieExtendsHeaderBox carries the
+  overall presentation `fragment_duration` (in the movie timescale,
+  per §8.8.2.3) — including all `moof` fragments — that an authoring
+  step can write once the fragments are laid down. Both versions are
+  read (v0 32-bit, v1 64-bit widened to `u64`). When present and
+  non-zero, the value drives `Demuxer::duration_micros` and takes
+  precedence over `mvhd.duration` — sealed fragmented files commonly
+  carry `mvhd.duration = 0` (the moov has no resident samples that
+  contribute to a non-fragment duration) and `mehd` is then the only
+  authoritative total. The raw value (in the movie timescale) is also
+  surfaced verbatim via `Demuxer::metadata()` as the
+  `mehd_fragment_duration` key, for tooling wanting the untranslated
+  number (e.g. CMAF live-edge probes confirming a producer's sealed
+  total against their own running tally). Absent `mehd`, the key is
+  not emitted and `duration_micros` falls back to `mvhd.duration` as
+  before.
 - Seek: `seek_to(stream, pts)` lands on the nearest sync-sample ≤ pts
   (or the first keyframe of the stream if none qualify).
 - Metadata: 3GPP `udta` boxes (`titl`/`auth`/…) and iTunes-style

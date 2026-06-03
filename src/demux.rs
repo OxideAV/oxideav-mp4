@@ -142,12 +142,38 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
 
     samples.sort_by_key(|s| s.offset);
 
-    // Movie duration from mvhd, translated into microseconds.
-    let duration_micros: i64 = if parsed.movie_timescale > 0 && parsed.movie_duration > 0 {
-        (parsed.movie_duration as i128 * 1_000_000 / parsed.movie_timescale as i128) as i64
+    // Movie duration from mvhd (§8.2.2), with §8.8.2 `mehd`
+    // (MovieExtendsHeaderBox) as fall-back for fragmented files. When
+    // a fragmented file is sealed with a known overall duration, the
+    // authoring step writes `mehd.fragment_duration` while
+    // `mvhd.duration` may legitimately stay zero (the moov has no
+    // resident samples that contribute to the duration). In that case
+    // we report the mehd value; when mvhd already supplies a non-zero
+    // duration and mehd is also present, the spec wording
+    // ("provides the overall duration, including fragments") makes
+    // mehd the authoritative total, so we still prefer it.
+    let effective_duration: u64 = parsed
+        .mehd_fragment_duration
+        .filter(|&d| d > 0)
+        .unwrap_or(parsed.movie_duration);
+    let duration_micros: i64 = if parsed.movie_timescale > 0 && effective_duration > 0 {
+        (effective_duration as i128 * 1_000_000 / parsed.movie_timescale as i128) as i64
     } else {
         0
     };
+
+    // Surface §8.8.2 mehd fragment_duration as a top-level metadata
+    // key when present. Mirrors the rest of this crate's flat metadata
+    // surface: the structured value is also reflected in
+    // `Demuxer::duration_micros` (see the duration calc above); this
+    // key exposes the raw value in the movie timescale for tooling
+    // that wants the untranslated number (e.g. CMAF live-edge probes
+    // wanting to confirm a producer's sealed total against their own
+    // running tally). Absent `mehd`, no key is emitted.
+    let mut metadata = parsed.metadata;
+    if let Some(d) = parsed.mehd_fragment_duration {
+        metadata.push(("mehd_fragment_duration".to_string(), d.to_string()));
+    }
 
     // Surface any parsed `prft` ProducerReferenceTimeBoxes through the
     // container metadata channel as `prft_<n>` (0-based file order)
@@ -156,7 +182,6 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     // `tref_<type>` / `sgpd_<n>` conventions used elsewhere in this
     // crate. Callers wanting the structured record can use the public
     // `parse_prft_box` entry point. Absent prft, no keys are emitted.
-    let mut metadata = parsed.metadata;
     for (n, p) in prfts.iter().enumerate() {
         metadata.push((
             format!("prft_{n}"),
@@ -339,6 +364,16 @@ struct ParsedMoov {
     tracks: Vec<Track>,
     movie_timescale: u32,
     movie_duration: u64,
+    /// §8.8.2 (`mehd` MovieExtendsHeaderBox) — overall presentation
+    /// duration of a fragmented movie, including fragments, in the
+    /// movie timescale. `None` when the box is absent (per the spec
+    /// it is optional). v0 widens to u64 on intake so the rest of the
+    /// pipeline sees one type. When present and non-zero, takes
+    /// precedence over `mvhd.duration` for the surfaced
+    /// `Demuxer::duration_micros` value — a sealed fragmented file
+    /// typically has `mvhd.duration = 0` and the only authoritative
+    /// total is the `mehd`.
+    mehd_fragment_duration: Option<u64>,
     metadata: Vec<(String, String)>,
     /// §8.1 (ISO/IEC 23001-7) — `pssh`
     /// ProtectionSystemSpecificHeaderBox entries collected at moov
@@ -833,7 +868,7 @@ fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
             }
             MVEX => {
                 let body = read_bytes_vec(&mut cur, psz)?;
-                parse_mvex(&body, &mut out.tracks)?;
+                parse_mvex(&body, &mut out.tracks, &mut out.mehd_fragment_duration)?;
             }
             PSSH => {
                 // ISO/IEC 23001-7 §8.1 — ProtectionSystemSpecificHeaderBox.
@@ -859,8 +894,14 @@ fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
 }
 
 /// §8.8.1 — `mvex` (MovieExtendsBox). Container for `trex` boxes that
-/// supply per-track defaults consumed by the fragment parser.
-fn parse_mvex(body: &[u8], tracks: &mut [Track]) -> Result<()> {
+/// supply per-track defaults consumed by the fragment parser, and an
+/// optional `mehd` MovieExtendsHeaderBox carrying the overall
+/// presentation duration of a fragmented movie.
+fn parse_mvex(
+    body: &[u8],
+    tracks: &mut [Track],
+    mehd_fragment_duration: &mut Option<u64>,
+) -> Result<()> {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
     while cur.position() < end {
@@ -874,13 +915,63 @@ fn parse_mvex(body: &[u8], tracks: &mut [Track]) -> Result<()> {
                 let b = read_bytes_vec(&mut cur, psz)?;
                 parse_trex(&b, tracks)?;
             }
-            // mehd (movie-extends-header) carries an overall fragment
-            // duration we don't consume — the per-fragment tfdt + trun
-            // are authoritative.
+            // §8.8.2 — `mehd` MovieExtendsHeaderBox. Optional FullBox
+            // (`Quantity: Zero or one`). v0 → 32-bit fragment_duration;
+            // v1 → 64-bit. Widened to u64 either way. The recorded
+            // value is in the movie timescale (per §8.8.2.3
+            // "indicated in the Movie Header Box"). A malformed mehd
+            // is non-fatal: we drop it but keep the file parseable
+            // (the demuxer falls back to mvhd.duration in that case).
+            MEHD => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                if let Ok(d) = parse_mehd(&b) {
+                    // Spec allows only one per mvex; if a second
+                    // mehd appears we keep the first (defensive — the
+                    // file is malformed and the rest of our parser
+                    // also takes the first occurrence of single-shot
+                    // boxes).
+                    if mehd_fragment_duration.is_none() {
+                        *mehd_fragment_duration = Some(d);
+                    }
+                }
+            }
             _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
     Ok(())
+}
+
+/// §8.8.2 — `mehd` MovieExtendsHeaderBox.
+///
+/// Layout: FullBox preamble (4 bytes: version + flags) followed by a
+/// single `fragment_duration` field — 4 bytes (v0) or 8 bytes (v1) —
+/// in the movie timescale.
+///
+/// Returns the duration widened to `u64`. v0 values are zero-extended;
+/// v1 values are read big-endian directly. An unknown version is
+/// treated as malformed (the spec defines only 0 and 1).
+fn parse_mehd(body: &[u8]) -> Result<u64> {
+    if body.is_empty() {
+        return Err(Error::invalid("MP4: mehd empty"));
+    }
+    let version = body[0];
+    match version {
+        0 => {
+            if body.len() < 8 {
+                return Err(Error::invalid("MP4: mehd v0 too short"));
+            }
+            Ok(u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as u64)
+        }
+        1 => {
+            if body.len() < 12 {
+                return Err(Error::invalid("MP4: mehd v1 too short"));
+            }
+            Ok(u64::from_be_bytes([
+                body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
+            ]))
+        }
+        _ => Err(Error::invalid("MP4: mehd unknown version")),
+    }
 }
 
 /// §8.8.3 — `trex` (TrackExtendsBox).
@@ -7603,5 +7694,55 @@ mod tests {
             info.params.options.get("saiz_0").unwrap(),
             "default_size=22 count=100"
         );
+    }
+
+    // ----- §8.8.2 mehd MovieExtendsHeaderBox parser ---------------------
+
+    #[test]
+    fn parse_mehd_v0_reads_32_bit_fragment_duration() {
+        // FullBox(version=0, flags=0) + u32 fragment_duration
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        let d = super::parse_mehd(&body).expect("v0 mehd parses");
+        assert_eq!(d, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn parse_mehd_v1_reads_64_bit_fragment_duration() {
+        // FullBox(version=1, flags=0) + u64 fragment_duration
+        let mut body = vec![1u8, 0, 0, 0];
+        let dur: u64 = 0x0123_4567_89AB_CDEF;
+        body.extend_from_slice(&dur.to_be_bytes());
+        let d = super::parse_mehd(&body).expect("v1 mehd parses");
+        assert_eq!(d, dur);
+    }
+
+    #[test]
+    fn parse_mehd_rejects_empty_body() {
+        assert!(super::parse_mehd(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_mehd_rejects_truncated_v0() {
+        // version=0, flags=0, only 2 of 4 duration bytes.
+        let body = vec![0u8, 0, 0, 0, 0x12, 0x34];
+        assert!(super::parse_mehd(&body).is_err());
+    }
+
+    #[test]
+    fn parse_mehd_rejects_truncated_v1() {
+        // version=1, flags=0, only 4 of 8 duration bytes.
+        let body = vec![1u8, 0, 0, 0, 0, 0, 0, 0];
+        assert!(super::parse_mehd(&body).is_err());
+    }
+
+    #[test]
+    fn parse_mehd_rejects_unknown_version() {
+        // The spec defines only versions 0 and 1; any other value is
+        // a forged / corrupt box and must be refused (not best-effort
+        // parsed — we don't know what the field layout is).
+        let mut body = vec![2u8, 0, 0, 0];
+        body.extend_from_slice(&0u64.to_be_bytes());
+        assert!(super::parse_mehd(&body).is_err());
     }
 }

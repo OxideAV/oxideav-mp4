@@ -270,6 +270,17 @@ pub const KIND: [u8; 4] = fourcc("kind");
 
 // Fragmented-MP4 box types (ISO/IEC 14496-12 §8.8 — Movie Fragments).
 pub const MVEX: [u8; 4] = fourcc("mvex");
+/// `mehd` — MovieExtendsHeaderBox (ISO/IEC 14496-12 §8.8.2). Sits inside
+/// `mvex`; optional FullBox carrying the overall presentation duration
+/// of a fragmented movie, including fragments, in the movie timescale.
+/// Version 0 stores the duration as u32, version 1 as u64. Per §8.8.2.3:
+/// "if an MP4 file is created in real-time, such as used in live
+/// streaming, it is not likely that the fragment_duration is known in
+/// advance and this box may be omitted." When the box is present, it
+/// supplies a duration the demuxer can report even when `mvhd.duration`
+/// is zero (the typical sealed-fragmented-file pattern: a final
+/// authoring step writes `mehd` after the fragments are laid down).
+pub const MEHD: [u8; 4] = fourcc("mehd");
 pub const TREX: [u8; 4] = fourcc("trex");
 pub const MOOF: [u8; 4] = fourcc("moof");
 pub const MFHD: [u8; 4] = fourcc("mfhd");

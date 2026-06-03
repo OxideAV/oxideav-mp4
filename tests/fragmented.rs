@@ -529,3 +529,161 @@ fn styp_segment_marker_is_skipped() {
     }
     assert_eq!(count, 2);
 }
+
+/// `mehd` MovieExtendsHeaderBox (ISO/IEC 14496-12 §8.8.2): when a
+/// sealed fragmented file carries `mehd` inside `mvex` with the overall
+/// presentation duration (including fragments), the demuxer surfaces
+/// that as the reported `duration_micros` even when `mvhd.duration` is
+/// zero — the typical pattern for fragmented files where the moov has
+/// no resident samples that contribute to a non-fragment duration.
+///
+/// Both versions (v0 32-bit and v1 64-bit `fragment_duration`) are
+/// exercised; the raw value is also surfaced verbatim on
+/// `Demuxer::metadata()` under the `mehd_fragment_duration` key, in
+/// the movie timescale.
+#[test]
+fn mehd_supplies_duration_when_mvhd_duration_is_zero() {
+    use std::io::Cursor;
+
+    /// Build a fragmented mvex that contains BOTH a `trex` (mandatory
+    /// per §8.8.3) and an `mehd` (optional, §8.8.2). Version selects
+    /// the on-disk width of `fragment_duration`.
+    fn mvex_with_mehd(track_id: u32, ddur: u32, dsiz: u32, version: u8, dur: u64) -> Vec<u8> {
+        let mut mehd_body = Vec::new();
+        mehd_body.push(version);
+        mehd_body.extend_from_slice(&[0u8; 3]); // flags
+        match version {
+            0 => mehd_body.extend_from_slice(&(dur as u32).to_be_bytes()),
+            1 => mehd_body.extend_from_slice(&dur.to_be_bytes()),
+            _ => panic!("invalid mehd version in test helper"),
+        }
+        let mehd = boxed(b"mehd", &mehd_body);
+
+        let mut mvex_body = Vec::new();
+        // Spec lets mehd appear before or after trex; we put mehd
+        // first to assert the order-independence (parse_mvex iterates
+        // children).
+        mvex_body.extend_from_slice(&mehd);
+        mvex_body.extend_from_slice(&trex(track_id, ddur, dsiz));
+        boxed(b"mvex", &mvex_body)
+    }
+
+    fn moov_audio_with_mehd(
+        timescale: u32,
+        track_id: u32,
+        ddur: u32,
+        version: u8,
+        dur: u64,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&mvhd(timescale)); // mvhd.duration = 0
+        body.extend_from_slice(&trak_audio(track_id, timescale));
+        body.extend_from_slice(&mvex_with_mehd(track_id, ddur, 4, version, dur));
+        boxed(b"moov", &body)
+    }
+
+    let track_id = 1u32;
+    let timescale = 48_000u32; // 48 kHz audio
+    let default_dur = 1u32;
+
+    // ----- v0 (32-bit fragment_duration) -----
+    // Duration = 96000 ticks @ 48 kHz = 2 seconds = 2_000_000 microseconds.
+    let dur_v0: u64 = 96_000;
+    let mut file_v0 = Vec::new();
+    file_v0.extend_from_slice(&ftyp());
+    file_v0.extend_from_slice(&moov_audio_with_mehd(
+        timescale,
+        track_id,
+        default_dur,
+        0,
+        dur_v0,
+    ));
+    let frag: Vec<Vec<u8>> = (0..2u8).map(|i| vec![i; 4]).collect();
+    file_v0.extend_from_slice(&moof_mdat_pair(1, track_id, default_dur, 0, &frag));
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file_v0));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    assert_eq!(
+        dmx.duration_micros(),
+        Some(2_000_000),
+        "mehd v0 → 2 s should surface as 2_000_000 microseconds"
+    );
+    let md: std::collections::HashMap<&str, &str> = dmx
+        .metadata()
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        md.get("mehd_fragment_duration").copied(),
+        Some("96000"),
+        "raw mehd value should be surfaced on metadata channel"
+    );
+
+    // ----- v1 (64-bit fragment_duration) -----
+    // A value that doesn't fit in u32 — exercises the wide path.
+    let dur_v1: u64 = (u32::MAX as u64) + 48_000; // u32::MAX + 1 second @ 48 kHz
+    let mut file_v1 = Vec::new();
+    file_v1.extend_from_slice(&ftyp());
+    file_v1.extend_from_slice(&moov_audio_with_mehd(
+        timescale,
+        track_id,
+        default_dur,
+        1,
+        dur_v1,
+    ));
+    file_v1.extend_from_slice(&moof_mdat_pair(1, track_id, default_dur, 0, &frag));
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file_v1));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let expected_us = (dur_v1 as i128 * 1_000_000 / timescale as i128) as i64;
+    assert_eq!(
+        dmx.duration_micros(),
+        Some(expected_us),
+        "mehd v1 64-bit duration must traverse the i128 widening path"
+    );
+    let md: std::collections::HashMap<&str, &str> = dmx
+        .metadata()
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        md.get("mehd_fragment_duration").copied(),
+        Some(dur_v1.to_string().as_str()),
+        "raw mehd v1 value should be surfaced verbatim"
+    );
+}
+
+/// When `mehd` is absent, the demuxer falls back to `mvhd.duration` —
+/// unchanged behaviour relative to pre-r221, and `mehd_fragment_duration`
+/// must not appear on the metadata channel. Regression guard against
+/// the new fallback path emitting a spurious zero key.
+#[test]
+fn mehd_absent_keeps_existing_mvhd_fallback_and_emits_no_key() {
+    use std::io::Cursor;
+
+    let track_id = 1u32;
+    let timescale = 48_000u32;
+    let default_dur = 1u32;
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp());
+    file.extend_from_slice(&moov_audio(timescale, track_id, default_dur));
+    let frag: Vec<Vec<u8>> = (0..2u8).map(|i| vec![i; 4]).collect();
+    file.extend_from_slice(&moof_mdat_pair(1, track_id, default_dur, 0, &frag));
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    // mvhd.duration is 0 in this synthetic file → no mehd → no
+    // duration to report.
+    assert_eq!(
+        dmx.duration_micros(),
+        None,
+        "without mehd or mvhd.duration there is nothing to report"
+    );
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "mehd_fragment_duration"),
+        "absent mehd must not emit a metadata key"
+    );
+}

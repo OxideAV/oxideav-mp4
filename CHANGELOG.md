@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Movie Extends Header Box parsing (ISO/IEC 14496-12 §8.8.2, `mehd` —
+  round 221). A sealed fragmented file's `mvex/mehd`
+  MovieExtendsHeaderBox carries the overall presentation
+  `fragment_duration` of the movie including all fragments, in the
+  movie timescale (per §8.8.2.3). Version 0 stores the duration as a
+  32-bit field; version 1 widens it to 64 bits. Both layouts are read
+  and widened to `u64`. When `mehd` is present with a non-zero
+  duration, it takes precedence over `mvhd.duration` for the value
+  surfaced through `Demuxer::duration_micros` — sealed fragmented
+  files typically carry `mvhd.duration = 0` (the moov has no resident
+  samples that contribute to a non-fragment duration) so `mehd` is
+  the only authoritative total. The raw value (in the movie
+  timescale) is also reflected verbatim on `Demuxer::metadata()` as
+  `mehd_fragment_duration`, mirroring the rest of the crate's flat
+  metadata surface. A `mehd` instance with an unknown version (the
+  spec defines only 0 and 1) or a truncated body is dropped silently
+  rather than failing the open (defensive; the demuxer falls back to
+  `mvhd.duration` in that case). Absent `mehd`, the metadata key is
+  not emitted and the demuxer's pre-r221 mvhd-only path is taken.
 - Degradation Priority Box parsing (ISO/IEC 14496-12 §8.5.3, `stdp` —
   round 216). A track's `stbl/stdp` DegradationPriorityBox is an
   optional per-sample table of 16-bit `priority` values. The
