@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Track Selection Box parsing (ISO/IEC 14496-12 §8.10.3, `tsel` —
+  round 228). The optional `TrackSelectionBox` inside a track-level
+  `udta` declares two media-selection signals: `switch_group`
+  (signed 32-bit, §8.10.3.4 — groups tracks that are
+  interchangeable *during* playback within the alternate group
+  declared on `tkhd`) and `attribute_list` (§8.10.3.5 — a list of
+  FourCC tags drawn from the descriptive set `tesc` / `fgsc` /
+  `cgsc` / `spsc` / `resc` / `vwsc` and the differentiating set
+  `bitr` / `cdec` / `lang` / …, characterising what the track
+  offers). Body layout after the 4-byte FullBox preamble is a
+  signed 32-bit `switch_group` followed by zero or more 4-byte
+  FourCCs running to the end of the box; trailing partial-FourCC
+  bytes are ignored (matching the `subs` / `sidx` "trailing partial
+  record" handling). Surfaced on `params.options` as
+  `tsel_switch_group` (the signed integer, emitted even when zero
+  so a caller can distinguish present-but-zero from absent) and
+  `tsel_attributes` (space-separated FourCCs, mirroring the
+  `tref_<type>` value convention; omitted when the attribute list
+  is empty). A `tsel` body shorter than the 8-byte minimum, or an
+  unknown FullBox version (the spec pins it to 0), is silently
+  dropped — the box is informational and a malformed entry never
+  aborts the open. Container preserves the raw FourCCs; mapping
+  them to consumer-level semantics (e.g. a player selecting by
+  language vs. bitrate within an alternate group) is delegated.
+  Absent `tsel`, no `tsel_*` keys are emitted.
 - Movie Extends Header Box parsing (ISO/IEC 14496-12 §8.8.2, `mehd` —
   round 221). A sealed fragmented file's `mvex/mehd`
   MovieExtendsHeaderBox carries the overall presentation

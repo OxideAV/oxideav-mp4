@@ -505,6 +505,17 @@ struct Track {
     /// multiple `kind` boxes from different schemes can co-label the
     /// same track (spec example: two schemes both declaring "subtitles").
     kinds: Vec<(String, String)>,
+    /// §8.10.3 — `tsel` (TrackSelectionBox) from the track-level `udta`.
+    /// The `switch_group` (signed; default 0) names a switching set
+    /// within the alternate group declared on `tkhd` (§8.3.2): two
+    /// tracks carrying the same non-zero `switch_group` are interchangeable
+    /// at any point during playback (the consumer may switch between
+    /// them on the fly, e.g. for bitrate adaptation). `attribute_list`
+    /// is the list of FourCC tags drawn from §8.10.3.5's descriptive
+    /// (`tesc`/`fgsc`/`cgsc`/`spsc`/`resc`/`vwsc`) and differentiating
+    /// (`bitr` / `cdec` / `lang` / …) sets that characterise what the
+    /// track offers. `None` when the track has no `tsel`.
+    tsel: Option<TselBox>,
     /// §8.6.1.4 — `cslg` (CompositionToDecodeBox). Present when signed
     /// composition offsets (a v1 `ctts`) are in use and the producer
     /// chose to document the composition↔decode timeline relationship.
@@ -805,6 +816,41 @@ struct CslgBox {
     /// The CTS-plus-duration of the sample with the largest computed
     /// CTS; `0` means "composition end time unknown" (§8.6.1.4.3).
     composition_end_time: i64,
+}
+
+/// Parsed `tsel` (TrackSelectionBox, ISO/IEC 14496-12 §8.10.3).
+///
+/// The box carries two pieces of media-selection metadata for the
+/// containing track:
+///
+/// * `switch_group` — a signed 32-bit identifier (§8.10.3.4) used by
+///   the consumer to group tracks that are interchangeable *during*
+///   playback (e.g. multi-bitrate renditions of the same stream where
+///   a player may flip between them on a frame boundary). Zero means
+///   "no information"; a non-zero value must match across the entire
+///   switch set. Tracks in the same `switch_group` are required by
+///   the spec to be in the same alternate group (§8.3.2) too.
+/// * `attribute_list` — a list of FourCCs (§8.10.3.5), each one
+///   *either* a descriptive tag (`tesc` = temporal scalability,
+///   `fgsc` = fine-grain SNR, `cgsc` = coarse-grain SNR, `spsc` =
+///   spatial, `resc` = region-of-interest, `vwsc` = view) *or* a
+///   differentiating tag (`bitr` = bitrate, `cdec` = codec, `lang` =
+///   language, …). The container preserves the on-disk byte order
+///   verbatim — interpretation is delegated to the consumer that
+///   knows the alternate-group semantics.
+///
+/// `template int(32)` in the spec syntax means the field has a
+/// recommended default of 0; we still parse the value as a signed
+/// 32-bit integer per the type.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TselBox {
+    /// `switch_group` (§8.10.3.4). Signed. 0 means "no information"
+    /// (also the spec-recommended default when the box is absent).
+    switch_group: i32,
+    /// `attribute_list` (§8.10.3.5). Each entry is a 4-byte FourCC.
+    /// Order matches the on-disk order. Empty when the box body
+    /// carried only the `switch_group`.
+    attribute_list: Vec<[u8; 4]>,
 }
 
 /// Single entry of an `elst` (EditListBox).
@@ -1213,6 +1259,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         trgr: Vec::new(),
         elng: None,
         kinds: Vec::new(),
+        tsel: None,
         cslg: None,
         stsh: Vec::new(),
         sbgp: Vec::new(),
@@ -1293,12 +1340,15 @@ fn parse_track_udta(body: &[u8], t: &mut Track) {
         }
         let start = cur.position() as usize;
         cur.set_position((start + psz) as u64);
-        if hdr.fourcc == KIND {
-            parse_kind(&body[start..start + psz], t);
+        match hdr.fourcc {
+            KIND => parse_kind(&body[start..start + psz], t),
+            TSEL => parse_tsel(&body[start..start + psz], t),
+            _ => {
+                // Other track-udta children (e.g. legacy `titl` overrides)
+                // are skipped — file-wide metadata is collected from the
+                // moov-level udta by `parse_udta`.
+            }
         }
-        // Other track-udta children (e.g. legacy `titl` overrides) are
-        // skipped — file-wide metadata is collected from the moov-level
-        // udta by `parse_udta`.
     }
 }
 
@@ -1351,6 +1401,58 @@ fn parse_kind(body: &[u8], t: &mut Track) {
         return;
     }
     t.kinds.push((uri, value));
+}
+
+/// §8.10.3 — `tsel` (TrackSelectionBox).
+///
+/// Spec syntax (§8.10.3.3):
+/// ```text
+/// aligned(8) class TrackSelectionBox
+/// extends FullBox('tsel', version = 0, 0) {
+///   template int(32) switch_group = 0;
+///   unsigned int(32) attribute_list[]; // to end of the box
+/// }
+/// ```
+///
+/// Body layout after the 4-byte FullBox preamble:
+///   * 4-byte signed big-endian `switch_group`.
+///   * Zero or more 4-byte FourCCs (the `attribute_list`).
+///
+/// A box with an unknown FullBox version (the spec pins it to 0) or a
+/// body too short to hold the FullBox + `switch_group` is silently
+/// dropped — the box is informational and a corrupted entry should
+/// never abort the demux (mirroring `parse_kind`'s posture).
+///
+/// Trailing bytes that don't make up a complete 4-byte FourCC are
+/// ignored: the spec wording is `attribute_list[]` "to end of the box",
+/// so a producer that miscalculated the box size is tolerated by
+/// taking only the complete entries (matches the §8.7.7 `subs` and
+/// §8.16.3 `sidx` "trailing partial record" handling elsewhere in this
+/// crate).
+fn parse_tsel(body: &[u8], t: &mut Track) {
+    // FullBox preamble (1 version + 3 flags) plus 4-byte switch_group.
+    if body.len() < 8 {
+        return;
+    }
+    let version = body[0];
+    if version != 0 {
+        // Spec pins it to 0. Drop rather than mis-parse a derived-spec
+        // extension we don't recognise.
+        return;
+    }
+    let switch_group = i32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    let mut attribute_list = Vec::new();
+    let mut i = 8;
+    while i + 4 <= body.len() {
+        let attr: [u8; 4] = [body[i], body[i + 1], body[i + 2], body[i + 3]];
+        attribute_list.push(attr);
+        i += 4;
+    }
+    // A trailing 1..3-byte fragment is silently dropped — see doc note.
+    t.tsel = Some(TselBox {
+        switch_group,
+        attribute_list,
+    });
 }
 
 /// §8.3.2 — `tkhd` (TrackHeaderBox). We only need `track_ID` for
@@ -4419,6 +4521,42 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert(format!("kind_{}", i), v);
     }
 
+    // ISO/IEC 14496-12 §8.10.3: surface the optional `tsel`
+    // (TrackSelectionBox) — when present, emit two `params.options`
+    // keys. `tsel_switch_group` is the signed 32-bit identifier
+    // grouping interchangeable-during-playback tracks (§8.10.3.4); a
+    // value of 0 still surfaces because it lets a consumer tell a
+    // present-but-zero `tsel` from an absent one. `tsel_attributes`
+    // is the space-separated list of FourCC tags from
+    // `attribute_list[]` (§8.10.3.5: descriptive `tesc` / `fgsc` /
+    // `cgsc` / `spsc` / `resc` / `vwsc` and differentiating `bitr` /
+    // `cdec` / `lang` / …); the key is omitted when the list is
+    // empty. FourCCs whose bytes contain non-printable values fall
+    // back to 8-digit hex (matching the `tref_<type>` / `trgr_<n>`
+    // convention). Absent `tsel`, neither key is emitted.
+    if let Some(tsel) = &t.tsel {
+        params
+            .options
+            .insert("tsel_switch_group", tsel.switch_group.to_string());
+        if !tsel.attribute_list.is_empty() {
+            let v = tsel
+                .attribute_list
+                .iter()
+                .map(|a| {
+                    std::str::from_utf8(a)
+                        .ok()
+                        .filter(|s| s.chars().all(|c| !c.is_control()))
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            format!("{:02x}{:02x}{:02x}{:02x}", a[0], a[1], a[2], a[3])
+                        })
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            params.options.insert("tsel_attributes", v);
+        }
+    }
+
     // ISO/IEC 14496-12 §8.6.1.4: when the track carries a `cslg`
     // (CompositionToDecodeBox), surface its five timeline-relation
     // fields on `params.options` as `cslg_<field>`. These document the
@@ -5305,6 +5443,7 @@ mod tests {
             trgr: Vec::new(),
             elng: None,
             kinds: Vec::new(),
+            tsel: None,
             cslg: None,
             stsh: Vec::new(),
             sbgp: Vec::new(),
@@ -6478,6 +6617,276 @@ mod tests {
         assert_eq!(t.kinds.len(), 1);
         assert_eq!(t.kinds[0].0, "urn:mpeg:dash:role:2011");
         assert_eq!(t.kinds[0].1, "main");
+    }
+
+    /// §8.10.3 — `tsel` (TrackSelectionBox): FullBox preamble + signed
+    /// 32-bit `switch_group` + zero or more 4-byte FourCC attributes
+    /// running to the end of the box. The canonical bitrate-adaptation
+    /// rendition: `switch_group = 1` + `bitr` (differentiating attribute
+    /// = bitrate).
+    #[test]
+    fn parse_tsel_switch_group_and_one_attribute() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox version 0 + flags 0
+        body.extend_from_slice(&1i32.to_be_bytes()); // switch_group = 1
+        body.extend_from_slice(b"bitr"); // attribute_list[0]
+        let mut t = fresh_track();
+        super::parse_tsel(&body, &mut t);
+        let tsel = t.tsel.as_ref().unwrap();
+        assert_eq!(tsel.switch_group, 1);
+        assert_eq!(tsel.attribute_list, vec![*b"bitr"]);
+    }
+
+    /// `tsel` with multiple attributes: each 4-byte chunk after the
+    /// `switch_group` is one FourCC. Order matches on-disk order
+    /// (the spec writes "list" without forcing a particular sort).
+    #[test]
+    fn parse_tsel_multiple_attributes_preserve_order() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox
+        body.extend_from_slice(&42i32.to_be_bytes()); // switch_group = 42
+        body.extend_from_slice(b"bitr"); // bitrate (differentiating)
+        body.extend_from_slice(b"cdec"); // codec (differentiating)
+        body.extend_from_slice(b"lang"); // language (differentiating)
+        let mut t = fresh_track();
+        super::parse_tsel(&body, &mut t);
+        let tsel = t.tsel.as_ref().unwrap();
+        assert_eq!(tsel.switch_group, 42);
+        assert_eq!(tsel.attribute_list, vec![*b"bitr", *b"cdec", *b"lang"]);
+    }
+
+    /// `tsel` with `switch_group = 0` and an empty attribute list is the
+    /// minimal legal body: 4-byte FullBox + 4-byte `switch_group`. The
+    /// box must still parse — surfacing a zero switch group lets a
+    /// consumer tell "present but no information" from "absent".
+    #[test]
+    fn parse_tsel_zero_switch_group_no_attributes() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox
+        body.extend_from_slice(&0i32.to_be_bytes()); // switch_group = 0
+        let mut t = fresh_track();
+        super::parse_tsel(&body, &mut t);
+        let tsel = t.tsel.as_ref().unwrap();
+        assert_eq!(tsel.switch_group, 0);
+        assert!(tsel.attribute_list.is_empty());
+    }
+
+    /// `template int(32) switch_group` is signed — a negative value must
+    /// be preserved. The spec doesn't reserve negative space, but the
+    /// declared type is signed so we read it as signed (a hand-crafted
+    /// authoring tool emitting `switch_group = -1` round-trips cleanly).
+    #[test]
+    fn parse_tsel_negative_switch_group_preserved() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox
+        body.extend_from_slice(&(-7i32).to_be_bytes()); // switch_group = -7
+        let mut t = fresh_track();
+        super::parse_tsel(&body, &mut t);
+        let tsel = t.tsel.as_ref().unwrap();
+        assert_eq!(tsel.switch_group, -7);
+    }
+
+    /// A body shorter than `FullBox + switch_group` (8 bytes) is silently
+    /// dropped — `tsel` is informational and a malformed entry should
+    /// never abort the demux (mirroring `parse_kind`).
+    #[test]
+    fn parse_tsel_too_short_silently_dropped() {
+        let mut t = fresh_track();
+        super::parse_tsel(&[0u8; 7], &mut t);
+        assert!(t.tsel.is_none());
+    }
+
+    /// Unknown FullBox `version` (the spec pins it to 0): silently
+    /// dropped so a future derived-spec extension never mis-parses on
+    /// pre-extension demuxers.
+    #[test]
+    fn parse_tsel_unknown_version_silently_dropped() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1, 0, 0, 0]); // version 1 + flags 0
+        body.extend_from_slice(&5i32.to_be_bytes()); // switch_group = 5
+        let mut t = fresh_track();
+        super::parse_tsel(&body, &mut t);
+        assert!(t.tsel.is_none());
+    }
+
+    /// Trailing bytes that don't make up a complete 4-byte FourCC
+    /// (1–3 bytes after the last full attribute) are ignored —
+    /// matches the existing "trailing partial record" handling
+    /// elsewhere in the crate (`subs`, `sidx`).
+    #[test]
+    fn parse_tsel_trailing_partial_fourcc_ignored() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox
+        body.extend_from_slice(&3i32.to_be_bytes()); // switch_group
+        body.extend_from_slice(b"bitr"); // one complete attribute
+        body.extend_from_slice(b"xy"); // 2 trailing bytes — dropped
+        let mut t = fresh_track();
+        super::parse_tsel(&body, &mut t);
+        let tsel = t.tsel.as_ref().unwrap();
+        assert_eq!(tsel.switch_group, 3);
+        assert_eq!(tsel.attribute_list, vec![*b"bitr"]);
+    }
+
+    /// End-to-end: a `tsel` nested inside `trak/udta` is picked up by
+    /// `parse_track_udta` (alongside `kind`).
+    #[test]
+    fn parse_track_udta_picks_up_tsel() {
+        let mut tsel = Vec::new();
+        tsel.extend_from_slice(&[0u8; 4]); // FullBox
+        tsel.extend_from_slice(&9i32.to_be_bytes()); // switch_group = 9
+        tsel.extend_from_slice(b"bitr");
+        tsel.extend_from_slice(b"lang");
+        let mut udta = Vec::new();
+        udta.extend(wrap_box_full_size(b"tsel", &tsel));
+
+        let mut t = fresh_track();
+        super::parse_track_udta(&udta, &mut t);
+        let tb = t.tsel.as_ref().unwrap();
+        assert_eq!(tb.switch_group, 9);
+        assert_eq!(tb.attribute_list, vec![*b"bitr", *b"lang"]);
+    }
+
+    /// `tsel` coexists with `kind` inside the same track-level `udta`.
+    /// Both children are picked up and land on their respective fields.
+    #[test]
+    fn parse_track_udta_collects_tsel_alongside_kind() {
+        let mut kind = Vec::new();
+        kind.extend_from_slice(&[0u8; 4]);
+        kind.extend_from_slice(b"urn:mpeg:dash:role:2011\0");
+        kind.extend_from_slice(b"alternate\0");
+
+        let mut tsel = Vec::new();
+        tsel.extend_from_slice(&[0u8; 4]);
+        tsel.extend_from_slice(&2i32.to_be_bytes());
+        tsel.extend_from_slice(b"cdec");
+
+        let mut udta = Vec::new();
+        udta.extend(wrap_box_full_size(b"kind", &kind));
+        udta.extend(wrap_box_full_size(b"tsel", &tsel));
+
+        let mut t = fresh_track();
+        super::parse_track_udta(&udta, &mut t);
+        assert_eq!(t.kinds.len(), 1);
+        assert_eq!(t.kinds[0].1, "alternate");
+        let tb = t.tsel.as_ref().unwrap();
+        assert_eq!(tb.switch_group, 2);
+        assert_eq!(tb.attribute_list, vec![*b"cdec"]);
+    }
+
+    /// Surfacing: a present `tsel` emits `tsel_switch_group` (always,
+    /// even when zero) and `tsel_attributes` (only when the list is
+    /// non-empty). The attributes render as space-separated FourCC
+    /// strings, matching the `tref_<type>` value convention.
+    #[test]
+    fn build_stream_info_surfaces_tsel_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 90000;
+        t.tsel = Some(super::TselBox {
+            switch_group: 11,
+            attribute_list: vec![*b"bitr", *b"cdec"],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("tsel_switch_group"), Some("11"));
+        assert_eq!(
+            info.params.options.get("tsel_attributes"),
+            Some("bitr cdec")
+        );
+    }
+
+    /// A `tsel` with `switch_group = 0` and an empty attribute list
+    /// still emits the `tsel_switch_group` key (present-but-zero is
+    /// distinguishable from absent at the caller layer) but omits
+    /// `tsel_attributes`.
+    #[test]
+    fn build_stream_info_tsel_zero_no_attributes() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48000;
+        t.tsel = Some(super::TselBox {
+            switch_group: 0,
+            attribute_list: Vec::new(),
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("tsel_switch_group"), Some("0"));
+        assert_eq!(info.params.options.get("tsel_attributes"), None);
+    }
+
+    /// A track with no `tsel` surfaces no `tsel_*` options at all.
+    #[test]
+    fn build_stream_info_no_tsel_no_tsel_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 90000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("tsel_switch_group"), None);
+        assert_eq!(info.params.options.get("tsel_attributes"), None);
+    }
+
+    /// A `tsel` attribute that contains non-printable bytes falls back
+    /// to 8-digit hex on the rendered surface, matching the
+    /// `tref_<type>` convention for unusual FourCCs.
+    #[test]
+    fn build_stream_info_tsel_attribute_non_printable_renders_as_hex() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 90000;
+        t.tsel = Some(super::TselBox {
+            switch_group: 1,
+            attribute_list: vec![[0x00, 0x01, 0x02, 0x03], *b"bitr"],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("tsel_attributes"),
+            Some("00010203 bitr")
+        );
+    }
+
+    /// End-to-end: a `tsel` nested inside `trak/udta` is picked up by
+    /// `parse_trak` and lands on the track field.
+    #[test]
+    fn parse_trak_picks_up_nested_tsel() {
+        let mut tkhd = vec![0u8; 84];
+        tkhd[12..16].copy_from_slice(&13u32.to_be_bytes());
+        let mut mdhd = Vec::new();
+        mdhd.extend_from_slice(&[0u8; 4]);
+        mdhd.extend_from_slice(&[0u8; 8]);
+        mdhd.extend_from_slice(&1000u32.to_be_bytes());
+        mdhd.extend_from_slice(&0u32.to_be_bytes());
+        mdhd.extend_from_slice(&[0u8; 4]);
+        let mut hdlr = Vec::new();
+        hdlr.extend_from_slice(&[0u8; 4]);
+        hdlr.extend_from_slice(&[0u8; 4]);
+        hdlr.extend_from_slice(b"soun");
+        hdlr.extend_from_slice(&[0u8; 12]);
+        hdlr.push(0);
+        let mut mdia = Vec::new();
+        mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
+        mdia.extend(wrap_box_full_size(b"hdlr", &hdlr));
+
+        let mut tsel = Vec::new();
+        tsel.extend_from_slice(&[0u8; 4]);
+        tsel.extend_from_slice(&100i32.to_be_bytes());
+        tsel.extend_from_slice(b"bitr");
+        tsel.extend_from_slice(b"lang");
+
+        let mut udta = Vec::new();
+        udta.extend(wrap_box_full_size(b"tsel", &tsel));
+
+        let mut trak = Vec::new();
+        trak.extend(wrap_box_full_size(b"tkhd", &tkhd));
+        trak.extend(wrap_box_full_size(b"mdia", &mdia));
+        trak.extend(wrap_box_full_size(b"udta", &udta));
+
+        let t = super::parse_trak(&trak).unwrap().unwrap();
+        assert_eq!(t.track_id, 13);
+        let tb = t.tsel.as_ref().unwrap();
+        assert_eq!(tb.switch_group, 100);
+        assert_eq!(tb.attribute_list, vec![*b"bitr", *b"lang"]);
     }
 
     /// §8.6.1.4 — `cslg` version 0: five signed 32-bit fields after the

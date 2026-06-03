@@ -260,6 +260,27 @@ Sample-entry FourCCs resolve to these codec ids:
   encounter index); the value is the URI alone when no name
   follows, or `"URI value"` (space-separated, mirroring the
   `tref_<type>` convention) when both are present.
+- Track selection (ISO/IEC 14496-12 §8.10.3, `tsel`): the optional
+  `TrackSelectionBox` inside a track-level `udta` carries two
+  media-selection signals — `switch_group` (signed 32-bit, §8.10.3.4)
+  groups tracks that are interchangeable *during* playback (e.g.
+  bitrate-adaptive renditions of the same stream) within the
+  alternate group declared on `tkhd` (§8.3.2), and `attribute_list`
+  (§8.10.3.5) is a list of FourCC tags drawn from the descriptive
+  set (`tesc` = temporal scalability, `fgsc` / `cgsc` = SNR
+  scalability, `spsc` = spatial, `resc` = region-of-interest, `vwsc`
+  = view) and differentiating set (`bitr` = bitrate, `cdec` = codec,
+  `lang` = language, …) describing what the track offers. Surfaced
+  on `params.options` as `tsel_switch_group` (the signed integer,
+  emitted even when zero so callers can tell present-but-zero from
+  absent) and `tsel_attributes` (space-separated FourCCs, mirroring
+  the `tref_<type>` convention; omitted when the list is empty). A
+  body shorter than the 8-byte FullBox + `switch_group` minimum or
+  an unknown FullBox version is silently dropped — `tsel` is
+  informational and a malformed entry never aborts the open.
+  Container preserves the raw FourCCs; consumer mapping (e.g. a
+  player selecting by language vs. bitrate within an alternate
+  group) is delegated. Absent `tsel`, no keys are emitted.
 - Composition-to-decode (ISO/IEC 14496-12 §8.6.1.4, `cslg`): a
   track's `stbl/cslg` CompositionToDecodeBox documents the
   composition↔decode timeline relationship implied by a signed

@@ -267,6 +267,19 @@ pub const DATA: [u8; 4] = fourcc("data");
 /// may be empty (its terminator still present) when `schemeURI`
 /// alone fully identifies the kind. Zero or more per track.
 pub const KIND: [u8; 4] = fourcc("kind");
+/// `tsel` — Track Selection Box (ISO/IEC 14496-12 §8.10.3). Sits in a
+/// track-level `udta`; quantity zero or one. FullBox(version=0, flags=0)
+/// body is `template int(32) switch_group = 0; unsigned int(32)
+/// attribute_list[]` to end of box. Tracks sharing the same non-zero
+/// `switch_group` are switchable during playback (and must already share
+/// the alternate group declared on `tkhd`, §8.3.2). The `attribute_list`
+/// is a list of FourCC tags drawn from the spec's descriptive set
+/// (`tesc`, `fgsc`, `cgsc`, `spsc`, `resc`, `vwsc`) and differentiating
+/// set (`bitr`, `cdec`, `lang`, …) that characterise what the track
+/// offers and how it differs from its siblings, so a media-selection
+/// layer can pick from the alternate group on language / bitrate /
+/// codec criteria.
+pub const TSEL: [u8; 4] = fourcc("tsel");
 
 // Fragmented-MP4 box types (ISO/IEC 14496-12 §8.8 — Movie Fragments).
 pub const MVEX: [u8; 4] = fourcc("mvex");
