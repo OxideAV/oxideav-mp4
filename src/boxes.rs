@@ -191,6 +191,14 @@ pub const STCO: [u8; 4] = fourcc("stco");
 /// use when seeking to a non-sync sample. Ignored in normal forward
 /// play.
 pub const STSH: [u8; 4] = fourcc("stsh");
+/// `stdp` — DegradationPriorityBox (ISO/IEC 14496-12 §8.5.3). Sits
+/// inside `stbl`; an optional per-sample table of 16-bit
+/// degradation-priority values. `sample_count` is implicit from
+/// `stsz` / `stz2`, mirroring the `sdtp` convention. The exact
+/// meaning and acceptable value range of `priority` are left to
+/// derived specifications (§8.5.3.1); the container preserves the
+/// raw u16 per sample without interpreting it.
+pub const STDP: [u8; 4] = fourcc("stdp");
 /// `sdtp` — SampleDependencyTypeBox (ISO/IEC 14496-12 §8.6.4). Sits
 /// inside `stbl`; an optional per-sample table of dependency hints —
 /// `is_leading`, `sample_depends_on`, `sample_is_depended_on`,

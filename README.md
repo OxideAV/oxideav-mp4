@@ -267,6 +267,23 @@ Sample-entry FourCCs resolve to these codec ids:
   table is purely a seek optimisation — it is ignored in normal
   forward play and a track decodes correctly without it. Absent
   `stsh`, none of the keys are emitted.
+- Sample degradation priority (ISO/IEC 14496-12 §8.5.3, `stdp`): a
+  track's `stbl/stdp` DegradationPriorityBox is an optional per-sample
+  table of 16-bit `priority` values, one per sample (the
+  `sample_count` is implicit from `stsz` / `stz2`, mirroring `sdtp`).
+  The exact meaning and value range of `priority` are owned by
+  derived specifications (§8.5.3.1 / §8.5.3.3 "Specifications derived
+  from this define the exact meaning and acceptable range of the
+  `priority` field"), so the container preserves the raw u16 without
+  interpreting it. The demuxer surfaces a small summary on
+  `params.options` rather than the per-sample table (which would
+  dominate the options map for a typical track) — four keys per
+  track-with-`stdp`: `stdp_count` (total entries), `stdp_min` /
+  `stdp_max` (value spread), and `stdp_sum` (a u64 — a u16 priority ×
+  2^32 samples fits comfortably; consumers compute the mean from
+  `sum / count`). A renderer dropping samples under bitrate / CPU
+  pressure consults the carrying spec for the priority ordering.
+  Absent `stdp`, none of the keys are emitted.
 - Sample dependency hints (ISO/IEC 14496-12 §8.6.4, `sdtp`): a
   track's `stbl/sdtp` SampleDependencyTypeBox is a per-sample table
   of four 2-bit fields — `is_leading`, `sample_depends_on`,

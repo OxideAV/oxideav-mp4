@@ -509,6 +509,14 @@ struct Track {
     /// is preserved verbatim (truncation is the producer's bug, not
     /// ours to invent zeros for).
     sdtp: Vec<SdtpEntry>,
+    /// §8.5.3 — `stdp` (DegradationPriorityBox). Per-sample 16-bit
+    /// `priority` values in decode order — the `sample_count` is
+    /// implicit from `stsz` / `stz2` (mirroring `sdtp`). The exact
+    /// meaning and acceptable range of `priority` are defined by
+    /// specifications derived from BMFF (§8.5.3.1), so the container
+    /// preserves the raw u16s without interpreting them. Empty when
+    /// the track has no `stdp` (the common case).
+    stdp: Vec<u16>,
     /// §8.7.7 — `subs` (SubSampleInformationBox) instances. The spec
     /// allows more than one per container provided they differ in `flags`
     /// (the carried codec's semantics for `flags` distinguish them); we
@@ -1119,6 +1127,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         sbgp: Vec::new(),
         sgpd: Vec::new(),
         sdtp: Vec::new(),
+        stdp: Vec::new(),
         subs: Vec::new(),
         saiz: Vec::new(),
         saio: Vec::new(),
@@ -1660,6 +1669,7 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             STSS => t.stss = parse_stss(&b)?,
             STSH => t.stsh = parse_stsh(&b)?,
             SDTP => t.sdtp = parse_sdtp(&b)?,
+            STDP => t.stdp = parse_stdp(&b)?,
             CTTS => t.ctts = parse_ctts(&b)?,
             CSLG => t.cslg = Some(parse_cslg(&b)?),
             SBGP => t.sbgp.push(parse_sbgp(&b)?),
@@ -2389,6 +2399,41 @@ fn parse_sdtp(body: &[u8]) -> Result<Vec<SdtpEntry>> {
             sample_is_depended_on: (byte >> 2) & 0x03,
             sample_has_redundancy: byte & 0x03,
         });
+    }
+    Ok(out)
+}
+
+/// Parse `stdp` (DegradationPriorityBox, ISO/IEC 14496-12 §8.5.3).
+///
+/// `FullBox(version = 0, flags = 0)` whose body, after the 4-byte
+/// FullBox preamble, is a packed array of big-endian `unsigned int(16)
+/// priority` entries — one per sample. The `sample_count` is taken
+/// from `stsz` / `stz2` and is *not* re-stated in the box (§8.5.3.1),
+/// so the table's length is simply `(body.len() - 4) / 2`. A trailing
+/// odd byte (the spec never produces one — `priority` is always
+/// 16-bit) is silently ignored rather than rejecting the whole box.
+///
+/// The exact meaning and acceptable range of `priority` are defined
+/// by derived specifications (§8.5.3.3 "Specifications derived from
+/// this define the exact meaning and acceptable range of the
+/// `priority` field"); the container preserves the raw u16 values
+/// without interpreting them. A renderer that needs to drop samples
+/// under bitrate / CPU pressure consults the carrying spec for the
+/// priority ordering.
+fn parse_stdp(body: &[u8]) -> Result<Vec<u16>> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: stdp too short"));
+    }
+    // §8.5.3.2 pins version = 0 and there are no defined flags; the
+    // FullBox preamble carries no information beyond that, so tolerate
+    // whatever the producer wrote — the per-sample u16 layout is
+    // unambiguous.
+    let payload = &body[4..];
+    let count = payload.len() / 2;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * 2;
+        out.push(u16::from_be_bytes([payload[off], payload[off + 1]]));
     }
     Ok(out)
 }
@@ -4426,6 +4471,48 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             .insert("sdtp_redundant_count".to_string(), redundant.to_string());
     }
 
+    // ISO/IEC 14496-12 §8.5.3: surface the optional DegradationPriorityBox
+    // (`stdp`) as a small summary on `params.options` rather than the raw
+    // per-sample table (a typical track has thousands of samples; the
+    // whole `priority` array would dominate the options map). The spec
+    // leaves the value semantics to derived specifications — we cannot
+    // bucket priorities into named tiers at the container layer, so the
+    // summary is the count plus min/max/sum so a consumer can recover the
+    // mean and check the value spread without scanning. Four keys per
+    // track-with-stdp:
+    //   * `stdp_count` — total per-sample priority entries.
+    //   * `stdp_min` — minimum `priority` value across the table (decimal).
+    //   * `stdp_max` — maximum `priority` value across the table (decimal).
+    //   * `stdp_sum` — sum of all `priority` values (u64 decimal — a u16
+    //     priority × 2^32 samples still fits comfortably).
+    // Absent `stdp`, none of the keys are emitted.
+    if !t.stdp.is_empty() {
+        let mut lo = u16::MAX;
+        let mut hi = 0u16;
+        let mut sum: u64 = 0;
+        for &p in &t.stdp {
+            if p < lo {
+                lo = p;
+            }
+            if p > hi {
+                hi = p;
+            }
+            sum += p as u64;
+        }
+        params
+            .options
+            .insert("stdp_count".to_string(), t.stdp.len().to_string());
+        params
+            .options
+            .insert("stdp_min".to_string(), lo.to_string());
+        params
+            .options
+            .insert("stdp_max".to_string(), hi.to_string());
+        params
+            .options
+            .insert("stdp_sum".to_string(), sum.to_string());
+    }
+
     // ISO/IEC 14496-12 §8.7.7: surface each `subs` (SubSampleInformationBox)
     // present on the track. Each `subs` becomes one `subs_<n>` key whose
     // value starts with `"v<version> flags=<f>"` (the FullBox preamble —
@@ -5132,6 +5219,7 @@ mod tests {
             sbgp: Vec::new(),
             sgpd: Vec::new(),
             sdtp: Vec::new(),
+            stdp: Vec::new(),
             subs: Vec::new(),
             saiz: Vec::new(),
             saio: Vec::new(),
@@ -6953,6 +7041,117 @@ mod tests {
         assert_eq!(info.params.options.get("sdtp_independent_count"), None);
         assert_eq!(info.params.options.get("sdtp_disposable_count"), None);
         assert_eq!(info.params.options.get("sdtp_redundant_count"), None);
+    }
+
+    // --- §8.5.3 stdp (DegradationPriorityBox) -------------------------------
+
+    /// §8.5.3 — `stdp` round-trip: a 3-sample priority table laid out
+    /// big-endian after the FullBox preamble decodes to the same three
+    /// u16 values.
+    #[test]
+    fn parse_stdp_three_entries() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox preamble (version 0 + flags 0)
+        body.extend_from_slice(&0x0001u16.to_be_bytes());
+        body.extend_from_slice(&0x0102u16.to_be_bytes());
+        body.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        let v = super::parse_stdp(&body).unwrap();
+        assert_eq!(v, vec![0x0001u16, 0x0102, 0xFFFF]);
+    }
+
+    /// A zero-sample `stdp` (FullBox preamble only) parses to an empty
+    /// table rather than failing — the implied `sample_count` from
+    /// `stsz` may legitimately be zero.
+    #[test]
+    fn parse_stdp_empty_table() {
+        let body = vec![0u8; 4];
+        let v = super::parse_stdp(&body).unwrap();
+        assert!(v.is_empty());
+    }
+
+    /// An `stdp` too short for even the FullBox preamble is rejected.
+    #[test]
+    fn parse_stdp_too_short() {
+        assert!(super::parse_stdp(&[0u8, 0, 0]).is_err());
+    }
+
+    /// A trailing odd byte (the spec never produces one — `priority`
+    /// is always a 16-bit value) is silently ignored rather than
+    /// failing. Two `priority` u16s + one trailing byte yields a
+    /// 2-entry table.
+    #[test]
+    fn parse_stdp_trailing_odd_byte_ignored() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox preamble
+        body.extend_from_slice(&0x0001u16.to_be_bytes());
+        body.extend_from_slice(&0x0002u16.to_be_bytes());
+        body.push(0xAA); // stray byte
+        let v = super::parse_stdp(&body).unwrap();
+        assert_eq!(v, vec![0x0001u16, 0x0002]);
+    }
+
+    /// `parse_stbl` lands the `stdp` on the track alongside the other
+    /// sample-table boxes (proves the dispatch arm is wired).
+    #[test]
+    fn parse_stbl_picks_up_stdp() {
+        let mut stdp = Vec::new();
+        stdp.extend_from_slice(&[0u8; 4]); // FullBox preamble
+        stdp.extend_from_slice(&0x0001u16.to_be_bytes());
+        stdp.extend_from_slice(&0x0005u16.to_be_bytes());
+        let mut stbl = Vec::new();
+        stbl.extend(wrap_box_full_size(b"stdp", &stdp));
+
+        let mut t = fresh_track();
+        super::parse_stbl(&stbl, &mut t).unwrap();
+        assert_eq!(t.stdp, vec![0x0001u16, 0x0005]);
+    }
+
+    /// Surfacing: a parsed `stdp` exposes its summary on `params.options`
+    /// as four `stdp_*` keys (count + min + max + sum). The spec leaves
+    /// the value semantics to derived specifications, so we surface the
+    /// raw aggregates rather than a named-bucket breakdown like `sdtp`.
+    #[test]
+    fn build_stream_info_surfaces_stdp_summary_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        // Four samples with priorities {1, 5, 7, 3}: min=1, max=7, sum=16.
+        t.stdp = vec![1u16, 5, 7, 3];
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("stdp_count"), Some("4"));
+        assert_eq!(info.params.options.get("stdp_min"), Some("1"));
+        assert_eq!(info.params.options.get("stdp_max"), Some("7"));
+        assert_eq!(info.params.options.get("stdp_sum"), Some("16"));
+    }
+
+    /// A single-entry `stdp` exposes `min == max == sum == priority`.
+    #[test]
+    fn build_stream_info_stdp_single_entry_min_eq_max() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.stdp = vec![42u16];
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("stdp_count"), Some("1"));
+        assert_eq!(info.params.options.get("stdp_min"), Some("42"));
+        assert_eq!(info.params.options.get("stdp_max"), Some("42"));
+        assert_eq!(info.params.options.get("stdp_sum"), Some("42"));
+    }
+
+    /// Absence: a track with no `stdp` emits none of the summary keys.
+    #[test]
+    fn build_stream_info_no_stdp_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("stdp_count"), None);
+        assert_eq!(info.params.options.get("stdp_min"), None);
+        assert_eq!(info.params.options.get("stdp_max"), None);
+        assert_eq!(info.params.options.get("stdp_sum"), None);
     }
 
     /// `(subsample_size16, priority, discardable, csp)` — one v0 sub-sample.

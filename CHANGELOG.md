@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Degradation Priority Box parsing (ISO/IEC 14496-12 §8.5.3, `stdp` —
+  round 216). A track's `stbl/stdp` DegradationPriorityBox is an
+  optional per-sample table of 16-bit `priority` values. The
+  `sample_count` is implicit from `stsz` / `stz2` (mirroring `sdtp`),
+  so the on-disk body after the FullBox preamble is a packed
+  big-endian u16 array. The spec leaves the value semantics to
+  derived specifications (§8.5.3.3 "Specifications derived from this
+  define the exact meaning and acceptable range of the `priority`
+  field"), so the container preserves the raw u16s without
+  interpretation. Surfaced on `params.options` as four summary keys
+  per track-with-`stdp`: `stdp_count` (total entries), `stdp_min` /
+  `stdp_max` (value spread), and `stdp_sum` (u64 — a u16 priority ×
+  2^32 samples fits comfortably; consumers compute the mean as `sum /
+  count`). A renderer dropping samples under bitrate / CPU pressure
+  consults the carrying spec for the priority ordering. A trailing
+  odd byte (the spec never produces one — `priority` is always
+  16-bit) is silently ignored rather than failing the whole box.
+  Absent `stdp`, no keys are emitted.
 - Track Group Box parsing (ISO/IEC 14496-12 §8.3.4, `trgr` — round
   210). Each typed `TrackGroupTypeBox` child inside `trak/trgr` is
   parsed as a `(track_group_type, track_group_id)` pair. The child's
