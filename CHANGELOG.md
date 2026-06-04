@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed CENC scheme-decision router + `seig` sample-group entry
+  parser (ISO/IEC 23001-7:2016 §4.2 / §6 / §10 — round 235). The
+  four protection schemes defined in §10 — `cenc` (AES-CTR full /
+  NAL-subsample), `cbc1` (AES-CBC full / NAL-subsample), `cens`
+  (AES-CTR pattern subsample), `cbcs` (AES-CBC pattern subsample)
+  — are exposed as the typed `cenc::CencScheme` enum (with a
+  passthrough `Unknown([u8; 4])` variant for private DRM dialects
+  that ship a custom `scheme_type` FourCC in `sinf/schm`). The two
+  binary axes a downstream decryptor dispatches on — cipher mode
+  (`cenc::CipherMode::{Ctr, Cbc}`, §9.3 / §9.4) and the
+  pattern-encryption flag (`cens` / `cbcs` only, §9.6) — are
+  surfaced as `CencScheme::cipher_mode()` and
+  `CencScheme::uses_pattern_encryption()`. A scheme value bundled
+  with the parsed `tenc` becomes a `cenc::CencSchemeDecision` —
+  the typed routing slip a future AES layer can pattern-match
+  against — built via `CencSchemeDecision::new(scheme, tenc)` with
+  structural validation only: the scheme's
+  `required_tenc_version()` (when known) must match `tenc.version`
+  (§10.1 / §10.2 pin v0; §10.3 / §10.4 pin v1), and pattern
+  schemes must carry a non-zero `(crypt_byte_block,
+  skip_byte_block)` pair (§9.6). The track-default IV-supply
+  discipline (§9.1) is recovered via `CencSchemeDecision::iv_supply()`
+  as the typed `cenc::IvSupply` enum — `PerSample { size: u8 }`
+  for the on-the-wire-IV case, `Constant` for the
+  `default_constant_IV` case, `None` for unprotected tracks. This
+  crate performs no AES operation; the bundle is a static dispatch
+  contract built from container-side bytes only, leaving the key
+  derivation + AES block call to a layer with key material from
+  the named `pssh.SystemID`. The §6
+  `CencSampleEncryptionInformationGroupEntry` (`seig`) — the
+  sample-group entry the spec defines for overriding the
+  track-default `(crypt_byte_block, skip_byte_block, isProtected,
+  Per_Sample_IV_Size, KID, constant_IV?)` for a group of samples
+  (the mechanism for mixing encrypted/unencrypted samples in one
+  track, or rotating keys per scene) — is parsed by
+  `cenc::parse_seig(body)` into the typed `cenc::SeigEntry`,
+  with the same IV-supply / pattern-flag accessors as the
+  track-default router. §6's "clients SHALL ignore additional
+  bytes after the fields defined" trailing-bytes rule is honoured.
 - Track Selection Box parsing (ISO/IEC 14496-12 §8.10.3, `tsel` —
   round 228). The optional `TrackSelectionBox` inside a track-level
   `udta` declares two media-selection signals: `switch_group`

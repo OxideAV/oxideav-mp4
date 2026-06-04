@@ -27,8 +27,418 @@
 //! but no further normalisation is applied. The constant-IV slice is
 //! returned only when the spec mandates its presence; pattern-encryption
 //! fields are surfaced separately so callers can detect v1 boxes.
+//!
+//! ## Scheme typing + decryption router
+//!
+//! The four protection schemes defined by ISO/IEC 23001-7:2016 §4.2 are
+//! exposed as the typed [`CencScheme`] enum. A scheme value packages
+//! the two routing axes a downstream decryptor needs in order to pick a
+//! code path:
+//!
+//! * **Cipher mode** (`AES-CTR` vs `AES-CBC`) — drives the actual block
+//!   operation. See [`CencScheme::cipher_mode`].
+//! * **Pattern encryption** (`cens` / `cbcs` only) — selects whether the
+//!   protected range is fully encrypted or follows a `(crypt_byte_block,
+//!   skip_byte_block)` pattern recovered from the v1 `tenc`. See
+//!   [`CencScheme::uses_pattern_encryption`].
+//!
+//! The combination of the parsed `tenc` and a `CencScheme` is bundled
+//! into a [`CencSchemeDecision`] — the typed "routing slip" a future
+//! decryption layer can pattern-match against. This crate **performs no
+//! AES operation**; the bundle is a static dispatch contract built from
+//! container-side bytes only. The actual key-derivation + AES block
+//! call is delegated to a layer with key material.
+//!
+//! The §6 `CencSampleEncryptionInformationGroupEntry` (`seig`) — a
+//! sample-group description entry that lets a track override the
+//! default `tenc` parameters for a group of samples — is parsed by
+//! [`parse_seig`] into a [`SeigEntry`]. Combined with the matching
+//! `sbgp` of grouping type `*b"seig"` already surfaced by the demuxer,
+//! a CENC consumer recovers the per-sample-group `(KID, IV-size,
+//! constant-IV, pattern)` override picture without further byte-layer
+//! work in this crate.
 
 use oxideav_core::{Error, Result};
+
+/// The four CENC protection schemes (§4.2 + §10).
+///
+/// Each variant names a `scheme_type` four-character code that appears
+/// in the `sinf/schm` box. The fourth variant — [`CencScheme::Unknown`] —
+/// preserves any other value verbatim (private DRM dialects sometimes
+/// register their own scheme codes that nonetheless travel the same
+/// `sinf/schm` envelope; a typed router should pass those through
+/// without losing them).
+///
+/// The two binary axes that any decryption layer needs are the
+/// **cipher mode** (CTR vs CBC) and whether **pattern encryption** is
+/// in effect (`cens` / `cbcs` only — §9.6). They are surfaced as
+/// dedicated accessors so the caller does not have to re-read the
+/// FourCC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CencScheme {
+    /// `cenc` — AES-CTR full-sample or video-NAL subsample encryption
+    /// (§10.1). Counter mode. No pattern. Mandatory to support per
+    /// §10.1.
+    Cenc,
+    /// `cbc1` — AES-CBC full-sample or video-NAL subsample encryption
+    /// (§10.2). Cipher-block-chaining mode. No pattern. Optional.
+    Cbc1,
+    /// `cens` — AES-CTR subsample **pattern** encryption (§10.3).
+    /// Counter mode with `(crypt_byte_block, skip_byte_block)` pattern.
+    /// `tenc.version == 1` required.
+    Cens,
+    /// `cbcs` — AES-CBC subsample **pattern** encryption (§10.4).
+    /// Cipher-block-chaining mode with `(crypt_byte_block,
+    /// skip_byte_block)` pattern. Constant-IV per sample group is the
+    /// typical configuration. `tenc.version == 1` required.
+    Cbcs,
+    /// A `scheme_type` four-character code not registered in §10.
+    /// Surfaced verbatim so callers carrying a private DRM dialect can
+    /// route on their own table. No cipher-mode / pattern guarantees
+    /// can be made; the typed accessors return `None` / `false`.
+    Unknown([u8; 4]),
+}
+
+/// The AES block cipher mode of operation a [`CencScheme`] dispatches
+/// to (§9.3 / §9.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CipherMode {
+    /// AES-CTR (counter mode) — used by `cenc` and `cens` (§9.3).
+    Ctr,
+    /// AES-CBC (cipher-block-chaining) — used by `cbc1` and `cbcs`
+    /// (§9.4.3).
+    Cbc,
+}
+
+impl CencScheme {
+    /// Map a `sinf/schm.scheme_type` four-character code to the typed
+    /// [`CencScheme`]. Codes outside the §10 set become
+    /// [`CencScheme::Unknown`] — the FourCC is preserved so a caller
+    /// with a private registry can still route.
+    pub fn from_fourcc(fourcc: &[u8; 4]) -> CencScheme {
+        match fourcc {
+            b"cenc" => CencScheme::Cenc,
+            b"cbc1" => CencScheme::Cbc1,
+            b"cens" => CencScheme::Cens,
+            b"cbcs" => CencScheme::Cbcs,
+            other => CencScheme::Unknown(*other),
+        }
+    }
+
+    /// The FourCC that appears on the wire for this scheme.
+    pub fn fourcc(&self) -> [u8; 4] {
+        match self {
+            CencScheme::Cenc => *b"cenc",
+            CencScheme::Cbc1 => *b"cbc1",
+            CencScheme::Cens => *b"cens",
+            CencScheme::Cbcs => *b"cbcs",
+            CencScheme::Unknown(fc) => *fc,
+        }
+    }
+
+    /// The AES cipher mode this scheme dispatches to. `None` for an
+    /// unrecognised scheme — a caller routing on a private dialect must
+    /// supply its own mode mapping.
+    pub fn cipher_mode(&self) -> Option<CipherMode> {
+        match self {
+            CencScheme::Cenc | CencScheme::Cens => Some(CipherMode::Ctr),
+            CencScheme::Cbc1 | CencScheme::Cbcs => Some(CipherMode::Cbc),
+            CencScheme::Unknown(_) => None,
+        }
+    }
+
+    /// `true` for the pattern-encryption schemes (`cens` / `cbcs`,
+    /// §9.6). For non-pattern schemes (`cenc` / `cbc1`) the
+    /// `(crypt_byte_block, skip_byte_block)` pair on `tenc` is required
+    /// to be zero (§10.1 / §10.2). Unknown schemes return `false`.
+    pub fn uses_pattern_encryption(&self) -> bool {
+        matches!(self, CencScheme::Cens | CencScheme::Cbcs)
+    }
+
+    /// The `tenc.version` value the scheme pins per §10. `cenc` and
+    /// `cbc1` pin v0; `cens` and `cbcs` pin v1. Unknown schemes return
+    /// `None` (the version is not constrained by this part).
+    pub fn required_tenc_version(&self) -> Option<u8> {
+        match self {
+            CencScheme::Cenc | CencScheme::Cbc1 => Some(0),
+            CencScheme::Cens | CencScheme::Cbcs => Some(1),
+            CencScheme::Unknown(_) => None,
+        }
+    }
+}
+
+/// A typed routing slip — the combination of a parsed `tenc` (track
+/// defaults) and the four-character `scheme_type` recovered from
+/// `sinf/schm`, packaged so a downstream decryption layer can pick a
+/// code path without re-reading any byte-layer structure.
+///
+/// The decision is intentionally **dispatch metadata only**: it carries
+/// no key material, runs no AES operation, and does not pre-derive a
+/// per-sample IV. Its job is to package the container-side facts
+/// (scheme FourCC, cipher mode, pattern flag, per-sample-IV vs
+/// constant-IV vs no-IV configuration) so that a caller with a key
+/// blob in hand has a single typed value to switch on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CencSchemeDecision {
+    /// The parsed `scheme_type` from `sinf/schm`.
+    pub scheme: CencScheme,
+    /// The track-level defaults from `tenc`.
+    pub tenc: TencBox,
+}
+
+/// The track-level IV-supply discipline a [`CencSchemeDecision`]
+/// dispatches to (§9.1).
+///
+/// Each protected sample carries an IV via exactly one of:
+///
+/// * **Per-sample** (`per_sample_iv_size ∈ {8, 16}`) — the IV is stored
+///   either inside `senc` or in `mdat`-resident sample-auxiliary
+///   information located via `saiz` + `saio`.
+/// * **Constant** (`per_sample_iv_size == 0 && isProtected == 1`) — the
+///   IV is the `default_constant_IV` on `tenc` (or the equivalent on a
+///   `seig` group entry); no per-sample IV bytes are stored.
+/// * **None** (`isProtected == 0`) — the sample is unprotected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IvSupply {
+    /// Per-sample IV stored on the wire; width is 8 or 16 bytes.
+    PerSample { size: u8 },
+    /// Constant IV used for every sample in the track or group; the
+    /// actual bytes live on the [`TencBox`] (or [`SeigEntry`]).
+    Constant,
+    /// `isProtected == 0` — the sample is not encrypted.
+    None,
+}
+
+impl CencSchemeDecision {
+    /// Bundle a parsed `tenc` and a `scheme_type` FourCC into a typed
+    /// router. Performs **structural** validation only — no key
+    /// material, no AES operation:
+    ///
+    /// * the scheme's `required_tenc_version()` (when known) must match
+    ///   `tenc.version`, and
+    /// * pattern-encryption schemes (`cens` / `cbcs`) must carry a
+    ///   non-zero `(crypt_byte_block, skip_byte_block)` pair (§9.6 —
+    ///   "When the fields … are non-zero numbers, pattern encryption
+    ///   SHALL be applied").
+    ///
+    /// Mismatches return `Err` with a descriptive message; a CENC
+    /// consumer can then decide whether to refuse the file or treat it
+    /// as a known-bad fixture.
+    pub fn new(scheme: CencScheme, tenc: TencBox) -> Result<CencSchemeDecision> {
+        if let Some(req) = scheme.required_tenc_version() {
+            if tenc.version != req {
+                return Err(Error::invalid(format!(
+                    "CENC scheme decision: scheme {} requires tenc version {} but tenc.version = {}",
+                    fourcc_str(&scheme.fourcc()),
+                    req,
+                    tenc.version
+                )));
+            }
+        }
+        if scheme.uses_pattern_encryption()
+            && tenc.default_crypt_byte_block == 0
+            && tenc.default_skip_byte_block == 0
+        {
+            return Err(Error::invalid(format!(
+                "CENC scheme decision: pattern-encryption scheme {} requires non-zero (crypt_byte_block, skip_byte_block)",
+                fourcc_str(&scheme.fourcc())
+            )));
+        }
+        Ok(CencSchemeDecision { scheme, tenc })
+    }
+
+    /// The AES cipher mode this decision dispatches to. `None` for an
+    /// unknown scheme (the typed [`CencScheme::Unknown`] variant); a
+    /// caller routing on a private dialect supplies its own mapping.
+    pub fn cipher_mode(&self) -> Option<CipherMode> {
+        self.scheme.cipher_mode()
+    }
+
+    /// `true` if the scheme is `cens` or `cbcs`.
+    pub fn uses_pattern_encryption(&self) -> bool {
+        self.scheme.uses_pattern_encryption()
+    }
+
+    /// The track-level IV-supply discipline implied by the parsed
+    /// `tenc` (§9.1):
+    ///
+    /// * `IvSupply::None` when `default_isProtected == 0` — there is no
+    ///   IV because there is nothing to decrypt at the track default.
+    /// * `IvSupply::Constant` when `default_isProtected == 1 &&
+    ///   default_Per_Sample_IV_Size == 0` — IV comes from
+    ///   `tenc.default_constant_iv` (or a `seig` group override).
+    /// * `IvSupply::PerSample { size }` otherwise (`size` is 8 or 16) —
+    ///   IV comes from `senc` or `saiz` / `saio` per sample.
+    ///
+    /// A `seig` override on a sample group can replace either of the
+    /// `IvSupply::Constant` / `IvSupply::PerSample` arms for a subset
+    /// of samples; the typed group-level analogue is on [`SeigEntry`].
+    pub fn iv_supply(&self) -> IvSupply {
+        if self.tenc.default_is_protected != 1 {
+            return IvSupply::None;
+        }
+        if self.tenc.default_per_sample_iv_size == 0 {
+            IvSupply::Constant
+        } else {
+            IvSupply::PerSample {
+                size: self.tenc.default_per_sample_iv_size,
+            }
+        }
+    }
+}
+
+/// `CencSampleEncryptionInformationGroupEntry` (`seig`) — a per-sample-group
+/// override of the `tenc` defaults (§6). Paired with an `sbgp` of
+/// `grouping_type = *b"seig"`, this entry overrides
+/// `(isProtected, Per_Sample_IV_Size, KID, pattern, constant_IV)` for
+/// the samples mapped to the group.
+///
+/// The on-wire layout (§6) is:
+///
+/// ```text
+/// aligned(8) class CencSampleEncryptionInformationGroupEntry
+///     extends SampleGroupEntry('seig')
+/// {
+///     unsigned int(8)    reserved = 0;
+///     unsigned int(4)    crypt_byte_block;
+///     unsigned int(4)    skip_byte_block;
+///     unsigned int(8)    isProtected;
+///     unsigned int(8)    Per_Sample_IV_Size;
+///     unsigned int(8)[16] KID;
+///     if (isProtected == 1 && Per_Sample_IV_Size == 0) {
+///         unsigned int(8)    constant_IV_size;
+///         unsigned int(8)[constant_IV_size] constant_IV;
+///     }
+/// }
+/// ```
+///
+/// Note the "clients SHALL ignore additional bytes after the fields
+/// defined" rule (§6 closing paragraph): trailing bytes from a future
+/// edition are not a parse error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeigEntry {
+    /// Pattern-encryption encrypted-block count (always zero on the
+    /// non-pattern schemes per §10.1 / §10.2).
+    pub crypt_byte_block: u8,
+    /// Pattern-encryption skipped-block count.
+    pub skip_byte_block: u8,
+    /// `isProtected` for samples mapped to this group. `0` overrides
+    /// the track default to "unencrypted for this group" (§6 second
+    /// paragraph).
+    pub is_protected: u8,
+    /// `Per_Sample_IV_Size` for samples mapped to this group; valid
+    /// values are 0 / 8 / 16 (§9.1).
+    pub per_sample_iv_size: u8,
+    /// `KID` for samples mapped to this group. May differ from the
+    /// track default `tenc.default_KID`, allowing a sample group to be
+    /// decrypted with a separate key.
+    pub kid: [u8; 16],
+    /// When `is_protected == 1 && per_sample_iv_size == 0`, the
+    /// constant IV bytes (8 or 16). `None` otherwise.
+    pub constant_iv: Option<Vec<u8>>,
+}
+
+impl SeigEntry {
+    /// Group-level IV-supply discipline (the per-group analogue of
+    /// [`CencSchemeDecision::iv_supply`]).
+    pub fn iv_supply(&self) -> IvSupply {
+        if self.is_protected != 1 {
+            return IvSupply::None;
+        }
+        if self.per_sample_iv_size == 0 {
+            IvSupply::Constant
+        } else {
+            IvSupply::PerSample {
+                size: self.per_sample_iv_size,
+            }
+        }
+    }
+
+    /// Whether this group entry overrides the default to a
+    /// pattern-encryption configuration (§9.6 — "When the fields … are
+    /// non-zero numbers, pattern encryption SHALL be applied").
+    pub fn uses_pattern_encryption(&self) -> bool {
+        self.crypt_byte_block != 0 || self.skip_byte_block != 0
+    }
+}
+
+/// Parse one `CencSampleEncryptionInformationGroupEntry` payload (§6).
+///
+/// The input is the per-entry blob handed to a `grouping_type =
+/// *b"seig"` `sgpd` description — i.e. the bytes the `sample_groups`
+/// surface already preserves verbatim. The trailing-bytes rule of §6
+/// is honoured (extra bytes after the fixed-size record are silently
+/// ignored; a future edition's extension does not fail the parse).
+///
+/// Returns the typed [`SeigEntry`].
+pub fn parse_seig(body: &[u8]) -> Result<SeigEntry> {
+    // Fixed prefix: 1 reserved + 1 packed (crypt|skip) + 1 isProtected
+    //              + 1 IV_size + 16 KID = 20 bytes.
+    if body.len() < 20 {
+        return Err(Error::invalid("CENC seig: short payload"));
+    }
+    // body[0] reserved (must be 0; not enforced).
+    let packed = body[1];
+    let crypt_byte_block = (packed >> 4) & 0x0F;
+    let skip_byte_block = packed & 0x0F;
+    let is_protected = body[2];
+    let per_sample_iv_size = body[3];
+    let mut kid = [0u8; 16];
+    kid.copy_from_slice(&body[4..20]);
+
+    let mut cursor = 20usize;
+    let constant_iv = if is_protected == 1 && per_sample_iv_size == 0 {
+        if body.len() < cursor + 1 {
+            return Err(Error::invalid(
+                "CENC seig: missing constant_IV_size when isProtected==1 && IV_size==0",
+            ));
+        }
+        let civ_size = body[cursor] as usize;
+        cursor += 1;
+        // §9.1: only 8 and 16 are supported sizes for constant IVs.
+        if civ_size != 8 && civ_size != 16 {
+            return Err(Error::invalid(format!(
+                "CENC seig: constant_IV_size {civ_size} not in {{8, 16}}"
+            )));
+        }
+        if body.len() < cursor + civ_size {
+            return Err(Error::invalid("CENC seig: truncated constant_IV"));
+        }
+        Some(body[cursor..cursor + civ_size].to_vec())
+    } else {
+        // §9.1: legal IV sizes are 0, 8, 16. Reject other values here so
+        // a malformed sample-group entry doesn't smuggle "IV size 4"
+        // past the typed router.
+        if !(per_sample_iv_size == 0 || per_sample_iv_size == 8 || per_sample_iv_size == 16) {
+            return Err(Error::invalid(format!(
+                "CENC seig: Per_Sample_IV_Size {per_sample_iv_size} not in {{0, 8, 16}}"
+            )));
+        }
+        None
+    };
+
+    Ok(SeigEntry {
+        crypt_byte_block,
+        skip_byte_block,
+        is_protected,
+        per_sample_iv_size,
+        kid,
+        constant_iv,
+    })
+}
+
+/// Lossy ASCII rendering of a FourCC, used inside error messages.
+fn fourcc_str(fc: &[u8; 4]) -> String {
+    let mut out = String::with_capacity(4);
+    for &b in fc {
+        if (0x20..=0x7E).contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push('?');
+        }
+    }
+    out
+}
 
 /// `tenc` — TrackEncryptionBox payload (§8.2).
 ///
@@ -676,5 +1086,277 @@ mod tests {
         body.extend_from_slice(&0u16.to_be_bytes());
         body.extend_from_slice(&0u32.to_be_bytes()); // only 1 supplied
         assert!(parse_senc(&body, 16).is_err());
+    }
+
+    // ---- CencScheme typed router -----------------------------------
+
+    #[test]
+    fn scheme_fourcc_round_trip() {
+        for fc in [b"cenc", b"cbc1", b"cens", b"cbcs"] {
+            let s = CencScheme::from_fourcc(fc);
+            assert_eq!(&s.fourcc(), fc, "round trip {fc:?}");
+        }
+        // Unknown FourCC round-trips verbatim.
+        let priv_fc = b"priv";
+        let s = CencScheme::from_fourcc(priv_fc);
+        assert!(matches!(s, CencScheme::Unknown(b) if &b == priv_fc));
+        assert_eq!(s.fourcc(), *priv_fc);
+    }
+
+    #[test]
+    fn scheme_cipher_mode_routes_ctr_vs_cbc() {
+        assert_eq!(
+            CencScheme::Cenc.cipher_mode(),
+            Some(CipherMode::Ctr),
+            "cenc → CTR (§10.1)"
+        );
+        assert_eq!(
+            CencScheme::Cens.cipher_mode(),
+            Some(CipherMode::Ctr),
+            "cens → CTR (§10.3)"
+        );
+        assert_eq!(
+            CencScheme::Cbc1.cipher_mode(),
+            Some(CipherMode::Cbc),
+            "cbc1 → CBC (§10.2)"
+        );
+        assert_eq!(
+            CencScheme::Cbcs.cipher_mode(),
+            Some(CipherMode::Cbc),
+            "cbcs → CBC (§10.4)"
+        );
+        // Unknown scheme cannot be routed.
+        assert_eq!(CencScheme::Unknown(*b"priv").cipher_mode(), None);
+    }
+
+    #[test]
+    fn scheme_pattern_flag() {
+        assert!(!CencScheme::Cenc.uses_pattern_encryption());
+        assert!(!CencScheme::Cbc1.uses_pattern_encryption());
+        assert!(CencScheme::Cens.uses_pattern_encryption());
+        assert!(CencScheme::Cbcs.uses_pattern_encryption());
+        assert!(!CencScheme::Unknown(*b"priv").uses_pattern_encryption());
+    }
+
+    #[test]
+    fn scheme_required_tenc_version() {
+        // §10.1 / §10.2 pin tenc v0 (no pattern fields needed).
+        assert_eq!(CencScheme::Cenc.required_tenc_version(), Some(0));
+        assert_eq!(CencScheme::Cbc1.required_tenc_version(), Some(0));
+        // §10.3 / §10.4 pin tenc v1 (carry the pattern pair).
+        assert_eq!(CencScheme::Cens.required_tenc_version(), Some(1));
+        assert_eq!(CencScheme::Cbcs.required_tenc_version(), Some(1));
+        // Unknown: unconstrained.
+        assert_eq!(CencScheme::Unknown(*b"priv").required_tenc_version(), None);
+    }
+
+    fn cenc_tenc_v0_per_sample() -> TencBox {
+        TencBox {
+            version: 0,
+            default_is_protected: 1,
+            default_per_sample_iv_size: 16,
+            default_kid: [0xAA; 16],
+            default_crypt_byte_block: 0,
+            default_skip_byte_block: 0,
+            default_constant_iv: None,
+        }
+    }
+
+    fn cbcs_tenc_v1_constant_iv() -> TencBox {
+        TencBox {
+            version: 1,
+            default_is_protected: 1,
+            default_per_sample_iv_size: 0,
+            default_kid: [0xBB; 16],
+            default_crypt_byte_block: 1,
+            default_skip_byte_block: 9,
+            default_constant_iv: Some(vec![0xCA; 16]),
+        }
+    }
+
+    #[test]
+    fn decision_routes_cenc_to_ctr_per_sample() {
+        // Typical cenc track: AES-CTR, per-sample 16-byte IV, no pattern.
+        let d = CencSchemeDecision::new(CencScheme::Cenc, cenc_tenc_v0_per_sample())
+            .expect("cenc decision");
+        assert_eq!(d.cipher_mode(), Some(CipherMode::Ctr));
+        assert!(!d.uses_pattern_encryption());
+        assert_eq!(d.iv_supply(), IvSupply::PerSample { size: 16 });
+    }
+
+    #[test]
+    fn decision_routes_cbcs_to_cbc_constant_iv_pattern() {
+        // Typical cbcs track: AES-CBC, constant IV, 1:9 protection
+        // pattern.
+        let d = CencSchemeDecision::new(CencScheme::Cbcs, cbcs_tenc_v1_constant_iv())
+            .expect("cbcs decision");
+        assert_eq!(d.cipher_mode(), Some(CipherMode::Cbc));
+        assert!(d.uses_pattern_encryption());
+        assert_eq!(d.iv_supply(), IvSupply::Constant);
+        assert_eq!(d.tenc.default_constant_iv.as_deref(), Some(&[0xCA; 16][..]));
+    }
+
+    #[test]
+    fn decision_rejects_version_mismatch() {
+        // cenc requires tenc v0 but caller supplied a v1 tenc.
+        let bad = TencBox {
+            version: 1,
+            ..cenc_tenc_v0_per_sample()
+        };
+        let err = CencSchemeDecision::new(CencScheme::Cenc, bad).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("requires tenc version 0"), "msg={msg}");
+    }
+
+    #[test]
+    fn decision_rejects_pattern_scheme_with_zero_pattern() {
+        // cbcs scheme but tenc has crypt=skip=0 → not actually patterned.
+        let bad = TencBox {
+            default_crypt_byte_block: 0,
+            default_skip_byte_block: 0,
+            ..cbcs_tenc_v1_constant_iv()
+        };
+        let err = CencSchemeDecision::new(CencScheme::Cbcs, bad).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("pattern-encryption"), "msg={msg}");
+    }
+
+    #[test]
+    fn decision_unprotected_track_is_iv_none() {
+        // isProtected=0 — entire track is plaintext at default.
+        let plain = TencBox {
+            version: 0,
+            default_is_protected: 0,
+            default_per_sample_iv_size: 0,
+            default_kid: [0u8; 16],
+            default_crypt_byte_block: 0,
+            default_skip_byte_block: 0,
+            default_constant_iv: None,
+        };
+        let d = CencSchemeDecision::new(CencScheme::Cenc, plain).expect("plaintext decision");
+        assert_eq!(d.iv_supply(), IvSupply::None);
+    }
+
+    #[test]
+    fn decision_unknown_scheme_routes_unconstrained() {
+        // Private DRM dialect with a custom FourCC: structural router
+        // accepts the bundle but reports None for cipher mode (since the
+        // dialect is not §10-registered).
+        let d =
+            CencSchemeDecision::new(CencScheme::from_fourcc(b"priv"), cenc_tenc_v0_per_sample())
+                .expect("unknown scheme decision");
+        assert!(matches!(d.scheme, CencScheme::Unknown(b) if &b == b"priv"));
+        assert_eq!(d.cipher_mode(), None);
+        assert!(!d.uses_pattern_encryption());
+    }
+
+    // ---- seig sample-group entry parser ----------------------------
+
+    #[test]
+    fn seig_per_sample_iv_round_trip() {
+        // reserved=0, crypt=0, skip=0, isProtected=1, IV_size=16,
+        // KID = 0x11..0x20.
+        let mut body: Vec<u8> = vec![
+            0,  // reserved
+            0,  // crypt|skip packed nibbles, both 0
+            1,  // isProtected
+            16, // Per_Sample_IV_Size
+        ];
+        let kid: [u8; 16] = [
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+            0x1F, 0x20,
+        ];
+        body.extend_from_slice(&kid);
+        let s = parse_seig(&body).expect("seig per-sample IV");
+        assert_eq!(s.is_protected, 1);
+        assert_eq!(s.per_sample_iv_size, 16);
+        assert_eq!(s.kid, kid);
+        assert_eq!(s.crypt_byte_block, 0);
+        assert_eq!(s.skip_byte_block, 0);
+        assert!(s.constant_iv.is_none());
+        assert_eq!(s.iv_supply(), IvSupply::PerSample { size: 16 });
+        assert!(!s.uses_pattern_encryption());
+    }
+
+    #[test]
+    fn seig_pattern_constant_iv_round_trip() {
+        // Typical cbcs-style group override: pattern 1:9, constant IV
+        // size 16.
+        let mut body: Vec<u8> = vec![
+            0,            // reserved
+            (1 << 4) | 9, // crypt=1 | skip=9
+            1,            // isProtected
+            0,            // Per_Sample_IV_Size = 0 ⇒ constant IV in use
+        ];
+        body.extend_from_slice(&[0x77; 16]); // KID
+        body.push(16); // constant_IV_size
+        body.extend_from_slice(&[0xDD; 16]);
+        let s = parse_seig(&body).expect("seig pattern + constant IV");
+        assert_eq!(s.crypt_byte_block, 1);
+        assert_eq!(s.skip_byte_block, 9);
+        assert_eq!(s.per_sample_iv_size, 0);
+        assert_eq!(s.constant_iv.as_deref(), Some(&[0xDD; 16][..]));
+        assert_eq!(s.iv_supply(), IvSupply::Constant);
+        assert!(s.uses_pattern_encryption());
+    }
+
+    #[test]
+    fn seig_unprotected_group_override() {
+        // isProtected=0 — override the track default for these samples
+        // to plaintext. IV size must be 0 in this case (§6 + §9.1).
+        let mut body: Vec<u8> = vec![
+            0, // reserved
+            0, // crypt|skip
+            0, // isProtected = 0
+            0, // IV_size = 0
+        ];
+        body.extend_from_slice(&[0u8; 16]); // KID (zeroed per §9.1 recommendation)
+        let s = parse_seig(&body).expect("seig unprotected group");
+        assert_eq!(s.is_protected, 0);
+        assert_eq!(s.iv_supply(), IvSupply::None);
+    }
+
+    #[test]
+    fn seig_ignores_trailing_bytes_per_spec_note() {
+        // §6 closing paragraph: "clients SHALL ignore additional bytes
+        // after the fields defined". Extra trailing bytes don't fail
+        // the parse.
+        let mut body: Vec<u8> = vec![0, 0, 1, 8];
+        body.extend_from_slice(&[0x33; 16]);
+        // Trailing bytes from a hypothetical future extension.
+        body.extend_from_slice(&[0xFE, 0xED, 0xBE, 0xEF]);
+        let s = parse_seig(&body).expect("seig with trailing bytes");
+        assert_eq!(s.per_sample_iv_size, 8);
+    }
+
+    #[test]
+    fn seig_rejects_unsupported_iv_size() {
+        let mut body: Vec<u8> = vec![0, 0, 1, 4]; // IV_size = 4 — not in {0, 8, 16}
+        body.extend_from_slice(&[0u8; 16]);
+        assert!(parse_seig(&body).is_err());
+    }
+
+    #[test]
+    fn seig_rejects_unsupported_constant_iv_size() {
+        let mut body: Vec<u8> = vec![0, 0, 1, 0];
+        body.extend_from_slice(&[0u8; 16]);
+        body.push(4); // constant_IV_size = 4 — not 8 or 16
+        body.extend_from_slice(&[0u8; 4]);
+        assert!(parse_seig(&body).is_err());
+    }
+
+    #[test]
+    fn seig_rejects_short_payload() {
+        // Fixed prefix is 20 bytes; 19 must fail.
+        assert!(parse_seig(&[0u8; 19]).is_err());
+    }
+
+    #[test]
+    fn seig_rejects_truncated_constant_iv() {
+        let mut body: Vec<u8> = vec![0, 0, 1, 0];
+        body.extend_from_slice(&[0u8; 16]);
+        body.push(16);
+        body.extend_from_slice(&[0u8; 15]); // one byte short
+        assert!(parse_seig(&body).is_err());
     }
 }

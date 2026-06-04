@@ -217,6 +217,49 @@ Sample-entry FourCCs resolve to these codec ids:
   / `cenc::parse_senc`) are public for callers that already have
   the box body in hand from another path (e.g. a non-MP4 carrier
   of CENC framing).
+  - Typed scheme decision router (§4.2 + §10). The four `scheme_type`
+    FourCCs defined in ISO/IEC 23001-7:2016 §10 — `cenc` (AES-CTR
+    full / NAL-subsample), `cbc1` (AES-CBC full / NAL-subsample),
+    `cens` (AES-CTR pattern subsample), `cbcs` (AES-CBC pattern
+    subsample) — are exposed as the typed `cenc::CencScheme` enum.
+    The two binary axes a downstream decryptor dispatches on —
+    cipher mode (CTR vs CBC, `cenc::CipherMode`) and pattern-encryption
+    flag — are surfaced via `CencScheme::cipher_mode()` and
+    `CencScheme::uses_pattern_encryption()`. A scheme value bundled
+    with the parsed `tenc` becomes a `cenc::CencSchemeDecision` —
+    the typed routing slip a future AES layer can pattern-match
+    against — built via `CencSchemeDecision::new(scheme, tenc)`
+    with structural validation only (the scheme's
+    `required_tenc_version()` must match `tenc.version`; pattern
+    schemes must carry a non-zero `(crypt_byte_block,
+    skip_byte_block)` pair per §9.6). The track-default IV-supply
+    discipline (§9.1) — per-sample 8/16-byte IV vs constant IV vs
+    no IV when `isProtected == 0` — is recovered via
+    `CencSchemeDecision::iv_supply()` as the typed `cenc::IvSupply`
+    enum. **This crate performs no AES operation.** The bundle is
+    a static dispatch contract built from container-side bytes
+    only; the actual key derivation + AES block call is delegated
+    to a layer with key material from the named `pssh.SystemID`.
+    Unknown `scheme_type` FourCCs are preserved verbatim through
+    `CencScheme::Unknown([u8; 4])` so a caller carrying a private
+    DRM dialect can still route on its own table.
+  - Typed `CencSampleEncryptionInformationGroupEntry` parser (§6).
+    A `seig` sample-group entry overrides the track-default `tenc`
+    parameters for a group of samples — `(crypt_byte_block,
+    skip_byte_block, isProtected, Per_Sample_IV_Size, KID,
+    constant_IV?)` — and is the spec's mechanism for mixing
+    encrypted and unencrypted samples in one track, or for
+    rotating keys per scene. `cenc::parse_seig(body)` decodes one
+    entry's payload (the opaque blob the existing `sgpd`
+    `grouping_type = *b"seig"` surface already preserves) into the
+    typed `cenc::SeigEntry`, mirroring the validation `parse_tenc`
+    applies (constant-IV size ∈ {8, 16}, per-sample IV size ∈ {0,
+    8, 16}). `SeigEntry::iv_supply()` and `::uses_pattern_encryption()`
+    answer the same routing questions as the track-default
+    accessors but at the per-group resolution. §6's
+    "clients SHALL ignore additional bytes after the fields
+    defined" rule is honoured — trailing bytes from a future
+    edition do not fail the parse.
 - Track references (ISO/IEC 14496-12 §8.3.3, `tref`): each typed
   `TrackReferenceTypeBox` inside `trak/tref` is parsed and the
   resulting `(reference_type → track_IDs)` pairs are surfaced on
@@ -563,12 +606,15 @@ first that applies:
   the demuxer feature list above; plus the spec-permitted
   alternative IV-carriage path via `saiz` / `saio` — see "Sample
   auxiliary information sizes + offsets") and surfaces the metadata,
-  but it does not run the AES-128 CTR / CBC decryption step. That
-  belongs to a downstream layer with key material from the named
-  `pssh.SystemID`. The mdat-resident auxiliary-information bytes
-  that the `saio` offsets name are not pre-fetched — a CENC
-  consumer reading them seeks the input itself using the surfaced
-  offsets.
+  but it does not run the AES-128 CTR / CBC decryption step. The
+  scheme + tenc bundle is exposed as the typed
+  `cenc::CencSchemeDecision` router (cipher mode, pattern flag,
+  IV-supply discipline) so a downstream layer with key material
+  from the named `pssh.SystemID` has a single typed value to
+  switch on; the actual AES block call is its responsibility. The
+  mdat-resident auxiliary-information bytes that the `saio`
+  offsets name are not pre-fetched — a CENC consumer reading them
+  seeks the input itself using the surfaced offsets.
 - Multiple sample descriptions per track (only the first entry of
   `stsd` is used; `tfhd.sample_description_index` overrides are
   ignored).
