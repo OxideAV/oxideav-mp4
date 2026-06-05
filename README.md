@@ -202,6 +202,21 @@ Sample-entry FourCCs resolve to these codec ids:
     keys with value `"<system_id_hex> <kid_count> <data_len>"`;
     structured records are reachable through the public
     `cenc::PsshBox` type for callers that downcast.
+  - moof-level `pssh` (§8.1.1 — "Container: Movie (`moov`) or
+    Movie Fragment (`moof`)"). pssh boxes that live directly inside
+    a `moof` are collected per fragment and keyed by the enclosing
+    `mfhd.sequence_number` so a downstream DRM layer can honour the
+    §8.1.1 reader rule "examine all Protection System Specific
+    Header boxes in the Movie Box and in the Movie Fragment Box
+    associated with the sample (but not those in other Movie
+    Fragment Boxes)". Surfaced via `Demuxer::metadata()` as
+    `moof_pssh_<n>` keys with value
+    `"systemid=<hex> seq=<mfhd_seq> kids=<n> data=<len>"`;
+    structured records are reachable through the public
+    `demux::MoofPsshRecord` type (one record per box in moof-walk
+    order, `version` 0 + v1 with KID list both supported). A
+    malformed pssh inside a moof is dropped without aborting the
+    fragment, mirroring the moov-level recovery policy.
   - `senc` (§7.2 SampleEncryptionBox) — collected from every `traf`
     whose matching track carried a `tenc` default (so the
     per-sample IV width is recoverable per §7.2.3). Captures

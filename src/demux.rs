@@ -129,6 +129,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
 
     let mut senc_records: Vec<SencRecord> = Vec::new();
     let mut sai_records: Vec<SaiRecord> = Vec::new();
+    let mut moof_psshes: Vec<MoofPsshRecord> = Vec::new();
     for moof in &moofs {
         parse_moof(
             moof,
@@ -137,6 +138,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
             &mut next_dts,
             &mut senc_records,
             &mut sai_records,
+            &mut moof_psshes,
         )?;
     }
 
@@ -237,6 +239,31 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         ));
     }
 
+    // ISO/IEC 23001-7 §8.1 — pssh boxes that live inside individual
+    // `moof` boxes (§8.1.1 permits pssh in either `moov` or `moof`).
+    // One `moof_pssh_<n>` key per MoofPsshRecord, in moof-walk order,
+    // summarising SystemID + fragment scope. The structured records
+    // are accessible via `Mp4Demuxer::moof_psshes()`. Hex encoding
+    // mirrors the moov-level `pssh_<n>` SystemID surface.
+    for (n, r) in moof_psshes.iter().enumerate() {
+        let sysid_hex: String = r
+            .pssh
+            .system_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        metadata.push((
+            format!("moof_pssh_{n}"),
+            format!(
+                "systemid={} seq={} kids={} data={}",
+                sysid_hex,
+                r.moof_sequence,
+                r.pssh.kids.len(),
+                r.pssh.data.len(),
+            ),
+        ));
+    }
+
     Ok(Box::new(Mp4Demuxer {
         input,
         streams,
@@ -248,6 +275,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         tfras,
         prfts,
         psshes: parsed.psshes,
+        moof_psshes,
         senc_records,
         sai_records,
         movie_timescale: parsed.movie_timescale,
@@ -3291,6 +3319,26 @@ pub struct TrafSaio {
     pub offsets: Vec<u64>,
 }
 
+/// One per-fragment ISO/IEC 23001-7 §8.1 `pssh`
+/// ProtectionSystemSpecificHeaderBox record collected from inside a
+/// `moof`. The spec (§8.1.1) instructs readers to examine pssh boxes
+/// "in the Movie Box and in the Movie Fragment Box associated with
+/// the sample (but not those in other Movie Fragment Boxes)", so a
+/// decrypting layer keys each record by `moof_sequence` to scope
+/// SystemID matches to the right fragment.
+///
+/// `pssh` carries the parsed PsshBox; `moof_sequence` is the
+/// `mfhd.sequence_number` of the enclosing `moof`.
+#[derive(Clone, Debug)]
+pub struct MoofPsshRecord {
+    /// `mfhd.sequence_number` of the enclosing `moof`. Surfaced so a
+    /// decrypting layer can scope SystemID matches to the right
+    /// fragment without re-walking the file.
+    pub moof_sequence: u32,
+    /// Parsed ProtectionSystemSpecificHeaderBox.
+    pub pssh: PsshBox,
+}
+
 /// Walk one `moof` box, locating its `traf` children and stitching the
 /// fragmented samples into the per-track sample list.
 ///
@@ -3307,6 +3355,18 @@ pub struct TrafSaio {
 /// bytes themselves remain in the mdat at the offsets the `saio`
 /// names; the demuxer doesn't fetch them (their semantics belong to
 /// the carried `aux_info_type`, e.g. CENC `cenc`/`cbcs`).
+///
+/// `moof_psshes` accumulates ISO/IEC 23001-7 §8.1 `pssh` boxes that
+/// live directly inside this `moof` (§8.1.1 permits pssh in either
+/// `moov` or `moof`). Each captured PsshBox is keyed by the enclosing
+/// `mfhd.sequence_number` so a downstream DRM layer can scope SystemID
+/// matches per §8.1.1 ("readers SHALL examine all Protection System
+/// Specific Header boxes in the Movie Box and in the Movie Fragment
+/// Box associated with the sample (but not those in other Movie
+/// Fragment Boxes)"). A malformed pssh inside a moof is dropped
+/// without failing the fragment, mirroring the moov-level recovery
+/// policy.
+#[allow(clippy::too_many_arguments)] // per-fragment record sinks are independent vectors threaded through one moof walk; bundling them obscures which box populates which sink
 fn parse_moof(
     moof: &MoofRecord,
     tracks: &[Track],
@@ -3314,10 +3374,17 @@ fn parse_moof(
     next_dts: &mut [i64],
     senc_records: &mut Vec<SencRecord>,
     sai_records: &mut Vec<SaiRecord>,
+    moof_psshes: &mut Vec<MoofPsshRecord>,
 ) -> Result<()> {
     let mut cur = std::io::Cursor::new(&moof.body);
     let end = moof.body.len() as u64;
     let mut moof_sequence: u32 = 0;
+    // §8.1.1 allows pssh boxes at moof level; collect their bodies as
+    // we walk so a pssh that precedes `mfhd` (rare but spec-legal —
+    // §8.8 doesn't fix the relative order between `mfhd` and `pssh`)
+    // still binds to the correct sequence_number once we've seen
+    // mfhd. Finalised below.
+    let mut pending_pssh_bodies: Vec<Vec<u8>> = Vec::new();
     while cur.position() < end {
         let hdr = match read_box_header(&mut cur)? {
             Some(h) => h,
@@ -3348,7 +3415,26 @@ fn parse_moof(
                     sai_records,
                 )?;
             }
+            PSSH => {
+                // ISO/IEC 23001-7 §8.1 — ProtectionSystemSpecificHeaderBox
+                // at moof level. Buffer the body until the whole moof has
+                // been walked (we need the captured `moof_sequence` from
+                // `mfhd` to key the record). A malformed pssh body is
+                // dropped without failing the fragment — mirrors the
+                // moov-level recovery policy and matches the spec's
+                // opaque-SystemID treatment.
+                let body = read_bytes_vec(&mut cur, psz)?;
+                pending_pssh_bodies.push(body);
+            }
             _ => skip_cursor_bytes(&mut cur, psz),
+        }
+    }
+    for body in pending_pssh_bodies {
+        if let Ok(pssh) = parse_pssh(&body) {
+            moof_psshes.push(MoofPsshRecord {
+                moof_sequence,
+                pssh,
+            });
         }
     }
     Ok(())
@@ -4906,6 +4992,17 @@ struct Mp4Demuxer {
     /// SystemID match here.
     #[allow(dead_code)]
     psshes: Vec<PsshBox>,
+    /// ISO/IEC 23001-7 §8.1 pssh entries collected from inside
+    /// individual `moof` boxes. Each record is keyed by the enclosing
+    /// `mfhd.sequence_number` so a decrypting layer can scope SystemID
+    /// matches to the right fragment per §8.1.1 ("readers SHALL
+    /// examine all Protection System Specific Header boxes in the
+    /// Movie Box and in the Movie Fragment Box associated with the
+    /// sample (but not those in other Movie Fragment Boxes)"). Empty
+    /// in non-fragmented files and in fragmented files that signal
+    /// protection only at moov level (the common case).
+    #[allow(dead_code)]
+    moof_psshes: Vec<MoofPsshRecord>,
     /// ISO/IEC 23001-7 §7.2 senc records, one per `traf` that carried
     /// a SampleEncryptionBox. Each holds the parsed per-sample IVs
     /// and (when `UseSubSampleEncryption` was set) the subsample map,
@@ -4938,12 +5035,28 @@ impl Mp4Demuxer {
     /// a downstream DRM layer that matches the SystemID consumes the
     /// `data` blob (and v1 `kids` list). Empty for unprotected files.
     ///
-    /// `pssh` entries inside individual `moof` boxes are also permitted
-    /// by the spec — they are not yet collected here; an r197 follow-up
-    /// can extend `SencRecord` / `parse_moof` to surface them.
+    /// `pssh` entries inside individual `moof` boxes are surfaced via
+    /// the parallel [`Mp4Demuxer::moof_psshes`] accessor, keyed by the
+    /// enclosing `mfhd.sequence_number` per §8.1.1.
     #[allow(dead_code)]
     pub fn psshes(&self) -> &[PsshBox] {
         &self.psshes
+    }
+
+    /// ISO/IEC 23001-7 §8.1 — `pssh` entries collected from inside
+    /// individual `moof` boxes, in moof-walk order. Each record is
+    /// keyed by the enclosing `mfhd.sequence_number` (the
+    /// `MoofPsshRecord::moof_sequence` field) so a decrypting layer
+    /// can scope SystemID lookups to the right fragment per the
+    /// §8.1.1 normative-reader rule: "examine all Protection System
+    /// Specific Header boxes in the Movie Box and in the Movie
+    /// Fragment Box associated with the sample (but not those in
+    /// other Movie Fragment Boxes)". Empty for non-fragmented files
+    /// and for fragmented files that signal protection only at moov
+    /// level (the common case).
+    #[allow(dead_code)]
+    pub fn moof_psshes(&self) -> &[MoofPsshRecord] {
+        &self.moof_psshes
     }
 
     /// ISO/IEC 23001-7 §7.2 — per-fragment `senc`
@@ -8153,5 +8266,233 @@ mod tests {
         let mut body = vec![2u8, 0, 0, 0];
         body.extend_from_slice(&0u64.to_be_bytes());
         assert!(super::parse_mehd(&body).is_err());
+    }
+
+    // ----- ISO/IEC 23001-7 §8.1.1 — moof-level pssh ---------------------
+
+    /// Build a `moof` body containing one `mfhd` + N `pssh` children
+    /// (no `traf` so we exercise just the pssh collection path).
+    fn build_moof_body_with_pssh(seq: u32, psshes: &[Vec<u8>]) -> Vec<u8> {
+        // mfhd: FullBox(version=0, flags=0) + u32 sequence_number.
+        let mut mfhd_body = vec![0u8; 4];
+        mfhd_body.extend_from_slice(&seq.to_be_bytes());
+        let mfhd = wrap_box(b"mfhd", &mfhd_body);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&mfhd);
+        for pssh_body in psshes {
+            body.extend_from_slice(&wrap_box(b"pssh", pssh_body));
+        }
+        body
+    }
+
+    /// Wrap `body` with an 8-byte BoxHeader (size + fourcc).
+    fn wrap_box(fourcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let total = (8 + body.len()) as u32;
+        let mut out = Vec::with_capacity(8 + body.len());
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(fourcc);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Construct a v0 `pssh` body: FullBox + 16-byte SystemID +
+    /// u32 DataSize + Data.
+    fn pssh_v0_body(system_id: &[u8; 16], data: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8; 4]; // version=0, flags=0
+        body.extend_from_slice(system_id);
+        body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        body.extend_from_slice(data);
+        body
+    }
+
+    /// Construct a v1 `pssh` body: FullBox + SystemID + KID_count + KIDs +
+    /// DataSize + Data.
+    fn pssh_v1_body(system_id: &[u8; 16], kids: &[[u8; 16]], data: &[u8]) -> Vec<u8> {
+        let mut body = vec![1u8, 0, 0, 0]; // version=1, flags=0
+        body.extend_from_slice(system_id);
+        body.extend_from_slice(&(kids.len() as u32).to_be_bytes());
+        for k in kids {
+            body.extend_from_slice(k);
+        }
+        body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        body.extend_from_slice(data);
+        body
+    }
+
+    /// A moof containing one v0 pssh after the mfhd is captured into
+    /// `moof_psshes` keyed by the mfhd sequence_number. Mirrors §8.1.1
+    /// "pssh may be in moov or moof" and §8.1.1's reader rule that
+    /// each fragment's pssh applies only to that fragment.
+    #[test]
+    fn parse_moof_collects_one_pssh_keyed_by_mfhd_sequence() {
+        let sysid: [u8; 16] = [
+            0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce, 0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d,
+            0x21, 0xed,
+        ];
+        let data = b"opaque-drm-blob".to_vec();
+        let body = build_moof_body_with_pssh(7, &[pssh_v0_body(&sysid, &data)]);
+        let moof = super::MoofRecord {
+            moof_start: 0,
+            body,
+        };
+        let mut samples: Vec<super::SampleRef> = Vec::new();
+        let mut next_dts: Vec<i64> = Vec::new();
+        let mut senc: Vec<super::SencRecord> = Vec::new();
+        let mut sai: Vec<super::SaiRecord> = Vec::new();
+        let mut moof_psshes: Vec<super::MoofPsshRecord> = Vec::new();
+        super::parse_moof(
+            &moof,
+            &[],
+            &mut samples,
+            &mut next_dts,
+            &mut senc,
+            &mut sai,
+            &mut moof_psshes,
+        )
+        .expect("moof walk succeeds");
+
+        assert_eq!(moof_psshes.len(), 1);
+        let r = &moof_psshes[0];
+        assert_eq!(r.moof_sequence, 7);
+        assert_eq!(r.pssh.version, 0);
+        assert_eq!(r.pssh.system_id, sysid);
+        assert!(r.pssh.kids.is_empty());
+        assert_eq!(r.pssh.data, data);
+    }
+
+    /// A moof containing two pssh boxes (one v0, one v1 with two
+    /// KIDs) — both records share the same `moof_sequence` (= mfhd
+    /// sequence_number) and preserve the on-wire walk order. Exercises
+    /// the per-fragment "multiple SystemIDs" shape called out in §8.1.1
+    /// ("A single file MAY be constructed to be playable by multiple
+    /// key and digital rights management systems").
+    #[test]
+    fn parse_moof_collects_two_psshes_v0_and_v1_in_walk_order() {
+        let sysid_a: [u8; 16] = [0x11; 16];
+        let sysid_b: [u8; 16] = [0x22; 16];
+        let kid_x: [u8; 16] = [0xAA; 16];
+        let kid_y: [u8; 16] = [0xBB; 16];
+        let data_a = b"sys-a-data".to_vec();
+        let data_b = b"sys-b-data-longer".to_vec();
+        let body = build_moof_body_with_pssh(
+            42,
+            &[
+                pssh_v0_body(&sysid_a, &data_a),
+                pssh_v1_body(&sysid_b, &[kid_x, kid_y], &data_b),
+            ],
+        );
+        let moof = super::MoofRecord {
+            moof_start: 0,
+            body,
+        };
+        let mut samples: Vec<super::SampleRef> = Vec::new();
+        let mut next_dts: Vec<i64> = Vec::new();
+        let mut senc: Vec<super::SencRecord> = Vec::new();
+        let mut sai: Vec<super::SaiRecord> = Vec::new();
+        let mut moof_psshes: Vec<super::MoofPsshRecord> = Vec::new();
+        super::parse_moof(
+            &moof,
+            &[],
+            &mut samples,
+            &mut next_dts,
+            &mut senc,
+            &mut sai,
+            &mut moof_psshes,
+        )
+        .expect("moof walk succeeds");
+
+        assert_eq!(moof_psshes.len(), 2);
+        // Same fragment scope on both.
+        assert_eq!(moof_psshes[0].moof_sequence, 42);
+        assert_eq!(moof_psshes[1].moof_sequence, 42);
+        // Walk order preserved.
+        assert_eq!(moof_psshes[0].pssh.version, 0);
+        assert_eq!(moof_psshes[0].pssh.system_id, sysid_a);
+        assert!(moof_psshes[0].pssh.kids.is_empty());
+        assert_eq!(moof_psshes[0].pssh.data, data_a);
+
+        assert_eq!(moof_psshes[1].pssh.version, 1);
+        assert_eq!(moof_psshes[1].pssh.system_id, sysid_b);
+        assert_eq!(moof_psshes[1].pssh.kids, vec![kid_x, kid_y]);
+        assert_eq!(moof_psshes[1].pssh.data, data_b);
+    }
+
+    /// A pssh that appears before the mfhd inside a moof still
+    /// receives the correct `moof_sequence` once mfhd is encountered.
+    /// §8.8 lists `mfhd` as the first child of `moof` but does not
+    /// forbid other top-level boxes preceding it in practice; the
+    /// buffered-finalize approach (collect pssh bodies, then key by
+    /// the post-walk captured sequence_number) handles either order
+    /// without losing fidelity.
+    #[test]
+    fn parse_moof_pssh_before_mfhd_still_binds_to_sequence() {
+        let sysid: [u8; 16] = [0xCC; 16];
+        let data = b"pre-mfhd-pssh".to_vec();
+
+        // Build moof body with pssh FIRST, then mfhd.
+        let mut mfhd_body = vec![0u8; 4];
+        mfhd_body.extend_from_slice(&99u32.to_be_bytes());
+        let mfhd = wrap_box(b"mfhd", &mfhd_body);
+        let pssh = wrap_box(b"pssh", &pssh_v0_body(&sysid, &data));
+        let mut body = Vec::new();
+        body.extend_from_slice(&pssh);
+        body.extend_from_slice(&mfhd);
+
+        let moof = super::MoofRecord {
+            moof_start: 0,
+            body,
+        };
+        let mut samples: Vec<super::SampleRef> = Vec::new();
+        let mut next_dts: Vec<i64> = Vec::new();
+        let mut senc: Vec<super::SencRecord> = Vec::new();
+        let mut sai: Vec<super::SaiRecord> = Vec::new();
+        let mut moof_psshes: Vec<super::MoofPsshRecord> = Vec::new();
+        super::parse_moof(
+            &moof,
+            &[],
+            &mut samples,
+            &mut next_dts,
+            &mut senc,
+            &mut sai,
+            &mut moof_psshes,
+        )
+        .expect("moof walk succeeds");
+
+        assert_eq!(moof_psshes.len(), 1);
+        assert_eq!(moof_psshes[0].moof_sequence, 99);
+        assert_eq!(moof_psshes[0].pssh.system_id, sysid);
+        assert_eq!(moof_psshes[0].pssh.data, data);
+    }
+
+    /// A malformed pssh inside a moof (here a truncated body) is
+    /// dropped without aborting the moof walk — mirrors the moov-level
+    /// recovery policy: a forged DRM box must not brick the demuxer
+    /// for unrelated playback (or for any non-decrypting workflow).
+    #[test]
+    fn parse_moof_drops_malformed_pssh_silently() {
+        // Truncated pssh body: just FullBox header, no SystemID/data.
+        let bad = vec![0u8; 4];
+        let body = build_moof_body_with_pssh(3, &[bad]);
+        let moof = super::MoofRecord {
+            moof_start: 0,
+            body,
+        };
+        let mut samples: Vec<super::SampleRef> = Vec::new();
+        let mut next_dts: Vec<i64> = Vec::new();
+        let mut senc: Vec<super::SencRecord> = Vec::new();
+        let mut sai: Vec<super::SaiRecord> = Vec::new();
+        let mut moof_psshes: Vec<super::MoofPsshRecord> = Vec::new();
+        super::parse_moof(
+            &moof,
+            &[],
+            &mut samples,
+            &mut next_dts,
+            &mut senc,
+            &mut sai,
+            &mut moof_psshes,
+        )
+        .expect("walk succeeds despite bad pssh");
+        assert!(moof_psshes.is_empty(), "malformed pssh dropped silently");
     }
 }

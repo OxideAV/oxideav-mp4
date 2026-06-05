@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- moof-level `pssh` (ProtectionSystemSpecificHeaderBox) parsing per
+  ISO/IEC 23001-7:2016 §8.1.1 — round 239. §8.1.1 lists the box's
+  container as "Movie (`moov`) or Movie Fragment (`moof`)", and the
+  same clause's normative reader rule pins fragment-scoped
+  lookups: "readers SHALL examine all Protection System Specific
+  Header boxes in the Movie Box and in the Movie Fragment Box
+  associated with the sample (but not those in other Movie
+  Fragment Boxes)". The fragmented walk (`parse_moof`) now
+  collects each `pssh` directly inside a `moof` into a new
+  `demux::MoofPsshRecord` (`pssh: cenc::PsshBox`,
+  `moof_sequence: u32`), keying each by the enclosing
+  `mfhd.sequence_number` so the §8.1.1 scope can be honoured by a
+  downstream DRM layer without re-walking the file. Records land
+  in moof-walk order and preserve the on-wire walk order across
+  multiple pssh boxes per fragment (the "single file constructed
+  to be playable by multiple key/DRM systems" shape called out in
+  §8.1.1). v0 (no KID list) and v1 (KID_count + KIDs) are both
+  supported through the existing `cenc::parse_pssh` path; a
+  malformed pssh inside a moof is dropped without aborting the
+  fragment, mirroring the moov-level recovery policy. Surfaced
+  through `Demuxer::metadata()` as `moof_pssh_<n>` keys with value
+  `"systemid=<hex> seq=<mfhd_seq> kids=<n> data=<len>"`; structured
+  records are reachable via the new `Mp4Demuxer::moof_psshes()`
+  accessor. pssh that precedes the `mfhd` inside a moof (§8.8 lists
+  mfhd first but does not forbid other top-level boxes preceding
+  it) still binds to the correct sequence_number via a
+  buffered-finalize pass. Four unit tests cover the canonical
+  mfhd-then-pssh case, two-pssh-per-fragment (v0 + v1), pssh-before
+  -mfhd ordering, and silent recovery from a truncated pssh body.
+
 - Typed CENC scheme-decision router + `seig` sample-group entry
   parser (ISO/IEC 23001-7:2016 §4.2 / §6 / §10 — round 235). The
   four protection schemes defined in §10 — `cenc` (AES-CTR full /
