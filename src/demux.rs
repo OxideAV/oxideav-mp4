@@ -3492,6 +3492,130 @@ const TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT: u32 = 0x000800;
 /// (ISO/IEC 14496-12 §8.8.3.1, byte 3 bit 0 of the 32-bit field).
 const SAMPLE_IS_NON_SYNC: u32 = 0x0001_0000;
 
+/// Decoded `sample_flags` (ISO/IEC 14496-12 §8.8.3.1) — the 32-bit
+/// field that appears as `default_sample_flags` in `trex` (§8.8.3) and
+/// `tfhd` (§8.8.7), and as `first_sample_flags` / per-sample
+/// `sample_flags` in `trun` (§8.8.8). All four sites share one packing.
+///
+/// On-wire layout, MSB to LSB (§8.8.3.1):
+///
+/// ```text
+/// bit(4)            reserved = 0;
+/// unsigned int(2)   is_leading;                  // bits 27..26
+/// unsigned int(2)   sample_depends_on;           // bits 25..24
+/// unsigned int(2)   sample_is_depended_on;       // bits 23..22
+/// unsigned int(2)   sample_has_redundancy;       // bits 21..20
+/// bit(3)            sample_padding_value;        // bits 19..17
+/// bit(1)            sample_is_non_sync_sample;   // bit  16
+/// unsigned int(16)  sample_degradation_priority; // bits 15..0
+/// ```
+///
+/// The four 2-bit fields (`is_leading`, `sample_depends_on`,
+/// `sample_is_depended_on`, `sample_has_redundancy`) share their
+/// value semantics with the `sdtp` (SampleDependencyTypeBox) entries —
+/// §8.8.3.1 says they are "defined as documented in the Independent
+/// and Disposable Samples Box" (§8.6.4). `sample_is_non_sync_sample`
+/// inverts the §8.6.2 sync-sample table semantics: when the flag is 0
+/// the sample is a sync (key) sample. `sample_padding_value` and
+/// `sample_degradation_priority` carry the same meanings as the
+/// `padb` / `stdp` (Padding / DegradationPriority) box entries.
+///
+/// The fields preserve the on-wire small-integer encoding rather than
+/// being mapped to typed enums: §8.6.4.3's value tables use `0` as
+/// "unknown" with format-specific overrides, and surfacing the raw
+/// values keeps callers in charge of those overrides (matching the
+/// approach taken for the private `SdtpEntry` already in this module).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SampleFlags {
+    /// 2 bits (bits 27..26). §8.6.4.3 / §8.8.3.1.
+    /// `0` = leading nature unknown, `1` = leading with a dependency
+    /// before the referenced I-picture (not decodable),
+    /// `2` = not a leading sample, `3` = leading without that
+    /// dependency (decodable).
+    pub is_leading: u8,
+    /// 2 bits (bits 25..24). §8.6.4.3 / §8.8.3.1.
+    /// `0` = dependency unknown, `1` = depends on others (not an
+    /// I-picture), `2` = does not depend on others (I-picture),
+    /// `3` = reserved.
+    pub sample_depends_on: u8,
+    /// 2 bits (bits 23..22). §8.6.4.3 / §8.8.3.1.
+    /// `0` = unknown, `1` = other samples may depend on this one
+    /// (not disposable), `2` = no other sample depends on this one
+    /// (disposable), `3` = reserved.
+    pub sample_is_depended_on: u8,
+    /// 2 bits (bits 21..20). §8.6.4.3 / §8.8.3.1.
+    /// `0` = redundancy unknown, `1` = redundant coding present,
+    /// `2` = no redundant coding, `3` = reserved.
+    pub sample_has_redundancy: u8,
+    /// 3 bits (bits 19..17). §8.8.3.1 — "defined as for the padding
+    /// bits". Carried verbatim without further interpretation.
+    pub sample_padding_value: u8,
+    /// 1 bit (bit 16). §8.8.3.1 — when `false` the sample is a sync
+    /// (key) sample, mirroring the §8.6.2 sync-sample table absence
+    /// semantics ("as if … all samples are sync samples, the sync
+    /// sample table were absent").
+    pub sample_is_non_sync_sample: bool,
+    /// 16 bits (bits 15..0). §8.8.3.1 — "defined as for the
+    /// degradation priority table" (§8.5.3). Producers that don't
+    /// carry per-sample priority leave this zero.
+    pub sample_degradation_priority: u16,
+}
+
+impl SampleFlags {
+    /// Decode the 32-bit packed `sample_flags` field per §8.8.3.1.
+    ///
+    /// The top 4 reserved bits are not surfaced — §8.8.3.1 fixes them
+    /// to zero, but we accept non-zero reserved bits without rejecting
+    /// (the spec is silent on producer-side enforcement, and a
+    /// well-formed reader should tolerate them rather than refuse the
+    /// fragment).
+    pub fn from_u32(raw: u32) -> Self {
+        Self {
+            is_leading: ((raw >> 26) & 0x03) as u8,
+            sample_depends_on: ((raw >> 24) & 0x03) as u8,
+            sample_is_depended_on: ((raw >> 22) & 0x03) as u8,
+            sample_has_redundancy: ((raw >> 20) & 0x03) as u8,
+            sample_padding_value: ((raw >> 17) & 0x07) as u8,
+            sample_is_non_sync_sample: (raw & SAMPLE_IS_NON_SYNC) != 0,
+            sample_degradation_priority: (raw & 0xFFFF) as u16,
+        }
+    }
+
+    /// Round-trip helper — pack the typed fields back into the on-wire
+    /// 32-bit form. Reserved bits 31..28 are emitted as zero per
+    /// §8.8.3.1. Field widths are masked so out-of-range values do not
+    /// bleed into neighbouring fields.
+    pub fn to_u32(self) -> u32 {
+        ((self.is_leading as u32 & 0x03) << 26)
+            | ((self.sample_depends_on as u32 & 0x03) << 24)
+            | ((self.sample_is_depended_on as u32 & 0x03) << 22)
+            | ((self.sample_has_redundancy as u32 & 0x03) << 20)
+            | ((self.sample_padding_value as u32 & 0x07) << 17)
+            | (if self.sample_is_non_sync_sample {
+                SAMPLE_IS_NON_SYNC
+            } else {
+                0
+            })
+            | self.sample_degradation_priority as u32
+    }
+
+    /// `true` when this is a sync (key) sample — the inverse of
+    /// `sample_is_non_sync_sample` per §8.8.3.1. Provided as a
+    /// convenience because §8.6.2 / §8.8.3.1 / §8.8.8 all use the
+    /// "absence = sync" convention and downstream code typically
+    /// wants the positive predicate.
+    pub fn is_sync_sample(self) -> bool {
+        !self.sample_is_non_sync_sample
+    }
+}
+
+/// Public §8.8.3.1 typed-accessor convenience — `pub` re-export of
+/// [`SampleFlags::from_u32`] for callers that have the raw on-wire
+/// `u32` from a `trex` / `tfhd` / `trun` parse.
+pub fn parse_sample_flags(raw: u32) -> SampleFlags {
+    SampleFlags::from_u32(raw)
+}
+
 #[allow(clippy::too_many_arguments)] // tfhd / tfdt / senc / saiz / saio inputs are independent state carried through the same walk; bundling them into a struct hides the per-box ownership and obscures the moof→traf data flow
 fn parse_traf(
     body: &[u8],
@@ -8494,5 +8618,168 @@ mod tests {
         )
         .expect("walk succeeds despite bad pssh");
         assert!(moof_psshes.is_empty(), "malformed pssh dropped silently");
+    }
+
+    // ----- §8.8.3.1 sample_flags typed accessor -----------------------------
+
+    #[test]
+    fn sample_flags_all_zero_decodes_to_sync_sample() {
+        // §8.8.3.1: when the field is 0 every 2-bit/3-bit/16-bit
+        // subfield is "unknown" / zero and the sync-sample bit is
+        // clear → sample IS a sync sample.
+        let f = super::SampleFlags::from_u32(0);
+        assert_eq!(f.is_leading, 0);
+        assert_eq!(f.sample_depends_on, 0);
+        assert_eq!(f.sample_is_depended_on, 0);
+        assert_eq!(f.sample_has_redundancy, 0);
+        assert_eq!(f.sample_padding_value, 0);
+        assert!(!f.sample_is_non_sync_sample);
+        assert!(f.is_sync_sample());
+        assert_eq!(f.sample_degradation_priority, 0);
+    }
+
+    #[test]
+    fn sample_flags_non_sync_bit_only() {
+        // The widely-used "non-sync sample" marker — every other
+        // subfield zero, just bit 16 set. Sentinel: 0x0001_0000.
+        let f = super::SampleFlags::from_u32(0x0001_0000);
+        assert!(f.sample_is_non_sync_sample);
+        assert!(!f.is_sync_sample());
+        assert_eq!(f.is_leading, 0);
+        assert_eq!(f.sample_depends_on, 0);
+        assert_eq!(f.sample_degradation_priority, 0);
+    }
+
+    #[test]
+    fn sample_flags_i_picture_pattern() {
+        // §8.6.4.3 / §8.8.3.1 convention for a typical I-picture
+        // (used by every fMP4 producer for the SAP-1 frame of a
+        // fragment): is_leading=2 (not leading),
+        // sample_depends_on=2 (does not depend on others →
+        // I-picture), sample_is_depended_on=1 (others may depend),
+        // sample_has_redundancy=0 (unknown), padding=0,
+        // non_sync=0, priority=0.
+        //
+        // Bit packing (§8.8.3.1, per-field shifts):
+        //   is_leading           << 26 = 2 << 26 = 0x0800_0000
+        //   sample_depends_on    << 24 = 2 << 24 = 0x0200_0000
+        //   sample_is_depended_on<< 22 = 1 << 22 = 0x0040_0000
+        //   everything else                       = 0
+        //   total                                 = 0x0A40_0000
+        let raw: u32 = 0x0A40_0000;
+        let f = super::SampleFlags::from_u32(raw);
+        assert_eq!(f.is_leading, 2);
+        assert_eq!(f.sample_depends_on, 2);
+        assert_eq!(f.sample_is_depended_on, 1);
+        assert_eq!(f.sample_has_redundancy, 0);
+        assert!(!f.sample_is_non_sync_sample);
+        assert!(f.is_sync_sample());
+        assert_eq!(f.sample_padding_value, 0);
+        assert_eq!(f.sample_degradation_priority, 0);
+        // Round-trip — reserved bits 31..28 stay zero per §8.8.3.1.
+        assert_eq!(f.to_u32(), raw);
+    }
+
+    #[test]
+    fn sample_flags_b_picture_pattern() {
+        // Typical B-picture pattern in fMP4:
+        // is_leading=0 (unknown), sample_depends_on=1 (depends on
+        // others), sample_is_depended_on=2 (no one depends → safely
+        // disposable), redundancy=0, padding=0, non_sync=1,
+        // priority=0.
+        //
+        // Bit packing (§8.8.3.1, per-field shifts):
+        //   sample_depends_on    << 24 = 1 << 24 = 0x0100_0000
+        //   sample_is_depended_on<< 22 = 2 << 22 = 0x0080_0000
+        //   sample_is_non_sync_sample  = bit 16   = 0x0001_0000
+        //   total                                 = 0x0181_0000
+        let raw: u32 = 0x0181_0000;
+        let f = super::SampleFlags::from_u32(raw);
+        assert_eq!(f.is_leading, 0);
+        assert_eq!(f.sample_depends_on, 1);
+        assert_eq!(f.sample_is_depended_on, 2);
+        assert_eq!(f.sample_has_redundancy, 0);
+        assert!(f.sample_is_non_sync_sample);
+        assert!(!f.is_sync_sample());
+        assert_eq!(f.sample_padding_value, 0);
+        assert_eq!(f.sample_degradation_priority, 0);
+        assert_eq!(f.to_u32(), raw);
+    }
+
+    #[test]
+    fn sample_flags_degradation_priority_field_is_low_16_bits() {
+        // Carry only the low 16 bits — exercises the degradation
+        // priority decode path independently. 0xBEEF is arbitrary
+        // and chosen so the byte boundary is visible.
+        let f = super::SampleFlags::from_u32(0x0000_BEEF);
+        assert_eq!(f.sample_degradation_priority, 0xBEEF);
+        assert_eq!(f.is_leading, 0);
+        assert_eq!(f.sample_depends_on, 0);
+        assert_eq!(f.sample_is_depended_on, 0);
+        assert_eq!(f.sample_has_redundancy, 0);
+        assert_eq!(f.sample_padding_value, 0);
+        assert!(!f.sample_is_non_sync_sample);
+    }
+
+    #[test]
+    fn sample_flags_padding_field_round_trips() {
+        // sample_padding_value is 3 bits — values 0..=7 are legal.
+        // Exercise the full range to catch a shift / mask bug in
+        // the bits 19..17 window.
+        for pad in 0u8..=7 {
+            let f = super::SampleFlags {
+                sample_padding_value: pad,
+                ..Default::default()
+            };
+            let round = super::SampleFlags::from_u32(f.to_u32());
+            assert_eq!(round.sample_padding_value, pad);
+            assert_eq!(round, f);
+        }
+    }
+
+    #[test]
+    fn sample_flags_reserved_bits_ignored_on_decode() {
+        // §8.8.3.1 fixes bits 31..28 to zero, but we tolerate a
+        // producer that sets them (silent-recovery posture matching
+        // the rest of the demuxer). A decode then re-encode strips
+        // the reserved bits back to zero.
+        let raw = 0xF000_0000_u32 | 0x0001_0000_u32; // reserved + non-sync
+        let f = super::SampleFlags::from_u32(raw);
+        assert!(f.sample_is_non_sync_sample);
+        // Re-encoding emits clean reserved=0.
+        assert_eq!(f.to_u32(), 0x0001_0000);
+    }
+
+    #[test]
+    fn sample_flags_all_field_widths_round_trip() {
+        // Saturate every field at its maximum legal value to confirm
+        // no field bleeds into a neighbour's window.
+        let f = super::SampleFlags {
+            is_leading: 3,
+            sample_depends_on: 3,
+            sample_is_depended_on: 3,
+            sample_has_redundancy: 3,
+            sample_padding_value: 7,
+            sample_is_non_sync_sample: true,
+            sample_degradation_priority: 0xFFFF,
+        };
+        let raw = f.to_u32();
+        // reserved=0000 then five-pairs-saturated then padding=111
+        // then non_sync=1 then priority=0xFFFF
+        // = 0000 11 11 11 11 111 1 1111111111111111
+        // = 0x0FFF_FFFF
+        assert_eq!(raw, 0x0FFF_FFFF);
+        assert_eq!(super::SampleFlags::from_u32(raw), f);
+    }
+
+    #[test]
+    fn parse_sample_flags_public_helper_matches_struct() {
+        // Confirms the free-function entry point routes through
+        // SampleFlags::from_u32 unchanged.
+        let raw = 0x0244_0000_u32;
+        assert_eq!(
+            super::parse_sample_flags(raw),
+            super::SampleFlags::from_u32(raw)
+        );
     }
 }

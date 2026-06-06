@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed accessor for the §8.8.3.1 `sample_flags` 32-bit field — round
+  242. The same packed `u32` appears in four sites across ISO/IEC
+  14496-12: `default_sample_flags` in `trex` (§8.8.3) and `tfhd`
+  (§8.8.7), and `first_sample_flags` / per-sample `sample_flags` in
+  `trun` (§8.8.8). §8.8.3.1 fixes the on-wire layout (MSB→LSB):
+  `bit(4) reserved=0; unsigned int(2) is_leading; unsigned int(2)
+  sample_depends_on; unsigned int(2) sample_is_depended_on; unsigned
+  int(2) sample_has_redundancy; bit(3) sample_padding_value; bit(1)
+  sample_is_non_sync_sample; unsigned int(16)
+  sample_degradation_priority;`. The new `demux::SampleFlags` struct
+  surfaces each named field together with `SampleFlags::from_u32` /
+  `to_u32` round-trip helpers and `is_sync_sample()` for the positive
+  predicate (the inverse of the §8.8.3.1 non-sync bit, matching the
+  §8.6.2 "absence = sync" convention). A free-function
+  `demux::parse_sample_flags` provides a thin entry point for callers
+  that hold the raw `u32` from a `trex`/`tfhd`/`trun` parse. §8.8.3.1
+  cross-references the §8.6.4.3 value tables for the four 2-bit
+  enums — the typed accessor surfaces the raw 2-bit small-int rather
+  than mapping to a typed enum, mirroring the existing private
+  `SdtpEntry` parser policy so callers stay in charge of the
+  format-specific value overrides §8.6.4.3 allows. Decoder tolerates
+  non-zero `reserved` bits (silent recovery, matching the rest of
+  the demuxer); re-encode strips them back to zero per §8.8.3.1.
+  Field-width masking on encode prevents an out-of-range field from
+  bleeding into its neighbour. Nine unit tests cover the all-zero
+  (sync) decode, the non-sync-only sentinel `0x0001_0000`, the
+  canonical fMP4 I-picture and B-picture patterns, low-16-bit
+  degradation-priority isolation, the 3-bit padding field's full 0..7
+  range, the saturated all-fields round-trip (`0x0FFF_FFFF`),
+  reserved-bit tolerance, and the free-function/struct equivalence.
 - moof-level `pssh` (ProtectionSystemSpecificHeaderBox) parsing per
   ISO/IEC 23001-7:2016 §8.1.1 — round 239. §8.1.1 lists the box's
   container as "Movie (`moov`) or Movie Fragment (`moof`)", and the
