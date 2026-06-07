@@ -533,6 +533,15 @@ struct Track {
     /// multiple `kind` boxes from different schemes can co-label the
     /// same track (spec example: two schemes both declaring "subtitles").
     kinds: Vec<(String, String)>,
+    /// §8.10.2 — `cprt` (CopyrightBox) entries from the track-level
+    /// `udta`. Each record pairs a packed-3-letter ISO 639-2/T language
+    /// code with the decoded notice string. Quantity "zero or more":
+    /// a producer can attach one box per language for a multi-lingual
+    /// per-track copyright. Distinct from the lumped 3GPP-style
+    /// metadata in `Mp4Demuxer::metadata` because the typed shape
+    /// preserves the language tag. Empty when the track has no `cprt`
+    /// (the common case).
+    copyrights: Vec<CopyrightRecord>,
     /// §8.10.3 — `tsel` (TrackSelectionBox) from the track-level `udta`.
     /// The `switch_group` (signed; default 0) names a switching set
     /// within the alternate group declared on `tkhd` (§8.3.2): two
@@ -879,6 +888,38 @@ struct TselBox {
     /// Order matches the on-disk order. Empty when the box body
     /// carried only the `switch_group`.
     attribute_list: Vec<[u8; 4]>,
+}
+
+/// Decoded `cprt` (CopyrightBox, ISO/IEC 14496-12 §8.10.2). Carried in a
+/// `udta` container — `moov/udta` for a file-wide notice or `trak/udta`
+/// for a per-track notice — and surfaced separately from the lumped
+/// 3GPP-style `udta` metadata channel because the typed shape exposes
+/// the language code alongside the notice (so a multilingual presentation
+/// can be reconstructed without re-parsing the box).
+///
+/// Spec syntax (§8.10.2.2): `FullBox('cprt', 0, 0) { bit(1) pad = 0;
+/// unsigned int(5)[3] language; string notice; }`. The 16-bit language
+/// word packs three lower-case ISO 639-2/T characters, each stored as
+/// `(ASCII - 0x60)`; the notice is a NULL-terminated UTF-8 (or
+/// UTF-16BE-with-BOM) string.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CopyrightRecord {
+    /// ISO 639-2/T three-letter language code (lower-case ASCII),
+    /// decoded from the packed 16-bit `language` word (§8.10.2.3).
+    /// Each byte equals the literal character `'a'..='z'`. When the box
+    /// carries the packed sentinel `\0\0\0` (i.e. `0x0000`, which decodes
+    /// to `0x60 0x60 0x60` = backticks rather than letters), the field
+    /// is left as ASCII backticks because the spec wording confines
+    /// well-formed values to "lower-case letters" only — a producer
+    /// that emitted a zero word is signalling "language unspecified"
+    /// per the §8.10.2.3 well-formedness rule, and the reader leaves
+    /// the literal decoded bytes for the caller to recognise.
+    language: [u8; 3],
+    /// The decoded copyright notice. UTF-8 by default; if the on-wire
+    /// string opened with the UTF-16 BOM (0xFE 0xFF) the bytes were
+    /// re-decoded as UTF-16BE. The trailing NUL terminator (§8.10.2.3)
+    /// is stripped before storage.
+    notice: String,
 }
 
 /// Single entry of an `elst` (EditListBox).
@@ -1287,6 +1328,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         trgr: Vec::new(),
         elng: None,
         kinds: Vec::new(),
+        copyrights: Vec::new(),
         tsel: None,
         cslg: None,
         stsh: Vec::new(),
@@ -1348,12 +1390,14 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
 /// Walk a *track-level* `udta` body and pick up any boxes whose semantics
 /// are per-track rather than per-movie. The moov-level `udta` parser
 /// (`parse_udta`) handles file-wide 3GPP / iTunes metadata; the
-/// track-level container additionally hosts `kind` (§8.10.4) plus —
-/// historically — per-track copyright / title overrides. We only
-/// implement `kind` here because that is the box whose presence has a
-/// well-defined effect on downstream stream routing; other children are
-/// skipped so a future round can add them without changing the entry
-/// point.
+/// track-level container additionally hosts `kind` (§8.10.4), `tsel`
+/// (§8.10.3), and `cprt` (§8.10.2 — per-track copyright). The `cprt`
+/// handler here is the BMFF typed-accessor path that preserves the
+/// 16-bit packed ISO 639-2/T language code alongside the notice — the
+/// 3GPP-style `udta` aggregator in `parse_udta` lumps `cprt` into the
+/// generic `(key, value)` metadata channel and drops the language tag.
+/// Other children (e.g. legacy `titl` overrides) are skipped so a
+/// future round can add them without changing the entry point.
 fn parse_track_udta(body: &[u8], t: &mut Track) {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
@@ -1371,6 +1415,7 @@ fn parse_track_udta(body: &[u8], t: &mut Track) {
         match hdr.fourcc {
             KIND => parse_kind(&body[start..start + psz], t),
             TSEL => parse_tsel(&body[start..start + psz], t),
+            CPRT => parse_cprt(&body[start..start + psz], t),
             _ => {
                 // Other track-udta children (e.g. legacy `titl` overrides)
                 // are skipped — file-wide metadata is collected from the
@@ -1378,6 +1423,59 @@ fn parse_track_udta(body: &[u8], t: &mut Track) {
             }
         }
     }
+}
+
+/// §8.10.2 — `cprt` (CopyrightBox) typed accessor. FullBox preamble
+/// (1 version + 3 flags) followed by a 16-bit packed language word and
+/// then the NULL-terminated notice string.
+///
+/// Language decoding (§8.10.2.3): the 16-bit big-endian word splits as
+/// `1 pad bit + 5 * 3` so the three 5-bit fields are read MSB-first; each
+/// field equals `(ASCII - 0x60)` for one lower-case ISO 639-2/T character.
+/// We reverse the offset to recover the literal character. A value
+/// outside `0x01..=0x1A` (i.e. not a valid 'a'..'z' offset) is left in
+/// the raw bits — the spec confines well-formed inputs to lowercase
+/// letters, so an out-of-range nibble signals a producer that emitted
+/// a zero / sentinel word; the reader records the literal decoded bytes
+/// for the caller to recognise.
+///
+/// Notice decoding (§8.10.2.3): the bytes immediately after the language
+/// word are the C-string notice. When the first two bytes are the
+/// UTF-16 BOM (0xFE 0xFF) the remainder is interpreted as UTF-16BE per
+/// the spec; otherwise the bytes are UTF-8. In both cases the trailing
+/// NUL terminator is stripped before storage. An empty notice (just a
+/// terminator) is preserved as an empty string — that still represents
+/// a well-formed declaration of language and is not the same as the
+/// absence of a `cprt` box.
+///
+/// Robustness: a non-zero FullBox version is unknown to this spec
+/// revision and the box is dropped; a body too short to hold the
+/// FullBox + language word is dropped; a notice that fails UTF-8
+/// validation is replaced lossily (matching `decode_utf8_or_utf16`'s
+/// posture) so a corrupt notice never aborts the demux.
+fn parse_cprt(body: &[u8], t: &mut Track) {
+    // FullBox preamble (1 version + 3 flags) + 16-bit packed language.
+    if body.len() < 6 {
+        return;
+    }
+    let version = body[0];
+    if version != 0 {
+        // §8.10.2.2 pins the box to version 0.
+        return;
+    }
+    // 16-bit packed language word: bit 15 is the pad, then three 5-bit
+    // characters. Each 5-bit value is (ASCII - 0x60); reverse the offset
+    // to recover the literal lowercase ASCII letter (a..z = 0x61..0x7A,
+    // offsets 0x01..0x1A).
+    let packed = u16::from_be_bytes([body[4], body[5]]);
+    let c0 = ((packed >> 10) & 0x1F) as u8;
+    let c1 = ((packed >> 5) & 0x1F) as u8;
+    let c2 = (packed & 0x1F) as u8;
+    let language = [c0 + 0x60, c1 + 0x60, c2 + 0x60];
+    // Notice: UTF-16BE if it opens with the BOM (0xFE 0xFF), UTF-8
+    // otherwise. Strip the trailing NUL terminator per §8.10.2.3.
+    let notice = decode_utf8_or_utf16(&body[6..]);
+    t.copyrights.push(CopyrightRecord { language, notice });
 }
 
 /// §8.10.4 — `kind` (KindBox). FullBox preamble (version 0, flags 0)
@@ -4731,6 +4829,42 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert(format!("kind_{}", i), v);
     }
 
+    // ISO/IEC 14496-12 §8.10.2: surface each track-level `cprt`
+    // (CopyrightBox) on `params.options` as a pair: `copyright_<n>`
+    // carries the decoded notice string and `copyright_<n>_lang` carries
+    // the 3-letter ISO 639-2/T language code. The key is omitted when
+    // the notice is empty, mirroring the `kind_<n>` posture that a
+    // value-less informational box does not pollute the option map; the
+    // accompanying `_lang` key is still emitted for a present-but-empty
+    // notice when the language tag itself is well-formed ASCII letters,
+    // so a consumer can tell "track declares an empty notice in `eng`"
+    // from "track has no `cprt` at all". When the decoded language
+    // bytes are outside the spec's `'a'..='z'` range (a malformed or
+    // zero-packed source word) the `_lang` key falls back to 8-digit
+    // hex of the raw 16-bit packed value, matching the `tref_<type>` /
+    // `trgr_<n>` non-printable fallback convention.
+    for (i, c) in t.copyrights.iter().enumerate() {
+        let lang_str = if c.language.iter().all(|&b| b.is_ascii_lowercase()) {
+            std::str::from_utf8(&c.language).unwrap().to_string()
+        } else {
+            // Reverse the packed-language decode to recover the original
+            // 16-bit word for a stable surface even when the bytes are
+            // out of the spec's lowercase-letter range.
+            let raw: u32 = ((c.language[0].wrapping_sub(0x60) as u32) << 10)
+                | ((c.language[1].wrapping_sub(0x60) as u32) << 5)
+                | (c.language[2].wrapping_sub(0x60) as u32);
+            format!("{:08x}", raw)
+        };
+        if !c.notice.is_empty() {
+            params
+                .options
+                .insert(format!("copyright_{}", i), c.notice.clone());
+        }
+        params
+            .options
+            .insert(format!("copyright_{}_lang", i), lang_str);
+    }
+
     // ISO/IEC 14496-12 §8.10.3: surface the optional `tsel`
     // (TrackSelectionBox) — when present, emit two `params.options`
     // keys. `tsel_switch_group` is the signed 32-bit identifier
@@ -5680,6 +5814,7 @@ mod tests {
             trgr: Vec::new(),
             elng: None,
             kinds: Vec::new(),
+            copyrights: Vec::new(),
             tsel: None,
             cslg: None,
             stsh: Vec::new(),
@@ -6854,6 +6989,218 @@ mod tests {
         assert_eq!(t.kinds.len(), 1);
         assert_eq!(t.kinds[0].0, "urn:mpeg:dash:role:2011");
         assert_eq!(t.kinds[0].1, "main");
+    }
+
+    /// Builds the 16-bit packed language word of an ISO/IEC 14496-12
+    /// §8.10.2.3 `cprt` box from a 3-letter ASCII lowercase tag.
+    /// Each character contributes 5 bits of `(c - 0x60)` and the
+    /// padding bit at position 15 is 0.
+    fn pack_lang(tag: &[u8; 3]) -> [u8; 2] {
+        let c0 = (tag[0] - 0x60) as u16;
+        let c1 = (tag[1] - 0x60) as u16;
+        let c2 = (tag[2] - 0x60) as u16;
+        let packed = (c0 << 10) | (c1 << 5) | c2;
+        packed.to_be_bytes()
+    }
+
+    /// §8.10.2 — `cprt` (CopyrightBox) ASCII case: FullBox preamble +
+    /// packed `eng` language + NULL-terminated UTF-8 notice. The decoded
+    /// record carries the 3-letter language tag and the notice without
+    /// the trailing NUL.
+    #[test]
+    fn parse_cprt_ascii_eng_notice() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox version 0 + flags 0
+        body.extend_from_slice(&pack_lang(b"eng"));
+        body.extend_from_slice(b"(c) 2026 Example\0");
+        let mut t = fresh_track();
+        super::parse_cprt(&body, &mut t);
+        assert_eq!(t.copyrights.len(), 1);
+        assert_eq!(&t.copyrights[0].language, b"eng");
+        assert_eq!(t.copyrights[0].notice, "(c) 2026 Example");
+    }
+
+    /// §8.10.2 — `cprt` with a UTF-16BE notice (the spec's
+    /// "if UTF-16 is used, the string shall start with the BYTE ORDER
+    /// MARK (0xFEFF)" path). The BOM is consumed and the notice is
+    /// decoded to a native String — the UTF-16 NUL-terminator pair at
+    /// the end is also stripped.
+    #[test]
+    fn parse_cprt_utf16be_notice_with_bom() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox
+        body.extend_from_slice(&pack_lang(b"jpn"));
+        // BOM + "あ" (U+3042) + NULL terminator (U+0000).
+        body.extend_from_slice(&[0xFE, 0xFF]);
+        body.extend_from_slice(&[0x30, 0x42]);
+        body.extend_from_slice(&[0x00, 0x00]);
+        let mut t = fresh_track();
+        super::parse_cprt(&body, &mut t);
+        assert_eq!(t.copyrights.len(), 1);
+        assert_eq!(&t.copyrights[0].language, b"jpn");
+        assert_eq!(t.copyrights[0].notice, "あ");
+    }
+
+    /// A `cprt` box with a non-zero FullBox version is unknown to the
+    /// §8.10.2.2 syntax (which pins it to 0); the box is silently
+    /// dropped — a forward-incompatible layout should not abort the
+    /// demux nor inject an entry with potentially-wrong byte offsets.
+    #[test]
+    fn parse_cprt_unknown_version_is_dropped() {
+        let mut body = Vec::new();
+        body.push(1); // version = 1 (not defined by §8.10.2.2)
+        body.extend_from_slice(&[0u8; 3]); // flags
+        body.extend_from_slice(&pack_lang(b"eng"));
+        body.extend_from_slice(b"ignored\0");
+        let mut t = fresh_track();
+        super::parse_cprt(&body, &mut t);
+        assert!(t.copyrights.is_empty());
+    }
+
+    /// A `cprt` body shorter than the FullBox + language word (6 bytes)
+    /// is silently dropped — the box is informational and a malformed
+    /// entry should never abort the demux (mirrors `parse_kind`'s
+    /// posture).
+    #[test]
+    fn parse_cprt_too_short_is_silently_dropped() {
+        let mut t = fresh_track();
+        super::parse_cprt(&[0, 0, 0, 0, 0], &mut t);
+        assert!(t.copyrights.is_empty());
+    }
+
+    /// A `cprt` with an empty notice (just the FullBox + language +
+    /// terminator) is preserved as an empty-string entry. The decoded
+    /// language tag is still meaningful — "the track declares an empty
+    /// notice for this language" is not the same as the absence of
+    /// any `cprt` box.
+    #[test]
+    fn parse_cprt_empty_notice_preserves_language() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(&pack_lang(b"fra"));
+        body.push(0); // notice is just the terminator
+        let mut t = fresh_track();
+        super::parse_cprt(&body, &mut t);
+        assert_eq!(t.copyrights.len(), 1);
+        assert_eq!(&t.copyrights[0].language, b"fra");
+        assert_eq!(t.copyrights[0].notice, "");
+    }
+
+    /// Multiple `cprt` boxes inside the same track-level `udta` —
+    /// §8.10.2.1's "Quantity: Zero or more" — each lands as a distinct
+    /// record in encounter order. The canonical use-case is a
+    /// multilingual copyright (one box per language).
+    #[test]
+    fn parse_track_udta_collects_multiple_cprts() {
+        let mut c1 = Vec::new();
+        c1.extend_from_slice(&[0u8; 4]);
+        c1.extend_from_slice(&pack_lang(b"eng"));
+        c1.extend_from_slice(b"(c) 2026 Example\0");
+        let mut c2 = Vec::new();
+        c2.extend_from_slice(&[0u8; 4]);
+        c2.extend_from_slice(&pack_lang(b"fra"));
+        c2.extend_from_slice(b"(c) 2026 Exemple\0");
+
+        let mut udta = Vec::new();
+        udta.extend(wrap_box_full_size(b"cprt", &c1));
+        udta.extend(wrap_box_full_size(b"cprt", &c2));
+
+        let mut t = fresh_track();
+        super::parse_track_udta(&udta, &mut t);
+        assert_eq!(t.copyrights.len(), 2);
+        assert_eq!(&t.copyrights[0].language, b"eng");
+        assert_eq!(t.copyrights[0].notice, "(c) 2026 Example");
+        assert_eq!(&t.copyrights[1].language, b"fra");
+        assert_eq!(t.copyrights[1].notice, "(c) 2026 Exemple");
+    }
+
+    /// Surfacing: each parsed `cprt` record shows up on `params.options`
+    /// as the pair `copyright_<n>` (notice) + `copyright_<n>_lang`
+    /// (3-letter language tag), keyed by 0-based encounter index. An
+    /// empty notice omits the notice key but keeps the `_lang` key so
+    /// a consumer can still tell "track declares an empty notice in
+    /// `eng`" from "track has no `cprt`".
+    #[test]
+    fn build_stream_info_surfaces_copyrights_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48000;
+        t.copyrights.push(super::CopyrightRecord {
+            language: *b"eng",
+            notice: "(c) 2026 Example".to_string(),
+        });
+        t.copyrights.push(super::CopyrightRecord {
+            language: *b"jpn",
+            notice: "".to_string(),
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("copyright_0"),
+            Some("(c) 2026 Example")
+        );
+        assert_eq!(info.params.options.get("copyright_0_lang"), Some("eng"));
+        assert_eq!(info.params.options.get("copyright_1"), None);
+        assert_eq!(info.params.options.get("copyright_1_lang"), Some("jpn"));
+        assert_eq!(info.params.options.get("copyright_2"), None);
+    }
+
+    /// A track with no `cprt` records surfaces no `copyright_*` options.
+    #[test]
+    fn build_stream_info_no_copyrights_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 90000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("copyright_0"), None);
+        assert_eq!(info.params.options.get("copyright_0_lang"), None);
+    }
+
+    /// End-to-end: a `cprt` box nested inside `trak/udta` is picked up
+    /// by `parse_trak` and lands on the track's `copyrights` list.
+    #[test]
+    fn parse_trak_picks_up_nested_cprt() {
+        // Minimal tkhd (v0): 84 bytes; set track_ID at offset 12.
+        let mut tkhd = vec![0u8; 84];
+        tkhd[12..16].copy_from_slice(&11u32.to_be_bytes());
+        // Minimal mdhd (v0, 24 bytes).
+        let mut mdhd = Vec::new();
+        mdhd.extend_from_slice(&[0u8; 4]); // version+flags
+        mdhd.extend_from_slice(&[0u8; 8]); // created+modified
+        mdhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+        mdhd.extend_from_slice(&0u32.to_be_bytes()); // duration
+        mdhd.extend_from_slice(&[0u8; 4]); // language + pre_defined
+                                           // Minimal hdlr identifying a video track.
+        let mut hdlr = Vec::new();
+        hdlr.extend_from_slice(&[0u8; 4]); // FullBox
+        hdlr.extend_from_slice(&[0u8; 4]); // pre_defined
+        hdlr.extend_from_slice(b"vide"); // handler_type
+        hdlr.extend_from_slice(&[0u8; 12]); // reserved
+        hdlr.push(0); // name (empty C string)
+                      // Wrap mdhd + hdlr into a minimal mdia.
+        let mut mdia = Vec::new();
+        mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
+        mdia.extend(wrap_box_full_size(b"hdlr", &hdlr));
+        // Minimal `cprt` box: language `eng`, notice "(c) 2026 Example".
+        let mut cprt = Vec::new();
+        cprt.extend_from_slice(&[0u8; 4]);
+        cprt.extend_from_slice(&pack_lang(b"eng"));
+        cprt.extend_from_slice(b"(c) 2026 Example\0");
+        // Wrap cprt in a track-level udta.
+        let mut udta = Vec::new();
+        udta.extend(wrap_box_full_size(b"cprt", &cprt));
+        // Assemble the trak body.
+        let mut trak = Vec::new();
+        trak.extend(wrap_box_full_size(b"tkhd", &tkhd));
+        trak.extend(wrap_box_full_size(b"mdia", &mdia));
+        trak.extend(wrap_box_full_size(b"udta", &udta));
+
+        let t = super::parse_trak(&trak).unwrap().unwrap();
+        assert_eq!(t.track_id, 11);
+        assert_eq!(t.copyrights.len(), 1);
+        assert_eq!(&t.copyrights[0].language, b"eng");
+        assert_eq!(t.copyrights[0].notice, "(c) 2026 Example");
     }
 
     /// §8.10.3 — `tsel` (TrackSelectionBox): FullBox preamble + signed

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Copyright Box typed accessor (ISO/IEC 14496-12 §8.10.2) — round 252.
+  A `CopyrightBox` (`cprt`) inside a track-level `udta` is now parsed
+  by the typed handler `parse_cprt`, distinct from the 3GPP-style
+  `udta` aggregator that lumps `cprt` into the file-wide flat metadata
+  channel. The 16-bit packed language word (§8.10.2.3 — 1 pad bit +
+  three 5-bit characters at `(ASCII - 0x60)`) is decoded back to a
+  3-letter ISO 639-2/T lowercase tag; the C-string notice is UTF-8
+  by default, UTF-16BE when it opens with the byte-order mark, with
+  the trailing NUL terminator stripped. Multiple `cprt` boxes per
+  track are supported (the §8.10.2.1 "Zero or more" multilingual
+  case). Each record is surfaced on `params.options` as
+  `copyright_<n>` (the notice; omitted for an empty notice so a
+  consumer can detect absent vs. empty) and `copyright_<n>_lang`
+  (the 3-letter tag; emitted even with an empty notice to preserve
+  the language declaration). A body shorter than the 6-byte FullBox
+  + language word minimum or an unknown FullBox version (§8.10.2.2
+  pins it to 0) is silently dropped — the box is informational and
+  a malformed entry never aborts the open.
 - Per-sample CENC cipher walker — round 245. The new
   `cenc::plan_sample_cipher(decision, subsamples, sample_len) ->
   Result<Vec<CipherStep>>` partitions a sample's plaintext

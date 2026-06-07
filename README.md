@@ -345,6 +345,26 @@ Sample-entry FourCCs resolve to these codec ids:
   encounter index); the value is the URI alone when no name
   follows, or `"URI value"` (space-separated, mirroring the
   `tref_<type>` convention) when both are present.
+- Track copyright (ISO/IEC 14496-12 §8.10.2, `cprt`): each
+  `CopyrightBox` inside a track-level `udta` is parsed as a typed
+  record carrying a 3-letter ISO 639-2/T language code and a decoded
+  notice string. The 16-bit packed language word (§8.10.2.3 — bit 15
+  pad + three 5-bit characters at `(ASCII - 0x60)`) is decoded back
+  to lowercase ASCII; the notice C string is UTF-8 by default and
+  UTF-16BE when it opens with the byte-order mark (0xFE 0xFF), with
+  the trailing NUL terminator stripped. Multiple `cprt` boxes per
+  track are supported — the spec's "Quantity: Zero or more" covers
+  the multilingual case (one box per language). Each record is
+  surfaced on `params.options` as the pair `copyright_<n>` (the
+  notice; key omitted when the notice is empty) and `copyright_<n>_lang`
+  (the 3-letter tag; emitted even with an empty notice so callers can
+  tell "empty notice in `eng`" from "no `cprt`"). A box body shorter
+  than the 6-byte FullBox + language word minimum or an unknown
+  FullBox version (§8.10.2.2 pins it to 0) is silently dropped — the
+  box is informational and a malformed entry never aborts the open.
+  Distinct from the 3GPP TS 26.244 `cprt` shape lumped under the
+  generic file-wide metadata channel, where the language code is
+  not surfaced separately.
 - Track selection (ISO/IEC 14496-12 §8.10.3, `tsel`): the optional
   `TrackSelectionBox` inside a track-level `udta` carries two
   media-selection signals — `switch_group` (signed 32-bit, §8.10.3.4)

@@ -267,6 +267,21 @@ pub const DATA: [u8; 4] = fourcc("data");
 /// may be empty (its terminator still present) when `schemeURI`
 /// alone fully identifies the kind. Zero or more per track.
 pub const KIND: [u8; 4] = fourcc("kind");
+/// `cprt` — Copyright Box (ISO/IEC 14496-12 §8.10.2). Sits inside a
+/// `udta` box (either inside `moov` for a file-wide copyright or inside
+/// a `trak` for a per-track copyright). FullBox(version=0, flags=0)
+/// body is a 1-bit pad + three 5-bit characters packed into 16 bits
+/// encoding an ISO 639-2/T language code (each character is the ASCII
+/// value minus 0x60), followed by a NULL-terminated UTF-8 string —
+/// or, if the first two bytes are the UTF-16 BOM (0xFEFF), a
+/// NULL-terminated UTF-16BE string — carrying the copyright notice.
+/// Quantity is zero or more: a producer can attach one box per language
+/// for multi-lingual notices. Distinct from the 3GPP TS 26.244 `cprt`
+/// shape (one of `titl` / `auth` / `cprt` / …) that lumps all the
+/// metadata strings under the same FullBox layout — the BMFF box's
+/// language and notice are surfaced separately to preserve the typed
+/// language code.
+pub const CPRT: [u8; 4] = fourcc("cprt");
 /// `tsel` — Track Selection Box (ISO/IEC 14496-12 §8.10.3). Sits in a
 /// track-level `udta`; quantity zero or one. FullBox(version=0, flags=0)
 /// body is `template int(32) switch_group = 0; unsigned int(32)
