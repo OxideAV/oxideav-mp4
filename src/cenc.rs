@@ -810,6 +810,374 @@ pub fn parse_senc(body: &[u8], per_sample_iv_size: u8) -> Result<SencBox> {
     Ok(SencBox { flags, samples })
 }
 
+// ---- Per-sample cipher walker (§9.4–9.6) ------------------------------
+
+/// The kind of byte run a [`CipherStep`] names.
+///
+/// A sample's payload bytes are partitioned into contiguous runs that
+/// either pass through verbatim ([`CipherStepKind::Clear`]) or feed the
+/// AES block call selected by the bundled [`CencSchemeDecision`]
+/// ([`CipherStepKind::Encrypted`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CipherStepKind {
+    /// Pass the byte run through verbatim — clear data (per
+    /// `BytesOfClearData`), an unencrypted pattern skip block per §9.6,
+    /// or the trailing partial block left in the clear under
+    /// `cbc1` / `cbcs` / pattern truncation rules.
+    Clear,
+    /// Feed the byte run to the AES block call selected by the
+    /// [`CencSchemeDecision::cipher_mode`] (CTR or CBC).
+    Encrypted,
+}
+
+/// One byte-level step in a sample's cipher plan.
+///
+/// Together a `Vec<CipherStep>` partitions the sample plaintext range
+/// `0..sample_len` into contiguous, non-overlapping runs. A downstream
+/// AES layer iterates the steps, applying the cipher to
+/// [`CipherStepKind::Encrypted`] runs and copying [`CipherStepKind::Clear`]
+/// runs verbatim. This crate does not perform the AES block call;
+/// `CipherStep` is a static dispatch contract built from container-side
+/// bytes only (the [`CencSchemeDecision`] + [`SencSample`] subsample
+/// list + sample length).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CipherStep {
+    /// Byte offset from the start of the sample payload.
+    pub offset: u64,
+    /// Run length in bytes. The sum of every step's `len` equals
+    /// `sample_len`.
+    pub len: u64,
+    /// Whether the run is clear or encrypted.
+    pub kind: CipherStepKind,
+    /// Spec-required IV restart on this step.
+    ///
+    /// `true` only on the first [`CipherStepKind::Encrypted`] step of
+    /// each subsample under the `cbcs` scheme (§9.5.1 — "The `cbcs`
+    /// scheme SHALL treat each Subsample as a separate chain of cipher
+    /// blocks, starting with the Initialization Vector associated with
+    /// the sample"). Always `false` for clear steps and for `cenc` /
+    /// `cbc1` / `cens` (those schemes carry one continuous cipher chain
+    /// / counter across subsamples in a sample). A consumer using a
+    /// constant IV resets its CBC chain state to the constant IV when
+    /// it sees this flag.
+    pub iv_restart: bool,
+}
+
+/// Plan a single sample's cipher partition (§9.4–9.6).
+///
+/// Inputs:
+/// * `decision` — the typed [`CencSchemeDecision`] for the track (or a
+///   `seig`-overridden group equivalent built by the caller). Drives
+///   cipher-mode + pattern-flag dispatch.
+/// * `subsamples` — `Some(_)` for §9.5 subsample encryption (the slice
+///   pulled from the matching [`SencSample::subsamples`]); `None` for
+///   §9.4 full-sample encryption.
+/// * `sample_len` — the plaintext sample length in bytes (the size
+///   recorded in `stsz` / `stz2` / `trun.sample_size`).
+///
+/// Returns the ordered `Vec<CipherStep>` partitioning `0..sample_len`.
+///
+/// # Spec contract honoured
+///
+/// * §9.5.1 — "The total length of all `BytesOfClearData` and
+///   `BytesOfProtectedData` in a sample SHALL equal the length of the
+///   sample". Enforced — mismatched totals return `Err`.
+/// * §9.5.1 — "The Subsample encryption entries SHALL NOT include an
+///   entry with a zero value in both the `BytesOfClearData` field and
+///   in the `BytesOfProtectedData` field." Enforced.
+/// * §9.4.3 — "AES-CBC mode requires all encrypted cipher blocks to be
+///   16 bytes … leave partial Blocks unencrypted." On §9.4 full-sample
+///   `cbc1`, a trailing 1–15 bytes of `sample_len` are emitted as a
+///   final [`CipherStepKind::Clear`] step.
+/// * §9.4.2 — "AES-CTR mode encryption SHALL use a unique IV per sample
+///   and encrypt all bytes in the sample." On §9.4 full-sample `cenc`,
+///   the entire `sample_len` is one Encrypted step (the last block may
+///   be a partial cipher block — still encrypted).
+/// * §9.6 — "the partial pattern SHALL be followed until truncated by
+///   the `BytesOfProtectedData` size and any partial `crypt_byte_block`
+///   SHALL remain unencrypted." A trailing partial block inside a
+///   pattern's encrypted run is emitted as Clear.
+/// * §9.5.1 / §9.6 — "The IV SHALL apply to the first encrypted cipher
+///   block of each Subsample" under `cbcs`. The first Encrypted step
+///   inside each subsample carries `iv_restart = true` for `cbcs` only.
+/// * §9.7 — whole-block full-sample encryption is the default for
+///   non-video tracks on `cens` / `cbcs` (per §10.3 / §10.4) when the
+///   caller passes `subsamples = None`. Trailing 0–15 bytes stay in
+///   the clear, IV restart per sample.
+///
+/// # Errors
+///
+/// * `Error::invalid` if the subsample size totals do not equal
+///   `sample_len`, if a subsample has both clear and protected = 0
+///   (§9.5.1 prohibition), or if a subsample's
+///   `BytesOfClearData + BytesOfProtectedData` overflows `u64`.
+/// * `Error::invalid` if the [`CencSchemeDecision`] reports
+///   `IvSupply::None` (track is unprotected at default) — that arm
+///   has no plan to make; callers route the sample through their
+///   "no cipher" path.
+/// * `Error::invalid` if the decision's scheme is
+///   [`CencScheme::Unknown`] — the structural rules above are tied to
+///   the §10-registered scheme set; a private dialect supplies its
+///   own walker.
+pub fn plan_sample_cipher(
+    decision: &CencSchemeDecision,
+    subsamples: Option<&[SubsampleEntry]>,
+    sample_len: u64,
+) -> Result<Vec<CipherStep>> {
+    // Unprotected track default → no plan. Caller routes through "copy
+    // verbatim" rather than asking the walker for a NOP partition.
+    if decision.iv_supply() == IvSupply::None {
+        return Err(Error::invalid(
+            "MP4 cenc cipher plan: track default is unprotected (IvSupply::None) — no plan",
+        ));
+    }
+    // Unknown scheme: structural rules below depend on §10 carve-outs.
+    let mode = decision.cipher_mode().ok_or_else(|| {
+        Error::invalid(
+            "MP4 cenc cipher plan: unknown scheme — caller supplies its own dialect walker",
+        )
+    })?;
+    let uses_pattern = decision.uses_pattern_encryption();
+    let crypt_blocks = decision.tenc.default_crypt_byte_block as u64;
+    let skip_blocks = decision.tenc.default_skip_byte_block as u64;
+
+    let mut plan: Vec<CipherStep> = Vec::new();
+
+    match subsamples {
+        None => {
+            // §9.4 / §9.7 — full-sample or whole-block full-sample.
+            // Pattern schemes on a sample with no subsamples land here
+            // for non-video tracks (§10.3 / §10.4 carve-out); §9.7 says
+            // every sample is encrypted from offset 0 to the last
+            // 16-byte boundary with trailing 0–15 bytes left clear.
+            //
+            // For §9.4.2 (`cenc` full-sample): CTR encrypts every byte
+            // including the partial trailing block. For §9.4.3 (`cbc1`
+            // full-sample) and §9.7 (any CBC or CTR whole-block path):
+            // trailing partial block stays in clear.
+            //
+            // The "trailing partial stays clear" rule applies to every
+            // CBC path; under pattern schemes the §9.7 rule also makes
+            // it apply to CTR (no §9.4.2 carve-out for pattern-CTR on
+            // a full sample because pattern by definition lives in §9.6
+            // which prohibits a partial encrypted block in the
+            // pattern's encrypted run).
+            let leave_partial_clear = match mode {
+                CipherMode::Cbc => true,
+                CipherMode::Ctr => uses_pattern, // §9.7 whole-block when patterned non-video.
+            };
+            let whole_blocks = (sample_len / 16) * 16;
+            let tail = sample_len - whole_blocks;
+            if leave_partial_clear && tail != 0 {
+                if whole_blocks > 0 {
+                    plan.push(CipherStep {
+                        offset: 0,
+                        len: whole_blocks,
+                        kind: CipherStepKind::Encrypted,
+                        iv_restart: false,
+                    });
+                }
+                plan.push(CipherStep {
+                    offset: whole_blocks,
+                    len: tail,
+                    kind: CipherStepKind::Clear,
+                    iv_restart: false,
+                });
+            } else if sample_len > 0 {
+                // §9.4.2 `cenc` full-sample (or whole-block path with
+                // sample_len already a multiple of 16): one Encrypted
+                // step covering everything.
+                plan.push(CipherStep {
+                    offset: 0,
+                    len: sample_len,
+                    kind: CipherStepKind::Encrypted,
+                    iv_restart: false,
+                });
+            }
+            // sample_len == 0: empty plan. The CENC framing for a
+            // zero-byte sample is degenerate; the caller has nothing to
+            // do either way.
+            return Ok(plan);
+        }
+        Some(subs) => {
+            // §9.5 — subsample encryption. Walk subsamples in order;
+            // each contributes a clear prefix + a protected suffix.
+            let mut cursor: u64 = 0;
+            let cbcs_restart_per_sub = matches!(decision.scheme, CencScheme::Cbcs);
+            for (i, s) in subs.iter().enumerate() {
+                let clear = s.bytes_of_clear_data as u64;
+                let protected = s.bytes_of_protected_data as u64;
+                // §9.5.1 prohibition: clear == 0 && protected == 0 is
+                // illegal (subsample entries SHALL NOT include a
+                // both-zero entry).
+                if clear == 0 && protected == 0 {
+                    return Err(Error::invalid(format!(
+                        "MP4 cenc cipher plan: subsample {i} is both-zero (§9.5.1 prohibition)"
+                    )));
+                }
+                let row_len = clear.checked_add(protected).ok_or_else(|| {
+                    Error::invalid(format!(
+                        "MP4 cenc cipher plan: subsample {i} clear+protected overflow"
+                    ))
+                })?;
+                let row_end = cursor.checked_add(row_len).ok_or_else(|| {
+                    Error::invalid("MP4 cenc cipher plan: subsample run-length overflow")
+                })?;
+                if row_end > sample_len {
+                    return Err(Error::invalid(format!(
+                        "MP4 cenc cipher plan: subsample {i} ends at {row_end} past sample_len {sample_len}"
+                    )));
+                }
+                if clear > 0 {
+                    plan.push(CipherStep {
+                        offset: cursor,
+                        len: clear,
+                        kind: CipherStepKind::Clear,
+                        iv_restart: false,
+                    });
+                    cursor += clear;
+                }
+                if protected > 0 {
+                    if uses_pattern {
+                        // §9.6 pattern walker. Repeat
+                        // (crypt_byte_block*16 encrypted, skip_byte_block*16 clear)
+                        // until the protected range is exhausted; a
+                        // trailing partial encrypted block stays clear.
+                        plan_pattern_run(
+                            &mut plan,
+                            cursor,
+                            protected,
+                            crypt_blocks,
+                            skip_blocks,
+                            cbcs_restart_per_sub,
+                        );
+                    } else {
+                        // §9.5.1 non-pattern: one encrypted span. CTR
+                        // counter / CBC chain are logically continuous
+                        // across subsamples in a sample.
+                        plan.push(CipherStep {
+                            offset: cursor,
+                            len: protected,
+                            kind: CipherStepKind::Encrypted,
+                            iv_restart: false,
+                        });
+                    }
+                    cursor += protected;
+                }
+            }
+            if cursor != sample_len {
+                return Err(Error::invalid(format!(
+                    "MP4 cenc cipher plan: subsample total {cursor} != sample_len {sample_len} (§9.5.1)"
+                )));
+            }
+        }
+    }
+    Ok(plan)
+}
+
+/// Emit pattern-encryption steps (§9.6) for one subsample's protected
+/// range starting at `offset` and `protected_len` bytes long.
+///
+/// Pushes alternating `crypt_byte_block * 16`-byte Encrypted runs and
+/// `skip_byte_block * 16`-byte Clear runs into `plan`. A trailing
+/// partial 16-byte block at the end of the protected range stays in
+/// the clear per §9.6 ("any partial `crypt_byte_block` SHALL remain
+/// unencrypted").
+///
+/// `cbcs_restart_per_sub` controls the `iv_restart` flag on the **first**
+/// Encrypted step emitted for this subsample — `true` only for the
+/// `cbcs` scheme (§9.5.1 per-subsample IV restart).
+///
+/// Special case `crypt_byte_block == 0`: the pattern degenerates to
+/// "skip everything" — the entire protected range is emitted as Clear.
+/// Special case `skip_byte_block == 0` with `crypt_byte_block > 0`:
+/// the pattern degenerates to "encrypt everything in 16-byte blocks
+/// with trailing partial clear" — equivalent to §9.7.
+fn plan_pattern_run(
+    plan: &mut Vec<CipherStep>,
+    offset: u64,
+    protected_len: u64,
+    crypt_blocks: u64,
+    skip_blocks: u64,
+    cbcs_restart_per_sub: bool,
+) {
+    if protected_len == 0 {
+        return;
+    }
+    if crypt_blocks == 0 {
+        // Pattern says "encrypt nothing" — entire protected range is
+        // clear. (Pathological; the validation in
+        // CencSchemeDecision::new rejects (0, 0) for pattern schemes,
+        // but a sample-group seig override with crypt=0, skip>0 is
+        // theoretically expressible and §9.6 says the partial pattern
+        // is followed until truncated.)
+        plan.push(CipherStep {
+            offset,
+            len: protected_len,
+            kind: CipherStepKind::Clear,
+            iv_restart: false,
+        });
+        return;
+    }
+    let crypt_bytes = crypt_blocks * 16;
+    let skip_bytes = skip_blocks * 16;
+    let pattern_bytes = crypt_bytes + skip_bytes;
+    let mut remaining = protected_len;
+    let mut cursor = offset;
+    let mut first_encrypted_in_sub = true;
+    while remaining > 0 {
+        // Encrypted portion of the pattern.
+        let take_full = crypt_bytes.min(remaining - (remaining % 16));
+        if take_full > 0 {
+            plan.push(CipherStep {
+                offset: cursor,
+                len: take_full,
+                kind: CipherStepKind::Encrypted,
+                iv_restart: cbcs_restart_per_sub && first_encrypted_in_sub,
+            });
+            cursor += take_full;
+            remaining -= take_full;
+            first_encrypted_in_sub = false;
+        }
+        // If the encrypted-block side did not consume its full quota,
+        // we have a trailing partial 16-byte block (or zero bytes left).
+        // §9.6: partial crypt block stays unencrypted. Promote the
+        // remainder to Clear and stop — the pattern is terminated.
+        if take_full < crypt_bytes {
+            if remaining > 0 {
+                plan.push(CipherStep {
+                    offset: cursor,
+                    len: remaining,
+                    kind: CipherStepKind::Clear,
+                    iv_restart: false,
+                });
+                cursor += remaining;
+            }
+            break;
+        }
+        // Skipped portion of the pattern.
+        if skip_bytes > 0 && remaining > 0 {
+            let take_skip = skip_bytes.min(remaining);
+            plan.push(CipherStep {
+                offset: cursor,
+                len: take_skip,
+                kind: CipherStepKind::Clear,
+                iv_restart: false,
+            });
+            cursor += take_skip;
+            remaining -= take_skip;
+        }
+        // Guard against an infinite loop in the (unreachable, validated)
+        // pattern_bytes == 0 case.
+        if pattern_bytes == 0 {
+            break;
+        }
+    }
+    // `cursor` and `offset + protected_len` are equal by construction
+    // when remaining hits zero; the unused `cursor` value is dropped.
+    let _ = cursor;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,5 +1726,359 @@ mod tests {
         body.push(16);
         body.extend_from_slice(&[0u8; 15]); // one byte short
         assert!(parse_seig(&body).is_err());
+    }
+
+    // ---- cipher walker (§9.4–9.6) ----------------------------------
+
+    fn cbc1_tenc_v0_per_sample() -> TencBox {
+        TencBox {
+            version: 0,
+            default_is_protected: 1,
+            default_per_sample_iv_size: 16,
+            default_kid: [0x12; 16],
+            default_crypt_byte_block: 0,
+            default_skip_byte_block: 0,
+            default_constant_iv: None,
+        }
+    }
+
+    fn cens_tenc_v1_pattern_1_9() -> TencBox {
+        TencBox {
+            version: 1,
+            default_is_protected: 1,
+            default_per_sample_iv_size: 8,
+            default_kid: [0x44; 16],
+            default_crypt_byte_block: 1,
+            default_skip_byte_block: 9,
+            default_constant_iv: None,
+        }
+    }
+
+    fn sub(clear: u16, protected: u32) -> SubsampleEntry {
+        SubsampleEntry {
+            bytes_of_clear_data: clear,
+            bytes_of_protected_data: protected,
+        }
+    }
+
+    #[test]
+    fn plan_cenc_full_sample_ctr_one_encrypted_span() {
+        // §9.4.2 — CTR encrypts every byte in the sample including the
+        // trailing partial block.
+        let d = CencSchemeDecision::new(CencScheme::Cenc, cenc_tenc_v0_per_sample()).unwrap();
+        let plan = plan_sample_cipher(&d, None, 137).expect("full-sample cenc");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].offset, 0);
+        assert_eq!(plan[0].len, 137);
+        assert_eq!(plan[0].kind, CipherStepKind::Encrypted);
+        assert!(!plan[0].iv_restart);
+    }
+
+    #[test]
+    fn plan_cbc1_full_sample_leaves_trailing_partial_clear() {
+        // §9.4.3 — CBC leaves partial trailing block unencrypted.
+        // sample_len = 137 = 8*16 + 9 → 128 encrypted + 9 clear.
+        let d = CencSchemeDecision::new(CencScheme::Cbc1, cbc1_tenc_v0_per_sample()).unwrap();
+        let plan = plan_sample_cipher(&d, None, 137).expect("full-sample cbc1");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].kind, CipherStepKind::Encrypted);
+        assert_eq!(plan[0].len, 128);
+        assert_eq!(plan[1].kind, CipherStepKind::Clear);
+        assert_eq!(plan[1].offset, 128);
+        assert_eq!(plan[1].len, 9);
+    }
+
+    #[test]
+    fn plan_cbc1_full_sample_aligned_no_clear_tail() {
+        // sample_len multiple of 16 → no trailing clear step.
+        let d = CencSchemeDecision::new(CencScheme::Cbc1, cbc1_tenc_v0_per_sample()).unwrap();
+        let plan = plan_sample_cipher(&d, None, 64).expect("aligned cbc1");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].kind, CipherStepKind::Encrypted);
+        assert_eq!(plan[0].len, 64);
+    }
+
+    #[test]
+    fn plan_cenc_subsamples_clear_then_encrypted() {
+        // §9.5 cenc with two NAL-like subsamples.
+        // sub0: 5 clear + 32 protected, sub1: 3 clear + 16 protected.
+        // Total = 56.
+        let d = CencSchemeDecision::new(CencScheme::Cenc, cenc_tenc_v0_per_sample()).unwrap();
+        let subs = vec![sub(5, 32), sub(3, 16)];
+        let plan = plan_sample_cipher(&d, Some(&subs), 56).expect("subsamples cenc");
+        assert_eq!(plan.len(), 4);
+        assert_eq!(
+            plan[0],
+            CipherStep {
+                offset: 0,
+                len: 5,
+                kind: CipherStepKind::Clear,
+                iv_restart: false
+            }
+        );
+        assert_eq!(
+            plan[1],
+            CipherStep {
+                offset: 5,
+                len: 32,
+                kind: CipherStepKind::Encrypted,
+                iv_restart: false
+            }
+        );
+        assert_eq!(
+            plan[2],
+            CipherStep {
+                offset: 37,
+                len: 3,
+                kind: CipherStepKind::Clear,
+                iv_restart: false
+            }
+        );
+        assert_eq!(
+            plan[3],
+            CipherStep {
+                offset: 40,
+                len: 16,
+                kind: CipherStepKind::Encrypted,
+                iv_restart: false
+            }
+        );
+    }
+
+    #[test]
+    fn plan_cbc1_subsamples_no_iv_restart() {
+        // §9.5.1 — cbc1 forms one continuous cipher chain per sample
+        // across subsamples; iv_restart stays false on every step.
+        let d = CencSchemeDecision::new(CencScheme::Cbc1, cbc1_tenc_v0_per_sample()).unwrap();
+        let subs = vec![sub(0, 32), sub(0, 16)];
+        let plan = plan_sample_cipher(&d, Some(&subs), 48).expect("subsamples cbc1");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].kind, CipherStepKind::Encrypted);
+        assert_eq!(plan[1].kind, CipherStepKind::Encrypted);
+        assert!(plan.iter().all(|s| !s.iv_restart));
+    }
+
+    #[test]
+    fn plan_cbcs_subsamples_iv_restart_per_subsample() {
+        // §9.5.1 — cbcs restarts the cipher chain at the start of each
+        // subsample's protected range. iv_restart=true on the first
+        // Encrypted of each subsample.
+        let d = CencSchemeDecision::new(CencScheme::Cbcs, cbcs_tenc_v1_constant_iv()).unwrap();
+        // 1:9 pattern means crypt=16, skip=144 per repetition (160 total).
+        // sub0: 8 clear + 160 protected = full one-repetition pattern.
+        // sub1: 8 clear + 160 protected = another full one-repetition pattern.
+        let subs = vec![sub(8, 160), sub(8, 160)];
+        let plan = plan_sample_cipher(&d, Some(&subs), 336).expect("subsamples cbcs");
+        // Per sub: Clear(8) + Encrypted(16) + Clear(144) = 3 steps.
+        // Two subs → 6 steps total.
+        assert_eq!(plan.len(), 6);
+        // sub0 first encrypted: iv_restart = true.
+        assert_eq!(plan[1].kind, CipherStepKind::Encrypted);
+        assert!(plan[1].iv_restart);
+        // sub1 first encrypted: iv_restart = true.
+        assert_eq!(plan[4].kind, CipherStepKind::Encrypted);
+        assert!(plan[4].iv_restart);
+    }
+
+    #[test]
+    fn plan_cens_subsamples_no_iv_restart_under_ctr() {
+        // §9.5.1 — under cens, CTR counter is continuous across
+        // subsamples; iv_restart is false even for the first encrypted
+        // of a subsample.
+        let d = CencSchemeDecision::new(CencScheme::Cens, cens_tenc_v1_pattern_1_9()).unwrap();
+        let subs = vec![sub(8, 160), sub(8, 160)];
+        let plan = plan_sample_cipher(&d, Some(&subs), 336).expect("subsamples cens");
+        assert!(plan.iter().all(|s| !s.iv_restart));
+    }
+
+    #[test]
+    fn plan_pattern_1_9_one_repetition_exact() {
+        // Pattern walker: crypt=1, skip=9 (1:9 = cbcs canonical).
+        // protected_len = 16 + 144 = 160 → one full pattern, no
+        // trailing partial.
+        let d = CencSchemeDecision::new(CencScheme::Cbcs, cbcs_tenc_v1_constant_iv()).unwrap();
+        let subs = vec![sub(0, 160)];
+        let plan = plan_sample_cipher(&d, Some(&subs), 160).expect("one-rep pattern");
+        // Encrypted(16) + Clear(144).
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan[0],
+            CipherStep {
+                offset: 0,
+                len: 16,
+                kind: CipherStepKind::Encrypted,
+                iv_restart: true
+            }
+        );
+        assert_eq!(
+            plan[1],
+            CipherStep {
+                offset: 16,
+                len: 144,
+                kind: CipherStepKind::Clear,
+                iv_restart: false
+            }
+        );
+    }
+
+    #[test]
+    fn plan_pattern_trailing_partial_encrypted_block_goes_clear() {
+        // §9.6 — partial crypt_byte_block at the end of the protected
+        // range stays in the clear. Use crypt=2, skip=0 (degenerate
+        // "encrypt every block, partial trailing stays clear").
+        let pattern_tenc = TencBox {
+            version: 1,
+            default_is_protected: 1,
+            default_per_sample_iv_size: 16,
+            default_kid: [0x77; 16],
+            default_crypt_byte_block: 2,
+            default_skip_byte_block: 1,
+            default_constant_iv: None,
+        };
+        let d = CencSchemeDecision::new(CencScheme::Cens, pattern_tenc).unwrap();
+        // protected_len = 2*16 + 5 = 37. Pattern: encrypt 32, then we
+        // want to encrypt up to another 32 — but only 5 bytes remain,
+        // which is a partial crypt block → those 5 go Clear.
+        let subs = vec![sub(0, 37)];
+        let plan = plan_sample_cipher(&d, Some(&subs), 37).expect("partial crypt → clear");
+        // Steps: Encrypted(32) + Clear(5).
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].kind, CipherStepKind::Encrypted);
+        assert_eq!(plan[0].len, 32);
+        assert_eq!(plan[1].kind, CipherStepKind::Clear);
+        assert_eq!(plan[1].offset, 32);
+        assert_eq!(plan[1].len, 5);
+    }
+
+    #[test]
+    fn plan_pattern_truncated_mid_skip_run() {
+        // Pattern: crypt=1, skip=9. protected_len = 16 + 50 = 66.
+        // After encrypted(16), 50 bytes remain. Skip would take 144 →
+        // truncated to 50 Clear bytes.
+        let d = CencSchemeDecision::new(CencScheme::Cbcs, cbcs_tenc_v1_constant_iv()).unwrap();
+        let subs = vec![sub(0, 66)];
+        let plan = plan_sample_cipher(&d, Some(&subs), 66).expect("truncated skip run");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].kind, CipherStepKind::Encrypted);
+        assert_eq!(plan[0].len, 16);
+        assert_eq!(plan[1].kind, CipherStepKind::Clear);
+        assert_eq!(plan[1].len, 50);
+    }
+
+    #[test]
+    fn plan_rejects_subsample_totals_short_of_sample_len() {
+        // §9.5.1 — clear+protected MUST equal sample_len.
+        let d = CencSchemeDecision::new(CencScheme::Cenc, cenc_tenc_v0_per_sample()).unwrap();
+        let subs = vec![sub(5, 32)];
+        let err = plan_sample_cipher(&d, Some(&subs), 100).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("subsample total") || msg.contains("!="),
+            "msg={msg}"
+        );
+    }
+
+    #[test]
+    fn plan_rejects_subsample_totals_over_sample_len() {
+        let d = CencSchemeDecision::new(CencScheme::Cenc, cenc_tenc_v0_per_sample()).unwrap();
+        let subs = vec![sub(50, 100)];
+        let err = plan_sample_cipher(&d, Some(&subs), 100).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("past sample_len"), "msg={msg}");
+    }
+
+    #[test]
+    fn plan_rejects_both_zero_subsample() {
+        // §9.5.1 prohibition: an entry with both clear=0 and protected=0
+        // is invalid.
+        let d = CencSchemeDecision::new(CencScheme::Cenc, cenc_tenc_v0_per_sample()).unwrap();
+        let subs = vec![sub(10, 10), sub(0, 0), sub(5, 5)];
+        let err = plan_sample_cipher(&d, Some(&subs), 30).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("both-zero"), "msg={msg}");
+    }
+
+    #[test]
+    fn plan_rejects_unprotected_track_default() {
+        // IvSupply::None — caller should not have called the walker.
+        let plain = TencBox {
+            version: 0,
+            default_is_protected: 0,
+            default_per_sample_iv_size: 0,
+            default_kid: [0u8; 16],
+            default_crypt_byte_block: 0,
+            default_skip_byte_block: 0,
+            default_constant_iv: None,
+        };
+        let d = CencSchemeDecision::new(CencScheme::Cenc, plain).unwrap();
+        let err = plan_sample_cipher(&d, None, 100).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unprotected"), "msg={msg}");
+    }
+
+    #[test]
+    fn plan_rejects_unknown_scheme() {
+        let d =
+            CencSchemeDecision::new(CencScheme::from_fourcc(b"priv"), cenc_tenc_v0_per_sample())
+                .unwrap();
+        let err = plan_sample_cipher(&d, None, 100).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown scheme"), "msg={msg}");
+    }
+
+    #[test]
+    fn plan_empty_sample_yields_empty_plan() {
+        let d = CencSchemeDecision::new(CencScheme::Cenc, cenc_tenc_v0_per_sample()).unwrap();
+        let plan = plan_sample_cipher(&d, None, 0).expect("empty sample");
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_subsample_with_only_clear_emits_clear_only() {
+        // A subsample with clear>0, protected=0 is legal (a NAL whose
+        // entire body is left in the clear, e.g. a parameter-set NAL).
+        let d = CencSchemeDecision::new(CencScheme::Cenc, cenc_tenc_v0_per_sample()).unwrap();
+        let subs = vec![sub(20, 0), sub(0, 16)];
+        let plan = plan_sample_cipher(&d, Some(&subs), 36).expect("clear-only sub");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].kind, CipherStepKind::Clear);
+        assert_eq!(plan[0].len, 20);
+        assert_eq!(plan[1].kind, CipherStepKind::Encrypted);
+        assert_eq!(plan[1].offset, 20);
+        assert_eq!(plan[1].len, 16);
+    }
+
+    #[test]
+    fn plan_subsample_with_only_protected_emits_encrypted_only() {
+        // A subsample with clear=0, protected>0 is legal.
+        let d = CencSchemeDecision::new(CencScheme::Cenc, cenc_tenc_v0_per_sample()).unwrap();
+        let subs = vec![sub(0, 32)];
+        let plan = plan_sample_cipher(&d, Some(&subs), 32).expect("protected-only sub");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].kind, CipherStepKind::Encrypted);
+        assert_eq!(plan[0].len, 32);
+    }
+
+    #[test]
+    fn plan_partitions_cover_sample_len_exactly() {
+        // Property: the sum of step lengths equals sample_len for any
+        // valid input, and offsets are strictly increasing with len.
+        let d = CencSchemeDecision::new(CencScheme::Cbcs, cbcs_tenc_v1_constant_iv()).unwrap();
+        let subs = vec![sub(8, 160), sub(4, 156), sub(0, 16)];
+        let total: u64 = subs
+            .iter()
+            .map(|s| s.bytes_of_clear_data as u64 + s.bytes_of_protected_data as u64)
+            .sum();
+        let plan = plan_sample_cipher(&d, Some(&subs), total).expect("partition cover");
+        let mut prev_end = 0u64;
+        let mut sum = 0u64;
+        for step in &plan {
+            assert_eq!(step.offset, prev_end, "non-contiguous step");
+            assert!(step.len > 0, "zero-length step");
+            prev_end = step.offset + step.len;
+            sum += step.len;
+        }
+        assert_eq!(sum, total);
+        assert_eq!(prev_end, total);
     }
 }

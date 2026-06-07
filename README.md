@@ -275,6 +275,33 @@ Sample-entry FourCCs resolve to these codec ids:
     "clients SHALL ignore additional bytes after the fields
     defined" rule is honoured — trailing bytes from a future
     edition do not fail the parse.
+  - Per-sample cipher walker (§9.4 / §9.5 / §9.6).
+    `cenc::plan_sample_cipher(decision, subsamples, sample_len)`
+    consumes a parsed `CencSchemeDecision` plus the per-sample
+    subsample list (from `parse_senc`) and returns the ordered
+    `Vec<CipherStep>` partition of the sample plaintext into
+    contiguous `(offset, len, kind, iv_restart)` runs an AES layer
+    iterates: `Clear` runs pass through verbatim and `Encrypted` runs
+    feed the cipher mode picked by `CencSchemeDecision::cipher_mode`
+    (CTR vs CBC). The walker bakes in every §10-registered
+    structural rule — full-sample CTR (§9.4.2) keeps the trailing
+    partial block encrypted, full-sample CBC (§9.4.3) and `§9.7`
+    whole-block leave it in the clear, subsample non-pattern is
+    `Clear(BytesOfClearData) + Encrypted(BytesOfProtectedData)` per
+    subsample with a continuous chain across them (§9.5.1),
+    subsample pattern walks `crypt_byte_block * 16` encrypted +
+    `skip_byte_block * 16` clear with the trailing partial
+    `crypt_byte_block` reset to clear (§9.6), and the `cbcs` IV
+    restart per subsample (§9.5.1) lights up only on the first
+    `Encrypted` step of each subsample for `cbcs` (not `cenc` /
+    `cbc1` / `cens`). §9.5.1 invariants are enforced —
+    `Σ (clear+protected) == sample_len`, no both-zero subsample,
+    no subsample running past sample_len. `IvSupply::None` and
+    `CencScheme::Unknown` are rejected so a caller routes through
+    its own "no cipher" / private-dialect path explicitly. **This
+    crate performs no AES operation** — `CipherStep` is the static
+    dispatch contract a downstream layer with key material from the
+    named `pssh.SystemID` switches on.
 - Track references (ISO/IEC 14496-12 §8.3.3, `tref`): each typed
   `TrackReferenceTypeBox` inside `trak/tref` is parsed and the
   resulting `(reference_type → track_IDs)` pairs are surfaced on
@@ -626,7 +653,12 @@ first that applies:
   `cenc::CencSchemeDecision` router (cipher mode, pattern flag,
   IV-supply discipline) so a downstream layer with key material
   from the named `pssh.SystemID` has a single typed value to
-  switch on; the actual AES block call is its responsibility. The
+  switch on, and the typed per-sample cipher walker
+  `cenc::plan_sample_cipher` partitions the sample plaintext into
+  the typed `(Clear, Encrypted)` step sequence the AES layer
+  iterates (with `cbcs` per-subsample IV restart and the §9.6
+  pattern-truncation rule baked in); the actual AES block call is
+  its responsibility. The
   mdat-resident auxiliary-information bytes that the `saio`
   offsets name are not pre-fetched — a CENC consumer reading them
   seeks the input itself using the surfaced offsets.

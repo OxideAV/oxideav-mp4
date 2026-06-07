@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-sample CENC cipher walker — round 245. The new
+  `cenc::plan_sample_cipher(decision, subsamples, sample_len) ->
+  Result<Vec<CipherStep>>` partitions a sample's plaintext
+  `0..sample_len` byte range into the typed ordered sequence of
+  contiguous `(offset, len, kind, iv_restart)` runs an AES-128 layer
+  iterates to perform decryption. The walker consumes the existing
+  `cenc::CencSchemeDecision` (scheme + tenc) and the per-sample
+  subsample list already surfaced by `parse_senc`, and runs each ISO/IEC
+  23001-7:2016 spec carve-out:
+  - §9.4.2 (`cenc` full-sample): one `Encrypted` step over the entire
+    sample including the trailing partial 16-byte block (CTR encrypts
+    partial cipher blocks).
+  - §9.4.3 (`cbc1` full-sample) and §9.7 (whole-block full-sample on
+    pattern schemes for non-video tracks): an `Encrypted` step over the
+    whole-block prefix and a trailing `Clear` step over the 0–15-byte
+    partial block.
+  - §9.5 subsample encryption: per-subsample `Clear(BytesOfClearData)`
+    then either one `Encrypted(BytesOfProtectedData)` span (non-pattern
+    schemes, §9.5.1) or a §9.6 pattern walk (`(crypt_byte_block * 16,
+    skip_byte_block * 16)` alternation with the trailing partial
+    `crypt_byte_block` left in the clear).
+  - §9.5.1 IV restart discipline: the `iv_restart` flag is `true` only
+    on the first `Encrypted` step inside each subsample under `cbcs`
+    (the spec's "treat each Subsample as a separate chain of cipher
+    blocks, starting with the Initialization Vector associated with the
+    sample"); `cenc` / `cbc1` / `cens` carry a continuous chain /
+    counter across subsamples so the flag stays `false`.
+  - §9.5.1 totals invariant: subsample `clear + protected` sums MUST
+    equal `sample_len`; mismatch is `Err`.
+  - §9.5.1 both-zero prohibition: a subsample with `clear == 0 &&
+    protected == 0` is rejected.
+  - `IvSupply::None` (unprotected track default) and
+    `CencScheme::Unknown` are rejected — the walker structurally
+    targets §10-registered schemes, and a private dialect supplies its
+    own equivalent.
+
+  **This crate performs no AES operation.** `CipherStep` is a static
+  dispatch contract built from container-side bytes only; the actual
+  key-derivation + AES block call is delegated to a downstream layer
+  with key material from the `pssh.SystemID`. Nineteen unit tests
+  exercise CTR / CBC full-sample, mixed clear / encrypted subsamples,
+  the four-scheme `iv_restart` matrix, the 1:9 pattern at one full
+  repetition, a trailing partial `crypt_byte_block` that goes clear, a
+  truncated mid-skip run, the totals-mismatch + both-zero +
+  unprotected + unknown-scheme rejection paths, the empty-sample
+  edge, and a partition-cover invariant (`Σ step.len == sample_len`
+  with contiguous offsets).
+
 - Typed accessor for the §8.8.3.1 `sample_flags` 32-bit field — round
   242. The same packed `u32` appears in four sites across ISO/IEC
   14496-12: `default_sample_flags` in `trex` (§8.8.3) and `tfhd`
