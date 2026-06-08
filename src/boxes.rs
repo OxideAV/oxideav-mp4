@@ -151,6 +151,18 @@ pub const fn fourcc(s: &str) -> [u8; 4] {
 
 // Common box types.
 pub const FTYP: [u8; 4] = fourcc("ftyp");
+/// `pdin` — ProgressiveDownloadInfoBox (ISO/IEC 14496-12 §8.1.3). A
+/// top-level FullBox (file scope, quantity zero or one) carrying pairs
+/// of `(rate, initial_delay)` u32s, each pair recommending an initial
+/// playback delay (milliseconds) for a given effective download rate
+/// (bytes/second). A receiver estimates the rate it is observing and
+/// interpolates between adjacent pairs (or extrapolates from the first
+/// / last entry) to pick a buffer occupancy that lets playback proceed
+/// without stalls. The box is meant to be placed as early as possible
+/// in the file (§8.1.3.1); the demuxer captures it from the top-level
+/// walk and surfaces both a structured `PdinRecord` accessor and a flat
+/// `pdin` metadata summary.
+pub const PDIN: [u8; 4] = fourcc("pdin");
 pub const MOOV: [u8; 4] = fourcc("moov");
 pub const MVHD: [u8; 4] = fourcc("mvhd");
 pub const TRAK: [u8; 4] = fourcc("trak");

@@ -557,6 +557,38 @@ Sample-entry FourCCs resolve to these codec ids:
   `oxideav_mp4::demux::parse_prft_box(&[u8])` entry point for tooling
   that wants the typed `PrftRecord` (`reference_track_id`,
   `ntp_timestamp`, `media_time`, `version`) directly.
+- Progressive download information (ISO/IEC 14496-12 §8.1.3, `pdin`): a
+  top-level `FullBox(version = 0, flags = 0)` whose body is a sequence
+  of `(rate, initial_delay)` u32 pairs (big-endian) — for each effective
+  download `rate` (bytes/second) the box hints the suggested initial
+  playback `initial_delay` (milliseconds) that lets the rest of the
+  file arrive ahead of its playback deadline (§8.1.3.3). A receiver
+  estimates its observed throughput, finds the bracketing pair, and
+  linearly interpolates the delay (or extrapolates from the first /
+  last entry when the observed rate sits outside the recorded range).
+  §8.1.3.1 fixes quantity at zero or one per file and recommends it
+  be placed as early as possible; the top-level walker captures the
+  first instance and ignores any subsequent copies. The parsed table
+  is surfaced on `Demuxer::metadata()` as `pdin_count` (total number of
+  pairs, decimal) plus `pdin_<n>` (one per pair, `"rate initial_delay"`
+  decimal space-separated, 0-based in file order); an explicitly empty
+  box (preamble only, zero pairs — a producer signalling "no hints
+  available") emits `pdin_count = 0` and no `pdin_<n>` keys. Absent
+  `pdin`, none of the keys are emitted (the demuxer signals "no box"
+  by omission rather than by a zero count). The structured record is
+  also reachable via the public
+  `oxideav_mp4::demux::parse_pdin_box(&[u8])` entry point for tooling
+  that already has the box's payload bytes in hand (a DASH packager,
+  a manifest emitter, a fixture validator), and via
+  `Mp4Demuxer::pdin_entries()` (downcast) for callers holding the
+  demuxer trait object. A body whose post-preamble length is not a
+  multiple of 8 (one u32 pair per entry) is rejected outright per
+  §8.1.3.2 — silently rounding to the nearest pair would mask a
+  producer-side framing bug; a body shorter than the 4-byte FullBox
+  preamble likewise fails the open. The version byte is tolerated even
+  if the producer wrote a non-zero value (the spec pins it to 0 but
+  the payload layout is unambiguous), matching `parse_padb` /
+  `parse_stdp` posture for FullBox version-bit slips.
 
 ### Muxer
 

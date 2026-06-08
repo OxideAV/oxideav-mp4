@@ -32,11 +32,29 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     let mut sidxes: Vec<SidxRecord> = Vec::new();
     let mut tfras: Vec<TfraRecord> = Vec::new();
     let mut prfts: Vec<PrftRecord> = Vec::new();
+    // §8.1.3 — optional `pdin` ProgressiveDownloadInfoBox. Quantity is
+    // zero or one per file (§8.1.3.1); we keep the first instance seen
+    // during the top-level walk and silently ignore any subsequent
+    // copies (a malformed file with two pdin boxes is no reason to
+    // abort the open — the first is the one the spec endorses).
+    let mut pdin: Option<PdinRecord> = None;
     while let Some(hdr) = read_box_header(&mut *input)? {
         match hdr.fourcc {
             FTYP => {
                 saw_ftyp = true;
                 skip_box_body(&mut *input, &hdr)?;
+            }
+            // §8.1.3 — `pdin` ProgressiveDownloadInfoBox. Top-level
+            // FullBox carrying (rate, initial_delay) u32 pairs that hint
+            // the suggested initial playback delay for a given effective
+            // download rate. Captured for the structured `pdin_entries`
+            // accessor and surfaced as flat `pdin` / `pdin_<n>`
+            // metadata keys below.
+            PDIN => {
+                let body = read_box_body(&mut *input, &hdr)?;
+                if pdin.is_none() {
+                    pdin = Some(parse_pdin(&body)?);
+                }
             }
             MOOV => {
                 moov = Some(read_box_body(&mut *input, &hdr)?);
@@ -177,6 +195,27 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         metadata.push(("mehd_fragment_duration".to_string(), d.to_string()));
     }
 
+    // Surface a parsed `pdin` (ProgressiveDownloadInfoBox, §8.1.3) on
+    // the flat metadata channel. Quantity is zero or one per file
+    // (§8.1.3.1); we emit:
+    //   - `pdin_count` = number of (rate, initial_delay) pairs
+    //   - `pdin_<n>` = "rate initial_delay" (decimal, space-separated)
+    //     for n in 0..count, mirroring the per-pair surface used for
+    //     `prft_<n>`. A consumer that wants the structured record
+    //     reaches for `Mp4Demuxer::pdin_entries()` (or the public
+    //     `parse_pdin_box`) — the flat surface is for tooling that
+    //     prefers a string-keyed metadata bag.
+    // Absent `pdin`, no keys are emitted.
+    if let Some(p) = pdin.as_ref() {
+        metadata.push(("pdin_count".to_string(), p.entries.len().to_string()));
+        for (n, e) in p.entries.iter().enumerate() {
+            metadata.push((
+                format!("pdin_{n}"),
+                format!("{} {}", e.rate, e.initial_delay),
+            ));
+        }
+    }
+
     // Surface any parsed `prft` ProducerReferenceTimeBoxes through the
     // container metadata channel as `prft_<n>` (0-based file order)
     // with value "reference_track_ID ntp_timestamp media_time" — three
@@ -274,6 +313,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         sidxes,
         tfras,
         prfts,
+        pdin,
         psshes: parsed.psshes,
         moof_psshes,
         senc_records,
@@ -385,6 +425,48 @@ pub struct PrftRecord {
     /// Surfaced so callers can validate against `media_time`'s
     /// representable range when round-tripping.
     pub version: u8,
+}
+
+/// One `(rate, initial_delay)` pair from a `pdin`
+/// ProgressiveDownloadInfoBox (ISO/IEC 14496-12 §8.1.3).
+///
+/// `rate` is an effective download rate in bytes per second; for that
+/// rate, `initial_delay` (milliseconds) is the suggested initial
+/// playback delay that lets the rest of the file arrive ahead of its
+/// playback deadline (§8.1.3.3). A receiver picks two adjacent
+/// entries whose rates bracket its observed throughput and linearly
+/// interpolates the delay, or extrapolates from the first / last entry
+/// when its observed rate sits outside the recorded range.
+///
+/// Both fields are `u32` on the wire (big-endian) and surfaced
+/// verbatim — neither is bounded by the spec other than its 32-bit
+/// width, so the structure preserves whatever the producer wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PdinEntry {
+    /// Effective download rate in bytes / second.
+    pub rate: u32,
+    /// Suggested initial playback delay in milliseconds at `rate`.
+    pub initial_delay: u32,
+}
+
+/// Decoded `pdin` (ProgressiveDownloadInfoBox, ISO/IEC 14496-12 §8.1.3).
+///
+/// `FullBox(version = 0, flags = 0)` whose body is `N` consecutive
+/// `(rate, initial_delay)` u32 pairs — `N = body_payload_size / 8`.
+/// The spec fixes no minimum or maximum count; an empty body (zero
+/// pairs) is permitted and yields an empty `entries` vec. The version
+/// is pinned to 0 (§8.1.3.2); a non-zero version is tolerated rather
+/// than rejected because the on-wire layout is unambiguous.
+///
+/// Quantity is zero or one per file (§8.1.3.1); the demuxer collects
+/// the first instance and ignores any subsequent ones.
+#[derive(Clone, Debug)]
+pub struct PdinRecord {
+    /// Pairs in file order, mirroring §8.1.3.2's loop ordering.
+    /// A consumer searching by rate should sort if a non-monotonic
+    /// producer is suspected — the spec wording recommends interpolation
+    /// but doesn't *mandate* monotonic ordering.
+    pub entries: Vec<PdinEntry>,
 }
 
 #[derive(Default)]
@@ -4372,6 +4454,68 @@ fn parse_sidx(body: &[u8], sidx_end_offset: u64) -> Result<Option<SidxRecord>> {
 /// box is associated with the NEXT `moof` in file order (§8.16.5.1
 /// placement rule); we don't enforce that ordering at parse time —
 /// callers correlate by file position.
+/// Parse a `pdin` (ProgressiveDownloadInfoBox, ISO/IEC 14496-12 §8.1.3)
+/// body. The body is the bytes after the 8/16-byte box header.
+///
+/// Layout (§8.1.3.2):
+///
+/// ```text
+///     FullBox(pdin, version = 0, flags = 0)
+///     for (i = 0; ; i++) {        // to end of box
+///         unsigned int(32) rate;
+///         unsigned int(32) initial_delay;
+///     }
+/// ```
+///
+/// The 4-byte FullBox preamble is consumed and verified to fit. The
+/// remaining payload must be a multiple of 8 bytes (one u32 pair per
+/// entry); a body whose post-preamble length is not a multiple of 8
+/// is rejected as malformed rather than silently truncated to the
+/// nearest pair. A zero-pair body is permitted and yields an empty
+/// `entries` vec — the box is informational and an empty table is
+/// the producer's way of saying "no progressive-download hints
+/// available".
+///
+/// Version is pinned to 0 by §8.1.3.2; a non-zero version is tolerated
+/// (the on-wire layout is unambiguous) rather than rejected, mirroring
+/// `parse_padb` / `parse_stdp` posture for FullBox version-bit slips.
+fn parse_pdin(body: &[u8]) -> Result<PdinRecord> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: pdin too short"));
+    }
+    // Skip the 4-byte FullBox preamble (version + flags). §8.1.3.2 pins
+    // version = 0 and flags = 0; we tolerate anything the producer
+    // wrote because the payload layout is unambiguous.
+    let payload = &body[4..];
+    if payload.len() % 8 != 0 {
+        return Err(Error::invalid(
+            "MP4: pdin payload not a multiple of 8 bytes (rate + initial_delay pairs)",
+        ));
+    }
+    let count = payload.len() / 8;
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * 8;
+        let rate = u32::from_be_bytes([
+            payload[off],
+            payload[off + 1],
+            payload[off + 2],
+            payload[off + 3],
+        ]);
+        let initial_delay = u32::from_be_bytes([
+            payload[off + 4],
+            payload[off + 5],
+            payload[off + 6],
+            payload[off + 7],
+        ]);
+        entries.push(PdinEntry {
+            rate,
+            initial_delay,
+        });
+    }
+    Ok(PdinRecord { entries })
+}
+
 fn parse_prft(body: &[u8]) -> Result<Option<PrftRecord>> {
     if body.len() < 16 {
         return Err(Error::invalid("MP4: prft too short"));
@@ -5380,6 +5524,14 @@ struct Mp4Demuxer {
     /// not consulted by `next_packet` / `seek_to`.
     #[allow(dead_code)]
     prfts: Vec<PrftRecord>,
+    /// Parsed `pdin` ProgressiveDownloadInfoBox (§8.1.3), if the file
+    /// carries one. Quantity is zero or one per file (§8.1.3.1); the
+    /// structured record is reachable via the public
+    /// `Mp4Demuxer::pdin_entries` accessor (downcast) and the flat
+    /// metadata channel surfaces it as `pdin_count` + `pdin_<n>` keys.
+    /// Informational only — the demuxer does not consult it.
+    #[allow(dead_code)]
+    pdin: Option<PdinRecord>,
     /// ISO/IEC 23001-7 §8.1 pssh entries collected from moov. One per
     /// DRM system signalled in the file; the demuxer does not consume
     /// them but a downstream decryption layer can look up its
@@ -5464,6 +5616,23 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn senc_records(&self) -> &[SencRecord] {
         &self.senc_records
+    }
+
+    /// ISO/IEC 14496-12 §8.1.3 — `pdin` ProgressiveDownloadInfoBox
+    /// pairs, if the file carries one. Each entry is a
+    /// `(rate, initial_delay)` u32 pair recommending an initial
+    /// playback delay (milliseconds) for a given effective download
+    /// rate (bytes/second); a receiver picks adjacent entries that
+    /// bracket its observed throughput and linearly interpolates the
+    /// delay (or extrapolates from the first / last entry).
+    /// Returns `None` when the file has no `pdin` box; returns
+    /// `Some(&[])` for an explicitly empty box (a producer's way of
+    /// saying "no hints available"). The structured record is
+    /// surfaced separately from the flat `pdin_count` / `pdin_<n>`
+    /// metadata keys so tooling can choose the shape it prefers.
+    #[allow(dead_code)]
+    pub fn pdin_entries(&self) -> Option<&[PdinEntry]> {
+        self.pdin.as_ref().map(|p| p.entries.as_slice())
     }
 
     /// ISO/IEC 14496-12 §8.7.8–9 — per-fragment Sample Auxiliary
@@ -5772,6 +5941,22 @@ pub fn parse_mfra_box(body: &[u8]) -> Result<Vec<TfraRecord>> {
 /// this entry per occurrence.
 pub fn parse_prft_box(body: &[u8]) -> Result<Option<PrftRecord>> {
     parse_prft(body)
+}
+
+/// Parse a standalone `pdin` (ProgressiveDownloadInfoBox, ISO/IEC
+/// 14496-12 §8.1.3) body from `body` (the bytes after the 8/16-byte
+/// box header).
+///
+/// Exposed as a public entry point so tooling that already has the
+/// box's payload bytes in hand (a DASH packager, a manifest emitter,
+/// a fixture validator) can recover the `(rate, initial_delay)` pairs
+/// without re-running `open()`. Returns `Err` for a body shorter than
+/// the 4-byte FullBox preamble or whose post-preamble length is not a
+/// multiple of 8 bytes (one `(rate, initial_delay)` u32 pair per
+/// entry); returns `Ok(PdinRecord { entries: vec![] })` for an
+/// explicitly empty box (preamble only, zero pairs).
+pub fn parse_pdin_box(body: &[u8]) -> Result<PdinRecord> {
+    parse_pdin(body)
 }
 
 use std::io::Read;
@@ -8531,6 +8716,132 @@ mod tests {
         assert_eq!(info.params.options.get("padb_max"), None);
         assert_eq!(info.params.options.get("padb_nonzero_count"), None);
         assert_eq!(info.params.options.get("padb_hist"), None);
+    }
+
+    /// Build a `pdin` (ISO/IEC 14496-12 §8.1.3) body: 4-byte FullBox
+    /// preamble followed by N `(rate, initial_delay)` u32 pairs in big
+    /// endian. Helper for the round 259 pdin tests.
+    fn build_pdin(entries: &[(u32, u32)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox(v=0, flags=0)
+        for (rate, delay) in entries {
+            body.extend_from_slice(&rate.to_be_bytes());
+            body.extend_from_slice(&delay.to_be_bytes());
+        }
+        body
+    }
+
+    /// `pdin` with a representative two-entry table round-trips through
+    /// the typed accessor in file order, with both u32 fields preserved
+    /// verbatim.
+    #[test]
+    fn parse_pdin_two_entries_preserves_order() {
+        let body = build_pdin(&[(125_000, 2_500), (250_000, 1_200)]);
+        let r = super::parse_pdin(&body).unwrap();
+        assert_eq!(r.entries.len(), 2);
+        assert_eq!(
+            r.entries[0],
+            super::PdinEntry {
+                rate: 125_000,
+                initial_delay: 2_500,
+            }
+        );
+        assert_eq!(
+            r.entries[1],
+            super::PdinEntry {
+                rate: 250_000,
+                initial_delay: 1_200,
+            }
+        );
+    }
+
+    /// `pdin` with zero pairs (preamble only, 4-byte body) is permitted:
+    /// a producer's way of signalling "no progressive-download hints".
+    #[test]
+    fn parse_pdin_empty_body_yields_empty_entries() {
+        let body = build_pdin(&[]);
+        let r = super::parse_pdin(&body).unwrap();
+        assert!(r.entries.is_empty());
+    }
+
+    /// A `pdin` body shorter than the 4-byte FullBox preamble is
+    /// rejected outright — `parse_pdin` cannot recover the version bits.
+    #[test]
+    fn parse_pdin_too_short_preamble() {
+        for n in 0..4 {
+            let body = vec![0u8; n];
+            assert!(super::parse_pdin(&body).is_err(), "len {n} must err");
+        }
+    }
+
+    /// A `pdin` body whose post-preamble length is not a multiple of 8
+    /// (one u32 pair per entry) is rejected — the spec's loop body is
+    /// exactly 8 bytes (§8.1.3.2) and a truncated tail is the
+    /// producer's bug, not ours to silently round down.
+    #[test]
+    fn parse_pdin_unaligned_payload_is_rejected() {
+        // 4-byte preamble + 12 bytes (1.5 pairs) → unaligned.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(&[0u8; 12]);
+        assert!(super::parse_pdin(&body).is_err());
+
+        // 4-byte preamble + 9 bytes (just past one pair) → unaligned.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(&[0u8; 9]);
+        assert!(super::parse_pdin(&body).is_err());
+    }
+
+    /// `parse_pdin` tolerates a non-zero version byte: §8.1.3.2 pins
+    /// version to 0 but the payload layout is unambiguous (no
+    /// version-dependent branching), so we surface whatever the
+    /// producer wrote rather than rejecting on a version-bit slip —
+    /// matching `parse_padb` / `parse_stdp` posture.
+    #[test]
+    fn parse_pdin_tolerates_nonzero_version() {
+        let mut body = Vec::new();
+        body.push(0xAA); // bogus version
+        body.extend_from_slice(&[0u8; 3]); // flags
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&2u32.to_be_bytes());
+        let r = super::parse_pdin(&body).unwrap();
+        assert_eq!(
+            r.entries,
+            vec![super::PdinEntry {
+                rate: 1,
+                initial_delay: 2,
+            }]
+        );
+    }
+
+    /// `parse_pdin` reads u32s in big-endian byte order per the spec
+    /// (every multi-byte field in ISOBMFF is big-endian, §4.2 and
+    /// §8.1.3.2). A naïve little-endian read would surface
+    /// `u32::from_le_bytes` semantics instead, which this test pins.
+    #[test]
+    fn parse_pdin_big_endian_byte_order() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // preamble
+                                           // rate = 0x01_02_03_04, initial_delay = 0x05_06_07_08 in big-endian.
+        body.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        body.extend_from_slice(&[0x05, 0x06, 0x07, 0x08]);
+        let r = super::parse_pdin(&body).unwrap();
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].rate, 0x01_02_03_04);
+        assert_eq!(r.entries[0].initial_delay, 0x05_06_07_08);
+    }
+
+    /// `parse_pdin_box` (the public wrapper) routes through the same
+    /// `parse_pdin` impl as the internal call, so tooling that has the
+    /// payload bytes in hand recovers the same `PdinRecord`.
+    #[test]
+    fn parse_pdin_box_public_entry_matches_internal() {
+        let body = build_pdin(&[(64_000, 5_000), (128_000, 2_400), (256_000, 1_000)]);
+        let r_public = super::parse_pdin_box(&body).unwrap();
+        let r_internal = super::parse_pdin(&body).unwrap();
+        assert_eq!(r_public.entries, r_internal.entries);
+        assert_eq!(r_public.entries.len(), 3);
     }
 
     /// `(subsample_size16, priority, discardable, csp)` — one v0 sub-sample.

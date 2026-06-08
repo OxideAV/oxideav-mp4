@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Progressive Download Information Box typed accessor
+  (ISO/IEC 14496-12 §8.1.3) — round 259. A `ProgressiveDownloadInfoBox`
+  (`pdin`) at file scope is now parsed by the typed handler
+  `parse_pdin`. The on-wire body — a 4-byte `FullBox(version=0, flags=0)`
+  preamble followed by an array of `(rate, initial_delay)` u32 pairs
+  in big-endian — is decoded into a `PdinRecord { entries: Vec<PdinEntry> }`
+  where each `PdinEntry { rate, initial_delay }` corresponds to one
+  spec-defined progressive-download hint pair. The top-level walker
+  in `demux::open` captures the first instance during the file walk
+  (§8.1.3.1 fixes quantity at zero or one); subsequent copies are
+  silently ignored. The parsed table is surfaced on
+  `Demuxer::metadata()` as `pdin_count` (total pair count, decimal)
+  plus `pdin_<n>` (one per pair, `"rate initial_delay"` decimal
+  space-separated, 0-based in file order). An explicitly empty box
+  (preamble only, zero pairs) emits `pdin_count = 0` and no
+  `pdin_<n>` keys; absent `pdin`, no keys are emitted at all so a
+  consumer can distinguish "no box" from "box but empty". The
+  structured record is reachable via the public
+  `oxideav_mp4::demux::parse_pdin_box(&[u8])` entry point for tooling
+  that already has the payload bytes in hand, and via
+  `Mp4Demuxer::pdin_entries() -> Option<&[PdinEntry]>` (downcast).
+  A body whose post-preamble length is not a multiple of 8 (one
+  `(rate, initial_delay)` u32 pair per entry per §8.1.3.2) is
+  rejected outright rather than silently truncated — a framing slip
+  is the producer's bug to fix. The version byte is tolerated even if
+  non-zero (the spec pins it to 0 but the payload layout is
+  unambiguous), matching `parse_padb` / `parse_stdp` posture for
+  FullBox version-bit slips.
 - Padding Bits Box typed accessor (ISO/IEC 14496-12 §8.7.6) — round 256.
   A `PaddingBitsBox` (`padb`) inside a track's `stbl` is now parsed by
   the typed handler `parse_padb`. The on-wire layout packs two samples
