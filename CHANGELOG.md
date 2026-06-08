@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Padding Bits Box typed accessor (ISO/IEC 14496-12 §8.7.6) — round 256.
+  A `PaddingBitsBox` (`padb`) inside a track's `stbl` is now parsed by
+  the typed handler `parse_padb`. The on-wire layout packs two samples
+  per byte (each nibble is `bit(1) reserved=0; bit(3) pad`); the
+  accessor unpacks them into a `Vec<u8>` of per-sample padding-bit
+  counts in `0..=7` (decode order). Unlike `sdtp` / `stdp`, `padb`
+  declares its own `sample_count` on the wire (§8.7.6.2) and the table
+  is self-contained — the trailing unused nibble when `sample_count`
+  is odd is dropped during parse, and a body shorter than the declared
+  size is rejected. The reserved high bit of each nibble (required
+  zero by §8.7.6.2) is masked off so a producer slip on the reserved
+  bit cannot corrupt the count. The parsed table is exposed on
+  `params.options` as four `padb_*` keys: `padb_count` (total entries),
+  `padb_max` (largest pad count, `0..=7`), `padb_nonzero_count`
+  (samples whose pad count is non-zero — the count that actually
+  matters to a bitstream consumer; an all-zero table means the track
+  is byte-aligned and the box is informational only), and `padb_hist`
+  (eight-bucket histogram `n0:n1:n2:n3:n4:n5:n6:n7` where `nK` is the
+  count of samples whose pad count is `K`). The histogram fully
+  captures the distribution in one short string. Absent `padb`, none
+  of the keys are emitted.
 - Copyright Box typed accessor (ISO/IEC 14496-12 §8.10.2) — round 252.
   A `CopyrightBox` (`cprt`) inside a track-level `udta` is now parsed
   by the typed handler `parse_cprt`, distinct from the 3GPP-style

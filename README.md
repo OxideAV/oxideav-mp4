@@ -427,6 +427,27 @@ Sample-entry FourCCs resolve to these codec ids:
   `sum / count`). A renderer dropping samples under bitrate / CPU
   pressure consults the carrying spec for the priority ordering.
   Absent `stdp`, none of the keys are emitted.
+- Sample padding bits (ISO/IEC 14496-12 §8.7.6, `padb`): a track's
+  `stbl/padb` PaddingBitsBox is an optional table recording, per
+  sample, how many bits at the tail of the sample's last byte are
+  padding (a value in `0..=7`). On the wire two samples share a byte:
+  each nibble is `bit(1) reserved=0; bit(3) pad`. Unlike `sdtp` /
+  `stdp` the box declares its own `sample_count` (independent of
+  `stsz` / `stz2`), so the table is self-contained — the trailing
+  unused nibble when `sample_count` is odd is dropped during parse.
+  The reserved high bit of each nibble (required zero by §8.7.6.2) is
+  masked off so a producer slip on the reserved bit does not corrupt
+  the surfaced pad count. The demuxer exposes a summary on
+  `params.options` rather than the per-sample table — four keys per
+  track-with-`padb`: `padb_count` (total entries), `padb_max` (largest
+  pad count seen, `0..=7`), `padb_nonzero_count` (samples whose pad
+  count is non-zero — the count that actually matters to a bitstream
+  consumer; an all-zero `padb` means the track is byte-aligned), and
+  `padb_hist` (eight-bucket histogram `n0:n1:n2:n3:n4:n5:n6:n7` where
+  `nK` is the number of samples whose pad count is `K`, decimal). The
+  histogram fully captures the value distribution in one short string;
+  consumers can recover any aggregate without scanning. Absent `padb`,
+  none of the keys are emitted.
 - Sample dependency hints (ISO/IEC 14496-12 §8.6.4, `sdtp`): a
   track's `stbl/sdtp` SampleDependencyTypeBox is a per-sample table
   of four 2-bit fields — `is_leading`, `sample_depends_on`,

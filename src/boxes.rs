@@ -207,6 +207,17 @@ pub const STDP: [u8; 4] = fourcc("stdp");
 /// samples without decoding them. One byte per sample;
 /// `sample_count` is implicit from `stsz` / `stz2`.
 pub const SDTP: [u8; 4] = fourcc("sdtp");
+/// `padb` — PaddingBitsBox (ISO/IEC 14496-12 §8.7.6). Sits inside
+/// `stbl`; optional table recording, for each sample, how many bits at
+/// the tail of the sample's last byte are padding (a value 0..=7). The
+/// on-wire encoding packs two samples into one byte: each nibble is
+/// `bit(1) reserved=0; bit(3) pad`. With `sample_count` declared
+/// explicitly in the box (not implicit from `stsz`), the table has
+/// `(sample_count + 1) / 2` bytes — the trailing nibble is unused when
+/// `sample_count` is odd. The padding count tells a bitstream consumer
+/// how many trailing bits of the sample to ignore; the container
+/// preserves the per-sample u8s without applying any padding itself.
+pub const PADB: [u8; 4] = fourcc("padb");
 pub const CTTS: [u8; 4] = fourcc("ctts");
 /// `cslg` — CompositionToDecodeBox (ISO/IEC 14496-12 §8.6.1.4). Sits
 /// inside `stbl` (or `trep`); relates the composition and decoding

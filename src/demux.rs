@@ -600,6 +600,15 @@ struct Track {
     /// preserves the raw u16s without interpreting them. Empty when
     /// the track has no `stdp` (the common case).
     stdp: Vec<u16>,
+    /// §8.7.6 — `padb` (PaddingBitsBox). Per-sample 3-bit
+    /// `pad` counts in decode order, decoded from the packed
+    /// `(reserved:1 + pad:3) × 2` per-byte nibble layout. The on-wire
+    /// `sample_count` (declared inside the box, unlike `sdtp` / `stdp`)
+    /// fixes the number of valid entries; the unused trailing nibble
+    /// when `sample_count` is odd is dropped during parse. Empty when
+    /// the track has no `padb` (the common case — only bitstream codecs
+    /// whose samples do not end on a byte boundary need this).
+    padb: Vec<u8>,
     /// §8.7.7 — `subs` (SubSampleInformationBox) instances. The spec
     /// allows more than one per container provided they differ in `flags`
     /// (the carried codec's semantics for `flags` distinguish them); we
@@ -1336,6 +1345,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         sgpd: Vec::new(),
         sdtp: Vec::new(),
         stdp: Vec::new(),
+        padb: Vec::new(),
         subs: Vec::new(),
         saiz: Vec::new(),
         saio: Vec::new(),
@@ -1989,6 +1999,7 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             STSH => t.stsh = parse_stsh(&b)?,
             SDTP => t.sdtp = parse_sdtp(&b)?,
             STDP => t.stdp = parse_stdp(&b)?,
+            PADB => t.padb = parse_padb(&b)?,
             CTTS => t.ctts = parse_ctts(&b)?,
             CSLG => t.cslg = Some(parse_cslg(&b)?),
             SBGP => t.sbgp.push(parse_sbgp(&b)?),
@@ -2753,6 +2764,80 @@ fn parse_stdp(body: &[u8]) -> Result<Vec<u16>> {
     for i in 0..count {
         let off = i * 2;
         out.push(u16::from_be_bytes([payload[off], payload[off + 1]]));
+    }
+    Ok(out)
+}
+
+/// §8.7.6 — `padb` (PaddingBitsBox) typed accessor.
+///
+/// `FullBox(version = 0, flags = 0)` whose body is:
+///
+/// ```text
+///     unsigned int(32) sample_count
+///     for i in 0 .. (sample_count + 1) / 2 {
+///         bit(1) reserved = 0; bit(3) pad1;   // top nibble
+///         bit(1) reserved = 0; bit(3) pad2;   // bottom nibble
+///     }
+/// ```
+///
+/// Each nibble's reserved bit is required to be 0 per §8.7.6.2 but is
+/// not enforced here — the container layer surfaces what the producer
+/// wrote rather than rejecting on a reserved-bit slip; a strict
+/// validator can re-check by walking the raw box bytes.
+///
+/// `pad1` is the padding-bit count for sample number `(i * 2) + 1`,
+/// `pad2` for sample `(i * 2) + 2` (§8.7.6.3 — sample numbering is
+/// 1-based on the wire; the returned vec is 0-indexed so entry `n` is
+/// the padding-bit count for the `n+1`-th sample). When `sample_count`
+/// is odd the trailing `pad2` nibble is unused and dropped: the
+/// returned vec is exactly `sample_count` long.
+///
+/// `sample_count == 0` is permitted (a zero-sample padb yields an empty
+/// vec). A body too short for the declared `sample_count` is rejected
+/// rather than silently truncated — the spec mandates the box carry
+/// `(sample_count + 1) / 2` bytes of data.
+///
+/// Unlike `sdtp` / `stdp` (whose sample count is implicit from
+/// `stsz` / `stz2`), `padb` re-declares its own `sample_count` on the
+/// wire and the table is self-contained; if a producer wrote a
+/// `sample_count` larger than the track's actual sample count the
+/// trailing entries are still returned — a length mismatch is the
+/// producer's bug, not ours to invent zeros for.
+fn parse_padb(body: &[u8]) -> Result<Vec<u8>> {
+    if body.len() < 8 {
+        return Err(Error::invalid("MP4: padb too short"));
+    }
+    // §8.7.6.2 pins version = 0 and there are no defined flags; the
+    // FullBox preamble carries no useful information beyond that.
+    let sample_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let need = sample_count.div_ceil(2);
+    if body.len() < 8 + need {
+        return Err(Error::invalid(
+            "MP4: padb body shorter than declared sample_count",
+        ));
+    }
+    let payload = &body[8..8 + need];
+    let mut out = Vec::with_capacity(sample_count);
+    for (i, &byte) in payload.iter().enumerate() {
+        // Top nibble = pad1 (sample (i*2)+1); bottom nibble = pad2
+        // (sample (i*2)+2). The low 3 bits of each nibble carry the
+        // padding-bit count; the high bit is a reserved zero per
+        // §8.7.6.2 and is masked off here so a producer slip on the
+        // reserved bit does not corrupt the count.
+        let pad1 = (byte >> 4) & 0x07;
+        out.push(pad1);
+        if out.len() == sample_count {
+            break;
+        }
+        let pad2 = byte & 0x07;
+        out.push(pad2);
+        if out.len() == sample_count {
+            break;
+        }
+        // Suppress the unused-binding warning when no break fires (i
+        // is the byte index but we don't need it here — kept for
+        // future per-byte diagnostics).
+        let _ = i;
     }
     Ok(out)
 }
@@ -5086,6 +5171,57 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             .insert("stdp_sum".to_string(), sum.to_string());
     }
 
+    // ISO/IEC 14496-12 §8.7.6: surface the optional PaddingBitsBox
+    // (`padb`) as a small summary on `params.options` rather than the
+    // raw per-sample table — a track with `padb` typically has every
+    // sample's pad count packed densely and the raw nibble stream would
+    // dominate the options map. Each pad count is bounded 0..=7 by
+    // §8.7.6.3 so a fixed-width histogram fits in one short string;
+    // keys emitted per track-with-padb:
+    //   * `padb_count` — total sample entries in the parsed table.
+    //   * `padb_max` — maximum pad count seen (0..=7).
+    //   * `padb_nonzero_count` — number of samples whose pad count is
+    //     non-zero (the count a bitstream consumer actually cares about
+    //     — a track with all-zero pad counts is byte-aligned and the
+    //     `padb` box is informational only).
+    //   * `padb_hist` — eight-element histogram `n0:n1:n2:n3:n4:n5:n6:n7`
+    //     where `nK` is the count of samples whose pad count is K
+    //     (decimal). The colon-separated form keeps the key compact and
+    //     lets a consumer recover the full per-bucket count without
+    //     parsing variable-length JSON.
+    // Absent `padb`, none of the keys are emitted.
+    if !t.padb.is_empty() {
+        let mut hist = [0u64; 8];
+        let mut max_pad = 0u8;
+        let mut nonzero: u64 = 0;
+        for &p in &t.padb {
+            let bucket = (p & 0x07) as usize;
+            hist[bucket] = hist[bucket].saturating_add(1);
+            if p > max_pad {
+                max_pad = p;
+            }
+            if p != 0 {
+                nonzero += 1;
+            }
+        }
+        params
+            .options
+            .insert("padb_count".to_string(), t.padb.len().to_string());
+        params
+            .options
+            .insert("padb_max".to_string(), max_pad.to_string());
+        params
+            .options
+            .insert("padb_nonzero_count".to_string(), nonzero.to_string());
+        params.options.insert(
+            "padb_hist".to_string(),
+            format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}",
+                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7]
+            ),
+        );
+    }
+
     // ISO/IEC 14496-12 §8.7.7: surface each `subs` (SubSampleInformationBox)
     // present on the track. Each `subs` becomes one `subs_<n>` key whose
     // value starts with `"v<version> flags=<f>"` (the FullBox preamble —
@@ -5822,6 +5958,7 @@ mod tests {
             sgpd: Vec::new(),
             sdtp: Vec::new(),
             stdp: Vec::new(),
+            padb: Vec::new(),
             subs: Vec::new(),
             saiz: Vec::new(),
             saio: Vec::new(),
@@ -8236,6 +8373,164 @@ mod tests {
         assert_eq!(info.params.options.get("stdp_min"), None);
         assert_eq!(info.params.options.get("stdp_max"), None);
         assert_eq!(info.params.options.get("stdp_sum"), None);
+    }
+
+    /// Pack two §8.7.6 `padb` nibble values into one byte: top nibble is
+    /// `pad1` (sample (i*2)+1), bottom nibble is `pad2` (sample (i*2)+2).
+    /// Each nibble's high bit is the reserved zero (§8.7.6.2) and the low
+    /// three bits carry the pad count in 0..=7.
+    fn pack_padb(pad1: u8, pad2: u8) -> u8 {
+        ((pad1 & 0x07) << 4) | (pad2 & 0x07)
+    }
+
+    /// `padb` with four samples (one byte holding two pairs of pad
+    /// counts) round-trips through the typed accessor and yields the
+    /// per-sample u8 vec in decode order.
+    #[test]
+    fn parse_padb_four_samples_two_bytes() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox preamble (v0, flags 0)
+        body.extend_from_slice(&4u32.to_be_bytes()); // sample_count = 4
+        body.push(pack_padb(1, 2)); // samples 1, 2
+        body.push(pack_padb(3, 7)); // samples 3, 4
+        let v = super::parse_padb(&body).unwrap();
+        assert_eq!(v, vec![1u8, 2, 3, 7]);
+    }
+
+    /// `padb` with an odd sample_count discards the unused trailing
+    /// nibble (§8.7.6.2 — `(sample_count + 1) / 2` bytes total, last
+    /// byte's bottom nibble is unused when sample_count is odd).
+    #[test]
+    fn parse_padb_odd_sample_count_drops_trailing_nibble() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox preamble
+        body.extend_from_slice(&3u32.to_be_bytes()); // sample_count = 3
+        body.push(pack_padb(2, 4)); // samples 1, 2
+        body.push(pack_padb(6, 5)); // sample 3; pad2 unused
+        let v = super::parse_padb(&body).unwrap();
+        assert_eq!(v, vec![2u8, 4, 6]);
+    }
+
+    /// `padb` with `sample_count == 0` (zero-sample table) is permitted
+    /// and yields an empty vec.
+    #[test]
+    fn parse_padb_zero_samples() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox preamble
+        body.extend_from_slice(&0u32.to_be_bytes()); // sample_count = 0
+        let v = super::parse_padb(&body).unwrap();
+        assert!(v.is_empty());
+    }
+
+    /// A `padb` body too short for even the FullBox + sample_count
+    /// preamble (8 bytes) is rejected outright.
+    #[test]
+    fn parse_padb_too_short_preamble() {
+        assert!(super::parse_padb(&[0u8; 4]).is_err());
+        assert!(super::parse_padb(&[0u8; 7]).is_err());
+    }
+
+    /// A `padb` whose declared `sample_count` would need more bytes than
+    /// the body carries is rejected — the spec mandates the box carry
+    /// `(sample_count + 1) / 2` bytes of payload data.
+    #[test]
+    fn parse_padb_truncated_payload() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox preamble
+        body.extend_from_slice(&10u32.to_be_bytes()); // sample_count = 10
+        body.push(0); // only 1 of the 5 needed bytes
+        body.push(0);
+        assert!(super::parse_padb(&body).is_err());
+    }
+
+    /// The reserved high bit of each nibble (§8.7.6.2) is masked off
+    /// rather than carried into the returned pad value — a producer
+    /// slip on the reserved bit does not corrupt the count.
+    #[test]
+    fn parse_padb_masks_reserved_bit() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(&2u32.to_be_bytes()); // sample_count = 2
+                                                     // pad1 = 5 (0b101) with reserved bit set: nibble = 0b1101 = 0xD
+                                                     // pad2 = 2 (0b010) with reserved bit set: nibble = 0b1010 = 0xA
+        body.push(0xDA);
+        let v = super::parse_padb(&body).unwrap();
+        assert_eq!(v, vec![5u8, 2]);
+    }
+
+    /// `parse_stbl` lands the `padb` on the track alongside the other
+    /// sample-table boxes (proves the dispatch arm is wired).
+    #[test]
+    fn parse_stbl_picks_up_padb() {
+        let mut padb = Vec::new();
+        padb.extend_from_slice(&[0u8; 4]); // FullBox preamble
+        padb.extend_from_slice(&2u32.to_be_bytes()); // sample_count = 2
+        padb.push(pack_padb(4, 1));
+        let mut stbl = Vec::new();
+        stbl.extend(wrap_box_full_size(b"padb", &padb));
+
+        let mut t = fresh_track();
+        super::parse_stbl(&stbl, &mut t).unwrap();
+        assert_eq!(t.padb, vec![4u8, 1]);
+    }
+
+    /// Surfacing: a parsed `padb` exposes its summary on `params.options`
+    /// as four `padb_*` keys (count + max + nonzero_count + 8-bucket
+    /// histogram). The histogram fully captures the value distribution
+    /// in a single key; consumers can recover any aggregate from it.
+    #[test]
+    fn build_stream_info_surfaces_padb_summary_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48_000;
+        // Eight samples with pad counts {0, 0, 1, 2, 2, 7, 7, 7}:
+        // count=8, max=7, nonzero=6
+        // histogram = [2,1,2,0,0,0,0,3]
+        t.padb = vec![0u8, 0, 1, 2, 2, 7, 7, 7];
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("padb_count"), Some("8"));
+        assert_eq!(info.params.options.get("padb_max"), Some("7"));
+        assert_eq!(info.params.options.get("padb_nonzero_count"), Some("6"));
+        assert_eq!(
+            info.params.options.get("padb_hist"),
+            Some("2:1:2:0:0:0:0:3")
+        );
+    }
+
+    /// A `padb` whose every entry is zero (the byte-aligned-bitstream
+    /// case) still emits the summary keys — the box's presence is the
+    /// signal that the producer accounted for padding, even if every
+    /// sample happens to be byte-aligned.
+    #[test]
+    fn build_stream_info_padb_all_zero_emits_keys() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48_000;
+        t.padb = vec![0u8; 5];
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("padb_count"), Some("5"));
+        assert_eq!(info.params.options.get("padb_max"), Some("0"));
+        assert_eq!(info.params.options.get("padb_nonzero_count"), Some("0"));
+        assert_eq!(
+            info.params.options.get("padb_hist"),
+            Some("5:0:0:0:0:0:0:0")
+        );
+    }
+
+    /// Absence: a track with no `padb` emits none of the summary keys.
+    #[test]
+    fn build_stream_info_no_padb_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48_000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("padb_count"), None);
+        assert_eq!(info.params.options.get("padb_max"), None);
+        assert_eq!(info.params.options.get("padb_nonzero_count"), None);
+        assert_eq!(info.params.options.get("padb_hist"), None);
     }
 
     /// `(subsample_size16, priority, discardable, csp)` — one v0 sub-sample.
