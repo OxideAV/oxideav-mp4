@@ -589,6 +589,52 @@ Sample-entry FourCCs resolve to these codec ids:
   if the producer wrote a non-zero value (the spec pins it to 0 but
   the payload layout is unambiguous), matching `parse_padb` /
   `parse_stdp` posture for FullBox version-bit slips.
+- Level assignment (ISO/IEC 14496-12 §8.8.13, `leva`): a `FullBox(0, 0)`
+  inside `mvex` whose body opens with `unsigned int(8) level_count`
+  and is followed by `level_count` per-level entries. Each entry maps
+  one fragment level to a `track_id` (u32) with a `padding_flag` (top
+  bit of the packed §8.8.13.2 byte) and a 7-bit `assignment_type`
+  discriminator: 0 selects a sample grouping by `grouping_type` (u32),
+  1 adds `grouping_type_parameter` (u32), 2/3 carry no further tail
+  (level by track / by track-subsegment), 4 names a `sub_track_id`
+  (u32) for sub-track scope. Levels specify subsets of subsequent
+  movie fragments — samples mapped to level `n` may depend on any
+  level `m ≤ n` but never on level `p > n` (§8.8.13.1). The §8.8.13
+  level table cannot be specified for the initial movie; the box
+  applies to all moof fragments that follow. In DASH (ISO/IEC 23009-1)
+  each subsegment indexed by a `sidx` (§8.16.3) is a "fraction" and
+  data for each level shall appear contiguously within it in
+  increasing level order; `padding_flag = 1` declares that a
+  conforming fraction can be formed by concatenating any positive
+  integer number of levels and padding the last `mdat` to its
+  declared size. §8.8.13.1 fixes quantity at zero or one per file;
+  the `mvex` walker captures the first instance and ignores any
+  subsequent copies. The parsed table is surfaced on
+  `Demuxer::metadata()` as `leva_count` (total entry count, decimal)
+  plus `leva_<n>` per-entry strings of the shape `"<track_id>
+  pad=<0|1> at=<assignment_type> [grouping_type=<u32>]
+  [grouping_type_parameter=<u32>] [sub_track_id=<u32>]"` — the
+  trailing tokens are emitted only when their `assignment_type`
+  variant uses them. The structured record is also reachable via the
+  public `oxideav_mp4::demux::parse_leva_box(&[u8])` entry point for
+  tooling that already has the box's payload bytes in hand (a DASH
+  packager, a manifest emitter, a scalable-bitstream layer picker),
+  and via `Mp4Demuxer::leva_entries() -> Option<&[LevaEntry]>`
+  (downcast) for callers holding the demuxer trait object. A
+  truncated entry header (less than 5 bytes for `track_id` +
+  padding/assignment) or a truncated variant tail is rejected at
+  parse time — a partial table would lie about which levels exist.
+  A malformed `leva` reaching `parse_mvex` is dropped silently so a
+  producer slip cannot brick `open()` (the box is informational —
+  playback proceeds without level scoping). The §8.8.13.3 minimum
+  `level_count ≥ 2` is **not** enforced (the demuxer carries
+  whatever the producer wrote so a validator can flag the short
+  table). Reserved `assignment_type` values (> 4) are surfaced as
+  5-byte header entries with the variant-specific fields zero — the
+  spec leaves their tail undefined so consuming any extra bytes would
+  desynchronise the loop. The version byte is tolerated even if the
+  producer wrote a non-zero value, matching `parse_pdin` / `parse_padb`
+  / `parse_stdp` posture for FullBox version-bit slips.
 
 ### Muxer
 

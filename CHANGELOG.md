@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Level Assignment Box typed accessor (ISO/IEC 14496-12 §8.8.13) —
+  round 264. A `LevelAssignmentBox` (`leva`) inside `mvex` is now parsed
+  by the typed handler `parse_leva`. The on-wire body — a 4-byte
+  `FullBox(version=0, flags=0)` preamble followed by `unsigned int(8)
+  level_count` and `level_count` per-level entries laid out per
+  §8.8.13.2 — is decoded into a `LevaRecord { entries: Vec<LevaEntry> }`
+  where each `LevaEntry` carries `track_id` (u32), `padding_flag`
+  (high bit of the §8.8.13.2 packed byte), `assignment_type` (low 7
+  bits), plus the variant-specific tail fields `grouping_type`,
+  `grouping_type_parameter`, and `sub_track_id`. The five spec-defined
+  `assignment_type` values (0/1/2/3/4) are each consumed with their
+  correct tail length; reserved values (> 4) carry only the 5-byte
+  header and a downstream validator can flag them. The `mvex` walker
+  in `parse_mvex` captures the first instance seen (§8.8.13.1 fixes
+  quantity at zero or one per file); subsequent copies are silently
+  ignored. The parsed table is surfaced on `Demuxer::metadata()` as
+  `leva_count` (total entry count, decimal) plus `leva_<n>` per-entry
+  strings of the shape `"<track_id> pad=<0|1> at=<assignment_type>
+  [grouping_type=<u32>] [grouping_type_parameter=<u32>]
+  [sub_track_id=<u32>]"` — the trailing tokens are emitted only when
+  their assignment_type variant uses them, mirroring the §8.8.13.2
+  variant tails. The structured record is reachable via the public
+  `oxideav_mp4::demux::parse_leva_box(&[u8])` entry point for tooling
+  that already has the payload bytes in hand, and via
+  `Mp4Demuxer::leva_entries() -> Option<&[LevaEntry]>` (downcast).
+  A truncated entry header or a truncated variant tail is rejected
+  outright at parse time rather than silently dropping the rest of the
+  table — a short table would lie about which levels exist. A
+  malformed `leva` reaching `parse_mvex` is dropped silently so a
+  producer slip cannot brick `open()` (the box is informational; the
+  file remains parseable). A zero `level_count` is permitted at parse
+  time so a downstream validator can spot the §8.8.13.3 "level_count
+  shall be greater than or equal to 2" violation; the version byte is
+  tolerated even if non-zero (the spec pins it to 0 but the payload
+  layout is unambiguous), matching `parse_pdin` / `parse_padb` /
+  `parse_stdp` posture for FullBox version-bit slips.
 - Progressive Download Information Box typed accessor
   (ISO/IEC 14496-12 §8.1.3) — round 259. A `ProgressiveDownloadInfoBox`
   (`pdin`) at file scope is now parsed by the typed handler

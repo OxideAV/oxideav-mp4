@@ -216,6 +216,48 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         }
     }
 
+    // Surface a parsed `leva` (LevelAssignmentBox, §8.8.13) on the flat
+    // metadata channel. Quantity is zero or one per file (§8.8.13.1);
+    // we emit:
+    //   - `leva_count` = number of per-level entries
+    //   - `leva_<n>` = "<track_id> pad=<0|1> at=<assignment_type>
+    //     [grouping_type=<u32>] [grouping_type_parameter=<u32>]
+    //     [sub_track_id=<u32>]" — the trailing tokens are emitted only
+    //     when their assignment_type variant uses them, mirroring the
+    //     variant-specific tails in §8.8.13.2.
+    // A consumer that wants the structured record reaches for
+    // `Mp4Demuxer::leva_entries()` (or the public `parse_leva_box`).
+    // Absent `leva`, no keys are emitted.
+    if let Some(l) = parsed.leva.as_ref() {
+        metadata.push(("leva_count".to_string(), l.entries.len().to_string()));
+        for (n, e) in l.entries.iter().enumerate() {
+            let mut s = format!(
+                "{} pad={} at={}",
+                e.track_id, e.padding_flag as u8, e.assignment_type
+            );
+            match e.assignment_type {
+                0 => {
+                    use std::fmt::Write;
+                    let _ = write!(s, " grouping_type={}", e.grouping_type);
+                }
+                1 => {
+                    use std::fmt::Write;
+                    let _ = write!(
+                        s,
+                        " grouping_type={} grouping_type_parameter={}",
+                        e.grouping_type, e.grouping_type_parameter,
+                    );
+                }
+                4 => {
+                    use std::fmt::Write;
+                    let _ = write!(s, " sub_track_id={}", e.sub_track_id);
+                }
+                _ => {}
+            }
+            metadata.push((format!("leva_{n}"), s));
+        }
+    }
+
     // Surface any parsed `prft` ProducerReferenceTimeBoxes through the
     // container metadata channel as `prft_<n>` (0-based file order)
     // with value "reference_track_ID ntp_timestamp media_time" — three
@@ -314,6 +356,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         tfras,
         prfts,
         pdin,
+        leva: parsed.leva,
         psshes: parsed.psshes,
         moof_psshes,
         senc_records,
@@ -469,6 +512,78 @@ pub struct PdinRecord {
     pub entries: Vec<PdinEntry>,
 }
 
+/// Per-level descriptor carried by `leva` (LevelAssignmentBox, ISO/IEC
+/// 14496-12 §8.8.13). One entry per `level_count` loop iteration in
+/// §8.8.13.2 syntax.
+///
+/// On the wire each entry is:
+/// `unsigned int(32) track_id; unsigned int(1) padding_flag;
+/// unsigned int(7) assignment_type; <type-specific tail>`.
+///
+/// The trailing tail varies with `assignment_type`:
+/// * 0 → `unsigned int(32) grouping_type`
+/// * 1 → `unsigned int(32) grouping_type` + `unsigned int(32) grouping_type_parameter`
+/// * 2 or 3 → empty (track / track-subsegment level assignment)
+/// * 4 → `unsigned int(32) sub_track_id`
+/// * other values are reserved (§8.8.13.3)
+///
+/// The §8.8.13.3 sequence rule constrains `assignment_type` ordering
+/// across an entire `leva`: "zero or more of type 2 or 3, followed by
+/// zero or more of exactly one type." The demuxer preserves the
+/// producer's order verbatim and does not enforce the rule — a downstream
+/// consumer that cares about it can validate against
+/// [`LevaEntry::assignment_type`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LevaEntry {
+    /// `track_id` field per §8.8.13.3 — identifies the track assigned
+    /// to this level. Track 0 is not a legal value (the spec defines
+    /// track IDs as ≥ 1 in §8.3.2.3); the demuxer carries whatever the
+    /// producer wrote so a validator can flag it.
+    pub track_id: u32,
+    /// `padding_flag` (1-bit, §8.8.13.3): when `true`, a conforming
+    /// fraction may be formed by concatenating any positive integer
+    /// number of levels and padding the last `mdat` to its full header
+    /// size with zero bytes. When `false`, this padding option is not
+    /// assured by the producer.
+    pub padding_flag: bool,
+    /// `assignment_type` (7-bit) — discriminator for the variant-specific
+    /// tail; surfaced verbatim. Values 0..=4 are defined by the spec;
+    /// any value > 4 falls in the §8.8.13.3 "reserved" range and the
+    /// demuxer carries it without further parsing the tail.
+    pub assignment_type: u8,
+    /// `grouping_type` (set when `assignment_type` ∈ {0, 1}), otherwise 0.
+    pub grouping_type: u32,
+    /// `grouping_type_parameter` (set when `assignment_type == 1`),
+    /// otherwise 0. §8.9.3 / §10.5 pin its semantics for the matching
+    /// sample grouping.
+    pub grouping_type_parameter: u32,
+    /// `sub_track_id` (set when `assignment_type == 4`), otherwise 0.
+    /// §8.14.4 identifies the sub-track that holds this level's samples.
+    pub sub_track_id: u32,
+}
+
+/// Decoded `leva` (LevelAssignmentBox, ISO/IEC 14496-12 §8.8.13).
+///
+/// `FullBox(version = 0, flags = 0)` whose body opens with
+/// `unsigned int(8) level_count` and is followed by `level_count`
+/// per-level entries laid out per [`LevaEntry`]. The spec requires
+/// `level_count ≥ 2` (§8.8.13.3 "level_count shall be greater than or
+/// equal to 2"); the demuxer carries whatever the producer wrote and
+/// surfaces the count via `entries.len()` so a validator can spot a
+/// short table.
+///
+/// Quantity is zero or one per file (§8.8.13.1); the demuxer collects
+/// the first instance seen inside `mvex` and ignores any subsequent
+/// copies (a malformed file with two leva boxes is no reason to abort
+/// the parse — the first is the one the spec endorses).
+#[derive(Clone, Debug)]
+pub struct LevaRecord {
+    /// Entries in file order, mirroring §8.8.13.2's loop ordering.
+    /// The §8.8.13.3 sequence rule on `assignment_type` ordering is
+    /// not enforced here; a consumer can validate by walking the slice.
+    pub entries: Vec<LevaEntry>,
+}
+
 #[derive(Default)]
 struct ParsedMoov {
     tracks: Vec<Track>,
@@ -493,6 +608,15 @@ struct ParsedMoov {
     /// fragment-level pssh can be added without changing the demuxer
     /// API.
     psshes: Vec<PsshBox>,
+    /// §8.8.13 — `leva` LevelAssignmentBox. Optional FullBox inside
+    /// `mvex` (quantity zero or one); maps tracks / sample groups /
+    /// sub-tracks to "levels" inside subsequent movie fragments. `None`
+    /// when the box is absent. Informational only — the demuxer does
+    /// not consume the levels itself, but downstream tooling (DASH
+    /// subsegment selection, scalable-bitstream layer selection) can
+    /// reach them through `Mp4Demuxer::leva_entries()` or the flat
+    /// `leva_count` / `leva_<n>` metadata keys.
+    leva: Option<LevaRecord>,
 }
 
 /// Per-track info collected from moov.
@@ -1074,7 +1198,12 @@ fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
             }
             MVEX => {
                 let body = read_bytes_vec(&mut cur, psz)?;
-                parse_mvex(&body, &mut out.tracks, &mut out.mehd_fragment_duration)?;
+                parse_mvex(
+                    &body,
+                    &mut out.tracks,
+                    &mut out.mehd_fragment_duration,
+                    &mut out.leva,
+                )?;
             }
             PSSH => {
                 // ISO/IEC 23001-7 §8.1 — ProtectionSystemSpecificHeaderBox.
@@ -1100,13 +1229,16 @@ fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
 }
 
 /// §8.8.1 — `mvex` (MovieExtendsBox). Container for `trex` boxes that
-/// supply per-track defaults consumed by the fragment parser, and an
+/// supply per-track defaults consumed by the fragment parser, an
 /// optional `mehd` MovieExtendsHeaderBox carrying the overall
-/// presentation duration of a fragmented movie.
+/// presentation duration of a fragmented movie, and (§8.8.13) an
+/// optional `leva` LevelAssignmentBox mapping tracks / sample groups /
+/// sub-tracks to fragment levels.
 fn parse_mvex(
     body: &[u8],
     tracks: &mut [Track],
     mehd_fragment_duration: &mut Option<u64>,
+    leva: &mut Option<LevaRecord>,
 ) -> Result<()> {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
@@ -1138,6 +1270,24 @@ fn parse_mvex(
                     // boxes).
                     if mehd_fragment_duration.is_none() {
                         *mehd_fragment_duration = Some(d);
+                    }
+                }
+            }
+            // §8.8.13 — `leva` LevelAssignmentBox. Optional FullBox
+            // (quantity zero or one per file). Maps tracks / sample
+            // groups / sub-tracks to "levels" inside subsequent moof
+            // fragments so a downstream consumer (DASH subsegment
+            // selector, scalable-bitstream layer picker) can skip
+            // levels it doesn't need. The demuxer captures the first
+            // instance seen and surfaces it through
+            // `Mp4Demuxer::leva_entries()` plus the flat `leva_count`
+            // / `leva_<n>` metadata channel. A malformed leva is
+            // non-fatal: dropped, file remains parseable.
+            LEVA => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                if leva.is_none() {
+                    if let Ok(r) = parse_leva(&b) {
+                        *leva = Some(r);
                     }
                 }
             }
@@ -4516,6 +4666,157 @@ fn parse_pdin(body: &[u8]) -> Result<PdinRecord> {
     Ok(PdinRecord { entries })
 }
 
+/// Parse a `leva` LevelAssignmentBox body (ISO/IEC 14496-12 §8.8.13).
+///
+/// Wire layout (§8.8.13.2):
+/// ```text
+/// FullBox('leva', 0, 0) {
+///     unsigned int(8)  level_count;
+///     for (j = 1; j <= level_count; j++) {
+///         unsigned int(32) track_id;
+///         unsigned int(1)  padding_flag;
+///         unsigned int(7)  assignment_type;
+///         if (assignment_type == 0)      { unsigned int(32) grouping_type; }
+///         else if (assignment_type == 1) { unsigned int(32) grouping_type;
+///                                          unsigned int(32) grouping_type_parameter; }
+///         else if (assignment_type == 2) {}
+///         else if (assignment_type == 3) {}
+///         else if (assignment_type == 4) { unsigned int(32) sub_track_id; }
+///     }
+/// }
+/// ```
+///
+/// Each entry is 4 (track_id) + 1 (padding_flag + assignment_type) + the
+/// type-specific tail (0/4/8/0/0/4 bytes for type 2/0/1/2/3/4
+/// respectively); a truncated tail rejects the whole box rather than
+/// silently dropping the rest of the table — a partial table would lie
+/// about which levels exist.
+///
+/// Version is pinned to 0 by §8.8.13.2; a non-zero version is tolerated
+/// (the on-wire layout is unambiguous) rather than rejected, mirroring
+/// the `parse_pdin` / `parse_padb` / `parse_stdp` posture for FullBox
+/// version-bit slips.
+///
+/// The §8.8.13.3 "level_count ≥ 2" rule is **not** enforced — the spec
+/// pins a minimum but the demuxer carries whatever the producer wrote
+/// so downstream validators can flag it. A `level_count` of 0 yields an
+/// empty `entries` vec.
+///
+/// Reserved `assignment_type` values (> 4) are carried verbatim with
+/// the variant-specific fields left at 0; the spec says they're
+/// reserved so this parser doesn't attempt to consume an unknown tail
+/// (any non-empty tail for a reserved type would desynchronise the
+/// loop). A reserved value therefore takes 5 bytes.
+fn parse_leva(body: &[u8]) -> Result<LevaRecord> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: leva too short for FullBox preamble"));
+    }
+    // Skip the 4-byte FullBox preamble (version + flags). §8.8.13.2 pins
+    // version = 0 and flags = 0; tolerated otherwise (layout is fixed).
+    let payload = &body[4..];
+    if payload.is_empty() {
+        return Err(Error::invalid("MP4: leva missing level_count byte"));
+    }
+    let level_count = payload[0] as usize;
+    let mut cursor = 1usize;
+    let mut entries = Vec::with_capacity(level_count);
+    for _ in 0..level_count {
+        // Need at least 5 bytes for track_id (4) + padding+assignment (1).
+        if cursor + 5 > payload.len() {
+            return Err(Error::invalid(
+                "MP4: leva truncated entry header (need 5 bytes for track_id+padding+assignment)",
+            ));
+        }
+        let track_id = u32::from_be_bytes([
+            payload[cursor],
+            payload[cursor + 1],
+            payload[cursor + 2],
+            payload[cursor + 3],
+        ]);
+        let packed = payload[cursor + 4];
+        // §8.8.13.2: high bit is padding_flag, low 7 bits are
+        // assignment_type.
+        let padding_flag = (packed & 0x80) != 0;
+        let assignment_type = packed & 0x7f;
+        cursor += 5;
+
+        let mut grouping_type = 0u32;
+        let mut grouping_type_parameter = 0u32;
+        let mut sub_track_id = 0u32;
+        match assignment_type {
+            0 => {
+                if cursor + 4 > payload.len() {
+                    return Err(Error::invalid(
+                        "MP4: leva truncated grouping_type for assignment_type=0",
+                    ));
+                }
+                grouping_type = u32::from_be_bytes([
+                    payload[cursor],
+                    payload[cursor + 1],
+                    payload[cursor + 2],
+                    payload[cursor + 3],
+                ]);
+                cursor += 4;
+            }
+            1 => {
+                if cursor + 8 > payload.len() {
+                    return Err(Error::invalid(
+                        "MP4: leva truncated grouping_type/parameter for assignment_type=1",
+                    ));
+                }
+                grouping_type = u32::from_be_bytes([
+                    payload[cursor],
+                    payload[cursor + 1],
+                    payload[cursor + 2],
+                    payload[cursor + 3],
+                ]);
+                grouping_type_parameter = u32::from_be_bytes([
+                    payload[cursor + 4],
+                    payload[cursor + 5],
+                    payload[cursor + 6],
+                    payload[cursor + 7],
+                ]);
+                cursor += 8;
+            }
+            2 | 3 => {
+                // §8.8.13.2 explicitly defines no further syntax
+                // elements for assignment_type 2 (level assignment by
+                // track) and 3 (by track-subsegment). The five-byte
+                // header is the whole entry.
+            }
+            4 => {
+                if cursor + 4 > payload.len() {
+                    return Err(Error::invalid(
+                        "MP4: leva truncated sub_track_id for assignment_type=4",
+                    ));
+                }
+                sub_track_id = u32::from_be_bytes([
+                    payload[cursor],
+                    payload[cursor + 1],
+                    payload[cursor + 2],
+                    payload[cursor + 3],
+                ]);
+                cursor += 4;
+            }
+            _ => {
+                // §8.8.13.3 — values > 4 are reserved. The spec doesn't
+                // define a tail length so we can't safely consume any
+                // extra bytes; the entry stands as the 5-byte header.
+                // A downstream validator can flag the reserved type.
+            }
+        }
+        entries.push(LevaEntry {
+            track_id,
+            padding_flag,
+            assignment_type,
+            grouping_type,
+            grouping_type_parameter,
+            sub_track_id,
+        });
+    }
+    Ok(LevaRecord { entries })
+}
+
 fn parse_prft(body: &[u8]) -> Result<Option<PrftRecord>> {
     if body.len() < 16 {
         return Err(Error::invalid("MP4: prft too short"));
@@ -5532,6 +5833,14 @@ struct Mp4Demuxer {
     /// Informational only — the demuxer does not consult it.
     #[allow(dead_code)]
     pdin: Option<PdinRecord>,
+    /// Parsed `leva` LevelAssignmentBox (§8.8.13), if the file carries
+    /// one. Quantity is zero or one per file (§8.8.13.1); the
+    /// structured record is reachable via the public
+    /// `Mp4Demuxer::leva_entries` accessor (downcast) and the flat
+    /// metadata channel surfaces it as `leva_count` + `leva_<n>` keys.
+    /// Informational only — the demuxer does not consult it.
+    #[allow(dead_code)]
+    leva: Option<LevaRecord>,
     /// ISO/IEC 23001-7 §8.1 pssh entries collected from moov. One per
     /// DRM system signalled in the file; the demuxer does not consume
     /// them but a downstream decryption layer can look up its
@@ -5633,6 +5942,22 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn pdin_entries(&self) -> Option<&[PdinEntry]> {
         self.pdin.as_ref().map(|p| p.entries.as_slice())
+    }
+
+    /// ISO/IEC 14496-12 §8.8.13 — `leva` LevelAssignmentBox entries,
+    /// if the file carries one. Each entry maps one fragment level to
+    /// a `track_id` (plus a `padding_flag` and an `assignment_type`
+    /// that discriminates among sample-group / track / track-subsegment
+    /// / sub-track variants per §8.8.13.2). Returns `None` when the
+    /// file has no `leva` box; returns `Some(&[])` for an explicit
+    /// `level_count = 0` (the spec pins a minimum of 2 in §8.8.13.3
+    /// but the demuxer carries whatever the producer wrote so a
+    /// validator can flag a short table). The structured record is
+    /// surfaced separately from the flat `leva_count` / `leva_<n>`
+    /// metadata keys so tooling can choose the shape it prefers.
+    #[allow(dead_code)]
+    pub fn leva_entries(&self) -> Option<&[LevaEntry]> {
+        self.leva.as_ref().map(|l| l.entries.as_slice())
     }
 
     /// ISO/IEC 14496-12 §8.7.8–9 — per-fragment Sample Auxiliary
@@ -5957,6 +6282,22 @@ pub fn parse_prft_box(body: &[u8]) -> Result<Option<PrftRecord>> {
 /// explicitly empty box (preamble only, zero pairs).
 pub fn parse_pdin_box(body: &[u8]) -> Result<PdinRecord> {
     parse_pdin(body)
+}
+
+/// Parse a standalone `leva` (LevelAssignmentBox, ISO/IEC 14496-12
+/// §8.8.13) body from `body` (the bytes after the 8/16-byte box
+/// header).
+///
+/// Exposed as a public entry point so tooling that already has the
+/// box's payload bytes in hand (a DASH packager, a manifest emitter, a
+/// fragment-level extractor) can recover the per-level table without
+/// re-running `open()`. Returns `Err` for a body shorter than the
+/// 4-byte FullBox preamble, a body missing its `level_count` byte, or
+/// any truncated per-entry tail; returns
+/// `Ok(LevaRecord { entries: vec![] })` for a body with the preamble +
+/// `level_count = 0`.
+pub fn parse_leva_box(body: &[u8]) -> Result<LevaRecord> {
+    parse_leva(body)
 }
 
 use std::io::Read;
@@ -8840,6 +9181,356 @@ mod tests {
         let body = build_pdin(&[(64_000, 5_000), (128_000, 2_400), (256_000, 1_000)]);
         let r_public = super::parse_pdin_box(&body).unwrap();
         let r_internal = super::parse_pdin(&body).unwrap();
+        assert_eq!(r_public.entries, r_internal.entries);
+        assert_eq!(r_public.entries.len(), 3);
+    }
+
+    /// One per-level entry to feed `build_leva`. The variant-specific
+    /// trailing fields are tagged on the assignment_type discriminant:
+    /// 0 → `Some(grouping_type)` only, 1 → both, 4 → sub_track_id, 2/3
+    /// → none.
+    #[derive(Clone, Copy, Debug)]
+    struct LevaBuild {
+        track_id: u32,
+        padding_flag: bool,
+        assignment_type: u8,
+        grouping_type: u32,
+        grouping_type_parameter: u32,
+        sub_track_id: u32,
+    }
+
+    /// Build a `leva` (ISO/IEC 14496-12 §8.8.13) body: 4-byte FullBox
+    /// preamble + `level_count` u8 + N per-level entries laid out per
+    /// §8.8.13.2. Reserved assignment_type values (> 4) emit only the
+    /// 5-byte header — the spec doesn't define their tail length.
+    fn build_leva(entries: &[LevaBuild]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox(v=0, flags=0)
+        body.push(entries.len() as u8); // level_count
+        for e in entries {
+            body.extend_from_slice(&e.track_id.to_be_bytes());
+            let packed = (if e.padding_flag { 0x80 } else { 0 }) | (e.assignment_type & 0x7f);
+            body.push(packed);
+            match e.assignment_type {
+                0 => body.extend_from_slice(&e.grouping_type.to_be_bytes()),
+                1 => {
+                    body.extend_from_slice(&e.grouping_type.to_be_bytes());
+                    body.extend_from_slice(&e.grouping_type_parameter.to_be_bytes());
+                }
+                2 | 3 => {}
+                4 => body.extend_from_slice(&e.sub_track_id.to_be_bytes()),
+                _ => {}
+            }
+        }
+        body
+    }
+
+    /// `leva` with a representative two-entry mix (one type-0, one
+    /// type-4) round-trips through `parse_leva` in file order, with
+    /// all variant-specific fields preserved verbatim.
+    #[test]
+    fn parse_leva_mixed_assignment_types_preserved() {
+        let entries = vec![
+            LevaBuild {
+                track_id: 1,
+                padding_flag: false,
+                assignment_type: 0,
+                grouping_type: u32::from_be_bytes(*b"roll"),
+                grouping_type_parameter: 0,
+                sub_track_id: 0,
+            },
+            LevaBuild {
+                track_id: 7,
+                padding_flag: true,
+                assignment_type: 4,
+                grouping_type: 0,
+                grouping_type_parameter: 0,
+                sub_track_id: 0xAABB_CCDD,
+            },
+        ];
+        let body = build_leva(&entries);
+        let r = super::parse_leva(&body).unwrap();
+        assert_eq!(r.entries.len(), 2);
+
+        assert_eq!(r.entries[0].track_id, 1);
+        assert!(!r.entries[0].padding_flag);
+        assert_eq!(r.entries[0].assignment_type, 0);
+        assert_eq!(r.entries[0].grouping_type, u32::from_be_bytes(*b"roll"));
+        assert_eq!(r.entries[0].grouping_type_parameter, 0);
+        assert_eq!(r.entries[0].sub_track_id, 0);
+
+        assert_eq!(r.entries[1].track_id, 7);
+        assert!(r.entries[1].padding_flag);
+        assert_eq!(r.entries[1].assignment_type, 4);
+        assert_eq!(r.entries[1].sub_track_id, 0xAABB_CCDD);
+    }
+
+    /// `leva` with assignment_type = 1 carries both `grouping_type`
+    /// and `grouping_type_parameter`; the parser must consume both
+    /// (8 bytes of tail) per §8.8.13.2.
+    #[test]
+    fn parse_leva_assignment_type_one_carries_both_grouping_fields() {
+        let entries = vec![LevaBuild {
+            track_id: 42,
+            padding_flag: false,
+            assignment_type: 1,
+            grouping_type: u32::from_be_bytes(*b"sync"),
+            grouping_type_parameter: 0xDEAD_BEEF,
+            sub_track_id: 0,
+        }];
+        let body = build_leva(&entries);
+        let r = super::parse_leva(&body).unwrap();
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].assignment_type, 1);
+        assert_eq!(r.entries[0].grouping_type, u32::from_be_bytes(*b"sync"));
+        assert_eq!(r.entries[0].grouping_type_parameter, 0xDEAD_BEEF);
+    }
+
+    /// `leva` with assignment_type 2 or 3 (level by track / by
+    /// track-subsegment) is just the 5-byte header — no variant tail.
+    /// Two back-to-back type-2 / type-3 entries round-trip cleanly.
+    #[test]
+    fn parse_leva_assignment_types_two_three_have_no_tail() {
+        let entries = vec![
+            LevaBuild {
+                track_id: 11,
+                padding_flag: false,
+                assignment_type: 2,
+                grouping_type: 0,
+                grouping_type_parameter: 0,
+                sub_track_id: 0,
+            },
+            LevaBuild {
+                track_id: 12,
+                padding_flag: true,
+                assignment_type: 3,
+                grouping_type: 0,
+                grouping_type_parameter: 0,
+                sub_track_id: 0,
+            },
+        ];
+        let body = build_leva(&entries);
+        // Body: 4 preamble + 1 level_count + 2*5 entry bytes = 15 total.
+        assert_eq!(body.len(), 4 + 1 + 2 * 5);
+        let r = super::parse_leva(&body).unwrap();
+        assert_eq!(r.entries.len(), 2);
+        assert_eq!(r.entries[0].assignment_type, 2);
+        assert_eq!(r.entries[0].track_id, 11);
+        assert_eq!(r.entries[1].assignment_type, 3);
+        assert_eq!(r.entries[1].track_id, 12);
+        assert!(r.entries[1].padding_flag);
+    }
+
+    /// `leva` with `level_count = 0` is permitted by this parser
+    /// (the spec pins a minimum of 2 in §8.8.13.3 but we carry whatever
+    /// the producer wrote so a validator can flag it). Body is 4-byte
+    /// preamble + 1-byte zero level_count.
+    #[test]
+    fn parse_leva_zero_level_count_yields_empty_entries() {
+        let body = build_leva(&[]);
+        let r = super::parse_leva(&body).unwrap();
+        assert!(r.entries.is_empty());
+    }
+
+    /// A `leva` body shorter than the 4-byte FullBox preamble is
+    /// rejected — `parse_leva` can't recover the version bits.
+    #[test]
+    fn parse_leva_too_short_preamble() {
+        for n in 0..4 {
+            let body = vec![0u8; n];
+            assert!(super::parse_leva(&body).is_err(), "len {n} must err");
+        }
+    }
+
+    /// A `leva` body with the FullBox preamble but no `level_count`
+    /// byte is rejected.
+    #[test]
+    fn parse_leva_missing_level_count_byte() {
+        let body = vec![0u8; 4];
+        assert!(super::parse_leva(&body).is_err());
+    }
+
+    /// A `leva` body that claims `level_count = 1` but stops before
+    /// the entry's 5-byte header is rejected as truncated rather than
+    /// silently treated as zero entries — a short table would lie
+    /// about which levels exist.
+    #[test]
+    fn parse_leva_truncated_entry_header_is_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // preamble
+        body.push(1); // level_count = 1
+                      // Only 4 bytes of the 5-byte header (track_id but no packed byte).
+        body.extend_from_slice(&[0u8; 4]);
+        assert!(super::parse_leva(&body).is_err());
+    }
+
+    /// `leva` assignment_type = 0 with a truncated `grouping_type` (3
+    /// bytes instead of 4) is rejected.
+    #[test]
+    fn parse_leva_truncated_grouping_type_for_at0_is_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // preamble
+        body.push(1); // level_count
+        body.extend_from_slice(&5u32.to_be_bytes()); // track_id
+        body.push(0); // padding=0 | at=0
+                      // Only 3 of 4 grouping_type bytes.
+        body.extend_from_slice(&[0u8; 3]);
+        assert!(super::parse_leva(&body).is_err());
+    }
+
+    /// `leva` assignment_type = 1 with a truncated tail (4 of 8
+    /// bytes) is rejected.
+    #[test]
+    fn parse_leva_truncated_grouping_parameter_for_at1_is_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // preamble
+        body.push(1); // level_count
+        body.extend_from_slice(&5u32.to_be_bytes()); // track_id
+        body.push(1); // padding=0 | at=1
+        body.extend_from_slice(&7u32.to_be_bytes()); // grouping_type
+                                                     // Missing the 4-byte grouping_type_parameter.
+        assert!(super::parse_leva(&body).is_err());
+    }
+
+    /// `leva` assignment_type = 4 with a truncated `sub_track_id` (2
+    /// bytes instead of 4) is rejected.
+    #[test]
+    fn parse_leva_truncated_sub_track_id_for_at4_is_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // preamble
+        body.push(1); // level_count
+        body.extend_from_slice(&5u32.to_be_bytes()); // track_id
+        body.push(4); // padding=0 | at=4
+        body.extend_from_slice(&[0u8; 2]); // only 2 of 4 sub_track_id bytes
+        assert!(super::parse_leva(&body).is_err());
+    }
+
+    /// `leva` reserved assignment_type values (> 4) are carried as
+    /// 5-byte headers with all variant-specific fields zero. The
+    /// spec doesn't define their tail, so the parser must not eat
+    /// any extra bytes — a downstream entry must still be reachable.
+    #[test]
+    fn parse_leva_reserved_assignment_type_consumes_no_tail() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // preamble
+        body.push(2); // level_count = 2
+                      // Entry 0: track_id = 9, padding = 1, at = 5 (reserved).
+        body.extend_from_slice(&9u32.to_be_bytes());
+        body.push(0x80 | 5);
+        // Entry 1: track_id = 10, padding = 0, at = 2 (no tail).
+        body.extend_from_slice(&10u32.to_be_bytes());
+        body.push(2);
+        let r = super::parse_leva(&body).unwrap();
+        assert_eq!(r.entries.len(), 2);
+        assert_eq!(r.entries[0].track_id, 9);
+        assert!(r.entries[0].padding_flag);
+        assert_eq!(r.entries[0].assignment_type, 5);
+        assert_eq!(r.entries[0].grouping_type, 0);
+        assert_eq!(r.entries[0].grouping_type_parameter, 0);
+        assert_eq!(r.entries[0].sub_track_id, 0);
+        // The second entry must have parsed cleanly, proving the
+        // reserved entry didn't consume the next header's bytes.
+        assert_eq!(r.entries[1].track_id, 10);
+        assert_eq!(r.entries[1].assignment_type, 2);
+    }
+
+    /// `parse_leva` tolerates a non-zero FullBox version byte
+    /// (§8.8.13.2 pins it to 0). The layout is unambiguous so we
+    /// surface whatever the producer wrote — same posture as
+    /// `parse_pdin` / `parse_padb` / `parse_stdp`.
+    #[test]
+    fn parse_leva_tolerates_nonzero_version() {
+        let mut body = Vec::new();
+        body.push(0xCC); // bogus version
+        body.extend_from_slice(&[0u8; 3]); // flags
+        body.push(1); // level_count
+        body.extend_from_slice(&42u32.to_be_bytes()); // track_id
+        body.push(0x80 | 3); // padding=1 | at=3 (no tail)
+        let r = super::parse_leva(&body).unwrap();
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].track_id, 42);
+        assert!(r.entries[0].padding_flag);
+        assert_eq!(r.entries[0].assignment_type, 3);
+    }
+
+    /// `parse_leva` reads u32s in big-endian byte order per §4.2 and
+    /// §8.8.13.2. A naïve little-endian read would surface
+    /// `u32::from_le_bytes` semantics; this test pins the BE choice.
+    #[test]
+    fn parse_leva_big_endian_byte_order() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // preamble
+        body.push(1); // level_count
+        body.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]); // track_id
+        body.push(0); // packed byte: padding=0 | at=0
+        body.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]); // grouping_type
+        let r = super::parse_leva(&body).unwrap();
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].track_id, 0x1122_3344);
+        assert_eq!(r.entries[0].grouping_type, 0xABCD_EF01);
+    }
+
+    /// `parse_leva` masks the 7-bit `assignment_type` against the
+    /// `padding_flag` high bit — both halves of the packed byte are
+    /// independently recoverable.
+    #[test]
+    fn parse_leva_packed_byte_splits_padding_and_assignment_type() {
+        for padding in [false, true] {
+            for at in 0u8..=4 {
+                let mut body = Vec::new();
+                body.extend_from_slice(&[0u8; 4]);
+                body.push(1);
+                body.extend_from_slice(&3u32.to_be_bytes());
+                body.push((if padding { 0x80 } else { 0 }) | at);
+                match at {
+                    0 => body.extend_from_slice(&0u32.to_be_bytes()),
+                    1 => body.extend_from_slice(&[0u8; 8]),
+                    2 | 3 => {}
+                    4 => body.extend_from_slice(&0u32.to_be_bytes()),
+                    _ => {}
+                }
+                let r = super::parse_leva(&body).unwrap();
+                assert_eq!(r.entries.len(), 1);
+                assert_eq!(r.entries[0].padding_flag, padding);
+                assert_eq!(r.entries[0].assignment_type, at);
+            }
+        }
+    }
+
+    /// `parse_leva_box` (the public wrapper) routes through the same
+    /// `parse_leva` impl as the internal call, so tooling that has
+    /// the payload bytes in hand recovers the same `LevaRecord`.
+    #[test]
+    fn parse_leva_box_public_entry_matches_internal() {
+        let entries = vec![
+            LevaBuild {
+                track_id: 1,
+                padding_flag: true,
+                assignment_type: 0,
+                grouping_type: u32::from_be_bytes(*b"rap "),
+                grouping_type_parameter: 0,
+                sub_track_id: 0,
+            },
+            LevaBuild {
+                track_id: 2,
+                padding_flag: false,
+                assignment_type: 1,
+                grouping_type: u32::from_be_bytes(*b"alst"),
+                grouping_type_parameter: 0x1234_5678,
+                sub_track_id: 0,
+            },
+            LevaBuild {
+                track_id: 3,
+                padding_flag: false,
+                assignment_type: 4,
+                grouping_type: 0,
+                grouping_type_parameter: 0,
+                sub_track_id: 99,
+            },
+        ];
+        let body = build_leva(&entries);
+        let r_public = super::parse_leva_box(&body).unwrap();
+        let r_internal = super::parse_leva(&body).unwrap();
         assert_eq!(r_public.entries, r_internal.entries);
         assert_eq!(r_public.entries.len(), 3);
     }

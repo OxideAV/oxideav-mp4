@@ -333,6 +333,20 @@ pub const MVEX: [u8; 4] = fourcc("mvex");
 /// authoring step writes `mehd` after the fragments are laid down).
 pub const MEHD: [u8; 4] = fourcc("mehd");
 pub const TREX: [u8; 4] = fourcc("trex");
+/// `leva` — LevelAssignmentBox (ISO/IEC 14496-12 §8.8.13). Sits inside
+/// `mvex`; optional FullBox(version=0, flags=0) with quantity zero or
+/// one per file. Maps tracks (or sample groups, parameterized sample
+/// groups, sub-tracks) to "levels" inside subsequent movie fragments;
+/// samples mapped to level n may depend on samples of any level m ≤ n
+/// but never on samples of level p > n (§8.8.13.1 "Levels specify
+/// subsets of the file"). Levels cannot be specified for the initial
+/// movie — the box applies to all moof fragments that follow. The DASH
+/// (ISO/IEC 23009-1) usage indexes each subsegment named by a `sidx`
+/// (§8.16.3) as a "fraction"; within a fraction, data for each level
+/// shall appear contiguously and in increasing order of level value.
+/// Demuxer carries the parsed entries through `leva_entries()`; the
+/// flat metadata channel surfaces `leva_count` + `leva_<n>` summaries.
+pub const LEVA: [u8; 4] = fourcc("leva");
 pub const MOOF: [u8; 4] = fourcc("moof");
 pub const MFHD: [u8; 4] = fourcc("mfhd");
 pub const TRAF: [u8; 4] = fourcc("traf");
