@@ -765,6 +765,12 @@ struct Track {
     /// `None` when the track has no `cslg` (the common case for files
     /// without B-frame reordering, or files that simply omit the box).
     cslg: Option<CslgBox>,
+    /// §12.1.2 / §8.4.5 — `vmhd` (VideoMediaHeaderBox). Present for
+    /// video tracks (the spec marks it mandatory inside `minf` for
+    /// video media). Carries the `graphicsmode` composition mode and
+    /// `opcolor`. `None` for non-video tracks (which use `smhd` /
+    /// `nmhd` / `sthd` instead) or when the box is absent.
+    vmhd: Option<VmhdBox>,
     /// §8.6.3 — `stsh` (ShadowSyncSampleBox) entries. Each pair is
     /// `(shadowed_sample_number, sync_sample_number)`, both 1-based
     /// sample indices: when seeking to (or before) the non-sync
@@ -1068,6 +1074,25 @@ struct CslgBox {
     /// The CTS-plus-duration of the sample with the largest computed
     /// CTS; `0` means "composition end time unknown" (§8.6.1.4.3).
     composition_end_time: i64,
+}
+
+/// Parsed `vmhd` (VideoMediaHeaderBox, ISO/IEC 14496-12 §12.1.2,
+/// defined per §8.4.5).
+///
+/// The media-type-specific header carried inside `minf` for a video
+/// track. Its body, after the 4-byte `FullBox(version=0, flags=1)`
+/// preamble, is a 16-bit `graphicsmode` and a `[u16; 3]` `opcolor`.
+/// `graphicsmode == 0` is `copy` (copy over the existing image);
+/// derived specifications may extend the set. `opcolor` is the
+/// (red, green, blue) colour available to graphics modes that use one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VmhdBox {
+    /// The composition mode for the video track. `0` is `copy`
+    /// (§12.1.2.3); other values are defined by derived specifications.
+    graphicsmode: u16,
+    /// The three (red, green, blue) colour components available for use
+    /// by graphics modes that consume an operation colour.
+    opcolor: [u16; 3],
 }
 
 /// Parsed `tsel` (TrackSelectionBox, ISO/IEC 14496-12 §8.10.3).
@@ -1572,6 +1597,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         copyrights: Vec::new(),
         tsel: None,
         cslg: None,
+        vmhd: None,
         stsh: Vec::new(),
         sbgp: Vec::new(),
         sgpd: Vec::new(),
@@ -2203,10 +2229,47 @@ fn parse_minf(body: &[u8], t: &mut Track) -> Result<()> {
                 let sub = read_bytes_vec(&mut cur, psz)?;
                 parse_stbl(&sub, t)?;
             }
+            VMHD => {
+                let sub = read_bytes_vec(&mut cur, psz)?;
+                // §12.1.2 fixes the quantity at exactly one; keep the
+                // first instance seen and ignore any stray duplicates.
+                if t.vmhd.is_none() {
+                    if let Ok(v) = parse_vmhd(&sub) {
+                        t.vmhd = Some(v);
+                    }
+                }
+            }
             _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
     Ok(())
+}
+
+/// Parse `vmhd` (VideoMediaHeaderBox, ISO/IEC 14496-12 §12.1.2 /
+/// §8.4.5).
+///
+/// The body is a 4-byte `FullBox(version=0, flags=1)` preamble followed
+/// by `unsigned int(16) graphicsmode` and `unsigned int(16)[3] opcolor`
+/// — eight payload bytes after the preamble, twelve total. The `version`
+/// is not enforced (the spec fixes it at 0, but we tolerate a non-zero
+/// value rather than dropping a usable header); `flags` is likewise not
+/// required to equal 1. A body shorter than the full 12 bytes is
+/// rejected — a partial header would surface an `opcolor` component that
+/// is really truncation noise.
+fn parse_vmhd(body: &[u8]) -> Result<VmhdBox> {
+    if body.len() < 12 {
+        return Err(Error::invalid("MP4: vmhd too short"));
+    }
+    let graphicsmode = u16::from_be_bytes([body[4], body[5]]);
+    let opcolor = [
+        u16::from_be_bytes([body[6], body[7]]),
+        u16::from_be_bytes([body[8], body[9]]),
+        u16::from_be_bytes([body[10], body[11]]),
+    ];
+    Ok(VmhdBox {
+        graphicsmode,
+        opcolor,
+    })
 }
 
 fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
@@ -5463,6 +5526,23 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         );
     }
 
+    // ISO/IEC 14496-12 §12.1.2 / §8.4.5: when the track carries a
+    // `vmhd` (VideoMediaHeaderBox) — i.e. a video track — surface its
+    // composition mode and operation colour on `params.options`.
+    // `vmhd_graphicsmode` is the decimal composition mode (0 = copy);
+    // `vmhd_opcolor` is the three (red, green, blue) 16-bit components
+    // space-separated, decimal. Callers that compose this track over an
+    // existing image read these instead of re-walking `minf`.
+    if let Some(v) = &t.vmhd {
+        params
+            .options
+            .insert("vmhd_graphicsmode", v.graphicsmode.to_string());
+        params.options.insert(
+            "vmhd_opcolor",
+            format!("{} {} {}", v.opcolor[0], v.opcolor[1], v.opcolor[2]),
+        );
+    }
+
     // ISO/IEC 14496-12 §8.6.3: surface the optional ShadowSyncSampleBox
     // (`stsh`) as `stsh_<n>` options keys (0-based encounter index),
     // each `"shadowed sync"` — the 1-based shadowed sample number and
@@ -6479,6 +6559,7 @@ mod tests {
             copyrights: Vec::new(),
             tsel: None,
             cslg: None,
+            vmhd: None,
             stsh: Vec::new(),
             sbgp: Vec::new(),
             sgpd: Vec::new(),
@@ -8221,6 +8302,111 @@ mod tests {
         assert_eq!(c.composition_end_time, 5000);
     }
 
+    /// §12.1.2 — `vmhd` body after the FullBox preamble is a 16-bit
+    /// `graphicsmode` plus three 16-bit `opcolor` components. Decode a
+    /// typical `copy`-mode header with a non-zero opcolor.
+    #[test]
+    fn parse_vmhd_graphicsmode_and_opcolor() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 1]); // version 0, flags 1
+        body.extend_from_slice(&0u16.to_be_bytes()); // graphicsmode = copy
+        body.extend_from_slice(&0x1234u16.to_be_bytes()); // opcolor red
+        body.extend_from_slice(&0x5678u16.to_be_bytes()); // opcolor green
+        body.extend_from_slice(&0x9abcu16.to_be_bytes()); // opcolor blue
+        let v = super::parse_vmhd(&body).unwrap();
+        assert_eq!(v.graphicsmode, 0);
+        assert_eq!(v.opcolor, [0x1234, 0x5678, 0x9abc]);
+    }
+
+    /// A non-zero `graphicsmode` (a derived-spec composition mode) is
+    /// preserved verbatim, not normalised to `copy`.
+    #[test]
+    fn parse_vmhd_nonzero_graphicsmode_preserved() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 1]);
+        body.extend_from_slice(&0x0100u16.to_be_bytes()); // graphicsmode
+        body.extend_from_slice(&[0u8; 6]); // opcolor all zero
+        let v = super::parse_vmhd(&body).unwrap();
+        assert_eq!(v.graphicsmode, 0x0100);
+        assert_eq!(v.opcolor, [0, 0, 0]);
+    }
+
+    /// The parser does not require `version == 0` — a stray non-zero
+    /// version byte still yields a usable header rather than a drop.
+    #[test]
+    fn parse_vmhd_tolerates_nonzero_version() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[3u8, 0, 0, 1]); // version 3
+        body.extend_from_slice(&7u16.to_be_bytes());
+        body.extend_from_slice(&[0u8; 6]);
+        let v = super::parse_vmhd(&body).unwrap();
+        assert_eq!(v.graphicsmode, 7);
+    }
+
+    /// A body shorter than the full 12 bytes (preamble + graphicsmode +
+    /// 3×opcolor) is rejected — a truncated tail would surface noise as
+    /// an opcolor component.
+    #[test]
+    fn parse_vmhd_too_short_is_rejected() {
+        // 11 bytes: one short of the final opcolor-blue byte.
+        let body = vec![0u8; 11];
+        assert!(super::parse_vmhd(&body).is_err());
+    }
+
+    /// `parse_minf` lands the `vmhd` on the track.
+    #[test]
+    fn parse_minf_picks_up_vmhd() {
+        let mut vmhd = Vec::new();
+        vmhd.extend_from_slice(&[0u8, 0, 0, 1]);
+        vmhd.extend_from_slice(&0u16.to_be_bytes());
+        vmhd.extend_from_slice(&10u16.to_be_bytes());
+        vmhd.extend_from_slice(&20u16.to_be_bytes());
+        vmhd.extend_from_slice(&30u16.to_be_bytes());
+        let mut minf = Vec::new();
+        minf.extend(wrap_box_full_size(b"vmhd", &vmhd));
+
+        let mut t = fresh_track();
+        super::parse_minf(&minf, &mut t).unwrap();
+        let v = t.vmhd.expect("vmhd should be parsed");
+        assert_eq!(v.graphicsmode, 0);
+        assert_eq!(v.opcolor, [10, 20, 30]);
+    }
+
+    /// §12.1.2 fixes the quantity at one — `parse_minf` keeps the first
+    /// `vmhd` and ignores a stray duplicate.
+    #[test]
+    fn parse_minf_keeps_first_vmhd_ignores_duplicate() {
+        let mut first = Vec::new();
+        first.extend_from_slice(&[0u8, 0, 0, 1]);
+        first.extend_from_slice(&1u16.to_be_bytes());
+        first.extend_from_slice(&[0u8; 6]);
+        let mut second = Vec::new();
+        second.extend_from_slice(&[0u8, 0, 0, 1]);
+        second.extend_from_slice(&2u16.to_be_bytes());
+        second.extend_from_slice(&[0u8; 6]);
+        let mut minf = Vec::new();
+        minf.extend(wrap_box_full_size(b"vmhd", &first));
+        minf.extend(wrap_box_full_size(b"vmhd", &second));
+
+        let mut t = fresh_track();
+        super::parse_minf(&minf, &mut t).unwrap();
+        assert_eq!(t.vmhd.unwrap().graphicsmode, 1);
+    }
+
+    /// A malformed `vmhd` (too short) inside `minf` is dropped silently —
+    /// the walker continues and the track simply has no video header,
+    /// rather than failing the whole `minf` parse.
+    #[test]
+    fn parse_minf_drops_malformed_vmhd() {
+        let short = vec![0u8; 5]; // far too short
+        let mut minf = Vec::new();
+        minf.extend(wrap_box_full_size(b"vmhd", &short));
+
+        let mut t = fresh_track();
+        super::parse_minf(&minf, &mut t).unwrap();
+        assert!(t.vmhd.is_none());
+    }
+
     /// Surfacing: a parsed `cslg` exposes its five fields on
     /// `params.options` as `cslg_<field>` decimal strings.
     #[test]
@@ -8277,6 +8463,36 @@ mod tests {
             None
         );
         assert_eq!(info.params.options.get("cslg_composition_end_time"), None);
+    }
+
+    /// Surfacing: a parsed `vmhd` exposes `vmhd_graphicsmode` (decimal)
+    /// and `vmhd_opcolor` (three space-separated decimal components) on
+    /// `params.options`.
+    #[test]
+    fn build_stream_info_surfaces_vmhd_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.vmhd = Some(super::VmhdBox {
+            graphicsmode: 0,
+            opcolor: [10, 20, 30],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("vmhd_graphicsmode"), Some("0"));
+        assert_eq!(info.params.options.get("vmhd_opcolor"), Some("10 20 30"));
+    }
+
+    /// Absence: a track with no `vmhd` emits neither `vmhd_*` key.
+    #[test]
+    fn build_stream_info_no_vmhd_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("vmhd_graphicsmode"), None);
+        assert_eq!(info.params.options.get("vmhd_opcolor"), None);
     }
 
     /// §8.6.3 — `stsh` with two `(shadowed, sync)` pairs. Verifies both

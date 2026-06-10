@@ -188,6 +188,12 @@ pub const MDHD: [u8; 4] = fourcc("mdhd");
 pub const ELNG: [u8; 4] = fourcc("elng");
 pub const HDLR: [u8; 4] = fourcc("hdlr");
 pub const MINF: [u8; 4] = fourcc("minf");
+/// `vmhd` — VideoMediaHeaderBox (ISO/IEC 14496-12 §12.1.2, defined per
+/// §8.4.5). Sits inside `minf`; the media-type-specific header for a
+/// video track. Carries a 16-bit `graphicsmode` composition mode and a
+/// three-component 16-bit `opcolor` (red, green, blue) for graphics
+/// modes that use it. Note the spec fixes `flags` at 1 for this box.
+pub const VMHD: [u8; 4] = fourcc("vmhd");
 pub const DINF: [u8; 4] = fourcc("dinf");
 pub const STBL: [u8; 4] = fourcc("stbl");
 pub const STSD: [u8; 4] = fourcc("stsd");

@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Video Media Header Box typed accessor (ISO/IEC 14496-12 §12.1.2,
+  defined per §8.4.5) — round 272. A `vmhd` (`VideoMediaHeaderBox`)
+  inside `minf` is now parsed by `parse_vmhd`. After the 4-byte
+  `FullBox` preamble (the spec fixes `version=0, flags=1`), the body is
+  `unsigned int(16) graphicsmode` followed by `unsigned int(16)[3]
+  opcolor` — eight payload bytes, twelve total — decoded into a
+  `VmhdBox { graphicsmode: u16, opcolor: [u16; 3] }`. `graphicsmode`
+  is preserved verbatim (`0` is the spec's `copy` mode; derived
+  specifications may extend the set, so a non-zero value is not
+  normalised), and the three `opcolor` (red, green, blue) components
+  are read in order. The parser tolerates a non-zero `version` byte
+  rather than dropping an otherwise-usable header, but rejects a body
+  shorter than the full 12 bytes — a truncated tail would surface
+  truncation noise as an `opcolor` component. The `minf` walker in
+  `parse_minf` captures the first instance seen (§12.1.2 fixes the
+  quantity at exactly one) and silently ignores stray duplicates; a
+  malformed `vmhd` is dropped without failing the surrounding `minf`
+  parse, so the track simply has no video header. The parsed values are
+  surfaced on `Demuxer::metadata()` as `vmhd_graphicsmode` (decimal)
+  and `vmhd_opcolor` (the three components space-separated, decimal),
+  mirroring the existing per-track media-box surfacing convention
+  (`cslg_*`), so a caller compositing the track over an existing image
+  reads them instead of re-walking `minf`.
+
 - Level Assignment Box typed accessor (ISO/IEC 14496-12 §8.8.13) —
   round 264. A `LevelAssignmentBox` (`leva`) inside `mvex` is now parsed
   by the typed handler `parse_leva`. The on-wire body — a 4-byte
