@@ -635,6 +635,35 @@ Sample-entry FourCCs resolve to these codec ids:
   desynchronise the loop. The version byte is tolerated even if the
   producer wrote a non-zero value, matching `parse_pdin` / `parse_padb`
   / `parse_stdp` posture for FullBox version-bit slips.
+- Subsegment index (ISO/IEC 14496-12 §8.16.4, `ssix`): the top-level
+  `FullBox(version = 0, flags = 0)` that maps levels (as assigned by
+  the §8.8.13 `leva` box above) to byte ranges of the subsegments
+  indexed by the immediately preceding `sidx` (§8.16.4.1 placement:
+  zero or one per leaf-only `sidx`, as its next box;
+  `subsegment_count` shall equal that sidx's `reference_count`), so a
+  client can fetch a partial subsegment — e.g. only the lower temporal
+  levels — by byte range. The §8.16.4.2 body (`subsegment_count` u32,
+  then per subsegment a `range_count` u32 followed by packed
+  `(level u8, range_size u24)` records that partition every byte of
+  the subsegment, level-contiguous and in increasing level order for
+  leaf subsegments) decodes into `SsixRecord` → `SsixSubsegment` →
+  `SsixRange`. Every `ssix` met during the top-level walk is collected
+  in file order and surfaced on `Demuxer::metadata()` as `ssix_<n>` =
+  `"<subsegment_count> <total_range_count>"` (shape summary — the full
+  table is reachable via the public
+  `oxideav_mp4::demux::parse_ssix_box(&[u8])` entry point or the
+  `Mp4Demuxer::ssixes()` accessor, downcast). Absent `ssix`, no keys
+  are emitted; like `leva`, a malformed instance is dropped without
+  failing `open()` (the box is informational — this demuxer seeks via
+  `sidx` / `tfra` and never fetches partial subsegments). Only
+  version 0 is defined and any other version byte is rejected rather
+  than mis-read; both u32 counts are validated against the bytes
+  actually present before any allocation. The §8.16.4.1 writer-side
+  `range_count ≥ 2` minimum is **not** enforced on read. The matching
+  `build_ssix_box(&SsixRecord)` builder emits a complete
+  `[size]['ssix']` box for segment-index emitters pairing it with a
+  `sidx`, rejecting `range_size` values above the 24-bit wire field's
+  0xFF_FFFF ceiling instead of silently masking them.
 
 ### Muxer
 

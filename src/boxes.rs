@@ -360,6 +360,14 @@ pub const TFHD: [u8; 4] = fourcc("tfhd");
 pub const TFDT: [u8; 4] = fourcc("tfdt");
 pub const TRUN: [u8; 4] = fourcc("trun");
 pub const SIDX: [u8; 4] = fourcc("sidx");
+/// `ssix` — SubsegmentIndexBox (ISO/IEC 14496-12 §8.16.4). A top-level
+/// FullBox(version=0, flags=0) mapping levels (as assigned by the
+/// `leva` LevelAssignmentBox, §8.8.13) to byte ranges of the indexed
+/// subsegment, so a client can fetch partial subsegments by byte
+/// range. Spec placement: zero or one per `sidx` that indexes only
+/// leaf subsegments, immediately following the associated `sidx`;
+/// `subsegment_count` shall equal that sidx's `reference_count`.
+pub const SSIX: [u8; 4] = fourcc("ssix");
 pub const STYP: [u8; 4] = fourcc("styp");
 /// `prft` — ProducerReferenceTimeBox (ISO/IEC 14496-12 §8.16.5). A
 /// top-level FullBox (file scope) that supplies a wall-clock time

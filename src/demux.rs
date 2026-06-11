@@ -30,6 +30,11 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     let mut moov: Option<Vec<u8>> = None;
     let mut moofs: Vec<MoofRecord> = Vec::new();
     let mut sidxes: Vec<SidxRecord> = Vec::new();
+    // §8.16.4 — optional `ssix` SubsegmentIndexBoxes (zero or one per
+    // leaf-only sidx, each immediately following its associated sidx).
+    // Collected in file order; informational for this demuxer (we seek
+    // via sidx / tfra), surfaced for partial-subsegment fetch tooling.
+    let mut ssixes: Vec<SsixRecord> = Vec::new();
     let mut tfras: Vec<TfraRecord> = Vec::new();
     let mut prfts: Vec<PrftRecord> = Vec::new();
     // §8.1.3 — optional `pdin` ProgressiveDownloadInfoBox. Quantity is
@@ -76,6 +81,19 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                 let body = read_box_body(&mut *input, &hdr)?;
                 if let Some(r) = parse_sidx(&body, sidx_end_offset)? {
                     sidxes.push(r);
+                }
+            }
+            // §8.16.4 — `ssix` SubsegmentIndexBox. Maps levels (per the
+            // `leva` LevelAssignmentBox, §8.8.13) to byte ranges of the
+            // subsegments indexed by the immediately preceding `sidx`,
+            // enabling partial-subsegment byte-range access. The box is
+            // informational for this demuxer (seeking uses sidx / tfra),
+            // so — like `leva` — a malformed instance is dropped rather
+            // than aborting the open.
+            SSIX => {
+                let body = read_box_body(&mut *input, &hdr)?;
+                if let Ok(r) = parse_ssix(&body) {
+                    ssixes.push(r);
                 }
             }
             // §8.8.4 — `moof` MovieFragmentBox. Capture the body and
@@ -275,6 +293,23 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         ));
     }
 
+    // Surface any parsed `ssix` SubsegmentIndexBoxes (§8.16.4) through
+    // the container metadata channel as `ssix_<n>` (0-based file order)
+    // with summary value "<subsegment_count> <total_range_count>" —
+    // two decimal integers, space-separated. The full per-subsegment
+    // (level, range_size) table can be large (one 4-byte record per
+    // partial-subsegment range), so the flat channel carries only the
+    // shape; callers wanting the structured record reach for the
+    // public `parse_ssix_box` entry point (or `Mp4Demuxer::ssixes`).
+    // Absent ssix, no keys are emitted.
+    for (n, s) in ssixes.iter().enumerate() {
+        let total_ranges: usize = s.subsegments.iter().map(|ss| ss.ranges.len()).sum();
+        metadata.push((
+            format!("ssix_{n}"),
+            format!("{} {}", s.subsegments.len(), total_ranges),
+        ));
+    }
+
     // Surface ISO/IEC 23001-7 §8.1 pssh boxes as `pssh_<n>` keys with
     // value `"<system_id_hex> <kid_count> <data_len>"`. Callers wanting
     // the structured record use the public `Mp4Demuxer::psshes` accessor.
@@ -353,6 +388,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         metadata,
         duration_micros,
         sidxes,
+        ssixes,
         tfras,
         prfts,
         pdin,
@@ -416,6 +452,51 @@ pub struct SidxReference {
     /// SAP type (0..=7); 1 = Closed-GOP (IDR), 2 = open-GOP IDR-like,
     /// 3 = open-GOP, etc. Per §I.2 of ISO/IEC 14496-12.
     pub sap_type: u8,
+}
+
+/// Decoded `ssix` (SubsegmentIndexBox, ISO/IEC 14496-12 §8.16.4).
+///
+/// Maps levels (as assigned by the `leva` LevelAssignmentBox, §8.8.13)
+/// to byte ranges of the indexed subsegments, so a client can fetch a
+/// partial subsegment (e.g. only the lower temporal levels) by byte
+/// range instead of downloading the whole subsegment. Placement rules
+/// (§8.16.4.1): zero or one per `sidx` that indexes only leaf
+/// subsegments, immediately following the associated `sidx`;
+/// `subsegment_count` shall equal that sidx's `reference_count`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SsixRecord {
+    /// One entry per subsegment indexed by the associated `sidx`, in
+    /// the same order as the sidx references.
+    pub subsegments: Vec<SsixSubsegment>,
+}
+
+/// Per-subsegment range list inside an `ssix` (§8.16.4.2).
+///
+/// Every byte of the subsegment is explicitly assigned to a level, so
+/// the ranges partition the subsegment: range j starts at the byte
+/// immediately after range j−1 ends (the first at the subsegment's
+/// first byte) and spans `range_size` bytes. §8.16.4.1 requires at
+/// least two ranges per subsegment in a conforming file; we parse a
+/// smaller count without error (the constraint binds writers — a
+/// reader gains nothing by rejecting a one-range partition).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SsixSubsegment {
+    pub ranges: Vec<SsixRange>,
+}
+
+/// One (level, range_size) record of an `ssix` subsegment (§8.16.4.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SsixRange {
+    /// Level this partial subsegment is assigned to (§8.16.4.3). For
+    /// leaf subsegments, levels appear in increasing order within a
+    /// subsegment — samples of a partial subsegment may depend on
+    /// preceding partial subsegments of the same subsegment, never on
+    /// later ones.
+    pub level: u8,
+    /// Byte size of the partial subsegment (24-bit field, so at most
+    /// 0xFF_FFFF per range; larger spans repeat the level across
+    /// consecutive ranges).
+    pub range_size: u32,
 }
 
 /// Decoded `tfra` (TrackFragmentRandomAccessBox, §8.8.11) — per-track
@@ -4652,6 +4733,68 @@ fn parse_sidx(body: &[u8], sidx_end_offset: u64) -> Result<Option<SidxRecord>> {
     }))
 }
 
+/// §8.16.4 — `ssix` SubsegmentIndexBox.
+///
+/// Layout (§8.16.4.2):
+///
+/// ```text
+///     FullBox(ssix, version = 0, flags = 0)
+///     unsigned int(32) subsegment_count;
+///     for (i = 1; i <= subsegment_count; i++) {
+///         unsigned int(32) range_count;
+///         for (j = 1; j <= range_count; j++) {
+///             unsigned int(8)  level;
+///             unsigned int(24) range_size;
+///         }
+///     }
+/// }
+/// ```
+///
+/// Only version 0 is defined; a different version byte is rejected
+/// rather than mis-read against the v0 layout. `subsegment_count` and
+/// each `range_count` are attacker-controlled u32s, so capacity is
+/// pre-allocated against the bytes actually remaining (4 per range,
+/// ≥ 4 per subsegment), never against the declared counts; any count
+/// that outruns the body is a truncation error.
+fn parse_ssix(body: &[u8]) -> Result<SsixRecord> {
+    if body.len() < 8 {
+        return Err(Error::invalid("MP4: ssix too short"));
+    }
+    if body[0] != 0 {
+        return Err(Error::invalid("MP4: ssix unsupported version"));
+    }
+    // bytes 1..4 are flags (always 0 per §8.16.4.2) — not consumed.
+    let subsegment_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let mut cursor = 8usize;
+    let mut subsegments =
+        Vec::with_capacity(subsegment_count.min(body.len().saturating_sub(cursor) / 4));
+    for _ in 0..subsegment_count {
+        if body.len() - cursor < 4 {
+            return Err(Error::invalid("MP4: ssix subsegment truncated"));
+        }
+        let range_count = u32::from_be_bytes([
+            body[cursor],
+            body[cursor + 1],
+            body[cursor + 2],
+            body[cursor + 3],
+        ]) as usize;
+        cursor += 4;
+        if (body.len() - cursor) / 4 < range_count {
+            return Err(Error::invalid("MP4: ssix range list truncated"));
+        }
+        let mut ranges = Vec::with_capacity(range_count);
+        for _ in 0..range_count {
+            let level = body[cursor];
+            let range_size =
+                u32::from_be_bytes([0, body[cursor + 1], body[cursor + 2], body[cursor + 3]]);
+            cursor += 4;
+            ranges.push(SsixRange { level, range_size });
+        }
+        subsegments.push(SsixSubsegment { ranges });
+    }
+    Ok(SsixRecord { subsegments })
+}
+
 /// §8.16.5 — `prft` ProducerReferenceTimeBox.
 ///
 /// Layout (FullBox 4 bytes already consumed by caller):
@@ -5893,6 +6036,15 @@ struct Mp4Demuxer {
     /// offset; the sample-list scan then snaps to the first keyframe
     /// at or after that offset, bounded by one subsegment.
     sidxes: Vec<SidxRecord>,
+    /// Parsed `ssix` SubsegmentIndexBoxes (§8.16.4), in file order.
+    /// Each maps levels (per the `leva` LevelAssignmentBox) to byte
+    /// ranges of the subsegments indexed by the associated `sidx`.
+    /// Surfaced as `ssix_<n>` flat-metadata summaries and through the
+    /// public `Mp4Demuxer::ssixes` accessor; not consulted by
+    /// `next_packet` / `seek_to` (we seek whole subsegments, not
+    /// partial ones).
+    #[allow(dead_code)]
+    ssixes: Vec<SsixRecord>,
     /// Parsed `tfra` random-access tables, one per track that the file's
     /// `mfra` indexes. Each holds (presentation time, moof offset) pairs
     /// for keyframes — `seek_to` walks these to land directly on a moof
@@ -6038,6 +6190,19 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn leva_entries(&self) -> Option<&[LevaEntry]> {
         self.leva.as_ref().map(|l| l.entries.as_slice())
+    }
+
+    /// ISO/IEC 14496-12 §8.16.4 — all `ssix` SubsegmentIndexBoxes
+    /// discovered during the top-level walk, in file order. Each maps
+    /// levels (per the `leva` LevelAssignmentBox, §8.8.13 — see
+    /// [`Mp4Demuxer::leva_entries`]) to byte ranges of the subsegments
+    /// indexed by the `sidx` the ssix follows. Empty for files without
+    /// subsegment indexes (which is most of the corpus). The flat
+    /// metadata channel carries `ssix_<n>` shape summaries; this
+    /// accessor returns the structured table.
+    #[allow(dead_code)]
+    pub fn ssixes(&self) -> &[SsixRecord] {
+        &self.ssixes
     }
 
     /// ISO/IEC 14496-12 §8.7.8–9 — per-fragment Sample Auxiliary
@@ -6321,6 +6486,62 @@ impl Mp4Demuxer {
 /// indexes without re-running `open()`.
 pub fn parse_sidx_box(body: &[u8], sidx_end_offset: u64) -> Result<Option<SidxRecord>> {
     parse_sidx(body, sidx_end_offset)
+}
+
+/// Parse a standalone `ssix` (SubsegmentIndexBox, §8.16.4) body from
+/// `body` (the bytes after the 8/16-byte box header).
+///
+/// Exposed as a public entry point so DASH tooling can map levels to
+/// partial-subsegment byte ranges without re-running `open()` — the
+/// ssix sits immediately after the `sidx` it documents (§8.16.4.1), so
+/// a segment fetcher that already walked to the sidx has the ssix
+/// bytes in hand.
+///
+/// Returns `Err` for a body shorter than the 8-byte floor (4-byte
+/// FullBox preamble + `subsegment_count`), for a version byte other
+/// than 0 (the only defined layout), and for any subsegment or range
+/// list that outruns the body. A `subsegment_count` of zero yields an
+/// empty record.
+pub fn parse_ssix_box(body: &[u8]) -> Result<SsixRecord> {
+    parse_ssix(body)
+}
+
+/// Serialise a [`SsixRecord`] into a complete `ssix` box — 8-byte
+/// header (`[size:u32]['ssix']`) plus the §8.16.4.2 v0 body — for
+/// segment-index emitters that pair it with a `sidx`.
+///
+/// The caller owns the §8.16.4.1 conformance constraints the record
+/// type cannot express: the box must immediately follow the `sidx` it
+/// documents, `subsegments.len()` must equal that sidx's
+/// `reference_count`, every byte of each subsegment must be covered
+/// (ranges partition the subsegment), and each subsegment should carry
+/// at least two ranges. `range_size` values are 24-bit on the wire;
+/// values above 0xFF_FFFF are rejected rather than silently masked.
+pub fn build_ssix_box(record: &SsixRecord) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(
+        8 + record
+            .subsegments
+            .iter()
+            .map(|s| 4 + 4 * s.ranges.len())
+            .sum::<usize>(),
+    );
+    body.extend_from_slice(&[0u8; 4]); // FullBox(version = 0, flags = 0)
+    body.extend_from_slice(&(record.subsegments.len() as u32).to_be_bytes());
+    for s in &record.subsegments {
+        body.extend_from_slice(&(s.ranges.len() as u32).to_be_bytes());
+        for r in &s.ranges {
+            if r.range_size > 0xFF_FFFF {
+                return Err(Error::invalid("MP4: ssix range_size exceeds 24 bits"));
+            }
+            let b = r.range_size.to_be_bytes();
+            body.extend_from_slice(&[r.level, b[1], b[2], b[3]]);
+        }
+    }
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+    out.extend_from_slice(b"ssix");
+    out.extend_from_slice(&body);
+    Ok(out)
 }
 
 /// Parse a standalone `mfra` (MovieFragmentRandomAccessBox, §8.8.10)
@@ -9749,6 +9970,53 @@ mod tests {
         let r_internal = super::parse_leva(&body).unwrap();
         assert_eq!(r_public.entries, r_internal.entries);
         assert_eq!(r_public.entries.len(), 3);
+    }
+
+    /// `parse_ssix_box` (the public wrapper) routes through the same
+    /// internal parser as the `open()` walk, and `build_ssix_box`
+    /// round-trips a record through it (modulo the 8-byte box header
+    /// the builder prepends).
+    #[test]
+    fn ssix_public_entries_round_trip() {
+        let record = super::SsixRecord {
+            subsegments: vec![
+                super::SsixSubsegment {
+                    ranges: vec![
+                        super::SsixRange {
+                            level: 0,
+                            range_size: 1_024,
+                        },
+                        super::SsixRange {
+                            level: 1,
+                            range_size: 0xFF_FFFF,
+                        },
+                    ],
+                },
+                super::SsixSubsegment {
+                    ranges: vec![
+                        super::SsixRange {
+                            level: 0,
+                            range_size: 512,
+                        },
+                        super::SsixRange {
+                            level: 2,
+                            range_size: 7,
+                        },
+                    ],
+                },
+            ],
+        };
+        let boxed = super::build_ssix_box(&record).unwrap();
+        assert_eq!(&boxed[4..8], b"ssix");
+        assert_eq!(
+            boxed.len(),
+            u32::from_be_bytes(boxed[..4].try_into().unwrap()) as usize
+        );
+        let body = &boxed[8..];
+        let r_public = super::parse_ssix_box(body).unwrap();
+        let r_internal = super::parse_ssix(body).unwrap();
+        assert_eq!(r_public, r_internal);
+        assert_eq!(r_public, record);
     }
 
     /// `(subsample_size16, priority, discardable, csp)` — one v0 sub-sample.

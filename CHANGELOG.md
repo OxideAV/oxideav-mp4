@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Subsegment Index Box typed parse + builder (ISO/IEC 14496-12
+  §8.16.4, `ssix`) — round 279. The top-level `SubsegmentIndexBox`
+  that maps levels (as assigned by the §8.8.13 `leva`
+  LevelAssignmentBox) to byte ranges of the subsegments indexed by
+  the immediately preceding `sidx` is now parsed by `parse_ssix`.
+  The on-wire body — a 4-byte `FullBox(version=0, flags=0)` preamble,
+  `unsigned int(32) subsegment_count`, and per subsegment an
+  `unsigned int(32) range_count` followed by `range_count` packed
+  `(unsigned int(8) level, unsigned int(24) range_size)` records per
+  §8.16.4.2 — decodes into `SsixRecord { subsegments:
+  Vec<SsixSubsegment> }` with each `SsixSubsegment` carrying its
+  ordered `Vec<SsixRange { level: u8, range_size: u32 }>`. Only
+  version 0 is defined; a different version byte is rejected rather
+  than mis-read against the v0 layout. The two u32 counts are
+  attacker-controlled, so capacity is pre-allocated against the bytes
+  actually remaining, never against the declared counts, and any
+  count that outruns the body is a truncation error. The §8.16.4.1
+  `range_count >= 2` writer constraint is **not** enforced on read (a
+  reader gains nothing by rejecting a one-range partition). The
+  top-level walk collects every `ssix` in file order and surfaces a
+  shape summary per box on `Demuxer::metadata()` as `ssix_<n>` =
+  `"<subsegment_count> <total_range_count>"` (the full range table
+  can be one 4-byte record per partial subsegment — too large for the
+  flat channel); absent `ssix`, no keys are emitted. Like `leva`, a
+  malformed instance is dropped without failing `open()` — the box is
+  informational for this demuxer (seeking uses `sidx` / `tfra`). The
+  structured record is reachable via the public
+  `oxideav_mp4::demux::parse_ssix_box(&[u8])` entry point and the
+  `Mp4Demuxer::ssixes() -> &[SsixRecord]` accessor (downcast); the
+  matching `build_ssix_box(&SsixRecord)` builder serialises a
+  complete `[size]['ssix']` box for segment-index emitters that pair
+  it with a `sidx`, rejecting `range_size` values that overflow the
+  24-bit wire field rather than silently masking them. Eleven new
+  tests cover the spliced-after-`sidx` placement (a real fragmented
+  mux output re-opened with one and two `ssix` boxes), omission,
+  malformed-drop, u24 ceiling round-trip, oversize-range rejection,
+  and the truncation / version guards.
+
 - Video Media Header Box typed accessor (ISO/IEC 14496-12 §12.1.2,
   defined per §8.4.5) — round 272. A `vmhd` (`VideoMediaHeaderBox`)
   inside `minf` is now parsed by `parse_vmhd`. After the 4-byte
