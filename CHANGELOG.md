@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- CENC AES-128 CTR / CBC cipher driver (ISO/IEC 23001-7:2016 §9,
+  module `cenc_cipher`) — round 283. The crate's CENC stack is no
+  longer parse-only: `cenc_cipher::decrypt_sample_in_place(decision,
+  key, per_sample_iv, subsamples, data)` decrypts one protected
+  sample in place for all four §10 schemes (`cenc` / `cbc1` /
+  `cens` / `cbcs`), executing the `CipherStep` partitions from
+  `cenc::plan_sample_cipher` against AES-128 via the
+  `aes` / `ctr` / `cbc` primitive crates (new dependencies — cipher
+  building blocks only). IV discipline is resolved from the
+  `CencSchemeDecision`: per-sample IVs are length-checked against
+  `tenc.default_Per_Sample_IV_Size`, the constant IV comes from
+  `tenc.default_constant_IV`, and supplying a per-sample IV to a
+  constant-IV configuration is rejected (§9.2 — IVs are either
+  constant or per-sample). `cenc_cipher::expand_iv` applies the §9.1
+  8-byte-IV expansion (bytes 0..8 = IV, bytes 8..16 zero); the §9.3
+  CTR counter is the low 64 bits of the expanded IV, big-endian,
+  incremented per encrypted cipher block and wrapping to zero
+  without carrying into bytes 0..8. §9.5.1 continuity rules are
+  executed: for non-`cbcs` schemes one continuous keystream / cipher
+  chain spans the concatenated protected runs (partial CTR blocks
+  continue across subsample boundaries, `cens` skip blocks consume
+  no keystream, the `cbc1` chain crosses clear gaps), while `cbcs`
+  reseeds its chain from the constant IV on each subsample's
+  `iv_restart` step and chains across skip runs within a subsample.
+  Encrypted CBC runs not a multiple of 16 bytes are rejected
+  (§9.4.3 / §10.2). The step-level engine
+  `cenc_cipher::decrypt_steps_in_place(mode, key, iv, steps, data)`
+  is public for `seig`-overridden sample groups where the caller
+  assembles its own plan/IV pairing. 23 new tests: a FIPS-197
+  Appendix C.1 known-answer AES anchor, first-principles ECB-built
+  §9.3 keystream checks (8-byte-IV counter start at zero; 16-byte-IV
+  64-bit counter wrap leaving bytes 0..8 untouched), known-key
+  round-trips for every scheme × subsample × pattern shape (`cenc`
+  partial-tail + mid-block subsample continuity, `cbc1` clear-tail +
+  chain continuity, `cens` 2:1 counter-skip semantics, `cbcs` 1:9
+  stride with chain-over-skip and per-subsample restart, §9.7
+  whole-block audio), and the IV-resolution / alignment /
+  inconsistent-plan error arms.
 - Subsegment Index Box typed parse + builder (ISO/IEC 14496-12
   §8.16.4, `ssix`) — round 279. The top-level `SubsegmentIndexBox`
   that maps levels (as assigned by the §8.8.13 `leva`

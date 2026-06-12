@@ -7,6 +7,7 @@
 
 pub mod boxes;
 pub mod cenc;
+pub mod cenc_cipher;
 pub mod codec_id;
 pub mod demux;
 pub mod frag;

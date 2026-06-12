@@ -2,9 +2,11 @@
 //!
 //! Parse-only support for the three boxes that carry CENC framing on top
 //! of the protected-sample-entry envelope already handled in
-//! `demux.rs` (the `sinf/frma/schm` unwrap). No decryption is performed;
-//! the structures here surface key identifiers, IV layout, and (when
-//! present) per-sample IV / subsample maps to a downstream layer.
+//! `demux.rs` (the `sinf/frma/schm` unwrap). No decryption is performed
+//! by *this module*; the structures here surface key identifiers, IV
+//! layout, and (when present) per-sample IV / subsample maps. The
+//! AES-128 CTR / CBC execution layer that consumes them lives in
+//! [`crate::cenc_cipher`].
 //!
 //! Box coverage:
 //!
@@ -43,11 +45,12 @@
 //!   [`CencScheme::uses_pattern_encryption`].
 //!
 //! The combination of the parsed `tenc` and a `CencScheme` is bundled
-//! into a [`CencSchemeDecision`] — the typed "routing slip" a future
-//! decryption layer can pattern-match against. This crate **performs no
-//! AES operation**; the bundle is a static dispatch contract built from
-//! container-side bytes only. The actual key-derivation + AES block
-//! call is delegated to a layer with key material.
+//! into a [`CencSchemeDecision`] — the typed "routing slip" the
+//! decryption layer pattern-matches against. This module performs no
+//! AES operation; the bundle is a static dispatch contract built from
+//! container-side bytes only. The actual AES block execution is in
+//! [`crate::cenc_cipher::decrypt_sample_in_place`], which takes the
+//! decision plus caller-supplied key material.
 //!
 //! The §6 `CencSampleEncryptionInformationGroupEntry` (`seig`) — a
 //! sample-group description entry that lets a track override the
@@ -836,10 +839,11 @@ pub enum CipherStepKind {
 /// `0..sample_len` into contiguous, non-overlapping runs. A downstream
 /// AES layer iterates the steps, applying the cipher to
 /// [`CipherStepKind::Encrypted`] runs and copying [`CipherStepKind::Clear`]
-/// runs verbatim. This crate does not perform the AES block call;
+/// runs verbatim. This module does not perform the AES block call;
 /// `CipherStep` is a static dispatch contract built from container-side
 /// bytes only (the [`CencSchemeDecision`] + [`SencSample`] subsample
-/// list + sample length).
+/// list + sample length). The executing AES layer is
+/// [`crate::cenc_cipher::decrypt_steps_in_place`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CipherStep {
     /// Byte offset from the start of the sample payload.

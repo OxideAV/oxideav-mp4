@@ -182,9 +182,9 @@ Sample-entry FourCCs resolve to these codec ids:
   callers know packet payloads are still ciphertext.
 - CENC metadata parsing (ISO/IEC 23001-7:2016): the three boxes
   that carry encryption framing on top of the §8.12 envelope are
-  parsed structurally and surfaced to callers (no decryption — the
-  AES key/decrypt op is left to a downstream layer with key
-  material).
+  parsed structurally and surfaced to callers; the AES-128
+  CTR / CBC decryption step itself lives in the `cenc_cipher`
+  module (key acquisition stays with the caller).
   - `tenc` (§8.2 TrackEncryptionBox) — discovered inside
     `sinf/schi`. v0 captures `default_isProtected`,
     `default_Per_Sample_IV_Size`, and `default_KID`; v1 adds the
@@ -251,10 +251,11 @@ Sample-entry FourCCs resolve to these codec ids:
     discipline (§9.1) — per-sample 8/16-byte IV vs constant IV vs
     no IV when `isProtected == 0` — is recovered via
     `CencSchemeDecision::iv_supply()` as the typed `cenc::IvSupply`
-    enum. **This crate performs no AES operation.** The bundle is
-    a static dispatch contract built from container-side bytes
-    only; the actual key derivation + AES block call is delegated
-    to a layer with key material from the named `pssh.SystemID`.
+    enum. The bundle is a static dispatch contract built from
+    container-side bytes only; the AES execution layer that
+    consumes it is `cenc_cipher::decrypt_sample_in_place`, with
+    key material (looked up by KID from the named `pssh.SystemID`
+    system) supplied by the caller.
     Unknown `scheme_type` FourCCs are preserved verbatim through
     `CencScheme::Unknown([u8; 4])` so a caller carrying a private
     DRM dialect can still route on its own table.
@@ -298,10 +299,38 @@ Sample-entry FourCCs resolve to these codec ids:
     `Σ (clear+protected) == sample_len`, no both-zero subsample,
     no subsample running past sample_len. `IvSupply::None` and
     `CencScheme::Unknown` are rejected so a caller routes through
-    its own "no cipher" / private-dialect path explicitly. **This
-    crate performs no AES operation** — `CipherStep` is the static
-    dispatch contract a downstream layer with key material from the
-    named `pssh.SystemID` switches on.
+    its own "no cipher" / private-dialect path explicitly.
+  - AES-128 CTR / CBC cipher driver (§9.3 / §9.4–§9.7, module
+    `cenc_cipher`). `cenc_cipher::decrypt_sample_in_place(decision,
+    key, per_sample_iv, subsamples, data)` resolves the IV
+    discipline from the `CencSchemeDecision` (per-sample IV
+    length-checked against `tenc`; constant IV pulled from
+    `tenc.default_constant_IV`; supplying both is a §9.2 error),
+    builds the `CipherStep` plan, and executes it in place against
+    AES-128 (the `aes` / `ctr` / `cbc` primitive crates) — all
+    four §10 schemes decrypt. The §9.1 IV expansion (8-byte IV →
+    bytes 0..8, bytes 8..16 zero) is `cenc_cipher::expand_iv`; the
+    §9.3 counter is the low 64 bits big-endian, starting at the
+    expanded-IV value and wrapping to zero without carrying into
+    bytes 0..8. §9.5.1 continuity is honoured: one continuous
+    keystream / cipher chain spans the concatenated protected
+    runs (a partial CTR block ending one subsample's protected
+    range continues in the next; `cens` skip blocks consume no
+    keystream; the `cbc1` chain crosses clear gaps), while `cbcs`
+    reseeds its chain from the constant IV at each subsample's
+    `iv_restart` step and chains across skip runs within the
+    subsample. Encrypted CBC runs that are not a multiple of 16
+    bytes are rejected (§9.4.3 / §10.2 — partial blocks are never
+    CBC-encrypted). The step-level engine is public as
+    `cenc_cipher::decrypt_steps_in_place(mode, key, iv, steps,
+    data)` for `seig`-overridden sample groups where the caller
+    assembles its own plan/IV pairing. Tested against a FIPS-197
+    known-answer AES block anchor, first-principles ECB-built §9.3
+    keystreams (including the 64-bit counter wrap), and synthetic
+    known-key round-trips for every scheme × subsample × pattern
+    shape (cens 2:1 counter continuity, cbcs 1:9 stride with
+    chain-over-skip + per-subsample restart, §9.7 whole-block
+    audio).
 - Track references (ISO/IEC 14496-12 §8.3.3, `tref`): each typed
   `TrackReferenceTypeBox` inside `trak/tref` is parsed and the
   resulting `(reference_type → track_IDs)` pairs are surfaced on
@@ -790,23 +819,13 @@ first that applies:
 - Fragmented-MP4 *muxing* — the demuxer reads `moof`+`mdat`
   segments, but the muxer only emits a single moov-at-end (or
   faststart) shape.
-- CENC decryption proper — the demuxer **parses** the CENC framing
-  (`tenc` defaults, `pssh` per-DRM headers, per-fragment `senc`
-  per-sample IVs + subsample maps; see "CENC metadata parsing" in
-  the demuxer feature list above; plus the spec-permitted
-  alternative IV-carriage path via `saiz` / `saio` — see "Sample
-  auxiliary information sizes + offsets") and surfaces the metadata,
-  but it does not run the AES-128 CTR / CBC decryption step. The
-  scheme + tenc bundle is exposed as the typed
-  `cenc::CencSchemeDecision` router (cipher mode, pattern flag,
-  IV-supply discipline) so a downstream layer with key material
-  from the named `pssh.SystemID` has a single typed value to
-  switch on, and the typed per-sample cipher walker
-  `cenc::plan_sample_cipher` partitions the sample plaintext into
-  the typed `(Clear, Encrypted)` step sequence the AES layer
-  iterates (with `cbcs` per-subsample IV restart and the §9.6
-  pattern-truncation rule baked in); the actual AES block call is
-  its responsibility. The
+- In-pipeline CENC decryption — the AES-128 CTR / CBC driver
+  exists (`cenc_cipher::decrypt_sample_in_place`, all four §10
+  schemes), but the demuxer does not invoke it automatically:
+  `read_packet` still yields ciphertext payloads and the caller —
+  the party holding the content key for the sample's KID — calls
+  the driver per sample. Key acquisition (DRM license exchange
+  against the `pssh.SystemID` blob) is out of scope by design. The
   mdat-resident auxiliary-information bytes that the `saio`
   offsets name are not pre-fetched — a CENC consumer reading them
   seeks the input itself using the surfaced offsets.
