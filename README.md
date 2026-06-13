@@ -664,6 +664,33 @@ Sample-entry FourCCs resolve to these codec ids:
   desynchronise the loop. The version byte is tolerated even if the
   producer wrote a non-zero value, matching `parse_pdin` / `parse_padb`
   / `parse_stdp` posture for FullBox version-bit slips.
+- Track extension properties (ISO/IEC 14496-12 §8.8.15, `trep`): a
+  `FullBox(0, 0)` inside `mvex` whose body opens with
+  `unsigned int(32) track_id` and is followed by "any number of boxes"
+  (§8.8.15.2) — e.g. an `assp` (Alternative Startup Sequence Properties
+  Box, §8.8.16). The box documents or summarises characteristics of one
+  track in the subsequent movie fragments. §8.8.15.1 fixes quantity at
+  zero or more per `mvex` (zero or one per track); the `mvex` walker
+  collects every instance in file order. The nested child boxes are
+  recorded by type + payload length only (`TrepChild`) — this crate does
+  not recurse into them, leaving their semantics to a downstream consumer
+  that recognises the specific child. Each `trep` is surfaced on
+  `Demuxer::metadata()` as `trep_<n>` (0-based file order) with value
+  `"<track_id> children=<k>[ <fourcc>...]"` — the track ID, the child
+  count, and each child's four-character type in order. The structured
+  record is reachable via the public
+  `oxideav_mp4::demux::parse_trep_box(&[u8])` entry point (for tooling
+  holding the box's payload bytes) and via
+  `Mp4Demuxer::treps() -> &[TrepRecord]` (downcast). A `trep` shorter
+  than its 4-byte FullBox preamble or with a truncated `track_id` is
+  rejected at parse time; a malformed `trep` reaching `parse_mvex` is
+  dropped silently so a producer slip cannot brick `open()` (the box is
+  informational). A child box whose declared size overruns the remaining
+  `trep` body is clamped to the bytes available and ends the child walk;
+  a trailing partial child header (fewer than 8 bytes) ends the walk
+  cleanly. The 64-bit `largesize` child form (`size == 1`) is read via
+  its 16-byte header. The version byte is tolerated even if non-zero,
+  matching the `parse_leva` posture.
 - Subsegment index (ISO/IEC 14496-12 §8.16.4, `ssix`): the top-level
   `FullBox(version = 0, flags = 0)` that maps levels (as assigned by
   the §8.8.13 `leva` box above) to byte ranges of the subsegments

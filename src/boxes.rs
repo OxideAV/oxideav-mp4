@@ -353,6 +353,14 @@ pub const TREX: [u8; 4] = fourcc("trex");
 /// Demuxer carries the parsed entries through `leva_entries()`; the
 /// flat metadata channel surfaces `leva_count` + `leva_<n>` summaries.
 pub const LEVA: [u8; 4] = fourcc("leva");
+/// `trep` — TrackExtensionPropertiesBox (ISO/IEC 14496-12 §8.8.15). A
+/// FullBox(version=0, flags=0) inside `mvex` that documents or
+/// summarises characteristics of one track (named by its `track_id`
+/// field) in the subsequent movie fragments. It may contain any number
+/// of child boxes (e.g. `assp`, the Alternative Startup Sequence
+/// Properties Box, §8.8.16). Quantity is zero or more per `mvex`, with
+/// zero or one per track.
+pub const TREP: [u8; 4] = fourcc("trep");
 pub const MOOF: [u8; 4] = fourcc("moof");
 pub const MFHD: [u8; 4] = fourcc("mfhd");
 pub const TRAF: [u8; 4] = fourcc("traf");

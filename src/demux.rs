@@ -276,6 +276,24 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         }
     }
 
+    // Surface any parsed `trep` TrackExtensionPropertiesBoxes (§8.8.15)
+    // on the flat metadata channel. Quantity is zero or more (zero or
+    // one per track, §8.8.15.1); we emit one `trep_<n>` key per box, in
+    // file order, with value "<track_id> children=<k>[ <fourcc>...]" —
+    // the track the box describes, the number of nested child boxes,
+    // and each child's four-character type (so a consumer can spot an
+    // `assp` without consuming the structured record). Callers wanting
+    // the structured form reach for `Mp4Demuxer::treps()` (or the
+    // public `parse_trep_box`). Absent `trep`, no keys are emitted.
+    for (n, t) in parsed.treps.iter().enumerate() {
+        let mut s = format!("{} children={}", t.track_id, t.children.len());
+        for c in &t.children {
+            use std::fmt::Write;
+            let _ = write!(s, " {}", String::from_utf8_lossy(&c.fourcc));
+        }
+        metadata.push((format!("trep_{n}"), s));
+    }
+
     // Surface any parsed `prft` ProducerReferenceTimeBoxes through the
     // container metadata channel as `prft_<n>` (0-based file order)
     // with value "reference_track_ID ntp_timestamp media_time" — three
@@ -393,6 +411,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         prfts,
         pdin,
         leva: parsed.leva,
+        treps: parsed.treps,
         psshes: parsed.psshes,
         moof_psshes,
         senc_records,
@@ -665,6 +684,52 @@ pub struct LevaRecord {
     pub entries: Vec<LevaEntry>,
 }
 
+/// One child box recorded inside a `trep` (TrackExtensionPropertiesBox,
+/// ISO/IEC 14496-12 §8.8.15). The box body is "any number of boxes"
+/// (§8.8.15.2) — the demuxer records each child's type and payload
+/// length without interpreting it, so a downstream consumer can spot,
+/// for example, an `assp` (Alternative Startup Sequence Properties Box,
+/// §8.8.16) without this crate having to model every box that might be
+/// nested. The structured nesting stays opaque here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrepChild {
+    /// The child box's four-character type code, verbatim on the wire.
+    pub fourcc: [u8; 4],
+    /// Length of the child's payload in bytes (the box size minus its
+    /// header). A child whose declared size ran past the end of the
+    /// `trep` body is clamped to the bytes actually available, so this
+    /// reflects what was readable, not necessarily the producer's
+    /// declared length.
+    pub payload_len: usize,
+}
+
+/// Decoded `trep` (TrackExtensionPropertiesBox, ISO/IEC 14496-12
+/// §8.8.15).
+///
+/// `FullBox(version = 0, flags = 0)` whose body opens with
+/// `unsigned int(32) track_id` (the track these extension properties
+/// describe, §8.8.15.3) and is followed by "any number of boxes"
+/// (§8.8.15.2). The trailing children are recorded by type + length
+/// only — see [`TrepChild`].
+///
+/// Quantity is "zero or more, zero or one per track" (§8.8.15.1); the
+/// demuxer collects every `trep` it finds inside `mvex` in file order.
+/// A `trep` with a malformed FullBox preamble or a truncated `track_id`
+/// is dropped rather than aborting the parse, matching the treatment of
+/// the sibling optional `mvex` boxes (`mehd`, `leva`).
+#[derive(Clone, Debug)]
+pub struct TrepRecord {
+    /// `track_id` (§8.8.15.3) — the track for which these extension
+    /// properties are provided. Carried verbatim; track 0 is not a
+    /// legal value (§8.3.2.3 pins track IDs ≥ 1) but the demuxer does
+    /// not reject it so a validator can flag it.
+    pub track_id: u32,
+    /// Child boxes nested in this `trep`, in file order. Each is
+    /// recorded by type + payload length only ([`TrepChild`]); the
+    /// list is empty for a `trep` that carries just its `track_id`.
+    pub children: Vec<TrepChild>,
+}
+
 #[derive(Default)]
 struct ParsedMoov {
     tracks: Vec<Track>,
@@ -698,6 +763,14 @@ struct ParsedMoov {
     /// reach them through `Mp4Demuxer::leva_entries()` or the flat
     /// `leva_count` / `leva_<n>` metadata keys.
     leva: Option<LevaRecord>,
+    /// §8.8.15 — `trep` TrackExtensionPropertiesBox entries. Optional
+    /// FullBoxes inside `mvex` (quantity zero or more, zero or one per
+    /// track); each documents characteristics of one track in the
+    /// subsequent movie fragments. Empty when the file carries none.
+    /// Informational only — the demuxer does not consume them, but
+    /// downstream tooling can reach them through
+    /// `Mp4Demuxer::treps()` or the flat `trep_<n>` metadata keys.
+    treps: Vec<TrepRecord>,
 }
 
 /// Per-track info collected from moov.
@@ -1309,6 +1382,7 @@ fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
                     &mut out.tracks,
                     &mut out.mehd_fragment_duration,
                     &mut out.leva,
+                    &mut out.treps,
                 )?;
             }
             PSSH => {
@@ -1345,6 +1419,7 @@ fn parse_mvex(
     tracks: &mut [Track],
     mehd_fragment_duration: &mut Option<u64>,
     leva: &mut Option<LevaRecord>,
+    treps: &mut Vec<TrepRecord>,
 ) -> Result<()> {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
@@ -1395,6 +1470,21 @@ fn parse_mvex(
                     if let Ok(r) = parse_leva(&b) {
                         *leva = Some(r);
                     }
+                }
+            }
+            // §8.8.15 — `trep` TrackExtensionPropertiesBox. Optional
+            // FullBox (quantity zero or more, zero or one per track).
+            // Documents/summarises a track's characteristics in the
+            // subsequent movie fragments; its body is `track_id`
+            // followed by "any number of boxes". The demuxer records
+            // each instance (track_id + the type/length of each child
+            // box) and surfaces them through `Mp4Demuxer::treps()` plus
+            // the flat `trep_<n>` metadata channel. A malformed trep is
+            // non-fatal: dropped, file remains parseable.
+            TREP => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                if let Ok(r) = parse_trep(&b) {
+                    treps.push(r);
                 }
             }
             _ => skip_cursor_bytes(&mut cur, psz),
@@ -4872,6 +4962,115 @@ fn parse_pdin(body: &[u8]) -> Result<PdinRecord> {
     Ok(PdinRecord { entries })
 }
 
+/// Parse a `trep` TrackExtensionPropertiesBox body (ISO/IEC 14496-12
+/// §8.8.15).
+///
+/// Wire layout (§8.8.15.2):
+/// ```text
+/// class TrackExtensionPropertiesBox extends FullBox('trep', 0, 0) {
+///     unsigned int(32) track_id;
+///     // Any number of boxes may follow
+/// }
+/// ```
+///
+/// The body is a 4-byte FullBox preamble (version + flags), a 4-byte
+/// `track_id`, then "any number of boxes" (§8.8.15.2). Those trailing
+/// children — e.g. `assp` (§8.8.16) — are recorded by type + payload
+/// length only ([`TrepChild`]); this parser does not recurse into them.
+///
+/// Version is pinned to 0 by §8.8.15.2; a non-zero version is tolerated
+/// (the layout up to `track_id` is unambiguous) rather than rejected,
+/// matching the `parse_leva` / `parse_pdin` posture for FullBox
+/// version-bit slips.
+///
+/// A child box whose declared size overruns the remaining `trep` body
+/// is clamped to the bytes available and recorded with the clamped
+/// length; parsing then stops (a child can't legally extend past its
+/// parent, and continuing would desynchronise the walk). A child header
+/// that itself doesn't fit (fewer than 8 bytes left) ends the child
+/// loop. Neither case rejects the box — the `track_id` is still useful.
+fn parse_trep(body: &[u8]) -> Result<TrepRecord> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: trep too short for FullBox preamble"));
+    }
+    // Skip the 4-byte FullBox preamble (version + flags). §8.8.15.2
+    // pins version = 0 and flags = 0; tolerated otherwise (the layout
+    // up to track_id is fixed regardless).
+    let payload = &body[4..];
+    if payload.len() < 4 {
+        return Err(Error::invalid("MP4: trep truncated track_id"));
+    }
+    let track_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+
+    // Walk the trailing "any number of boxes" recording each child's
+    // type + payload length. We parse the child headers inline rather
+    // than via `read_box_header` so a clamped/over-long child can't
+    // abort the whole parse (the demuxer treats trep as informational).
+    let mut children = Vec::new();
+    let mut off = 4usize;
+    while off + 8 <= payload.len() {
+        let size32 = u32::from_be_bytes([
+            payload[off],
+            payload[off + 1],
+            payload[off + 2],
+            payload[off + 3],
+        ]) as usize;
+        let fourcc = [
+            payload[off + 4],
+            payload[off + 5],
+            payload[off + 6],
+            payload[off + 7],
+        ];
+        // §4.2 box-size semantics: size 0 means "to end of enclosing
+        // box"; size 1 means a 64-bit largesize follows. trep children
+        // are small property boxes, so we read the 64-bit largesize
+        // when present and treat size 0 as "rest of the trep body".
+        let (header_len, box_size) = match size32 {
+            0 => (8usize, payload.len() - off),
+            1 => {
+                if off + 16 > payload.len() {
+                    // largesize header doesn't fit — stop the walk.
+                    break;
+                }
+                let large = u64::from_be_bytes([
+                    payload[off + 8],
+                    payload[off + 9],
+                    payload[off + 10],
+                    payload[off + 11],
+                    payload[off + 12],
+                    payload[off + 13],
+                    payload[off + 14],
+                    payload[off + 15],
+                ]) as usize;
+                (16usize, large)
+            }
+            n => (8usize, n),
+        };
+        // A box can't be smaller than its own header. A malformed
+        // small size ends the walk rather than looping forever.
+        if box_size < header_len {
+            break;
+        }
+        // Clamp an over-long child to the bytes that remain in the
+        // trep body — a child legally can't extend past its parent.
+        let available = payload.len() - off;
+        let effective = box_size.min(available);
+        let payload_len = effective - header_len;
+        children.push(TrepChild {
+            fourcc,
+            payload_len,
+        });
+        off += effective;
+        // If we clamped (the declared size ran past the parent), there
+        // are no further siblings — stop cleanly.
+        if effective < box_size {
+            break;
+        }
+    }
+
+    Ok(TrepRecord { track_id, children })
+}
+
 /// Parse a `leva` LevelAssignmentBox body (ISO/IEC 14496-12 §8.8.13).
 ///
 /// Wire layout (§8.8.13.2):
@@ -6073,6 +6272,15 @@ struct Mp4Demuxer {
     /// Informational only — the demuxer does not consult it.
     #[allow(dead_code)]
     leva: Option<LevaRecord>,
+    /// Parsed `trep` TrackExtensionPropertiesBoxes (§8.8.15), in file
+    /// order. Quantity is zero or more (zero or one per track); each
+    /// documents one track's characteristics in the subsequent movie
+    /// fragments. The structured records are reachable via the public
+    /// `Mp4Demuxer::treps` accessor (downcast) and the flat metadata
+    /// channel surfaces them as `trep_<n>` keys. Informational only —
+    /// the demuxer does not consult them.
+    #[allow(dead_code)]
+    treps: Vec<TrepRecord>,
     /// ISO/IEC 23001-7 §8.1 pssh entries collected from moov. One per
     /// DRM system signalled in the file; the demuxer does not consume
     /// them but a downstream decryption layer can look up its
@@ -6190,6 +6398,20 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn leva_entries(&self) -> Option<&[LevaEntry]> {
         self.leva.as_ref().map(|l| l.entries.as_slice())
+    }
+
+    /// ISO/IEC 14496-12 §8.8.15 — all `trep`
+    /// TrackExtensionPropertiesBoxes discovered inside `mvex`, in file
+    /// order. Each names the `track_id` it describes and carries the
+    /// type + payload length of any child boxes it nests (e.g. an
+    /// `assp` Alternative Startup Sequence Properties Box, §8.8.16).
+    /// Empty for files without `trep` boxes (which is most of the
+    /// corpus — `trep` is a fragmented-movie hint). The flat metadata
+    /// channel carries `trep_<n>` summaries; this accessor returns the
+    /// structured records.
+    #[allow(dead_code)]
+    pub fn treps(&self) -> &[TrepRecord] {
+        &self.treps
     }
 
     /// ISO/IEC 14496-12 §8.16.4 — all `ssix` SubsegmentIndexBoxes
@@ -6599,6 +6821,21 @@ pub fn parse_pdin_box(body: &[u8]) -> Result<PdinRecord> {
 /// `level_count = 0`.
 pub fn parse_leva_box(body: &[u8]) -> Result<LevaRecord> {
     parse_leva(body)
+}
+
+/// Parse a standalone `trep` (TrackExtensionPropertiesBox, ISO/IEC
+/// 14496-12 §8.8.15) body from `body` (the bytes after the 8/16-byte
+/// box header).
+///
+/// Exposed as a public entry point so tooling that already has the
+/// box's payload bytes in hand can recover the `track_id` and the
+/// type/length list of nested child boxes without re-running `open()`.
+/// Returns `Err` for a body shorter than the 4-byte FullBox preamble or
+/// one missing its 4-byte `track_id`; returns
+/// `Ok(TrepRecord { children: vec![], .. })` for a `trep` carrying just
+/// its `track_id` with no child boxes.
+pub fn parse_trep_box(body: &[u8]) -> Result<TrepRecord> {
+    parse_trep(body)
 }
 
 use std::io::Read;
@@ -9970,6 +10207,156 @@ mod tests {
         let r_internal = super::parse_leva(&body).unwrap();
         assert_eq!(r_public.entries, r_internal.entries);
         assert_eq!(r_public.entries.len(), 3);
+    }
+
+    // ---- trep (TrackExtensionPropertiesBox, §8.8.15) -------------------
+
+    /// Build a child box (8-byte header + payload) for embedding in a
+    /// `trep` body.
+    fn build_child_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = 8 + payload.len();
+        let mut v = Vec::with_capacity(size);
+        v.extend_from_slice(&(size as u32).to_be_bytes());
+        v.extend_from_slice(fourcc);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Build a `trep` body: 4-byte FullBox preamble + 4-byte track_id +
+    /// the concatenated child boxes.
+    fn build_trep(track_id: u32, children: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0u8; 4]); // version + flags = 0
+        v.extend_from_slice(&track_id.to_be_bytes());
+        for c in children {
+            v.extend_from_slice(c);
+        }
+        v
+    }
+
+    /// A `trep` carrying just its `track_id` (no children) parses to an
+    /// empty `children` list. Body is 4 preamble + 4 track_id = 8 bytes.
+    #[test]
+    fn parse_trep_track_id_only() {
+        let body = build_trep(0x0102_0304, &[]);
+        assert_eq!(body.len(), 8);
+        let r = super::parse_trep(&body).unwrap();
+        assert_eq!(r.track_id, 0x0102_0304);
+        assert!(r.children.is_empty());
+    }
+
+    /// A `trep` with two child boxes records each child's fourcc and
+    /// payload length, in file order, without recursing into them.
+    #[test]
+    fn parse_trep_records_children_in_order() {
+        let assp = build_child_box(b"assp", &[0xaa; 12]);
+        let unkn = build_child_box(b"xyzw", &[]);
+        let body = build_trep(7, &[assp, unkn]);
+        let r = super::parse_trep(&body).unwrap();
+        assert_eq!(r.track_id, 7);
+        assert_eq!(r.children.len(), 2);
+        assert_eq!(&r.children[0].fourcc, b"assp");
+        assert_eq!(r.children[0].payload_len, 12);
+        assert_eq!(&r.children[1].fourcc, b"xyzw");
+        assert_eq!(r.children[1].payload_len, 0);
+    }
+
+    /// A `trep` body shorter than the 4-byte FullBox preamble is
+    /// rejected — there's nothing to recover.
+    #[test]
+    fn parse_trep_too_short_preamble() {
+        for n in 0..4 {
+            let body = vec![0u8; n];
+            assert!(super::parse_trep(&body).is_err(), "len {n} must err");
+        }
+    }
+
+    /// A `trep` body with the preamble but a truncated `track_id` (fewer
+    /// than 4 bytes after the preamble) is rejected.
+    #[test]
+    fn parse_trep_truncated_track_id() {
+        for extra in 0..4 {
+            let mut body = vec![0u8; 4]; // preamble
+            body.extend_from_slice(&vec![0u8; extra]);
+            assert!(
+                super::parse_trep(&body).is_err(),
+                "track_id with {extra} bytes must err",
+            );
+        }
+    }
+
+    /// A non-zero FullBox version is tolerated (the layout up to
+    /// `track_id` is unambiguous), matching the `parse_leva` posture.
+    #[test]
+    fn parse_trep_tolerates_nonzero_version() {
+        let mut body = build_trep(42, &[build_child_box(b"assp", &[1, 2, 3, 4])]);
+        body[0] = 0x01; // flip the version byte
+        let r = super::parse_trep(&body).unwrap();
+        assert_eq!(r.track_id, 42);
+        assert_eq!(r.children.len(), 1);
+        assert_eq!(r.children[0].payload_len, 4);
+    }
+
+    /// A child whose declared size overruns the remaining `trep` body is
+    /// clamped to the bytes available, recorded with the clamped length,
+    /// and ends the child walk (no sibling can follow an over-long box).
+    #[test]
+    fn parse_trep_clamps_overlong_child() {
+        let mut body = build_trep(3, &[]);
+        // Child header declaring size 0x40 (64) but only 4 payload
+        // bytes actually present after the 8-byte header.
+        body.extend_from_slice(&64u32.to_be_bytes());
+        body.extend_from_slice(b"assp");
+        body.extend_from_slice(&[0xff; 4]);
+        let r = super::parse_trep(&body).unwrap();
+        assert_eq!(r.children.len(), 1);
+        assert_eq!(&r.children[0].fourcc, b"assp");
+        // Available after the header = 4 bytes; clamped payload_len = 4.
+        assert_eq!(r.children[0].payload_len, 4);
+    }
+
+    /// A trailing child header that doesn't fit (fewer than 8 bytes left
+    /// after the previous child) ends the walk cleanly rather than
+    /// erroring — the `track_id` and the well-formed children survive.
+    #[test]
+    fn parse_trep_trailing_partial_child_header_ignored() {
+        let mut body = build_trep(9, &[build_child_box(b"assp", &[0; 4])]);
+        // Append 5 stray bytes — too few for an 8-byte box header.
+        body.extend_from_slice(&[0x11; 5]);
+        let r = super::parse_trep(&body).unwrap();
+        assert_eq!(r.track_id, 9);
+        assert_eq!(r.children.len(), 1);
+        assert_eq!(&r.children[0].fourcc, b"assp");
+    }
+
+    /// A child using the 64-bit `largesize` form (size32 == 1) is read
+    /// via its 16-byte header and the largesize field.
+    #[test]
+    fn parse_trep_child_largesize_form() {
+        let mut body = build_trep(5, &[]);
+        // size32 = 1 signals a 64-bit largesize follows the fourcc.
+        let payload = [0x55u8; 6];
+        let total: u64 = (16 + payload.len()) as u64;
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(b"assp");
+        body.extend_from_slice(&total.to_be_bytes());
+        body.extend_from_slice(&payload);
+        let r = super::parse_trep(&body).unwrap();
+        assert_eq!(r.children.len(), 1);
+        assert_eq!(&r.children[0].fourcc, b"assp");
+        assert_eq!(r.children[0].payload_len, 6);
+    }
+
+    /// `parse_trep_box` (the public wrapper) routes through the same
+    /// internal parser as the `open()` walk.
+    #[test]
+    fn parse_trep_box_public_entry_matches_internal() {
+        let body = build_trep(123, &[build_child_box(b"assp", &[7; 8])]);
+        let r_public = super::parse_trep_box(&body).unwrap();
+        let r_internal = super::parse_trep(&body).unwrap();
+        assert_eq!(r_public.track_id, r_internal.track_id);
+        assert_eq!(r_public.children, r_internal.children);
+        assert_eq!(r_public.track_id, 123);
     }
 
     /// `parse_ssix_box` (the public wrapper) routes through the same

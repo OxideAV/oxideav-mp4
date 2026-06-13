@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Track Extension Properties Box (`trep`, ISO/IEC 14496-12 §8.8.15) —
+  round 291. The `mvex` walker now recognises the `trep` `FullBox(0, 0)`
+  that documents a track's characteristics in subsequent movie
+  fragments: it reads the `unsigned int(32) track_id` (§8.8.15.3) and
+  records the type + payload length of each nested child box (§8.8.15.2
+  "any number of boxes", e.g. an `assp` Alternative Startup Sequence
+  Properties Box) without recursing into them. Quantity is zero or more
+  (zero or one per track, §8.8.15.1); every instance is collected in
+  file order. Surfaced on `Demuxer::metadata()` as `trep_<n>` with value
+  `"<track_id> children=<k>[ <fourcc>...]"`, via the public
+  `demux::parse_trep_box(&[u8]) -> Result<TrepRecord>` entry point, and
+  via `Mp4Demuxer::treps() -> &[TrepRecord]` (downcast). Over-long child
+  boxes are clamped to the remaining body, the 64-bit `largesize` child
+  form is handled, and a malformed `trep` is dropped silently so a
+  producer slip cannot brick `open()` (the box is informational). New
+  public types `TrepRecord` / `TrepChild`. 14 new tests (9 unit + 5
+  integration in `tests/trep.rs`).
 - CENC AES-128 CTR / CBC cipher driver (ISO/IEC 23001-7:2016 §9,
   module `cenc_cipher`) — round 283. The crate's CENC stack is no
   longer parse-only: `cenc_cipher::decrypt_sample_in_place(decision,
