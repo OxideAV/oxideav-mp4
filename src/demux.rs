@@ -949,6 +949,12 @@ struct Track {
     /// (as hex) without interpreting them. Empty when the track has no
     /// `sgpd` (the common case).
     sgpd: Vec<SgpdBox>,
+    /// §8.9.5 — `csgp` (CompactSampleToGroupBox) instances. The compact
+    /// alternative to `sbgp`: each records the grouping type, the
+    /// optional `grouping_type_parameter`, and a small set of repeating
+    /// index patterns replicated across the track. Empty when the track
+    /// has no `csgp` (the common case — `csgp` is a 2020+ addition).
+    csgp: Vec<CsgpBox>,
     /// §8.6.4 — `sdtp` (SampleDependencyTypeBox). Per-sample dependency
     /// hints in decode order: one entry per sample, four 2-bit fields
     /// `(is_leading, sample_depends_on, sample_is_depended_on,
@@ -1066,6 +1072,38 @@ struct SgpdBox {
     /// interpret them — interpretation belongs to the layer that knows
     /// the `grouping_type` semantics.
     entries: Vec<Vec<u8>>,
+}
+
+/// One pattern of a `csgp` (CompactSampleToGroupBox, §8.9.5): a run of
+/// `pattern_length` per-sample `sample_group_description_index` values,
+/// replicated across `sample_count` consecutive groups of that length.
+#[derive(Clone, Debug, Default)]
+struct CsgpPattern {
+    /// `sample_count[i]` — number of consecutive groups (each
+    /// `pattern_length` samples long) that replay this pattern. The
+    /// pattern covers `sample_count * pattern_length` samples in total.
+    sample_count: u32,
+    /// `sample_group_description_index[i][1..=pattern_length]` — one
+    /// index per sample of the pattern. Index 0 means "member of no
+    /// group of this type"; when the box lives in a `traf`, the index's
+    /// most-significant bit (for the field's width) distinguishes a
+    /// fragment-local description (set) from a global one (clear). The
+    /// raw value is preserved verbatim; the demuxer does not resolve it.
+    indices: Vec<u32>,
+}
+
+/// Parsed `csgp` (CompactSampleToGroupBox, ISO/IEC 14496-12:2020 §8.9.5).
+#[derive(Clone, Debug, Default)]
+struct CsgpBox {
+    /// Four-byte grouping type linking this box to the `sgpd` of the
+    /// same type — identical role to `sbgp.grouping_type`.
+    grouping_type: [u8; 4],
+    /// `grouping_type_parameter` — present only when the flag layout's
+    /// presence bit is set, selecting one of several alternative
+    /// groupings of the same type. `None` when the bit is clear.
+    grouping_type_parameter: Option<u32>,
+    /// The repeating index patterns, in disk order.
+    patterns: Vec<CsgpPattern>,
 }
 
 /// One sub-sample of a `subs` (SubSampleInformationBox, §8.7.7) entry.
@@ -1772,6 +1810,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         stsh: Vec::new(),
         sbgp: Vec::new(),
         sgpd: Vec::new(),
+        csgp: Vec::new(),
         sdtp: Vec::new(),
         stdp: Vec::new(),
         padb: Vec::new(),
@@ -2470,6 +2509,7 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             CSLG => t.cslg = Some(parse_cslg(&b)?),
             SBGP => t.sbgp.push(parse_sbgp(&b)?),
             SGPD => t.sgpd.push(parse_sgpd(&b)?),
+            CSGP => t.csgp.push(parse_csgp(&b)?),
             SUBS => t.subs.push(parse_subs(&b)?),
             SAIZ => t.saiz.push(parse_saiz(&b)?),
             SAIO => t.saio.push(parse_saio(&b)?),
@@ -3484,6 +3524,173 @@ fn parse_sgpd(body: &[u8]) -> Result<SgpdBox> {
         grouping_type,
         default_sample_description_index,
         entries,
+    })
+}
+
+/// MSB-first big-endian bit cursor over a byte slice, used for the
+/// bit-packed variable-width fields of `csgp` (§8.9.5). Reads up to 32
+/// bits per call; returns `None` when the request would run past the end
+/// of the slice (the caller maps that to a "truncated" parse error).
+struct BitCursor<'a> {
+    data: &'a [u8],
+    /// Absolute bit position from the start of `data`.
+    bit_pos: usize,
+}
+
+impl<'a> BitCursor<'a> {
+    /// Anchor the cursor at byte offset `byte_off` (bit `byte_off * 8`).
+    fn new(data: &'a [u8], byte_off: usize) -> Self {
+        BitCursor {
+            data,
+            bit_pos: byte_off * 8,
+        }
+    }
+
+    /// Read `n` bits (0..=32) MSB-first as a big-endian unsigned value.
+    /// `n == 0` yields `0` without consuming any bits. Returns `None`
+    /// when fewer than `n` bits remain.
+    fn read(&mut self, n: u32) -> Option<u32> {
+        debug_assert!(n <= 32);
+        if n == 0 {
+            return Some(0);
+        }
+        let total_bits = self.data.len() * 8;
+        if self.bit_pos + n as usize > total_bits {
+            return None;
+        }
+        let mut value: u32 = 0;
+        for _ in 0..n {
+            let byte = self.data[self.bit_pos >> 3];
+            let bit = (byte >> (7 - (self.bit_pos & 7))) & 1;
+            value = (value << 1) | bit as u32;
+            self.bit_pos += 1;
+        }
+        Some(value)
+    }
+}
+
+/// Parse `csgp` (CompactSampleToGroupBox, ISO/IEC 14496-12:2020 §8.9.5).
+///
+/// The compact alternative to `sbgp`. `FullBox(version=0, flags)` where
+/// the 24-bit `flags` is overloaded to carry four sub-fields (LSB-first
+/// bit numbering):
+///
+/// ```text
+///     index_size_code                = flags[0..1]   (2 bits)
+///     count_size_code                = flags[2..3]   (2 bits)
+///     pattern_size_code              = flags[4..5]   (2 bits)
+///     grouping_type_parameter_present = flags[6]     (1 bit)
+/// ```
+///
+/// Each 2-bit size code selects a field width via `width = 4 << code`
+/// (code 0→4, 1→8, 2→16, 3→32 bits). The body is then:
+///
+/// ```text
+///     unsigned int(32) grouping_type
+///     if (grouping_type_parameter_present)
+///         unsigned int(32) grouping_type_parameter
+///     unsigned int(32) pattern_count
+///     for i in 1..=pattern_count {
+///         unsigned int(f(pattern_size_code)) pattern_length[i]
+///         unsigned int(f(count_size_code))   sample_count[i]
+///     }
+///     for j in 1..=pattern_count {
+///         for k in 1..=pattern_length[j] {
+///             unsigned int(f(index_size_code))
+///                 sample_group_description_index[j][k]
+///         }
+///     }
+/// ```
+///
+/// The `pattern_length`/`sample_count` array and the index array are two
+/// separate runs (all lengths first, then all indices) — the index run's
+/// total width is `sum(pattern_length[j]) * f(index_size_code)` bits. The
+/// 4- and 8-bit field widths mean fields are bit-packed (not byte
+/// aligned) across the array; we read MSB-first from a running bit
+/// cursor, matching the `unsigned int(N)` big-endian bit-field
+/// convention used throughout 14496-12.
+///
+/// `sample_group_description_index` values are kept verbatim: 0 = "no
+/// group of this type"; in a `traf` the field's most-significant bit
+/// distinguishes a fragment-local description (set) from a global one
+/// (clear). The demuxer does not resolve fragment-local references.
+fn parse_csgp(body: &[u8]) -> Result<CsgpBox> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: csgp too short"));
+    }
+    // FullBox: version(8) then 24-bit flags carrying the size codes.
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    let index_size_code = (flags & 0x3) as u8;
+    let count_size_code = ((flags >> 2) & 0x3) as u8;
+    let pattern_size_code = ((flags >> 4) & 0x3) as u8;
+    let gtpp = (flags >> 6) & 0x1 == 1;
+    let width = |code: u8| -> u32 { 4u32 << code };
+    let index_w = width(index_size_code);
+    let count_w = width(count_size_code);
+    let pattern_w = width(pattern_size_code);
+
+    let read_u32 = |b: &[u8], o: usize| -> Option<u32> {
+        b.get(o..o + 4)
+            .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let mut off = 4usize;
+    let grouping_type_raw =
+        read_u32(body, off).ok_or_else(|| Error::invalid("MP4: csgp grouping_type truncated"))?;
+    let grouping_type = grouping_type_raw.to_be_bytes();
+    off += 4;
+    let grouping_type_parameter = if gtpp {
+        let p = read_u32(body, off)
+            .ok_or_else(|| Error::invalid("MP4: csgp grouping_type_parameter truncated"))?;
+        off += 4;
+        Some(p)
+    } else {
+        None
+    };
+    let pattern_count = read_u32(body, off)
+        .ok_or_else(|| Error::invalid("MP4: csgp pattern_count truncated"))?
+        as usize;
+    off += 4;
+
+    // From here on, fields are bit-packed (4-/8-/16-/32-bit widths) with
+    // no byte alignment between them. Read MSB-first from a bit cursor
+    // anchored at the current byte offset.
+    let mut bits = BitCursor::new(body, off);
+    // Bound the up-front pattern allocation by the remaining bit budget:
+    // every pattern needs at least `pattern_w + count_w` bits here. Both
+    // widths are `4 << code`, hence ≥ 4, so the divisor is always ≥ 8.
+    let remaining_bits = body.len().saturating_sub(off).saturating_mul(8);
+    let min_pattern_bits = (pattern_w + count_w) as usize;
+    let cap = pattern_count.min(remaining_bits / min_pattern_bits);
+    let mut lengths: Vec<(u32, u32)> = Vec::with_capacity(cap);
+    for _ in 0..pattern_count {
+        let pattern_length = bits
+            .read(pattern_w)
+            .ok_or_else(|| Error::invalid("MP4: csgp pattern_length truncated"))?;
+        let sample_count = bits
+            .read(count_w)
+            .ok_or_else(|| Error::invalid("MP4: csgp sample_count truncated"))?;
+        lengths.push((pattern_length, sample_count));
+    }
+
+    let mut patterns: Vec<CsgpPattern> = Vec::with_capacity(lengths.len());
+    for (pattern_length, sample_count) in lengths {
+        let mut indices = Vec::with_capacity(pattern_length.min(remaining_bits as u32) as usize);
+        for _ in 0..pattern_length {
+            let idx = bits
+                .read(index_w)
+                .ok_or_else(|| Error::invalid("MP4: csgp index truncated"))?;
+            indices.push(idx);
+        }
+        patterns.push(CsgpPattern {
+            sample_count,
+            indices,
+        });
+    }
+
+    Ok(CsgpBox {
+        grouping_type,
+        grouping_type_parameter,
+        patterns,
     })
 }
 
@@ -5942,6 +6149,36 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert(format!("sgpd_{}", i), v);
     }
 
+    // ISO/IEC 14496-12:2020 §8.9.5: surface CompactSampleToGroupBox
+    // (`csgp`) instances. Each becomes one `csgp_<n>` key whose value is
+    // the grouping type, an optional `param=<P>` (when the flag layout's
+    // grouping_type_parameter_present bit is set), then one
+    // space-separated token per pattern of the form
+    // `count*idx0,idx1,...,idxN` — `count` is the pattern's
+    // `sample_count` (how many times the index run replays) and the
+    // comma-list is the per-sample `sample_group_description_index`
+    // values of the pattern (0 = "no group"; fragment-local indices kept
+    // verbatim with their high bit set). Shares `grouping_type` with the
+    // matching `sgpd_<m>` exactly like `sbgp`. Absent `csgp`, no keys.
+    for (i, cg) in t.csgp.iter().enumerate() {
+        let mut v = render_grouping_type(&cg.grouping_type);
+        if let Some(p) = cg.grouping_type_parameter {
+            v.push_str(&format!(" param={}", p));
+        }
+        for pat in &cg.patterns {
+            v.push(' ');
+            v.push_str(&format!("{}*", pat.sample_count));
+            let idx_list = pat
+                .indices
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            v.push_str(&idx_list);
+        }
+        params.options.insert(format!("csgp_{}", i), v);
+    }
+
     // ISO/IEC 14496-12 §8.6.4: surface the optional SampleDependencyTypeBox
     // (`sdtp`) as a small summary on `params.options` rather than
     // per-sample (per-sample would flood the map for a typical track).
@@ -7021,6 +7258,7 @@ mod tests {
             stsh: Vec::new(),
             sbgp: Vec::new(),
             sgpd: Vec::new(),
+            csgp: Vec::new(),
             sdtp: Vec::new(),
             stdp: Vec::new(),
             padb: Vec::new(),
@@ -9211,6 +9449,143 @@ mod tests {
         body.extend_from_slice(&8u32.to_be_bytes()); // claims 8 bytes
         body.extend_from_slice(&[0x01, 0x02]); // only 2 present
         assert!(super::parse_sgpd(&body).is_err());
+    }
+
+    /// The MSB-first `BitCursor` reads big-endian bit fields across byte
+    /// boundaries, including a zero-width read.
+    #[test]
+    fn bit_cursor_reads_msb_first() {
+        // 0b1010_0110 0b1100_0001
+        let data = [0xA6u8, 0xC1];
+        let mut c = super::BitCursor::new(&data, 0);
+        assert_eq!(c.read(0), Some(0)); // zero width consumes nothing
+        assert_eq!(c.read(4), Some(0b1010));
+        assert_eq!(c.read(4), Some(0b0110));
+        assert_eq!(c.read(8), Some(0b1100_0001));
+        assert_eq!(c.read(1), None); // exhausted
+    }
+
+    /// The cursor honours a non-zero byte anchor and rejects an
+    /// over-long read.
+    #[test]
+    fn bit_cursor_anchor_and_overrun() {
+        let data = [0x00, 0xFF, 0x0F];
+        let mut c = super::BitCursor::new(&data, 1); // start at byte 1
+        assert_eq!(c.read(12), Some(0xFF0)); // 0xFF then top nibble of 0x0F
+        assert_eq!(c.read(8), None); // only 4 bits left
+        assert_eq!(c.read(4), Some(0x0F));
+    }
+
+    /// §8.9.5 — `csgp` with 16-bit field widths (byte-aligned): two
+    /// patterns of one and two samples. flags encode all three size
+    /// codes as `2` (16-bit) with no grouping_type_parameter.
+    #[test]
+    fn parse_csgp_16bit_widths() {
+        // index_size_code=2, count_size_code=2, pattern_size_code=2,
+        // gtpp=0  →  flags = 2 | (2<<2) | (2<<4) = 0x2A.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0x2A]); // version 0 + flags
+        body.extend_from_slice(b"roll"); // grouping_type
+        body.extend_from_slice(&2u32.to_be_bytes()); // pattern_count = 2
+                                                     // pattern 1: length 1, sample_count 3
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&3u16.to_be_bytes());
+        // pattern 2: length 2, sample_count 1
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        // indices: pattern 1 → [5]; pattern 2 → [0, 7]
+        body.extend_from_slice(&5u16.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&7u16.to_be_bytes());
+        let cg = super::parse_csgp(&body).unwrap();
+        assert_eq!(&cg.grouping_type, b"roll");
+        assert_eq!(cg.grouping_type_parameter, None);
+        assert_eq!(cg.patterns.len(), 2);
+        assert_eq!(cg.patterns[0].sample_count, 3);
+        assert_eq!(cg.patterns[0].indices, vec![5]);
+        assert_eq!(cg.patterns[1].sample_count, 1);
+        assert_eq!(cg.patterns[1].indices, vec![0, 7]);
+    }
+
+    /// §8.9.5 — 4-bit bit-packed fields (the densest form). All three
+    /// size codes are `0` (width 4). A single pattern of three samples
+    /// packs `pattern_length`+`sample_count` into one byte and the three
+    /// indices into 12 bits.
+    #[test]
+    fn parse_csgp_4bit_packed() {
+        // size codes all 0 → flags 0; gtpp=0.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0]); // version 0 + flags 0
+        body.extend_from_slice(b"sync"); // grouping_type
+        body.extend_from_slice(&1u32.to_be_bytes()); // pattern_count = 1
+                                                     // pattern_length=3 (0b0011), sample_count=2 (0b0010) → 0x32
+                                                     // indices [1, 2, 4] → 0b0001 0010 0100 = 0x12 0x4_ (12 bits,
+                                                     // padded to a byte boundary by the box's size).
+        body.push(0x32);
+        body.push(0x12);
+        body.push(0x40); // top nibble = index 4, low nibble padding
+        let cg = super::parse_csgp(&body).unwrap();
+        assert_eq!(&cg.grouping_type, b"sync");
+        assert_eq!(cg.patterns.len(), 1);
+        assert_eq!(cg.patterns[0].sample_count, 2);
+        assert_eq!(cg.patterns[0].indices, vec![1, 2, 4]);
+    }
+
+    /// §8.9.5 — the flag presence bit (bit 6) adds a 32-bit
+    /// `grouping_type_parameter` after `grouping_type`.
+    #[test]
+    fn parse_csgp_with_grouping_type_parameter() {
+        // size codes all 2 (16-bit) plus presence bit (1<<6 = 0x40):
+        // flags = 0x2A | 0x40 = 0x6A.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0x6A]);
+        body.extend_from_slice(b"rap ");
+        body.extend_from_slice(&9u32.to_be_bytes()); // grouping_type_parameter
+        body.extend_from_slice(&1u32.to_be_bytes()); // pattern_count = 1
+        body.extend_from_slice(&1u16.to_be_bytes()); // pattern_length
+        body.extend_from_slice(&4u16.to_be_bytes()); // sample_count
+        body.extend_from_slice(&2u16.to_be_bytes()); // index
+        let cg = super::parse_csgp(&body).unwrap();
+        assert_eq!(&cg.grouping_type, b"rap ");
+        assert_eq!(cg.grouping_type_parameter, Some(9));
+        assert_eq!(cg.patterns[0].sample_count, 4);
+        assert_eq!(cg.patterns[0].indices, vec![2]);
+    }
+
+    /// §8.9.5 — a fragment-local index keeps its high bit verbatim. With
+    /// a 32-bit index width, bit 31 set marks fragment-local.
+    #[test]
+    fn parse_csgp_fragment_local_index_preserved() {
+        // index_size_code=3 (32-bit), count/pattern codes 2 (16-bit):
+        // flags = 3 | (2<<2) | (2<<4) = 0x2B.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0x2B]);
+        body.extend_from_slice(b"seig");
+        body.extend_from_slice(&1u32.to_be_bytes()); // pattern_count
+        body.extend_from_slice(&1u16.to_be_bytes()); // pattern_length
+        body.extend_from_slice(&1u16.to_be_bytes()); // sample_count
+        body.extend_from_slice(&0x8000_0001u32.to_be_bytes()); // frag-local idx
+        let cg = super::parse_csgp(&body).unwrap();
+        assert_eq!(cg.patterns[0].indices, vec![0x8000_0001]);
+    }
+
+    /// A `csgp` truncated mid-index is rejected, not silently shortened.
+    #[test]
+    fn parse_csgp_truncated_index_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0x2A]); // 16-bit widths
+        body.extend_from_slice(b"roll");
+        body.extend_from_slice(&1u32.to_be_bytes()); // pattern_count
+        body.extend_from_slice(&2u16.to_be_bytes()); // pattern_length = 2
+        body.extend_from_slice(&1u16.to_be_bytes()); // sample_count
+        body.extend_from_slice(&5u16.to_be_bytes()); // only one of two indices
+        assert!(super::parse_csgp(&body).is_err());
+    }
+
+    /// A `csgp` too short even for the FullBox header is rejected.
+    #[test]
+    fn parse_csgp_too_short() {
+        assert!(super::parse_csgp(&[0u8, 0]).is_err());
     }
 
     /// `parse_stbl` accumulates multiple `sbgp`/`sgpd` instances (one per

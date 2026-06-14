@@ -515,6 +515,22 @@ Sample-entry FourCCs resolve to these codec ids:
   they are surfaced verbatim for a layer that knows the
   `grouping_type` semantics. Absent both boxes, none of the keys are
   emitted.
+- Compact sample-to-group (ISO/IEC 14496-12:2020 §8.9.5, `csgp`): the
+  compact alternative to `sbgp` is parsed. The `FullBox.flags` field is
+  overloaded to carry three 2-bit width selectors (`index_size_code`,
+  `count_size_code`, `pattern_size_code`, each mapped to a field width
+  via `width = 4 << code` → 4/8/16/32 bits) plus a
+  `grouping_type_parameter_present` bit. The body's variable-width
+  fields are bit-packed (no byte alignment between 4-/8-bit fields) and
+  read MSB-first: a `pattern_count`-long array of
+  `(pattern_length, sample_count)` followed by the per-pattern
+  `sample_group_description_index` run. Each `csgp` is accumulated and
+  surfaced on `params.options` as `csgp_<n>`: the grouping type, an
+  optional `param=<P>`, then one `count*idx0,idx1,…` token per pattern
+  (`count` = `sample_count`, the index list = the pattern's per-sample
+  indices; 0 = "no group", fragment-local high-bit kept verbatim). It
+  shares `grouping_type` with the matching `sgpd_<m>`. Absent `csgp`,
+  no keys are emitted.
 - Sub-sample information (ISO/IEC 14496-12 §8.7.7, `subs`): a track's
   `stbl/subs` SubSampleInformationBox is an optional sparse table
   describing how selected samples decompose into smaller,

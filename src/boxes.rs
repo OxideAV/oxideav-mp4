@@ -253,6 +253,14 @@ pub const SBGP: [u8; 4] = fourcc("sbgp");
 /// entries that an `sbgp` of the same `grouping_type` indexes. Entry
 /// payloads are grouping-type-specific and opaque to the container.
 pub const SGPD: [u8; 4] = fourcc("sgpd");
+/// `csgp` — CompactSampleToGroupBox (ISO/IEC 14496-12:2020 §8.9.5).
+/// Sits inside `stbl` (or `traf`); the compact form of `sbgp`. Instead
+/// of one `(sample_count, group_description_index)` pair per run, it
+/// encodes a small set of repeating index **patterns** that are
+/// replicated across the track, with field widths selected by code
+/// values packed into the `FullBox.flags`. Like `sbgp`, it indexes the
+/// per-group entries of an `sgpd` of the same `grouping_type`.
+pub const CSGP: [u8; 4] = fourcc("csgp");
 /// `subs` — SubSampleInformationBox (ISO/IEC 14496-12 §8.7.7). Sits
 /// inside `stbl` (or `traf`); an optional sparse table describing how
 /// selected samples decompose into smaller, semantically meaningful
