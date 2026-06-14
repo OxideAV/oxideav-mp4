@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sub Track boxes (`strk` / `stri` / `strd` / `stsg`, ISO/IEC
+  14496-12 §8.14) — round 300. The track-level `udta` walker now
+  recognises the `strk` Sub Track box (§8.14.3): each assigns *part*
+  of a track to the same alternate / switch groups whole tracks use
+  (§8.3.2 / §8.10.3), the mechanism for selecting among layered-codec
+  alternatives (SVC / MVC temporal, spatial, SNR, view layers) that
+  don't map onto track boundaries (§8.14.1). The mandatory `stri`
+  (Sub Track Information, §8.14.4) is parsed for `switch_group`
+  (i16), `alternate_group` (i16), `sub_track_ID` (u32), and the
+  §8.14.4.3 `attribute_list[]` of descriptive / differentiating
+  FourCCs; the mandatory `strd` (Sub Track Definition, §8.14.5) is
+  walked one level for its `stsg` (Sub Track Sample Group, §8.14.6)
+  children, each carrying a `grouping_type` plus its `sgpd`
+  description-index list. Surfaced on `params.options` as
+  `subtrack_<n>` = `"id=<id> switch=<s> alt=<a> [attrs=<fourcc...>]
+  [stsg=<grouping_type>:<idx>,<idx>;...]"`. A `strk` missing its
+  mandatory `stri` contributes no sub track; an unknown FullBox
+  version on `stri` / `stsg`, a too-short `stri`, or a `stsg` whose
+  `item_count` overruns the body are rejected — the boxes are
+  informational and a malformed entry never aborts the open. 21 new
+  unit tests. Source: ISO/IEC 14496-12:2015 §8.14 (staged PDF).
 - Track Extension Properties Box (`trep`, ISO/IEC 14496-12 §8.8.15) —
   round 291. The `mvex` walker now recognises the `trep` `FullBox(0, 0)`
   that documents a track's characteristics in subsequent movie

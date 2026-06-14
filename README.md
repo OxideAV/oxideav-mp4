@@ -415,6 +415,36 @@ Sample-entry FourCCs resolve to these codec ids:
   Container preserves the raw FourCCs; consumer mapping (e.g. a
   player selecting by language vs. bitrate within an alternate
   group) is delegated. Absent `tsel`, no keys are emitted.
+- Sub tracks (ISO/IEC 14496-12 §8.14, `strk` / `stri` / `strd` /
+  `stsg`): a track-level `udta` may carry zero or more `strk` Sub
+  Track boxes (§8.14.3), each assigning *part* of the track to the
+  same alternate / switch groups that whole tracks use (§8.3.2 /
+  §8.10.3) — the mechanism for selecting among layered-codec
+  alternatives (SVC / MVC temporal, spatial, SNR, or view layers)
+  that don't map onto track boundaries (§8.14.1). Each `strk`'s
+  mandatory `stri` (Sub Track Information, §8.14.4) carries
+  `switch_group` (signed 16-bit), `alternate_group` (signed 16-bit),
+  `sub_track_ID` (32-bit), and an `attribute_list[]` of FourCCs from
+  §8.14.4.3's descriptive (`tesc` / `fgsc` / `cgsc` / `spsc` /
+  `resc` / `vwsc`) and differentiating (`bitr` / `frar` / `nvws` /
+  …) vocabulary. The mandatory `strd` (Sub Track Definition,
+  §8.14.5) is walked one level for its `stsg` (Sub Track Sample
+  Group, §8.14.6) children — each names a `grouping_type` shared with
+  the track's `sbgp` / `sgpd` (§8.9) plus the `sgpd` description
+  indices that make up the sub track. Each sub track is surfaced on
+  `params.options` as `subtrack_<n>` (0-based encounter index) with
+  value `"id=<sub_track_ID> switch=<switch_group> alt=<alternate_group>
+  [attrs=<fourcc...>] [stsg=<grouping_type>:<idx>,<idx>;...]"` — the
+  three fixed fields are always present (0 is meaningful — it
+  distinguishes present-but-unassigned from a missing field), the
+  `attrs=` and `stsg=` blocks are omitted when empty, and FourCCs
+  with non-printable bytes fall back to 8-digit hex (matching the
+  `tsel_attributes` convention). A `strk` missing its mandatory
+  `stri` contributes no sub track; an unknown FullBox version on
+  `stri` / `stsg`, a too-short `stri`, or a `stsg` whose declared
+  `item_count` overruns the body are rejected — the boxes are
+  informational and a malformed entry never aborts the open. Absent
+  `strk`, no keys are emitted.
 - Composition-to-decode (ISO/IEC 14496-12 §8.6.1.4, `cslg`): a
   track's `stbl/cslg` CompositionToDecodeBox documents the
   composition↔decode timeline relationship implied by a signed

@@ -913,6 +913,14 @@ struct Track {
     /// (`bitr` / `cdec` / `lang` / …) sets that characterise what the
     /// track offers. `None` when the track has no `tsel`.
     tsel: Option<TselBox>,
+    /// §8.14.3 — `strk` (Sub Track Box) entries from the track-level
+    /// `udta`. Each defines a sub track (part of this track assigned to
+    /// alternate / switch groups for layered-codec media selection): the
+    /// `stri` (§8.14.4) selection metadata plus zero or more `strd/stsg`
+    /// (§8.14.6) sample-group definitions. Quantity "zero or more"
+    /// (§8.14.3.1); order matches the on-disk order. Empty when the
+    /// track defines no sub tracks (the common case).
+    sub_tracks: Vec<SubTrack>,
     /// §8.6.1.4 — `cslg` (CompositionToDecodeBox). Present when signed
     /// composition offsets (a v1 `ctts`) are in use and the producer
     /// chose to document the composition↔decode timeline relationship.
@@ -1320,6 +1328,62 @@ struct TselBox {
     /// Order matches the on-disk order. Empty when the box body
     /// carried only the `switch_group`.
     attribute_list: Vec<[u8; 4]>,
+}
+
+/// One Sub Track Sample Group (ISO/IEC 14496-12 §8.14.6, `stsg`).
+///
+/// Defines one slice of a sub track as the union of the sample groups —
+/// of a single `grouping_type` — named by the listed `sgpd` (§8.9.3)
+/// description indices. The container does not resolve the indices
+/// against the matching `sgpd` table; it preserves the `(grouping_type,
+/// indices)` pairing verbatim for a consumer that knows the grouping
+/// semantics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SubTrackSampleGroup {
+    /// `grouping_type` (§8.14.6.3). The same FourCC used by the matching
+    /// `sbgp` (§8.9.2) and `sgpd` (§8.9.3) boxes on the parent track.
+    grouping_type: [u8; 4],
+    /// `group_description_index[]` (§8.14.6.3). Each entry indexes a
+    /// `sgpd` entry of `grouping_type` that describes samples belonging
+    /// to this sub track. Order matches the on-disk order.
+    group_description_indices: Vec<u32>,
+}
+
+/// One parsed Sub Track (ISO/IEC 14496-12 §8.14.3, `strk`).
+///
+/// A sub track assigns *part* of the containing track to alternate /
+/// switch groups (§8.14.1), letting a media-selection layer choose among
+/// layered-codec alternatives (SVC / MVC temporal, spatial, SNR, or view
+/// layers) that don't map onto whole-track boundaries. The mandatory
+/// `stri` (§8.14.4) carries the selection metadata; the mandatory `strd`
+/// (§8.14.5) holds zero or more `stsg` (§8.14.6) that define which sample
+/// groups make up the sub track.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SubTrack {
+    /// `stri.switch_group` (§8.14.4.3). Signed; 0 (default) means "no
+    /// switching information". Shares the global numbering with
+    /// `tsel.switch_group` (§8.10.3) so a switch group can span track
+    /// and sub-track boundaries. `None` when the `strk` carried no
+    /// well-formed `stri` (the box is mandatory per §8.14.4.1, but a
+    /// malformed entry is tolerated rather than aborting the demux).
+    switch_group: i16,
+    /// `stri.alternate_group` (§8.14.4.3). Signed; 0 (default) means "no
+    /// information on relations to other tracks/sub-tracks". Shares the
+    /// numbering with `tkhd.alternate_group` (§8.3.2).
+    alternate_group: i16,
+    /// `stri.sub_track_ID` (§8.14.4.3). A non-zero value uniquely
+    /// identifies the sub track locally within the parent track; 0
+    /// (default) means "not assigned".
+    sub_track_id: u32,
+    /// `stri.attribute_list[]` (§8.14.4.3). Each entry is a 4-byte
+    /// FourCC drawn from the descriptive set (`tesc`, `fgsc`, `cgsc`,
+    /// `spsc`, `resc`, `vwsc`) or the differentiating set (`bitr`,
+    /// `frar`, `nvws`, …). Order matches the on-disk order. Empty when
+    /// the `stri` body carried only the three group/id fields.
+    attribute_list: Vec<[u8; 4]>,
+    /// `strd/stsg` Sub Track Sample Group boxes (§8.14.6). Zero or more;
+    /// order matches the on-disk order.
+    sample_groups: Vec<SubTrackSampleGroup>,
 }
 
 /// Decoded `cprt` (CopyrightBox, ISO/IEC 14496-12 §8.10.2). Carried in a
@@ -1805,6 +1869,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         kinds: Vec::new(),
         copyrights: Vec::new(),
         tsel: None,
+        sub_tracks: Vec::new(),
         cslg: None,
         vmhd: None,
         stsh: Vec::new(),
@@ -1893,6 +1958,7 @@ fn parse_track_udta(body: &[u8], t: &mut Track) {
         match hdr.fourcc {
             KIND => parse_kind(&body[start..start + psz], t),
             TSEL => parse_tsel(&body[start..start + psz], t),
+            STRK => parse_strk(&body[start..start + psz], t),
             CPRT => parse_cprt(&body[start..start + psz], t),
             _ => {
                 // Other track-udta children (e.g. legacy `titl` overrides)
@@ -2057,6 +2123,213 @@ fn parse_tsel(body: &[u8], t: &mut Track) {
         switch_group,
         attribute_list,
     });
+}
+
+/// Render a 4-byte FourCC for surfacing on `params.options`: the printable
+/// ASCII string when every byte is non-control valid UTF-8, otherwise an
+/// 8-digit lowercase hex fallback. Mirrors the inline closure used by the
+/// `tsel_attributes` / `tref_<type>` surfacing so the sub-track attribute
+/// and grouping-type tokens read identically.
+fn fourcc_token(a: &[u8; 4]) -> String {
+    std::str::from_utf8(a)
+        .ok()
+        .filter(|s| s.chars().all(|c| !c.is_control()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{:02x}{:02x}{:02x}{:02x}", a[0], a[1], a[2], a[3]))
+}
+
+/// §8.14.3 — `strk` (Sub Track Box).
+///
+/// Spec syntax (§8.14.3.2): `aligned(8) class SubTrack extends
+/// Box('strk') {}` — a plain `Box` (no FullBox preamble) whose body is a
+/// container. It holds a mandatory `stri` (Sub Track Information,
+/// §8.14.4) and a mandatory `strd` (Sub Track Definition, §8.14.5). We
+/// walk the child boxes, parse the `stri` selection metadata, and recurse
+/// one level into `strd` to collect its `stsg` (Sub Track Sample Group,
+/// §8.14.6) children.
+///
+/// Robustness: `stri` and `strd` are both mandatory (§8.14.4.1 /
+/// §8.14.5.1), but a `strk` missing one of them — or carrying a malformed
+/// `stri` — is tolerated rather than aborting the demux (the box is
+/// informational, mirroring `parse_tsel` / `parse_kind`). A `strk` whose
+/// `stri` fails to parse contributes no `SubTrack` (there is nothing
+/// useful to surface without the selection fields); a present `stri` with
+/// a missing or empty `strd` still surfaces the selection metadata with
+/// an empty `sample_groups`.
+fn parse_strk(body: &[u8], t: &mut Track) {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    let mut info: Option<SubTrack> = None;
+    let mut sample_groups: Vec<SubTrackSampleGroup> = Vec::new();
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur).ok().flatten() {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        if cur.position() as usize + psz > body.len() {
+            break;
+        }
+        let start = cur.position() as usize;
+        cur.set_position((start + psz) as u64);
+        match hdr.fourcc {
+            STRI => info = parse_stri(&body[start..start + psz]),
+            STRD => sample_groups = parse_strd(&body[start..start + psz]),
+            _ => {
+                // Other `strk` children (codec-specific definitions, e.g.
+                // SVC/MVC tier boxes from ISO/IEC 14496-15) are skipped —
+                // §8.14.1 leaves the door open for media-specific
+                // definitions a future round can recognise.
+            }
+        }
+    }
+    // `stri` is mandatory (§8.14.4.1); without it we have no selection
+    // metadata to surface, so the whole `strk` is dropped. With it, the
+    // `strd/stsg` definitions (which may be empty) are attached.
+    if let Some(mut st) = info {
+        st.sample_groups = sample_groups;
+        t.sub_tracks.push(st);
+    }
+}
+
+/// §8.14.4 — `stri` (Sub Track Information Box).
+///
+/// Spec syntax (§8.14.4.2):
+/// ```text
+/// aligned(8) class SubTrackInformation
+///   extends FullBox('stri', version = 0, 0) {
+///   template int(16) switch_group = 0;
+///   template int(16) alternate_group = 0;
+///   template unsigned int(32) sub_track_ID = 0;
+///   unsigned int(32) attribute_list[]; // to the end of the box
+/// }
+/// ```
+///
+/// Body layout after the 4-byte FullBox preamble:
+///   * 2-byte signed big-endian `switch_group`.
+///   * 2-byte signed big-endian `alternate_group`.
+///   * 4-byte unsigned big-endian `sub_track_ID`.
+///   * Zero or more 4-byte FourCCs (the `attribute_list`).
+///
+/// Returns `None` for an unknown FullBox version (the spec pins it to 0)
+/// or a body too short to hold the FullBox + the three fixed fields. A
+/// trailing 1..3-byte fragment that doesn't complete a 4-byte FourCC is
+/// ignored ("attribute_list[] to the end of the box"), matching the
+/// `parse_tsel` posture.
+fn parse_stri(body: &[u8]) -> Option<SubTrack> {
+    // FullBox preamble (1 version + 3 flags) + 2 + 2 + 4 fixed fields.
+    if body.len() < 12 {
+        return None;
+    }
+    let version = body[0];
+    if version != 0 {
+        // §8.14.4.2 pins the box to version 0.
+        return None;
+    }
+    let switch_group = i16::from_be_bytes([body[4], body[5]]);
+    let alternate_group = i16::from_be_bytes([body[6], body[7]]);
+    let sub_track_id = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+    let mut attribute_list = Vec::new();
+    let mut i = 12;
+    while i + 4 <= body.len() {
+        let attr: [u8; 4] = [body[i], body[i + 1], body[i + 2], body[i + 3]];
+        attribute_list.push(attr);
+        i += 4;
+    }
+    Some(SubTrack {
+        switch_group,
+        alternate_group,
+        sub_track_id,
+        attribute_list,
+        sample_groups: Vec::new(),
+    })
+}
+
+/// §8.14.5 — `strd` (Sub Track Definition Box).
+///
+/// Spec syntax (§8.14.5.2): `aligned(8) class SubTrackDefinition extends
+/// Box('strd') {}` — a plain `Box` container holding zero or more `stsg`
+/// (§8.14.6) for the generic (non-codec-specific) sub-track definition
+/// mechanism. Walks the children and returns the parsed `stsg` records in
+/// on-disk order. Children other than `stsg` (codec-specific definitions)
+/// are skipped.
+fn parse_strd(body: &[u8]) -> Vec<SubTrackSampleGroup> {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    let mut out = Vec::new();
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur).ok().flatten() {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        if cur.position() as usize + psz > body.len() {
+            break;
+        }
+        let start = cur.position() as usize;
+        cur.set_position((start + psz) as u64);
+        if hdr.fourcc == STSG {
+            if let Some(sg) = parse_stsg(&body[start..start + psz]) {
+                out.push(sg);
+            }
+        }
+    }
+    out
+}
+
+/// §8.14.6 — `stsg` (Sub Track Sample Group Box).
+///
+/// Spec syntax (§8.14.6.2):
+/// ```text
+/// aligned(8) class SubTrackSampleGroupBox extends FullBox('stsg', 0, 0) {
+///   unsigned int(32) grouping_type;
+///   unsigned int(16) item_count;
+///   for (i = 0; i < item_count; i++)
+///     unsigned int(32) group_description_index;
+/// }
+/// ```
+///
+/// Body layout after the 4-byte FullBox preamble:
+///   * 4-byte `grouping_type` FourCC.
+///   * 2-byte big-endian `item_count`.
+///   * `item_count` 4-byte big-endian `group_description_index` values.
+///
+/// Returns `None` for an unknown FullBox version, a body too short for
+/// the FullBox + `grouping_type` + `item_count`, or a declared
+/// `item_count` that overruns the bytes actually present (a truncated
+/// index list would lie about which sample groups make up the sub track,
+/// so it is rejected rather than silently shortened).
+fn parse_stsg(body: &[u8]) -> Option<SubTrackSampleGroup> {
+    // FullBox preamble (4) + grouping_type (4) + item_count (2).
+    if body.len() < 10 {
+        return None;
+    }
+    let version = body[0];
+    if version != 0 {
+        // §8.14.6.2 pins the box to version 0.
+        return None;
+    }
+    let grouping_type: [u8; 4] = [body[4], body[5], body[6], body[7]];
+    let item_count = u16::from_be_bytes([body[8], body[9]]) as usize;
+    // Each entry is a 4-byte index; reject a count that overruns the body.
+    if body.len() < 10 + item_count * 4 {
+        return None;
+    }
+    let mut group_description_indices = Vec::with_capacity(item_count);
+    let mut i = 10;
+    for _ in 0..item_count {
+        group_description_indices.push(u32::from_be_bytes([
+            body[i],
+            body[i + 1],
+            body[i + 2],
+            body[i + 3],
+        ]));
+        i += 4;
+    }
+    Some(SubTrackSampleGroup {
+        grouping_type,
+        group_description_indices,
+    })
 }
 
 /// §8.3.2 — `tkhd` (TrackHeaderBox). We only need `track_ID` for
@@ -6043,6 +6316,58 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         }
     }
 
+    // ISO/IEC 14496-12 §8.14: surface each Sub Track (`strk`) the track
+    // declared. A sub track assigns *part* of a track to alternate /
+    // switch groups for layered-codec media selection (§8.14.1). Each is
+    // emitted on `params.options` as `subtrack_<n>` (0-based encounter
+    // index) carrying the `stri` (§8.14.4) selection fields:
+    //   `"id=<sub_track_ID> switch=<switch_group> alt=<alternate_group>
+    //     [attrs=<fourcc...>] [stsg=<grouping_type>:<idx>,<idx>;...]"`
+    // The `switch` / `alt` fields are always emitted (0 is meaningful —
+    // it distinguishes present-but-unassigned from a missing field); the
+    // `attrs=` block lists the §8.14.4.3 attribute FourCCs (descriptive
+    // `tesc`/`fgsc`/… and differentiating `bitr`/`frar`/`nvws`/…) and is
+    // omitted when empty; the `stsg=` block lists each `strd/stsg`
+    // (§8.14.6) sub-track sample-group definition as
+    // `<grouping_type>:<index>,<index>,…` and is omitted when the sub
+    // track declared none. FourCCs whose bytes are non-printable fall
+    // back to 8-digit hex (matching the `tsel_attributes` convention).
+    // Absent `strk`, no keys are emitted.
+    for (n, st) in t.sub_tracks.iter().enumerate() {
+        use std::fmt::Write;
+        let mut s = format!(
+            "id={} switch={} alt={}",
+            st.sub_track_id, st.switch_group, st.alternate_group
+        );
+        if !st.attribute_list.is_empty() {
+            let attrs = st
+                .attribute_list
+                .iter()
+                .map(fourcc_token)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = write!(s, " attrs={attrs}");
+        }
+        if !st.sample_groups.is_empty() {
+            let groups = st
+                .sample_groups
+                .iter()
+                .map(|sg| {
+                    let idxs = sg
+                        .group_description_indices
+                        .iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{}:{}", fourcc_token(&sg.grouping_type), idxs)
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            let _ = write!(s, " stsg={groups}");
+        }
+        params.options.insert(format!("subtrack_{n}"), s);
+    }
+
     // ISO/IEC 14496-12 §8.6.1.4: when the track carries a `cslg`
     // (CompositionToDecodeBox), surface its five timeline-relation
     // fields on `params.options` as `cslg_<field>`. These document the
@@ -7253,6 +7578,7 @@ mod tests {
             kinds: Vec::new(),
             copyrights: Vec::new(),
             tsel: None,
+            sub_tracks: Vec::new(),
             cslg: None,
             vmhd: None,
             stsh: Vec::new(),
@@ -8911,6 +9237,323 @@ mod tests {
         let tb = t.tsel.as_ref().unwrap();
         assert_eq!(tb.switch_group, 100);
         assert_eq!(tb.attribute_list, vec![*b"bitr", *b"lang"]);
+    }
+
+    // --- §8.14 Sub tracks (strk / stri / strd / stsg) ---
+
+    /// Build a minimal `stri` (§8.14.4) body: FullBox preamble +
+    /// `switch_group` (i16) + `alternate_group` (i16) + `sub_track_ID`
+    /// (u32) + zero or more attribute FourCCs.
+    fn stri_body(switch: i16, alt: i16, id: u32, attrs: &[&[u8; 4]]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0u8; 4]); // FullBox version 0 + flags 0
+        b.extend_from_slice(&switch.to_be_bytes());
+        b.extend_from_slice(&alt.to_be_bytes());
+        b.extend_from_slice(&id.to_be_bytes());
+        for a in attrs {
+            b.extend_from_slice(*a);
+        }
+        b
+    }
+
+    /// Build a `stsg` (§8.14.6) body: FullBox preamble + `grouping_type`
+    /// FourCC + `item_count` (u16) + that many `group_description_index`
+    /// (u32) values.
+    fn stsg_body(grouping_type: &[u8; 4], indices: &[u32]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0u8; 4]); // FullBox
+        b.extend_from_slice(grouping_type);
+        b.extend_from_slice(&(indices.len() as u16).to_be_bytes());
+        for i in indices {
+            b.extend_from_slice(&i.to_be_bytes());
+        }
+        b
+    }
+
+    /// §8.14.4 — `stri`: the three fixed fields plus a two-entry
+    /// `attribute_list`. The canonical view-scalable sub track:
+    /// `switch_group = 1`, `alternate_group = 1`, `sub_track_ID = 2`,
+    /// attributes `vwsc` (view scalability, descriptive) + `nvws`
+    /// (number of views, differentiating).
+    #[test]
+    fn parse_stri_fields_and_attributes() {
+        let body = stri_body(1, 1, 2, &[b"vwsc", b"nvws"]);
+        let st = super::parse_stri(&body).unwrap();
+        assert_eq!(st.switch_group, 1);
+        assert_eq!(st.alternate_group, 1);
+        assert_eq!(st.sub_track_id, 2);
+        assert_eq!(st.attribute_list, vec![*b"vwsc", *b"nvws"]);
+        assert!(st.sample_groups.is_empty());
+    }
+
+    /// `stri` group fields are signed 16-bit (`template int(16)`); a
+    /// negative value must round-trip. The minimal legal body carries the
+    /// three fixed fields and an empty attribute list.
+    #[test]
+    fn parse_stri_negative_groups_no_attributes() {
+        let body = stri_body(-3, -5, 0, &[]);
+        let st = super::parse_stri(&body).unwrap();
+        assert_eq!(st.switch_group, -3);
+        assert_eq!(st.alternate_group, -5);
+        assert_eq!(st.sub_track_id, 0);
+        assert!(st.attribute_list.is_empty());
+    }
+
+    /// A `stri` body shorter than `FullBox + switch + alt + id` (12 bytes)
+    /// is rejected — without the fixed fields there is no usable selection
+    /// metadata.
+    #[test]
+    fn parse_stri_too_short_rejected() {
+        assert!(super::parse_stri(&[0u8; 11]).is_none());
+    }
+
+    /// Unknown FullBox `version` (the spec pins `stri` to 0) is rejected
+    /// so a future derived-spec extension never mis-parses.
+    #[test]
+    fn parse_stri_unknown_version_rejected() {
+        let mut body = stri_body(1, 1, 1, &[b"bitr"]);
+        body[0] = 1; // version 1
+        assert!(super::parse_stri(&body).is_none());
+    }
+
+    /// A trailing 1–3 byte fragment after the last complete attribute
+    /// FourCC is ignored ("attribute_list[] to the end of the box"),
+    /// matching the `parse_tsel` posture.
+    #[test]
+    fn parse_stri_trailing_partial_fourcc_ignored() {
+        let mut body = stri_body(7, 0, 9, &[b"frar"]);
+        body.extend_from_slice(b"xy"); // 2 trailing bytes — dropped
+        let st = super::parse_stri(&body).unwrap();
+        assert_eq!(st.attribute_list, vec![*b"frar"]);
+    }
+
+    /// §8.14.6 — `stsg`: grouping_type + item_count + index list.
+    #[test]
+    fn parse_stsg_grouping_and_indices() {
+        let body = stsg_body(b"tele", &[1, 3, 7]);
+        let sg = super::parse_stsg(&body).unwrap();
+        assert_eq!(&sg.grouping_type, b"tele");
+        assert_eq!(sg.group_description_indices, vec![1, 3, 7]);
+    }
+
+    /// `stsg` with `item_count = 0` is a legal empty definition (the box
+    /// names the grouping type but no description indices yet).
+    #[test]
+    fn parse_stsg_empty_index_list() {
+        let body = stsg_body(b"roll", &[]);
+        let sg = super::parse_stsg(&body).unwrap();
+        assert_eq!(&sg.grouping_type, b"roll");
+        assert!(sg.group_description_indices.is_empty());
+    }
+
+    /// A declared `item_count` that overruns the bytes present is rejected
+    /// — a truncated index list would lie about the sub track's groups.
+    #[test]
+    fn parse_stsg_overrunning_item_count_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // FullBox
+        body.extend_from_slice(b"tele");
+        body.extend_from_slice(&3u16.to_be_bytes()); // claims 3 indices
+        body.extend_from_slice(&1u32.to_be_bytes()); // only 1 present
+        assert!(super::parse_stsg(&body).is_none());
+    }
+
+    /// Unknown FullBox version on `stsg` is rejected.
+    #[test]
+    fn parse_stsg_unknown_version_rejected() {
+        let mut body = stsg_body(b"tele", &[1]);
+        body[0] = 2;
+        assert!(super::parse_stsg(&body).is_none());
+    }
+
+    /// §8.14.3 — `strk`: full assembly with a `stri` plus a `strd`
+    /// holding two `stsg` boxes. The whole sub track lands on
+    /// `t.sub_tracks` with its sample-group definitions attached in
+    /// on-disk order.
+    #[test]
+    fn parse_strk_with_stri_and_strd_stsg() {
+        let stri = stri_body(2, 2, 5, &[b"tesc"]);
+        let stsg0 = stsg_body(b"tele", &[1, 2]);
+        let stsg1 = stsg_body(b"roll", &[4]);
+        let mut strd = Vec::new();
+        strd.extend(wrap_box_full_size(b"stsg", &stsg0));
+        strd.extend(wrap_box_full_size(b"stsg", &stsg1));
+        let mut strk = Vec::new();
+        strk.extend(wrap_box_full_size(b"stri", &stri));
+        strk.extend(wrap_box_full_size(b"strd", &strd));
+
+        let mut t = fresh_track();
+        super::parse_strk(&strk, &mut t);
+        assert_eq!(t.sub_tracks.len(), 1);
+        let st = &t.sub_tracks[0];
+        assert_eq!(st.switch_group, 2);
+        assert_eq!(st.alternate_group, 2);
+        assert_eq!(st.sub_track_id, 5);
+        assert_eq!(st.attribute_list, vec![*b"tesc"]);
+        assert_eq!(st.sample_groups.len(), 2);
+        assert_eq!(&st.sample_groups[0].grouping_type, b"tele");
+        assert_eq!(st.sample_groups[0].group_description_indices, vec![1, 2]);
+        assert_eq!(&st.sample_groups[1].grouping_type, b"roll");
+        assert_eq!(st.sample_groups[1].group_description_indices, vec![4]);
+    }
+
+    /// A `strk` with a `stri` but no `strd` still surfaces the selection
+    /// metadata (with an empty `sample_groups`). `strd` is mandatory per
+    /// §8.14.5.1, but a producer slip is tolerated rather than aborting.
+    #[test]
+    fn parse_strk_stri_only_no_strd() {
+        let stri = stri_body(1, 0, 3, &[]);
+        let mut strk = Vec::new();
+        strk.extend(wrap_box_full_size(b"stri", &stri));
+        let mut t = fresh_track();
+        super::parse_strk(&strk, &mut t);
+        assert_eq!(t.sub_tracks.len(), 1);
+        assert_eq!(t.sub_tracks[0].sub_track_id, 3);
+        assert!(t.sub_tracks[0].sample_groups.is_empty());
+    }
+
+    /// A `strk` missing its mandatory `stri` contributes no sub track —
+    /// there is no selection metadata to surface.
+    #[test]
+    fn parse_strk_without_stri_dropped() {
+        let strd = Vec::new();
+        let mut strk = Vec::new();
+        strk.extend(wrap_box_full_size(b"strd", &strd));
+        let mut t = fresh_track();
+        super::parse_strk(&strk, &mut t);
+        assert!(t.sub_tracks.is_empty());
+    }
+
+    /// Multiple `strk` boxes per track (§8.14.3.1 "Zero or more") are all
+    /// collected in on-disk order via `parse_track_udta`.
+    #[test]
+    fn parse_track_udta_collects_multiple_strk() {
+        let strk_a = {
+            let stri = stri_body(1, 1, 1, &[b"tesc"]);
+            wrap_box_full_size(b"stri", &stri)
+        };
+        let strk_b = {
+            let stri = stri_body(2, 1, 2, &[b"spsc"]);
+            wrap_box_full_size(b"stri", &stri)
+        };
+        let mut udta = Vec::new();
+        udta.extend(wrap_box_full_size(b"strk", &strk_a));
+        udta.extend(wrap_box_full_size(b"strk", &strk_b));
+        let mut t = fresh_track();
+        super::parse_track_udta(&udta, &mut t);
+        assert_eq!(t.sub_tracks.len(), 2);
+        assert_eq!(t.sub_tracks[0].sub_track_id, 1);
+        assert_eq!(t.sub_tracks[0].attribute_list, vec![*b"tesc"]);
+        assert_eq!(t.sub_tracks[1].sub_track_id, 2);
+        assert_eq!(t.sub_tracks[1].attribute_list, vec![*b"spsc"]);
+    }
+
+    /// Surfacing: a sub track emits `subtrack_<n>` carrying the three
+    /// selection fields plus optional `attrs=` / `stsg=` blocks.
+    #[test]
+    fn build_stream_info_surfaces_subtrack_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 90000;
+        t.sub_tracks.push(super::SubTrack {
+            switch_group: 4,
+            alternate_group: 2,
+            sub_track_id: 7,
+            attribute_list: vec![*b"tesc", *b"bitr"],
+            sample_groups: vec![super::SubTrackSampleGroup {
+                grouping_type: *b"tele",
+                group_description_indices: vec![1, 2],
+            }],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("subtrack_0"),
+            Some("id=7 switch=4 alt=2 attrs=tesc bitr stsg=tele:1,2")
+        );
+    }
+
+    /// A sub track with no attributes and no sample groups surfaces only
+    /// the three always-present fixed fields.
+    #[test]
+    fn build_stream_info_subtrack_minimal() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        t.codec_id_fourcc = *b"mp4a";
+        t.timescale = 48000;
+        t.sub_tracks.push(super::SubTrack {
+            switch_group: 0,
+            alternate_group: 0,
+            sub_track_id: 0,
+            attribute_list: Vec::new(),
+            sample_groups: Vec::new(),
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("subtrack_0"),
+            Some("id=0 switch=0 alt=0")
+        );
+    }
+
+    /// A track with no `strk` surfaces no `subtrack_*` options.
+    #[test]
+    fn build_stream_info_no_strk_no_subtrack_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 90000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("subtrack_0"), None);
+    }
+
+    /// End-to-end: a `strk` nested inside `trak/udta` is picked up by
+    /// `parse_trak` and lands on the track field.
+    #[test]
+    fn parse_trak_picks_up_nested_strk() {
+        let mut tkhd = vec![0u8; 84];
+        tkhd[12..16].copy_from_slice(&21u32.to_be_bytes());
+        let mut mdhd = Vec::new();
+        mdhd.extend_from_slice(&[0u8; 4]);
+        mdhd.extend_from_slice(&[0u8; 8]);
+        mdhd.extend_from_slice(&1000u32.to_be_bytes());
+        mdhd.extend_from_slice(&0u32.to_be_bytes());
+        mdhd.extend_from_slice(&[0u8; 4]);
+        let mut hdlr = Vec::new();
+        hdlr.extend_from_slice(&[0u8; 4]);
+        hdlr.extend_from_slice(&[0u8; 4]);
+        hdlr.extend_from_slice(b"vide");
+        hdlr.extend_from_slice(&[0u8; 12]);
+        hdlr.push(0);
+        let mut mdia = Vec::new();
+        mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
+        mdia.extend(wrap_box_full_size(b"hdlr", &hdlr));
+
+        let stri = stri_body(5, 5, 8, &[b"spsc"]);
+        let stsg = stsg_body(b"tele", &[2]);
+        let mut strd = Vec::new();
+        strd.extend(wrap_box_full_size(b"stsg", &stsg));
+        let mut strk = Vec::new();
+        strk.extend(wrap_box_full_size(b"stri", &stri));
+        strk.extend(wrap_box_full_size(b"strd", &strd));
+        let mut udta = Vec::new();
+        udta.extend(wrap_box_full_size(b"strk", &strk));
+
+        let mut trak = Vec::new();
+        trak.extend(wrap_box_full_size(b"tkhd", &tkhd));
+        trak.extend(wrap_box_full_size(b"mdia", &mdia));
+        trak.extend(wrap_box_full_size(b"udta", &udta));
+
+        let t = super::parse_trak(&trak).unwrap().unwrap();
+        assert_eq!(t.track_id, 21);
+        assert_eq!(t.sub_tracks.len(), 1);
+        let st = &t.sub_tracks[0];
+        assert_eq!(st.switch_group, 5);
+        assert_eq!(st.alternate_group, 5);
+        assert_eq!(st.sub_track_id, 8);
+        assert_eq!(st.attribute_list, vec![*b"spsc"]);
+        assert_eq!(st.sample_groups.len(), 1);
+        assert_eq!(&st.sample_groups[0].grouping_type, b"tele");
+        assert_eq!(st.sample_groups[0].group_description_indices, vec![2]);
     }
 
     /// §8.6.1.4 — `cslg` version 0: five signed 32-bit fields after the

@@ -332,6 +332,42 @@ pub const CPRT: [u8; 4] = fourcc("cprt");
 /// layer can pick from the alternate group on language / bitrate /
 /// codec criteria.
 pub const TSEL: [u8; 4] = fourcc("tsel");
+/// `strk` — Sub Track Box (ISO/IEC 14496-12 §8.14.3). A plain `Box`
+/// (not a FullBox) that sits inside a track-level `udta`; quantity zero
+/// or more — one per sub track defined within the containing track. Its
+/// body is a container holding a mandatory `stri` (Sub Track Information,
+/// §8.14.4) and a mandatory `strd` (Sub Track Definition, §8.14.5). Sub
+/// tracks assign *parts* of a track to the same alternate / switch groups
+/// that whole tracks use (§8.3.2 / §8.10.3), so a media-selection layer
+/// can pick among layered-codec alternatives (SVC / MVC temporal,
+/// spatial, SNR, or view layers) that don't map cleanly onto track
+/// boundaries (§8.14.1).
+pub const STRK: [u8; 4] = fourcc("strk");
+/// `stri` — Sub Track Information Box (ISO/IEC 14496-12 §8.14.4). A
+/// `FullBox(version = 0, flags = 0)` inside `strk`; mandatory, quantity
+/// one. Body: `template int(16) switch_group; template int(16)
+/// alternate_group; template unsigned int(32) sub_track_ID; unsigned
+/// int(32) attribute_list[]` (to end of box). The two group fields use
+/// the same global numbering as the track-level `tkhd.alternate_group`
+/// (§8.3.2) and `tsel.switch_group` (§8.10.3) so groups can span track
+/// and sub-track boundaries; `attribute_list` reuses §8.10.3.5's
+/// descriptive / differentiating FourCC vocabulary (`tesc`, `fgsc`,
+/// `cgsc`, `spsc`, `resc`, `vwsc`, `bitr`, `frar`, `nvws`, …).
+pub const STRI: [u8; 4] = fourcc("stri");
+/// `strd` — Sub Track Definition Box (ISO/IEC 14496-12 §8.14.5). A
+/// plain `Box` inside `strk`; mandatory, quantity one. Holds the objects
+/// that *define* (rather than describe) the sub track — for the generic
+/// (non-codec-specific) mechanism that is zero or more `stsg` Sub Track
+/// Sample Group boxes (§8.14.6).
+pub const STRD: [u8; 4] = fourcc("strd");
+/// `stsg` — Sub Track Sample Group Box (ISO/IEC 14496-12 §8.14.6). A
+/// `FullBox(version = 0, flags = 0)` inside `strd`; quantity zero or
+/// more. Body: `unsigned int(32) grouping_type; unsigned int(16)
+/// item_count; unsigned int(32) group_description_index[item_count]`. It
+/// defines the sub track as the union of one or more sample groups by
+/// naming the `sgpd` (§8.9.3) description indices that describe the
+/// samples belonging to the sub track for the shared `grouping_type`.
+pub const STSG: [u8; 4] = fourcc("stsg");
 
 // Fragmented-MP4 box types (ISO/IEC 14496-12 §8.8 — Movie Fragments).
 pub const MVEX: [u8; 4] = fourcc("mvex");
