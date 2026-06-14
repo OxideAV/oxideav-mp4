@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multiple sample descriptions per track (`stsd`, ISO/IEC 14496-12
+  §8.5.2) — round 306. `parse_stsd` now walks **every** `SampleEntry`
+  in the box rather than discarding all but the first. Entry `[0]`
+  still drives active decode dispatch and codec-config parsing; the
+  additional entries (present when a track switches description
+  mid-stream via a per-chunk `stsc.sample_description_index ≥ 2` or a
+  fragment's `tfhd` / `trex` `sample_description_index`) are recorded
+  with their FourCC and §8.5.2.2 `data_reference_index`. When
+  `entry_count > 1` they surface on `params.options` as `stsd_count`
+  plus `stsd_<n>` (1-based, matching the spec's
+  `sample_description_index`) = `<fourcc> dref=<data_reference_index>`.
+  Single-description tracks emit no `stsd_*` keys. A forged
+  `entry_count` exceeding the bytes present stops at what could be read
+  (no over-allocation, no invented entries). Four unit tests cover the
+  multi-entry record, options surfacing, single-entry no-keys, and the
+  over-count truncation case.
+
 - Sub Track boxes (`strk` / `stri` / `strd` / `stsg`, ISO/IEC
   14496-12 §8.14) — round 300. The track-level `udta` walker now
   recognises the `strk` Sub Track box (§8.14.3): each assigns *part*

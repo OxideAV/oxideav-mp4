@@ -524,6 +524,25 @@ Sample-entry FourCCs resolve to these codec ids:
   and `sdtp_redundant_count` (samples with `sample_has_redundancy =
   1`). Absent `sdtp`, none of the keys are emitted (the demuxer
   falls back to `stss` for keyframe detection, as before).
+- Multiple sample descriptions (ISO/IEC 14496-12 §8.5.2, `stsd`):
+  every `SampleEntry` in the box is now parsed, not just the first.
+  Entry `[0]` still drives active decode dispatch (its FourCC is the
+  stream's resolved `codec`), and its codec-specific tail (audio /
+  video preamble + child config boxes) is parsed as before. The
+  additional entries — present when a track switches description
+  mid-stream via a per-chunk `stsc.sample_description_index ≥ 2` or a
+  fragment's `tfhd` / `trex` `sample_description_index` — are recorded
+  with their FourCC and §8.5.2.2 `data_reference_index`. When
+  `entry_count > 1` the demuxer surfaces them on `params.options`:
+  `stsd_count` (total entries) plus `stsd_<n>` for each entry, where
+  `<n>` is the **1-based** index matching the spec's
+  `sample_description_index` (so a `stsc` / `tfhd` index value `k`
+  looks up directly as `stsd_<k>`). Each value is
+  `<fourcc> dref=<data_reference_index>`. A single-description track
+  (the overwhelming common case) emits none of these keys — the active
+  `codec` already carries that information. A declared `entry_count`
+  larger than the bytes actually present stops at what could be read
+  rather than failing the box or inventing entries.
 - Sample groups (ISO/IEC 14496-12 §8.9, `sbgp` + `sgpd`): a track's
   `stbl/sbgp` (SampleToGroupBox §8.9.2) run-length map and
   `stbl/sgpd` (SampleGroupDescriptionBox §8.9.3) per-group entries
@@ -902,9 +921,12 @@ first that applies:
   mdat-resident auxiliary-information bytes that the `saio`
   offsets name are not pre-fetched — a CENC consumer reading them
   seeks the input itself using the surfaced offsets.
-- Multiple sample descriptions per track (only the first entry of
-  `stsd` is used; `tfhd.sample_description_index` overrides are
-  ignored).
+- Per-sample *selection* of a non-active sample description. All
+  `stsd` entries are now parsed and surfaced (see §8.5.2 above), but
+  active decode always uses entry `[0]`: a per-chunk
+  `stsc.sample_description_index ≥ 2` or a fragment's
+  `tfhd.sample_description_index` override is recorded/surfaced but not
+  yet honoured to re-dispatch the codec mid-stream.
 - mdat payloads larger than 4 GiB (the 32-bit box header is not
   promoted to `largesize`).
 

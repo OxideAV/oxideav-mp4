@@ -1007,6 +1007,40 @@ struct Track {
     /// absolute file positions when read from `stbl`. Empty in the
     /// common case.
     saio: Vec<SaioBox>,
+    /// §8.5.2 — every `stsd` (SampleDescriptionBox) entry, in on-disk
+    /// order. Entry `[0]` is the one used for active decode dispatch
+    /// (its FourCC is mirrored to `codec_id_fourcc`); entries `[1..]`
+    /// are additional sample descriptions the track may switch to via a
+    /// per-chunk `stsc.sample_description_index` (≥ 2) or, in fragments,
+    /// a `tfhd` / `trex` `sample_description_index`. A track has more
+    /// than one entry when the same media changes parameters mid-stream
+    /// (e.g. a resolution / codec-config switch) without starting a new
+    /// track. Each `StsdEntry` records the entry's FourCC plus the
+    /// §8.5.2.2 `data_reference_index`. Never empty for a media track
+    /// (a track always has at least one sample description); the vector
+    /// is left empty only when the `stsd` was absent or `entry_count`
+    /// was zero (both non-conforming).
+    stsd_entries: Vec<StsdEntry>,
+}
+
+/// One `stsd` (SampleDescriptionBox, §8.5.2) entry header. Every
+/// SampleEntry (§8.5.2.2) begins with the same 8-byte preamble — 6
+/// `reserved` bytes then the 16-bit `data_reference_index` — regardless
+/// of the concrete sample-entry class that follows. We capture that
+/// common prefix plus the entry's FourCC; the codec-specific tail
+/// (audio / video preamble + child config boxes) is parsed separately
+/// for entry `[0]` via `parse_sample_entry`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StsdEntry {
+    /// The sample-entry FourCC (`box` type of the SampleEntry). For a
+    /// protected entry this is the outer `enc*` placeholder, not the
+    /// un-transformed format (§8.12); the active-entry unwrap only
+    /// rewrites `codec_id_fourcc`, not this raw record.
+    format: [u8; 4],
+    /// §8.5.2.2 `data_reference_index` — 1-based index into the track's
+    /// `dref` table naming where the samples using this description are
+    /// stored. Almost always `1` (samples in this same file).
+    data_reference_index: u16,
 }
 
 /// One entry of an `sdtp` (SampleDependencyTypeBox, §8.6.4) — decoded
@@ -1882,6 +1916,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         subs: Vec::new(),
         saiz: Vec::new(),
         saio: Vec::new(),
+        stsd_entries: Vec::new(),
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -2800,13 +2835,59 @@ fn parse_stsd(body: &[u8], t: &mut Track) -> Result<()> {
     if entry_count == 0 {
         return Ok(());
     }
+    // ISO/IEC 14496-12 §8.5.2: walk **all** SampleEntry instances, not
+    // just the first. The first entry drives active decode dispatch; the
+    // rest are recorded so callers can resolve a `stsc` / `tfhd`
+    // `sample_description_index` ≥ 2 to the FourCC of the description it
+    // selects. Each SampleEntry shares the §8.5.2.2 8-byte preamble
+    // (`reserved[6]` + `data_reference_index`), which we capture per
+    // entry; the codec-specific tail of entry [0] is parsed below.
     let mut cur = std::io::Cursor::new(&body[8..]);
-    let hdr = match read_box_header(&mut cur)? {
-        Some(h) => h,
+    let mut first_entry: Option<(BoxHeader, Vec<u8>)> = None;
+    // Bound the recorded-entries vector by the byte budget so a forged
+    // `entry_count` can't trigger a giant up-front allocation: the
+    // smallest possible SampleEntry is its 8-byte box header plus the
+    // 8-byte preamble (16 bytes), so the body can hold at most
+    // `body.len() / 16` real entries.
+    let max_entries = (body.len() / 16).max(1);
+    t.stsd_entries
+        .reserve(entry_count.min(max_entries as u32) as usize);
+    for i in 0..entry_count {
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => {
+                if i == 0 {
+                    return Err(Error::invalid("MP4: stsd first entry missing"));
+                }
+                // A truncated trailing entry: the declared `entry_count`
+                // over-counts the bytes actually present. Stop at what we
+                // could read rather than inventing entries.
+                break;
+            }
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let entry = read_bytes_vec(&mut cur, psz)?;
+        // §8.5.2.2 preamble: 6 reserved bytes then a 16-bit
+        // data_reference_index. Entries shorter than 8 bytes are
+        // malformed; record a zero index rather than failing the whole
+        // box (the FourCC alone is still useful metadata).
+        let data_reference_index = if entry.len() >= 8 {
+            u16::from_be_bytes([entry[6], entry[7]])
+        } else {
+            0
+        };
+        t.stsd_entries.push(StsdEntry {
+            format: hdr.fourcc,
+            data_reference_index,
+        });
+        if i == 0 {
+            first_entry = Some((hdr, entry));
+        }
+    }
+    let (hdr, entry) = match first_entry {
+        Some(pair) => pair,
         None => return Err(Error::invalid("MP4: stsd first entry missing")),
     };
-    let psz = hdr.payload_size().unwrap_or(0) as usize;
-    let entry = read_bytes_vec(&mut cur, psz)?;
     t.codec_id_fourcc = hdr.fourcc;
     // ISO/IEC 14496-12 §8.12 — protected sample entries (`encv`, `enca`,
     // `enct`, `encs`) wrap the original sample description: the original
@@ -6430,6 +6511,40 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             .insert(format!("stsh_{}", i), format!("{} {}", shadowed, sync));
     }
 
+    // ISO/IEC 14496-12 §8.5.2: surface the full SampleDescriptionBox
+    // entry list when a track carries more than one sample description.
+    // Entry [0] always drives active decode (its FourCC is the track's
+    // `codec` / `codec_id_fourcc`), so for the overwhelmingly common
+    // single-entry case there is nothing extra to say and no keys are
+    // emitted. When `entry_count > 1` the track can switch descriptions
+    // mid-stream via a per-chunk `stsc.sample_description_index` (≥ 2) or
+    // a fragment's `tfhd` / `trex` `sample_description_index`; the
+    // alternatives are surfaced so a caller can map such an index to the
+    // FourCC it selects:
+    //   * `stsd_count` — the total number of sample-description entries.
+    //   * `stsd_<n>` (1-based, matching the spec's 1-based
+    //     `sample_description_index`) — `<fourcc> dref=<data_reference_index>`
+    //     for every entry. Entry 1 is the active one (also reflected in
+    //     `codec`); entries ≥ 2 are the alternates. The 1-based key index
+    //     lets a `sample_description_index` value be looked up directly as
+    //     `stsd_<index>`.
+    // Absent multiple entries, none of these keys are emitted.
+    if t.stsd_entries.len() > 1 {
+        params
+            .options
+            .insert("stsd_count".to_string(), t.stsd_entries.len().to_string());
+        for (i, e) in t.stsd_entries.iter().enumerate() {
+            params.options.insert(
+                format!("stsd_{}", i + 1),
+                format!(
+                    "{} dref={}",
+                    fourcc_token(&e.format),
+                    e.data_reference_index
+                ),
+            );
+        }
+    }
+
     // ISO/IEC 14496-12 §8.9.2/§8.9.3: surface sample groupings. Each
     // `sbgp` (SampleToGroupBox) becomes one `sbgp_<n>` key (0-based
     // encounter index) whose value is the grouping type, an optional
@@ -7591,6 +7706,7 @@ mod tests {
             subs: Vec::new(),
             saiz: Vec::new(),
             saio: Vec::new(),
+            stsd_entries: Vec::new(),
         }
     }
 
@@ -7706,6 +7822,128 @@ mod tests {
         assert_eq!(t.protection_scheme, Some(*b"cbcs"));
         assert_eq!(t.width, Some(1280));
         assert_eq!(t.height, Some(720));
+    }
+
+    /// Build a minimal audio `SampleEntry` body (no codec config children):
+    /// the §8.5.2.2 8-byte preamble (`reserved[6]` + `data_reference_index`)
+    /// followed by the 20-byte AudioSampleEntry v0 tail. `dref` sets the
+    /// `data_reference_index`. The returned bytes are the *body* (no box
+    /// header).
+    fn audio_sample_entry_body(channels: u16, dref: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 6]); // reserved
+        out.extend_from_slice(&dref.to_be_bytes()); // data_reference_index
+        out.extend_from_slice(&[0u8; 8]); // reserved (2 × u32)
+        out.extend_from_slice(&channels.to_be_bytes()); // channelcount
+        out.extend_from_slice(&16u16.to_be_bytes()); // samplesize
+        out.extend_from_slice(&[0u8; 4]); // pre_defined + reserved
+        out.extend_from_slice(&((48_000u32) << 16).to_be_bytes()); // samplerate
+        out
+    }
+
+    /// Wrap a SampleEntry body in its box header (size + FourCC).
+    fn boxed_sample_entry(fourcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let total = (8 + body.len()) as u32;
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(fourcc);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Assemble a `stsd` body (FullBox header + entry_count + entries).
+    fn build_stsd(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 4]); // version + flags
+        out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for e in entries {
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    #[test]
+    fn stsd_records_all_entries_first_drives_active_codec() {
+        // Three sample descriptions: mp4a (active), then ac-3 and a
+        // hex-rendered non-printable FourCC. ISO/IEC 14496-12 §8.5.2 —
+        // entry [0] is the active description, [1..] are alternates.
+        let e0 = boxed_sample_entry(b"mp4a", &audio_sample_entry_body(2, 1));
+        let e1 = boxed_sample_entry(b"ac-3", &audio_sample_entry_body(6, 1));
+        let e2 = boxed_sample_entry(&[0x00, 0x01, 0x02, 0x03], &audio_sample_entry_body(1, 2));
+        let stsd = build_stsd(&[e0, e1, e2]);
+
+        let mut t = fresh_track();
+        super::parse_stsd(&stsd, &mut t).unwrap();
+
+        // Active codec is entry [0].
+        assert_eq!(&t.codec_id_fourcc, b"mp4a");
+        // Active entry's preamble still drives the audio fields.
+        assert_eq!(t.channels, Some(2));
+
+        // All three entries recorded in order with their FourCC + dref.
+        assert_eq!(t.stsd_entries.len(), 3);
+        assert_eq!(&t.stsd_entries[0].format, b"mp4a");
+        assert_eq!(t.stsd_entries[0].data_reference_index, 1);
+        assert_eq!(&t.stsd_entries[1].format, b"ac-3");
+        assert_eq!(t.stsd_entries[1].data_reference_index, 1);
+        assert_eq!(t.stsd_entries[2].format, [0x00, 0x01, 0x02, 0x03]);
+        assert_eq!(t.stsd_entries[2].data_reference_index, 2);
+    }
+
+    #[test]
+    fn build_stream_info_surfaces_multi_stsd_on_options() {
+        let e0 = boxed_sample_entry(b"mp4a", &audio_sample_entry_body(2, 1));
+        let e1 = boxed_sample_entry(b"ac-3", &audio_sample_entry_body(6, 3));
+        let stsd = build_stsd(&[e0, e1]);
+
+        let mut t = fresh_track();
+        t.timescale = 48_000;
+        super::parse_stsd(&stsd, &mut t).unwrap();
+
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        // entry_count surfaced.
+        assert_eq!(info.params.options.get("stsd_count"), Some("2"));
+        // 1-based keys matching the spec's sample_description_index, with
+        // the data_reference_index per entry.
+        assert_eq!(info.params.options.get("stsd_1"), Some("mp4a dref=1"));
+        assert_eq!(info.params.options.get("stsd_2"), Some("ac-3 dref=3"));
+        // No phantom third key.
+        assert_eq!(info.params.options.get("stsd_3"), None);
+    }
+
+    #[test]
+    fn build_stream_info_single_stsd_emits_no_keys() {
+        // The overwhelmingly common single-description track surfaces no
+        // stsd_* keys — the active codec already carries that info.
+        let e0 = boxed_sample_entry(b"mp4a", &audio_sample_entry_body(2, 1));
+        let stsd = build_stsd(&[e0]);
+
+        let mut t = fresh_track();
+        super::parse_stsd(&stsd, &mut t).unwrap();
+        assert_eq!(t.stsd_entries.len(), 1);
+
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("stsd_count"), None);
+        assert_eq!(info.params.options.get("stsd_1"), None);
+    }
+
+    #[test]
+    fn stsd_overcount_stops_at_present_entries() {
+        // A forged entry_count larger than the bytes present: parse stops
+        // at what it could read rather than inventing entries or erroring.
+        let e0 = boxed_sample_entry(b"mp4a", &audio_sample_entry_body(2, 1));
+        let e1 = boxed_sample_entry(b"ac-3", &audio_sample_entry_body(6, 1));
+        let mut stsd = Vec::new();
+        stsd.extend_from_slice(&[0u8; 4]); // version + flags
+        stsd.extend_from_slice(&9u32.to_be_bytes()); // lie: claim 9 entries
+        stsd.extend_from_slice(&e0);
+        stsd.extend_from_slice(&e1);
+
+        let mut t = fresh_track();
+        super::parse_stsd(&stsd, &mut t).unwrap();
+        // Only the two real entries are recorded.
+        assert_eq!(t.stsd_entries.len(), 2);
+        assert_eq!(&t.codec_id_fourcc, b"mp4a");
     }
 
     /// Build a `tenc` box (ISO/IEC 23001-7 §8.2) including its 8-byte
