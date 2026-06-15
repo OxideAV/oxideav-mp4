@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.8...v0.0.9) - 2026-06-15
+
+### Other
+
+- demux dref DataReferenceBox (dinf/url /urn , ISO/IEC 14496-12 §8.7.1-2)
+- parse and surface all sample-description entries (§8.5.2)
+- Sub Track boxes (strk/stri/strd/stsg, ISO/IEC 14496-12 §8.14)
+- parse csgp CompactSampleToGroupBox (ISO/IEC 14496-12:2020 §8.9.5)
+- parse trep TrackExtensionPropertiesBox (ISO/IEC 14496-12 §8.8.15)
+- Round 283 — CENC AES-128 CTR/CBC cipher driver (ISO/IEC 23001-7:2016 §9)
+- Round 279 — Subsegment Index Box (ssix) typed parse + builder (ISO/IEC 14496-12 §8.16.4)
+- Round 272 — Video Media Header Box (vmhd) typed accessor (ISO/IEC 14496-12 §12.1.2)
+- Round 264 — Level Assignment Box (leva) typed accessor (ISO/IEC 14496-12 §8.8.13)
+- Round 259 — Progressive Download Information Box (pdin) typed accessor (ISO/IEC 14496-12 §8.1.3)
+- Round 256 — Padding Bits Box (padb) typed accessor (ISO/IEC 14496-12 §8.7.6)
+- Round 252 — Copyright Box (cprt) typed accessor (ISO/IEC 14496-12 §8.10.2)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- Round 245 — per-sample CENC cipher walker (ISO/IEC 23001-7:2016 §9.4–9.6)
+- Round 242 — SampleFlags typed accessor for §8.8.3.1 trun/tfhd/trex packed u32
+- Round 239 — collect moof-level pssh boxes keyed by mfhd.sequence_number (ISO/IEC 23001-7:2016 §8.1.1)
+- Round 235 — typed CENC scheme-decision router + seig sample-group entry parser (ISO/IEC 23001-7:2016 §4.2 / §6 / §10)
+- Round 228 — Track Selection Box parsing (ISO/IEC 14496-12 §8.10.3)
+- Round 221 — Movie Extends Header Box parsing (ISO/IEC 14496-12 §8.8.2)
+- Round 216 — Degradation Priority Box parsing (ISO/IEC 14496-12 §8.5.3)
+- Round 210 — Track Group Box parsing (ISO/IEC 14496-12 §8.3.4)
+- Round 203 — saiz / saio parsing (ISO/IEC 14496-12 §8.7.8 + §8.7.9)
+
 ### Added
 
 - Data Reference Box (`dinf` / `dref` / `url ` / `urn `, ISO/IEC
