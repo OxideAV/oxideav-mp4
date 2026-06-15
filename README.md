@@ -991,8 +991,7 @@ Pinned regressions worth calling out:
   example). `read_box_header` now `checked_add`s `start + total_size`
   and rejects the header before any caller computes a derived end
   byte. Replayed by `tests/largesize_overflow.rs` and two boundary
-  unit tests in `src/boxes.rs`. Companion to oxideav-mov's round 187
-  fix on the QTFF atom walker.
+  unit tests in `src/boxes.rs`.
 
 ## License
 
