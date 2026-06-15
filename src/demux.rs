@@ -933,6 +933,13 @@ struct Track {
     /// `opcolor`. `None` for non-video tracks (which use `smhd` /
     /// `nmhd` / `sthd` instead) or when the box is absent.
     vmhd: Option<VmhdBox>,
+    /// §12.4.2 / §8.4.5 — `hmhd` (HintMediaHeaderBox). Present for hint
+    /// tracks (a `hdlr` of type `hint`); the spec marks exactly one
+    /// media header mandatory inside `minf`, and a hint track uses this
+    /// one. Carries protocol-independent PDU-size + bitrate statistics.
+    /// `None` for non-hint tracks (which use `vmhd` / `smhd` / `nmhd` /
+    /// `sthd` instead) or when the box is absent.
+    hmhd: Option<HmhdBox>,
     /// §8.7.2 — `dref` (DataReferenceBox) from the track's
     /// `minf/dinf/dref`. The table of media-data locations that every
     /// sample entry's 1-based `data_reference_index` (§8.5.2.2) selects
@@ -1337,6 +1344,31 @@ struct VmhdBox {
     /// The three (red, green, blue) colour components available for use
     /// by graphics modes that consume an operation colour.
     opcolor: [u16; 3],
+}
+
+/// Parsed `hmhd` (HintMediaHeaderBox, ISO/IEC 14496-12 §12.4.2,
+/// defined per §8.4.5).
+///
+/// The media-type-specific header carried inside `minf` for a hint
+/// track (a `hdlr` of type `hint`). Its body, after the 4-byte
+/// `FullBox(version=0, 0)` preamble, is two 16-bit Protocol Data Unit
+/// (PDU) byte sizes and two 32-bit bitrates, followed by a reserved
+/// 32-bit zero (§12.4.2.2). The statistics are protocol-independent
+/// (§12.4.2.1) — they summarise the packetised stream a hint track
+/// describes so a streaming server can size buffers / pace delivery
+/// without parsing every hint sample.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HmhdBox {
+    /// Size in bytes of the largest PDU in this hint stream (§12.4.2.3).
+    max_pdu_size: u16,
+    /// Average size of a PDU over the entire presentation (§12.4.2.3).
+    avg_pdu_size: u16,
+    /// Maximum rate in bits/second over any window of one second
+    /// (§12.4.2.3).
+    max_bitrate: u32,
+    /// Average rate in bits/second over the entire presentation
+    /// (§12.4.2.3).
+    avg_bitrate: u32,
 }
 
 /// One entry of a `dref` (DataReferenceBox, ISO/IEC 14496-12 §8.7.2).
@@ -1965,6 +1997,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         sub_tracks: Vec::new(),
         cslg: None,
         vmhd: None,
+        hmhd: None,
         dref: None,
         stsh: Vec::new(),
         sbgp: Vec::new(),
@@ -2817,6 +2850,18 @@ fn parse_minf(body: &[u8], t: &mut Track) -> Result<()> {
                     }
                 }
             }
+            HMHD => {
+                let sub = read_bytes_vec(&mut cur, psz)?;
+                // §12.4.2 marks exactly one media header mandatory inside
+                // `minf`; keep the first parseable `hmhd` and ignore stray
+                // duplicates. A malformed one is dropped (informational —
+                // the track still demuxes), so the walk never aborts.
+                if t.hmhd.is_none() {
+                    if let Ok(h) = parse_hmhd(&sub) {
+                        t.hmhd = Some(h);
+                    }
+                }
+            }
             DINF => {
                 // §8.7.1: DataInformationBox is a plain container whose
                 // sole child of interest is the `dref` DataReferenceBox.
@@ -3012,6 +3057,36 @@ fn parse_vmhd(body: &[u8]) -> Result<VmhdBox> {
     Ok(VmhdBox {
         graphicsmode,
         opcolor,
+    })
+}
+
+/// Parse `hmhd` (HintMediaHeaderBox, ISO/IEC 14496-12 §12.4.2 /
+/// §8.4.5).
+///
+/// The body is a 4-byte `FullBox(version=0, 0)` preamble followed by
+/// `unsigned int(16) maxPDUsize`, `unsigned int(16) avgPDUsize`,
+/// `unsigned int(32) maxbitrate`, `unsigned int(32) avgbitrate`, and a
+/// reserved `unsigned int(32)` — sixteen payload bytes after the
+/// preamble, twenty total. The `version` is not enforced (the spec
+/// fixes it at 0, but a non-zero value is tolerated rather than
+/// dropping a usable header, matching the `parse_vmhd` posture); the
+/// trailing reserved word (required zero by §12.4.2.2) is read past but
+/// not surfaced. A body shorter than the full 20 bytes is rejected — a
+/// partial header would surface a bitrate that is really truncation
+/// noise.
+fn parse_hmhd(body: &[u8]) -> Result<HmhdBox> {
+    if body.len() < 20 {
+        return Err(Error::invalid("MP4: hmhd too short"));
+    }
+    let max_pdu_size = u16::from_be_bytes([body[4], body[5]]);
+    let avg_pdu_size = u16::from_be_bytes([body[6], body[7]]);
+    let max_bitrate = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+    let avg_bitrate = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+    Ok(HmhdBox {
+        max_pdu_size,
+        avg_pdu_size,
+        max_bitrate,
+        avg_bitrate,
     })
 }
 
@@ -6723,6 +6798,30 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         );
     }
 
+    // ISO/IEC 14496-12 §12.4.2 / §8.4.5: when the track carries an
+    // `hmhd` (HintMediaHeaderBox) — i.e. a hint track — surface its
+    // protocol-independent streaming statistics on `params.options`:
+    // `hmhd_max_pdu_size` / `hmhd_avg_pdu_size` (byte sizes of the
+    // largest / average Protocol Data Unit) and `hmhd_max_bitrate` /
+    // `hmhd_avg_bitrate` (bits/second over any one-second window / the
+    // whole presentation), all decimal. A streaming server pacing
+    // delivery or sizing buffers reads these instead of re-walking
+    // `minf`. Absent `hmhd`, none of the keys are emitted.
+    if let Some(h) = &t.hmhd {
+        params
+            .options
+            .insert("hmhd_max_pdu_size", h.max_pdu_size.to_string());
+        params
+            .options
+            .insert("hmhd_avg_pdu_size", h.avg_pdu_size.to_string());
+        params
+            .options
+            .insert("hmhd_max_bitrate", h.max_bitrate.to_string());
+        params
+            .options
+            .insert("hmhd_avg_bitrate", h.avg_bitrate.to_string());
+    }
+
     // ISO/IEC 14496-12 §8.7.2: surface the DataReferenceBox (`dref`) so a
     // caller can resolve where each sample description's media data lives.
     // The 1-based `data_reference_index` on every sample entry (§8.5.2.2)
@@ -7966,6 +8065,7 @@ mod tests {
             sub_tracks: Vec::new(),
             cslg: None,
             vmhd: None,
+            hmhd: None,
             dref: None,
             stsh: Vec::new(),
             sbgp: Vec::new(),
@@ -10199,6 +10299,111 @@ mod tests {
         // 11 bytes: one short of the final opcolor-blue byte.
         let body = vec![0u8; 11];
         assert!(super::parse_vmhd(&body).is_err());
+    }
+
+    /// §12.4.2 — `hmhd` body after the FullBox preamble is two 16-bit
+    /// PDU sizes, two 32-bit bitrates, and a reserved 32-bit word.
+    /// Decode a typical hint-track header.
+    #[test]
+    fn parse_hmhd_pdu_sizes_and_bitrates() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0]); // version 0, flags 0
+        body.extend_from_slice(&1500u16.to_be_bytes()); // maxPDUsize
+        body.extend_from_slice(&820u16.to_be_bytes()); // avgPDUsize
+        body.extend_from_slice(&3_000_000u32.to_be_bytes()); // maxbitrate
+        body.extend_from_slice(&1_200_000u32.to_be_bytes()); // avgbitrate
+        body.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        let h = super::parse_hmhd(&body).unwrap();
+        assert_eq!(h.max_pdu_size, 1500);
+        assert_eq!(h.avg_pdu_size, 820);
+        assert_eq!(h.max_bitrate, 3_000_000);
+        assert_eq!(h.avg_bitrate, 1_200_000);
+    }
+
+    /// The parser does not require `version == 0` — a stray non-zero
+    /// version byte still yields a usable header rather than a drop
+    /// (mirroring `parse_vmhd`).
+    #[test]
+    fn parse_hmhd_tolerates_nonzero_version() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[2u8, 0, 0, 0]); // version 2
+        body.extend_from_slice(&64u16.to_be_bytes());
+        body.extend_from_slice(&64u16.to_be_bytes());
+        body.extend_from_slice(&500u32.to_be_bytes());
+        body.extend_from_slice(&500u32.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        let h = super::parse_hmhd(&body).unwrap();
+        assert_eq!(h.max_pdu_size, 64);
+        assert_eq!(h.max_bitrate, 500);
+    }
+
+    /// A non-zero reserved trailing word is read past, not surfaced —
+    /// the parse still succeeds with the four real fields intact.
+    #[test]
+    fn parse_hmhd_nonzero_reserved_tolerated() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0]);
+        body.extend_from_slice(&10u16.to_be_bytes());
+        body.extend_from_slice(&20u16.to_be_bytes());
+        body.extend_from_slice(&30u32.to_be_bytes());
+        body.extend_from_slice(&40u32.to_be_bytes());
+        body.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes()); // reserved != 0
+        let h = super::parse_hmhd(&body).unwrap();
+        assert_eq!(h.avg_bitrate, 40);
+    }
+
+    /// A body shorter than the full 20 bytes (preamble + 2×u16 +
+    /// 2×u32 + reserved u32) is rejected — a truncated tail would
+    /// surface noise as a bitrate.
+    #[test]
+    fn parse_hmhd_too_short_is_rejected() {
+        // 19 bytes: one short of the reserved word.
+        let body = vec![0u8; 19];
+        assert!(super::parse_hmhd(&body).is_err());
+    }
+
+    /// `parse_minf` lands the `hmhd` on the track.
+    #[test]
+    fn parse_minf_picks_up_hmhd() {
+        let mut hmhd = Vec::new();
+        hmhd.extend_from_slice(&[0u8, 0, 0, 0]);
+        hmhd.extend_from_slice(&1400u16.to_be_bytes());
+        hmhd.extend_from_slice(&700u16.to_be_bytes());
+        hmhd.extend_from_slice(&2_500_000u32.to_be_bytes());
+        hmhd.extend_from_slice(&900_000u32.to_be_bytes());
+        hmhd.extend_from_slice(&0u32.to_be_bytes());
+        let mut minf = Vec::new();
+        minf.extend(wrap_box_full_size(b"hmhd", &hmhd));
+
+        let mut t = fresh_track();
+        super::parse_minf(&minf, &mut t).unwrap();
+        let h = t.hmhd.expect("hmhd should be parsed");
+        assert_eq!(h.max_pdu_size, 1400);
+        assert_eq!(h.avg_pdu_size, 700);
+        assert_eq!(h.max_bitrate, 2_500_000);
+        assert_eq!(h.avg_bitrate, 900_000);
+    }
+
+    /// §12.4.2 fixes the quantity at one — `parse_minf` keeps the first
+    /// `hmhd` and ignores a stray duplicate.
+    #[test]
+    fn parse_minf_keeps_first_hmhd_ignores_duplicate() {
+        let mut first = Vec::new();
+        first.extend_from_slice(&[0u8, 0, 0, 0]);
+        first.extend_from_slice(&111u16.to_be_bytes());
+        first.extend_from_slice(&[0u8; 14]);
+        let mut second = Vec::new();
+        second.extend_from_slice(&[0u8, 0, 0, 0]);
+        second.extend_from_slice(&222u16.to_be_bytes());
+        second.extend_from_slice(&[0u8; 14]);
+        let mut minf = Vec::new();
+        minf.extend(wrap_box_full_size(b"hmhd", &first));
+        minf.extend(wrap_box_full_size(b"hmhd", &second));
+
+        let mut t = fresh_track();
+        super::parse_minf(&minf, &mut t).unwrap();
+        let h = t.hmhd.expect("hmhd should be parsed");
+        assert_eq!(h.max_pdu_size, 111);
     }
 
     /// `parse_minf` lands the `vmhd` on the track.

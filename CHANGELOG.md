@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- Round 314 — Hint Media Header Box (hmhd) typed accessor (ISO/IEC 14496-12 §12.4.2)
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.8...v0.0.9) - 2026-06-15
 
 ### Other

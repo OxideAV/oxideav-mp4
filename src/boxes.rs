@@ -194,6 +194,15 @@ pub const MINF: [u8; 4] = fourcc("minf");
 /// three-component 16-bit `opcolor` (red, green, blue) for graphics
 /// modes that use it. Note the spec fixes `flags` at 1 for this box.
 pub const VMHD: [u8; 4] = fourcc("vmhd");
+/// `hmhd` — HintMediaHeaderBox (ISO/IEC 14496-12 §12.4.2, defined per
+/// §8.4.5). Sits inside `minf`; the media-type-specific header for a
+/// hint track (a `hdlr` of type `hint`). A `FullBox(0, 0)` carrying
+/// protocol-independent streaming statistics: `maxPDUsize` /
+/// `avgPDUsize` (16-bit byte sizes of the largest / average Protocol
+/// Data Unit) and `maxbitrate` / `avgbitrate` (32-bit bits/second over
+/// any one-second window / the whole presentation), followed by a
+/// reserved 32-bit zero.
+pub const HMHD: [u8; 4] = fourcc("hmhd");
 /// `dinf` — DataInformationBox (ISO/IEC 14496-12 §8.7.1). Sits inside
 /// `minf` (mandatory, exactly one) or `meta` (optional). A pure
 /// container whose sole child of interest is the `dref` DataReferenceBox

@@ -445,6 +445,22 @@ Sample-entry FourCCs resolve to these codec ids:
   `item_count` overruns the body are rejected — the boxes are
   informational and a malformed entry never aborts the open. Absent
   `strk`, no keys are emitted.
+- Hint media header (ISO/IEC 14496-12 §12.4.2, `hmhd`): a hint
+  track's `minf/hmhd` HintMediaHeaderBox carries protocol-independent
+  streaming statistics for the packetised stream the hint track
+  describes — `maxPDUsize` / `avgPDUsize` (byte sizes of the largest /
+  average Protocol Data Unit) and `maxbitrate` / `avgbitrate`
+  (bits/second over any one-second window / the whole presentation),
+  with a trailing reserved 32-bit word read past but not surfaced.
+  Used by a streaming server to size buffers / pace delivery without
+  parsing every hint sample. The four fields are surfaced on
+  `params.options` as `hmhd_max_pdu_size`, `hmhd_avg_pdu_size`,
+  `hmhd_max_bitrate`, and `hmhd_avg_bitrate` (decimal). The FullBox
+  `version` (pinned to 0 by §12.4.2.2) and a non-zero reserved word are
+  tolerated rather than dropping a usable header, matching the `vmhd`
+  posture; a body shorter than the full 20 bytes is rejected (a
+  truncated tail would surface noise as a bitrate). Absent `hmhd`, none
+  of the keys are emitted.
 - Composition-to-decode (ISO/IEC 14496-12 §8.6.1.4, `cslg`): a
   track's `stbl/cslg` CompositionToDecodeBox documents the
   composition↔decode timeline relationship implied by a signed
