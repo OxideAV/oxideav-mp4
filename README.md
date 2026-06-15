@@ -543,6 +543,29 @@ Sample-entry FourCCs resolve to these codec ids:
   `codec` already carries that information. A declared `entry_count`
   larger than the bytes actually present stops at what could be read
   rather than failing the box or inventing entries.
+- Data references (ISO/IEC 14496-12 §8.7.1–2, `dinf` / `dref` /
+  `url ` / `urn `): a track's `minf/dinf/dref` DataReferenceBox is the
+  table of media-data locations that every sample entry's 1-based
+  `data_reference_index` (§8.5.2.2) indexes into — it declares whether a
+  description's samples are self-contained in this file or stored in an
+  external resource. Each `DataEntryBox` is a `url ` (with the
+  §8.7.2.3 self-contained flag, or a NULL-terminated `location` URL when
+  external) or a `urn ` (a NULL-terminated `name` plus an optional
+  `location`); a non-`url `/`urn ` child is non-conforming and dropped.
+  The overwhelmingly common single self-contained `url ` case is
+  surfaced compactly on `params.options` as `dref_self_contained = "true"`
+  with no per-entry keys (a one-lookup "no external resources" check).
+  When the table has more than one entry, or any entry is *not*
+  self-contained (a split-source track), the full table surfaces:
+  `dref_count` (total entries), `dref_self_contained` ("true" only when
+  *every* entry is self-contained), and `dref_<n>` (1-based, matching
+  `data_reference_index`) = `<kind> self=<true|false>[ name=<urn>]
+  [ loc=<url>]`. A forged `entry_count` cannot over-allocate (the
+  smallest child is its 8-byte box header) and a child overrunning the
+  body ends the walk at what was read; an unknown FullBox version is
+  tolerated. A malformed `dref` is dropped without failing the `minf`
+  parse (the file still demuxes against the single-source default).
+  Absent / unparseable `dref`, none of the keys are emitted.
 - Sample groups (ISO/IEC 14496-12 §8.9, `sbgp` + `sgpd`): a track's
   `stbl/sbgp` (SampleToGroupBox §8.9.2) run-length map and
   `stbl/sgpd` (SampleGroupDescriptionBox §8.9.3) per-group entries

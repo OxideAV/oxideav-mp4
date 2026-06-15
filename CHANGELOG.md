@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Data Reference Box (`dinf` / `dref` / `url ` / `urn `, ISO/IEC
+  14496-12 §8.7.1–2) — round 309. The `minf` walker now recurses into
+  the `dinf` DataInformationBox (§8.7.1) for its `dref` DataReferenceBox
+  (§8.7.2), the table of media-data locations that every sample entry's
+  1-based `data_reference_index` (§8.5.2.2) indexes into. Each
+  `DataEntryBox` is parsed as a `url ` DataEntryUrlBox (the §8.7.2.3
+  self-contained flag, or a NULL-terminated `location` URL when external)
+  or a `urn ` DataEntryUrnBox (a NULL-terminated `name` plus an optional
+  `location`); a non-`url `/`urn ` child is dropped without disturbing
+  the entry ordering that `data_reference_index` relies on. Surfaced on
+  `params.options`: the common single self-contained `url ` case collapses
+  to `dref_self_contained = "true"` with no per-entry keys (a one-lookup
+  "all samples in this file" check); a multi-entry or external (split-
+  source) table additionally emits `dref_count` and `dref_<n>` (1-based,
+  matching `data_reference_index`) = `"<kind> self=<true|false>
+  [ name=<urn>][ loc=<url>]"`. Robustness mirrors the rest of the demuxer:
+  a forged `entry_count` cannot over-allocate (capacity bounded by the
+  8-byte-per-child floor of the remaining body), a child overrunning the
+  body ends the walk at what was read, an unknown FullBox version is
+  tolerated, and a malformed `dref` is dropped without failing the `minf`
+  parse (the file still demuxes against the single-source default). New
+  internal types `DrefBox` / `DataEntry`; new `parse_dinf` / `parse_dref`
+  / `read_c_string` / `read_c_string_split` helpers; new `DREF` / `URL_`
+  / `URN_` box constants. 12 new unit tests cover the single
+  self-contained entry, external URL location, `urn ` name+location and
+  name-only, multi-entry ordering, unknown-child drop, too-short and
+  forged-count guards, the `minf`→`dinf`→`dref` pickup path, and the
+  three surfacing shapes (single-self-contained collapse, external
+  per-entry surfacing, absence-no-keys). Source: ISO/IEC 14496-12:2015
+  §8.7.1–2 (staged PDF `docs/container/isobmff/bmff.txt`).
 - Multiple sample descriptions per track (`stsd`, ISO/IEC 14496-12
   §8.5.2) — round 306. `parse_stsd` now walks **every** `SampleEntry`
   in the box rather than discarding all but the first. Entry `[0]`

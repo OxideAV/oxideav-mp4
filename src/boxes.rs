@@ -194,7 +194,28 @@ pub const MINF: [u8; 4] = fourcc("minf");
 /// three-component 16-bit `opcolor` (red, green, blue) for graphics
 /// modes that use it. Note the spec fixes `flags` at 1 for this box.
 pub const VMHD: [u8; 4] = fourcc("vmhd");
+/// `dinf` — DataInformationBox (ISO/IEC 14496-12 §8.7.1). Sits inside
+/// `minf` (mandatory, exactly one) or `meta` (optional). A pure
+/// container whose sole child of interest is the `dref` DataReferenceBox
+/// declaring where the track's media data physically lives.
 pub const DINF: [u8; 4] = fourcc("dinf");
+/// `dref` — DataReferenceBox (ISO/IEC 14496-12 §8.7.2). Sits inside
+/// `dinf`; a `FullBox(0, 0)` carrying an `entry_count` and that many
+/// `DataEntryBox` children (each a `url ` or `urn ` FullBox). The
+/// 1-based `data_reference_index` on every sample entry (§8.5.2.2)
+/// indexes into this table, so it declares whether each description's
+/// samples are self-contained in this file or stored in an external
+/// resource.
+pub const DREF: [u8; 4] = fourcc("dref");
+/// `url ` — DataEntryUrlBox (ISO/IEC 14496-12 §8.7.2.2). A `dref`
+/// child. When `flags & 1` is set the media is in this same file and no
+/// URL string is present; otherwise the body is a NULL-terminated UTF-8
+/// URL naming the external resource.
+pub const URL_: [u8; 4] = fourcc("url ");
+/// `urn ` — DataEntryUrnBox (ISO/IEC 14496-12 §8.7.2.2). A `dref`
+/// child carrying a NULL-terminated `name` (the URN) and an optional
+/// NULL-terminated `location` URL.
+pub const URN_: [u8; 4] = fourcc("urn ");
 pub const STBL: [u8; 4] = fourcc("stbl");
 pub const STSD: [u8; 4] = fourcc("stsd");
 pub const STTS: [u8; 4] = fourcc("stts");

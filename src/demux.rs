@@ -933,6 +933,16 @@ struct Track {
     /// `opcolor`. `None` for non-video tracks (which use `smhd` /
     /// `nmhd` / `sthd` instead) or when the box is absent.
     vmhd: Option<VmhdBox>,
+    /// §8.7.2 — `dref` (DataReferenceBox) from the track's
+    /// `minf/dinf/dref`. The table of media-data locations that every
+    /// sample entry's 1-based `data_reference_index` (§8.5.2.2) selects
+    /// from: a self-contained entry (`flags & 1`) means the samples live
+    /// in this same file, an external `url `/`urn ` entry names another
+    /// resource. `None` when the track has no parseable `dref` (the box
+    /// is mandatory inside `minf`, but a malformed one is tolerated). The
+    /// common single-source case is exactly one self-contained `url `
+    /// entry.
+    dref: Option<DrefBox>,
     /// §8.6.3 — `stsh` (ShadowSyncSampleBox) entries. Each pair is
     /// `(shadowed_sample_number, sync_sample_number)`, both 1-based
     /// sample indices: when seeking to (or before) the non-sync
@@ -1327,6 +1337,55 @@ struct VmhdBox {
     /// The three (red, green, blue) colour components available for use
     /// by graphics modes that consume an operation colour.
     opcolor: [u16; 3],
+}
+
+/// One entry of a `dref` (DataReferenceBox, ISO/IEC 14496-12 §8.7.2).
+///
+/// Each entry is either a `url ` DataEntryUrlBox or a `urn `
+/// DataEntryUrnBox. The 24-bit FullBox `flags` field carries the only
+/// defined flag: bit 0 (`0x000001`) means the media data is in the same
+/// file as the Movie Box that contains this data reference — the
+/// *self-contained* case. When self-contained, the URL form is used and
+/// no string follows the flags (§8.7.2.3); otherwise `location` names the
+/// external resource (a `urn ` entry additionally carries a `name`, the
+/// URN proper).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DataEntry {
+    /// The entry box type — `url ` or `urn `. Preserved verbatim so a
+    /// surfacing layer can distinguish the two forms; any other FourCC is
+    /// non-conforming (§8.7.2.1) and dropped during parse.
+    kind: [u8; 4],
+    /// The full 24-bit FullBox `flags`. Bit 0 set ⇒ self-contained.
+    flags: u32,
+    /// For a `urn ` entry, the URN `name` (the resource's name); `None`
+    /// for a `url ` entry, which has no name field.
+    name: Option<String>,
+    /// The `location` URL. Absent (`None`) for a self-contained entry
+    /// (`flags & 1` set, no string present per §8.7.2.3); present for an
+    /// external `url `, and optional for a `urn ` (§8.7.2.3 — "optional
+    /// in a URN entry").
+    location: Option<String>,
+}
+
+impl DataEntry {
+    /// §8.7.2.3 — the data is in the same file as the Movie Box when the
+    /// low flag bit is set.
+    fn is_self_contained(&self) -> bool {
+        self.flags & 1 != 0
+    }
+}
+
+/// Parsed `dref` (DataReferenceBox, ISO/IEC 14496-12 §8.7.2), the table
+/// of media-data locations that the per-sample-entry
+/// `data_reference_index` (§8.5.2.2) indexes into. A track may be split
+/// over several sources, so the box holds `entry_count` entries; index
+/// `k` (1-based) names where the samples of a sample description carrying
+/// `data_reference_index == k` are stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DrefBox {
+    /// The data-reference table, in on-disk order. Entry `[i]` is the
+    /// 1-based `data_reference_index` `i + 1`.
+    entries: Vec<DataEntry>,
 }
 
 /// Parsed `tsel` (TrackSelectionBox, ISO/IEC 14496-12 §8.10.3).
@@ -1906,6 +1965,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         sub_tracks: Vec::new(),
         cslg: None,
         vmhd: None,
+        dref: None,
         stsh: Vec::new(),
         sbgp: Vec::new(),
         sgpd: Vec::new(),
@@ -2757,10 +2817,175 @@ fn parse_minf(body: &[u8], t: &mut Track) -> Result<()> {
                     }
                 }
             }
+            DINF => {
+                // §8.7.1: DataInformationBox is a plain container whose
+                // sole child of interest is the `dref` DataReferenceBox.
+                // §8.7.1.1 fixes the quantity at exactly one; keep the
+                // first parseable instance and ignore stray duplicates. A
+                // malformed `dref` is dropped (informational — the file
+                // still demuxes against the single-source default), so the
+                // dinf walk never aborts the surrounding `minf` parse.
+                let sub = read_bytes_vec(&mut cur, psz)?;
+                if t.dref.is_none() {
+                    if let Some(d) = parse_dinf(&sub) {
+                        t.dref = Some(d);
+                    }
+                }
+            }
             _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
     Ok(())
+}
+
+/// Walk a `dinf` (DataInformationBox, §8.7.1) body for its `dref`
+/// (DataReferenceBox) child and parse it. Returns `None` when the `dinf`
+/// carries no parseable `dref`.
+fn parse_dinf(body: &[u8]) -> Option<DrefBox> {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = read_box_header(&mut cur).ok()??;
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let sub = read_bytes_vec(&mut cur, psz).ok()?;
+        if hdr.fourcc == DREF {
+            return parse_dref(&sub).ok();
+        }
+    }
+    None
+}
+
+/// Parse a `dref` (DataReferenceBox, ISO/IEC 14496-12 §8.7.2) body.
+///
+/// Layout after the box header: a 4-byte `FullBox(version=0, flags=0)`
+/// preamble, a `unsigned int(32) entry_count`, then `entry_count`
+/// `DataEntryBox` children — each a `url ` DataEntryUrlBox or `urn `
+/// DataEntryUrnBox FullBox (§8.7.2.2). Each child's own 24-bit
+/// `entry_flags` carries the §8.7.2.3 self-contained bit; when it is set
+/// the URL form is used with no string body. A `urn ` entry holds a
+/// NULL-terminated `name` followed by an optional NULL-terminated
+/// `location`; a `url ` entry holds at most a `location`.
+///
+/// Robustness mirrors the rest of the demuxer: a forged `entry_count`
+/// cannot trigger a large up-front allocation (the smallest possible
+/// child is its 8-byte box header), a child whose declared size overruns
+/// the remaining body ends the walk at what was read, and an unknown
+/// FullBox `version` is tolerated (the spec pins it to 0 but the layout
+/// is unambiguous).
+fn parse_dref(body: &[u8]) -> Result<DrefBox> {
+    if body.len() < 8 {
+        return Err(Error::invalid("MP4: dref too short"));
+    }
+    let entry_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    let mut cur = std::io::Cursor::new(&body[8..]);
+    let avail = (body.len() - 8) as u64;
+    // The smallest DataEntryBox is an 8-byte box header (the
+    // self-contained `url ` form, 4-byte preamble = the size+type), so
+    // the body can hold at most `avail / 8` real entries.
+    let max_entries = (avail / 8).max(1);
+    let mut entries = Vec::with_capacity(entry_count.min(max_entries as u32) as usize);
+    for _ in 0..entry_count {
+        if cur.position() >= avail {
+            break;
+        }
+        let hdr = match read_box_header(&mut cur)? {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = match hdr.payload_size() {
+            Some(p) => p as usize,
+            None => break,
+        };
+        let child = match read_bytes_vec(&mut cur, psz) {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        // The child body is a FullBox: 1 version byte + 3 flag bytes.
+        if child.len() < 4 {
+            // A malformed child (no FullBox preamble); skip it rather
+            // than aborting the whole table — the rest may be valid.
+            continue;
+        }
+        let flags = u32::from_be_bytes([0, child[1], child[2], child[3]]);
+        let payload = &child[4..];
+        match hdr.fourcc {
+            URL_ => {
+                // §8.7.2.3: self-contained ⇒ no string present. Otherwise
+                // a single NULL-terminated UTF-8 `location`.
+                let location = if flags & 1 != 0 {
+                    None
+                } else {
+                    read_c_string(payload)
+                };
+                entries.push(DataEntry {
+                    kind: URL_,
+                    flags,
+                    name: None,
+                    location,
+                });
+            }
+            URN_ => {
+                // §8.7.2.2: a NULL-terminated `name` then an optional
+                // NULL-terminated `location`. `name` is required for a
+                // URN entry; `location` is optional. Self-contained URN
+                // entries are not the spec's intent (it directs the URL
+                // form for self-contained data), so we still read the
+                // strings present.
+                let (name, rest) = read_c_string_split(payload);
+                let location = read_c_string(rest);
+                entries.push(DataEntry {
+                    kind: URN_,
+                    flags,
+                    name,
+                    location,
+                });
+            }
+            // §8.7.2.1: each DataEntryBox shall be a `url ` or `urn `.
+            // Anything else is non-conforming — record nothing for it so
+            // the entry index alignment with `data_reference_index` is
+            // preserved by skipping (rather than inserting a bogus entry).
+            _ => {}
+        }
+    }
+    Ok(DrefBox { entries })
+}
+
+/// Read a single NULL-terminated UTF-8 C string from `buf`. Returns
+/// `None` when the string is empty (no bytes, or an immediate NUL) so a
+/// "present but empty" entry collapses to "no string". A buffer with no
+/// NUL terminator is read to its end (a producer slip on the terminator
+/// should not lose the string).
+fn read_c_string(buf: &[u8]) -> Option<String> {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
+/// Split `buf` at the first NUL: returns the leading C string (or `None`
+/// when empty) and the bytes after the terminator (for reading a second
+/// C string). When no NUL is present the whole buffer is the string and
+/// the remainder is empty.
+fn read_c_string_split(buf: &[u8]) -> (Option<String>, &[u8]) {
+    match buf.iter().position(|&b| b == 0) {
+        Some(pos) => {
+            let s = if pos == 0 {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&buf[..pos]).into_owned())
+            };
+            (s, &buf[pos + 1..])
+        }
+        None => {
+            let s = if buf.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(buf).into_owned())
+            };
+            (s, &[])
+        }
+    }
 }
 
 /// Parse `vmhd` (VideoMediaHeaderBox, ISO/IEC 14496-12 §12.1.2 /
@@ -6498,6 +6723,51 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         );
     }
 
+    // ISO/IEC 14496-12 §8.7.2: surface the DataReferenceBox (`dref`) so a
+    // caller can resolve where each sample description's media data lives.
+    // The 1-based `data_reference_index` on every sample entry (§8.5.2.2)
+    // indexes this table. The overwhelmingly common case — a single
+    // self-contained `url ` entry, i.e. all samples in this same file — is
+    // surfaced compactly as `dref_self_contained = "true"` with no
+    // per-entry keys, so a consumer can confirm "no external resources" in
+    // one lookup. When the table has more than one entry, or any entry is
+    // *not* self-contained (an external `url `/`urn ` split-source track),
+    // every entry is surfaced:
+    //   * `dref_count` — total entries.
+    //   * `dref_self_contained` — "true" only when *every* entry is
+    //     self-contained, else "false".
+    //   * `dref_<n>` (1-based, matching `data_reference_index`) —
+    //     `<kind> self=<true|false>[ name=<urn>][ loc=<url>]`. `kind` is
+    //     `url ` or `urn `; the `name=` token appears only for a `urn `
+    //     with a name; `loc=` only when a location string is present.
+    // Absent / unparseable `dref`, none of the keys are emitted.
+    if let Some(d) = &t.dref {
+        let all_self_contained =
+            !d.entries.is_empty() && d.entries.iter().all(|e| e.is_self_contained());
+        let single_self_contained = d.entries.len() == 1 && all_self_contained;
+        params.options.insert(
+            "dref_self_contained",
+            if all_self_contained { "true" } else { "false" }.to_string(),
+        );
+        if !single_self_contained {
+            params
+                .options
+                .insert("dref_count".to_string(), d.entries.len().to_string());
+            for (i, e) in d.entries.iter().enumerate() {
+                let mut s = format!("{} self={}", fourcc_token(&e.kind), e.is_self_contained());
+                if let Some(name) = &e.name {
+                    s.push_str(" name=");
+                    s.push_str(name);
+                }
+                if let Some(loc) = &e.location {
+                    s.push_str(" loc=");
+                    s.push_str(loc);
+                }
+                params.options.insert(format!("dref_{}", i + 1), s);
+            }
+        }
+    }
+
     // ISO/IEC 14496-12 §8.6.3: surface the optional ShadowSyncSampleBox
     // (`stsh`) as `stsh_<n>` options keys (0-based encounter index),
     // each `"shadowed sync"` — the 1-based shadowed sample number and
@@ -7696,6 +7966,7 @@ mod tests {
             sub_tracks: Vec::new(),
             cslg: None,
             vmhd: None,
+            dref: None,
             stsh: Vec::new(),
             sbgp: Vec::new(),
             sgpd: Vec::new(),
@@ -10070,6 +10341,222 @@ mod tests {
         let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
         assert_eq!(info.params.options.get("vmhd_graphicsmode"), None);
         assert_eq!(info.params.options.get("vmhd_opcolor"), None);
+    }
+
+    /// Build a `dref` body: FullBox(0,0) preamble + entry_count + the
+    /// concatenated child boxes.
+    fn build_dref(children: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // version 0, flags 0
+        body.extend_from_slice(&(children.len() as u32).to_be_bytes());
+        for c in children {
+            body.extend_from_slice(c);
+        }
+        body
+    }
+
+    /// A self-contained `url ` entry: 4-byte FullBox preamble with the
+    /// low flag bit set, no string body.
+    fn url_self_contained() -> Vec<u8> {
+        wrap_box_full_size(b"url ", &[0u8, 0, 0, 1])
+    }
+
+    /// An external `url ` entry: flags = 0, then a NULL-terminated URL.
+    fn url_external(loc: &str) -> Vec<u8> {
+        let mut payload = vec![0u8; 4]; // version 0, flags 0
+        payload.extend_from_slice(loc.as_bytes());
+        payload.push(0);
+        wrap_box_full_size(b"url ", &payload)
+    }
+
+    /// §8.7.2.2: the canonical single self-contained `url ` entry — the
+    /// overwhelmingly common shape. Parses to one entry, self-contained,
+    /// no location string.
+    #[test]
+    fn parse_dref_single_self_contained_url() {
+        let body = build_dref(&[url_self_contained()]);
+        let d = super::parse_dref(&body).unwrap();
+        assert_eq!(d.entries.len(), 1);
+        assert_eq!(&d.entries[0].kind, b"url ");
+        assert!(d.entries[0].is_self_contained());
+        assert_eq!(d.entries[0].location, None);
+        assert_eq!(d.entries[0].name, None);
+    }
+
+    /// §8.7.2.3: a `url ` entry whose self-contained bit is clear carries
+    /// a NULL-terminated `location` URL naming the external resource.
+    #[test]
+    fn parse_dref_external_url_location() {
+        let body = build_dref(&[url_external("http://example.com/a.mp4")]);
+        let d = super::parse_dref(&body).unwrap();
+        assert_eq!(d.entries.len(), 1);
+        assert!(!d.entries[0].is_self_contained());
+        assert_eq!(
+            d.entries[0].location.as_deref(),
+            Some("http://example.com/a.mp4")
+        );
+    }
+
+    /// §8.7.2.2: a `urn ` entry carries a NULL-terminated `name` (the URN)
+    /// followed by an optional NULL-terminated `location`.
+    #[test]
+    fn parse_dref_urn_name_and_location() {
+        let mut payload = vec![0u8; 4]; // version 0, flags 0
+        payload.extend_from_slice(b"urn:example:res");
+        payload.push(0);
+        payload.extend_from_slice(b"ftp://host/res");
+        payload.push(0);
+        let body = build_dref(&[wrap_box_full_size(b"urn ", &payload)]);
+        let d = super::parse_dref(&body).unwrap();
+        assert_eq!(d.entries.len(), 1);
+        assert_eq!(&d.entries[0].kind, b"urn ");
+        assert_eq!(d.entries[0].name.as_deref(), Some("urn:example:res"));
+        assert_eq!(d.entries[0].location.as_deref(), Some("ftp://host/res"));
+    }
+
+    /// §8.7.2.3: `location` is optional for a `urn ` — a name with no
+    /// trailing location string parses with `location == None`.
+    #[test]
+    fn parse_dref_urn_name_only() {
+        let mut payload = vec![0u8; 4];
+        payload.extend_from_slice(b"urn:example:res");
+        payload.push(0);
+        let body = build_dref(&[wrap_box_full_size(b"urn ", &payload)]);
+        let d = super::parse_dref(&body).unwrap();
+        assert_eq!(d.entries[0].name.as_deref(), Some("urn:example:res"));
+        assert_eq!(d.entries[0].location, None);
+    }
+
+    /// §8.7.2: a split-source track — two entries, the first
+    /// self-contained, the second external. The 1-based entry order is
+    /// preserved (it aligns with `data_reference_index`).
+    #[test]
+    fn parse_dref_multiple_entries_order_preserved() {
+        let body = build_dref(&[url_self_contained(), url_external("rel/path.bin")]);
+        let d = super::parse_dref(&body).unwrap();
+        assert_eq!(d.entries.len(), 2);
+        assert!(d.entries[0].is_self_contained());
+        assert!(!d.entries[1].is_self_contained());
+        assert_eq!(d.entries[1].location.as_deref(), Some("rel/path.bin"));
+    }
+
+    /// §8.7.2.1: a non-`url `/`urn ` child is non-conforming and is
+    /// dropped (no bogus entry inserted), but conforming siblings around
+    /// it still parse.
+    #[test]
+    fn parse_dref_drops_unknown_child() {
+        let bogus = wrap_box_full_size(b"foo ", &[0u8; 4]);
+        let body = build_dref(&[bogus, url_self_contained()]);
+        let d = super::parse_dref(&body).unwrap();
+        assert_eq!(d.entries.len(), 1);
+        assert!(d.entries[0].is_self_contained());
+    }
+
+    /// A `dref` body shorter than the 8-byte FullBox + entry_count floor
+    /// is rejected.
+    #[test]
+    fn parse_dref_too_short_is_rejected() {
+        assert!(super::parse_dref(&[0u8; 7]).is_err());
+    }
+
+    /// A forged `entry_count` far larger than the bytes present does not
+    /// over-allocate and does not invent entries — parsing stops at the
+    /// real data.
+    #[test]
+    fn parse_dref_forged_count_does_not_overrun() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]);
+        body.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // forged count
+        body.extend_from_slice(&url_self_contained());
+        let d = super::parse_dref(&body).unwrap();
+        assert_eq!(d.entries.len(), 1);
+    }
+
+    /// `parse_minf` walks `dinf` → `dref` and lands the table on the
+    /// track.
+    #[test]
+    fn parse_minf_picks_up_dref_via_dinf() {
+        let dref = build_dref(&[url_external("http://h/v.mp4")]);
+        let dref_box = wrap_box_full_size(b"dref", &dref);
+        let dinf = wrap_box_full_size(b"dinf", &dref_box);
+
+        let mut t = fresh_track();
+        super::parse_minf(&dinf, &mut t).unwrap();
+        let d = t.dref.expect("dref should be parsed");
+        assert_eq!(d.entries.len(), 1);
+        assert_eq!(d.entries[0].location.as_deref(), Some("http://h/v.mp4"));
+    }
+
+    /// Surfacing: a single self-contained `url ` (the common case)
+    /// collapses to `dref_self_contained = "true"` with no per-entry
+    /// or count keys.
+    #[test]
+    fn build_stream_info_surfaces_single_self_contained_dref() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.dref = Some(super::DrefBox {
+            entries: vec![super::DataEntry {
+                kind: *b"url ",
+                flags: 1,
+                name: None,
+                location: None,
+            }],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("dref_self_contained"), Some("true"));
+        assert_eq!(info.params.options.get("dref_count"), None);
+        assert_eq!(info.params.options.get("dref_1"), None);
+    }
+
+    /// Surfacing: an external split-source `dref` emits `dref_count`,
+    /// `dref_self_contained = "false"`, and a `dref_<n>` per entry.
+    #[test]
+    fn build_stream_info_surfaces_external_dref_entries() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.dref = Some(super::DrefBox {
+            entries: vec![
+                super::DataEntry {
+                    kind: *b"url ",
+                    flags: 1,
+                    name: None,
+                    location: None,
+                },
+                super::DataEntry {
+                    kind: *b"urn ",
+                    flags: 0,
+                    name: Some("urn:x".to_string()),
+                    location: Some("http://h/r".to_string()),
+                },
+            ],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("dref_self_contained"),
+            Some("false")
+        );
+        assert_eq!(info.params.options.get("dref_count"), Some("2"));
+        assert_eq!(info.params.options.get("dref_1"), Some("url  self=true"));
+        assert_eq!(
+            info.params.options.get("dref_2"),
+            Some("urn  self=false name=urn:x loc=http://h/r")
+        );
+    }
+
+    /// Absence: a track with no `dref` emits none of the `dref_*` keys.
+    #[test]
+    fn build_stream_info_no_dref_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("dref_self_contained"), None);
+        assert_eq!(info.params.options.get("dref_count"), None);
     }
 
     /// §8.6.3 — `stsh` with two `(shadowed, sync)` pairs. Verifies both
