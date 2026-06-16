@@ -827,6 +827,32 @@ Sample-entry FourCCs resolve to these codec ids:
   `[size]['ssix']` box for segment-index emitters pairing it with a
   `sidx`, rejecting `range_size` values above the 24-bit wire field's
   0xFF_FFFF ceiling instead of silently masking them.
+- Ambient viewing environment (ISO/IEC 14496-12 post-2015 addition,
+  `amve`): a track's `VisualSampleEntry` (`avc1` / `hvc1` / `av01` …)
+  may carry an `AmbientViewingEnvironmentBox` — a plain `Box` (not a
+  `FullBox`; no version/flags byte) with a fixed 8-byte body signalling
+  the nominal ambient viewing environment for the display of the video.
+  It is the file-format carriage of the same three syntax elements (with
+  the same units and ranges) as the `ambient_viewing_environment` SEI
+  message and the ISO/IEC 23091-3 (CICP) ambient-viewing-environment
+  parameters: `ambient_illuminance` (0.0001 lux per unit),
+  `ambient_light_x` / `ambient_light_y` (0.00002 CIE 1931 chromaticity
+  per unit). The three raw integers are surfaced verbatim on
+  `params.options` as `amve_ambient_illuminance`, `amve_ambient_light_x`,
+  and `amve_ambient_light_y` (decimal) — a downstream HDR pipeline
+  applies the unit scaling and can populate the matching SEI
+  field-for-field with no conversion. The first `amve` met across a
+  track's sample entries wins (one nominal environment per track); a
+  body shorter than the fixed 8 bytes is dropped without aborting the
+  open (the box is informational), and trailing bytes beyond byte 8
+  (reserved for a future edition) are ignored. The structured record is
+  reachable via the public `oxideav_mp4::demux::parse_amve_box(&[u8])`
+  entry point (typed `AmveRecord` with `ambient_illuminance`,
+  `ambient_light_x`, `ambient_light_y`) for tooling holding the box
+  body. Absent `amve`, none of the keys are emitted. Distinct from and
+  complementary to the mastering-display (`mdcv`) / content-light-level
+  (`clli`) metadata, which describe the *content's* mastering
+  environment rather than the *viewer's* ambient one.
 
 ### Muxer
 

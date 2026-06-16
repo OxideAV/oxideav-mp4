@@ -570,6 +570,34 @@ pub struct PrftRecord {
     pub version: u8,
 }
 
+/// Decoded `amve` (AmbientViewingEnvironmentBox, ISO/IEC 14496-12
+/// post-2015 addition).
+///
+/// A plain `Box` (NOT a `FullBox` — there is no `version` / `flags`
+/// byte) carried inside a `VisualSampleEntry` (e.g. `avc1` / `hvc1` /
+/// `av01`). It signals the nominal ambient viewing environment for the
+/// display of the track's video — the same three syntax elements, with
+/// the same units and ranges, as the `ambient_viewing_environment` SEI
+/// message and the ISO/IEC 23091-3 (CICP) ambient-viewing-environment
+/// parameters. The body is a fixed 8 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AmveRecord {
+    /// Environmental illuminance of the ambient viewing environment, in
+    /// units of 0.0001 lux (i.e. `lux = ambient_illuminance / 10000`).
+    /// `0` is permitted by the syntax but generally treated as
+    /// "unknown" / unspecified by consumers.
+    pub ambient_illuminance: u32,
+    /// Normalized CIE 1931 *x* chromaticity of the environmental ambient
+    /// light, in increments of 0.00002 (`x = ambient_light_x × 0.00002`).
+    /// The spec range is 0..=50000 (0.0 .. 1.0); the raw u16 is preserved
+    /// verbatim so a producer slip out of range round-trips unchanged.
+    pub ambient_light_x: u16,
+    /// Normalized CIE 1931 *y* chromaticity of the environmental ambient
+    /// light, in increments of 0.00002 (`y = ambient_light_y × 0.00002`).
+    /// Range as for `ambient_light_x`.
+    pub ambient_light_y: u16,
+}
+
 /// One `(rate, initial_delay)` pair from a `pdin`
 /// ProgressiveDownloadInfoBox (ISO/IEC 14496-12 §8.1.3).
 ///
@@ -933,6 +961,16 @@ struct Track {
     /// `opcolor`. `None` for non-video tracks (which use `smhd` /
     /// `nmhd` / `sthd` instead) or when the box is absent.
     vmhd: Option<VmhdBox>,
+    /// `amve` (AmbientViewingEnvironmentBox, ISO/IEC 14496-12 post-2015
+    /// addition) found inside the track's `VisualSampleEntry`. Carries the
+    /// nominal ambient viewing environment (illuminance + CIE 1931
+    /// chromaticity) for the display of the video — the file-format
+    /// carriage of the `ambient_viewing_environment` SEI / ISO/IEC
+    /// 23091-3 parameters. `None` for non-video tracks or when the box is
+    /// absent (the common case). When two sample entries each carry an
+    /// `amve`, the first encountered wins (a single nominal environment
+    /// per track).
+    amve: Option<AmveRecord>,
     /// §12.4.2 / §8.4.5 — `hmhd` (HintMediaHeaderBox). Present for hint
     /// tracks (a `hdlr` of type `hint`); the spec marks exactly one
     /// media header mandatory inside `minf`, and a hint track uses this
@@ -1997,6 +2035,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         sub_tracks: Vec::new(),
         cslg: None,
         vmhd: None,
+        amve: None,
         hmhd: None,
         dref: None,
         stsh: Vec::new(),
@@ -3680,10 +3719,43 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
                     t.esds_oti = parsed.oti;
                 }
             }
+            // AmbientViewingEnvironmentBox (ISO/IEC 14496-12 post-2015) —
+            // the file-format carriage of the ambient_viewing_environment
+            // SEI / ISO/IEC 23091-3 parameters. A plain Box (no FullBox
+            // version/flags), fixed 8-byte body. First one on the track
+            // wins; a malformed (short) body is dropped (informational —
+            // it never aborts the open).
+            b"amve" if t.amve.is_none() => {
+                if let Some(rec) = parse_amve(&body) {
+                    t.amve = Some(rec);
+                }
+            }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Parse an `amve` (AmbientViewingEnvironmentBox) body — the 8 bytes
+/// after the plain 8-byte box header (`amve` is a `Box`, not a
+/// `FullBox`, so there is no version/flags preamble).
+///
+/// Returns `None` for a body shorter than the fixed 8-byte layout
+/// (`ambient_illuminance` u32 + `ambient_light_x` u16 +
+/// `ambient_light_y` u16). Trailing bytes beyond byte 8 — reserved for a
+/// future edition — are ignored so an extended box still parses.
+fn parse_amve(body: &[u8]) -> Option<AmveRecord> {
+    if body.len() < 8 {
+        return None;
+    }
+    let ambient_illuminance = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    let ambient_light_x = u16::from_be_bytes([body[4], body[5]]);
+    let ambient_light_y = u16::from_be_bytes([body[6], body[7]]);
+    Some(AmveRecord {
+        ambient_illuminance,
+        ambient_light_x,
+        ambient_light_y,
+    })
 }
 
 fn parse_stts(body: &[u8]) -> Result<Vec<(u32, u32)>> {
@@ -6798,6 +6870,28 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         );
     }
 
+    // ISO/IEC 14496-12 (post-2015): when the track's `VisualSampleEntry`
+    // carried an `amve` (AmbientViewingEnvironmentBox), surface its three
+    // raw fields on `params.options` as `amve_ambient_illuminance`
+    // (0.0001 lux per unit), `amve_ambient_light_x`, and
+    // `amve_ambient_light_y` (0.00002 CIE 1931 chromaticity per unit),
+    // all decimal. The raw integers are preserved verbatim — a downstream
+    // HDR pipeline applies the unit scaling and can populate the matching
+    // `ambient_viewing_environment` SEI field-for-field with no
+    // conversion. Absent `amve`, none of the keys are emitted.
+    if let Some(a) = &t.amve {
+        params.options.insert(
+            "amve_ambient_illuminance",
+            a.ambient_illuminance.to_string(),
+        );
+        params
+            .options
+            .insert("amve_ambient_light_x", a.ambient_light_x.to_string());
+        params
+            .options
+            .insert("amve_ambient_light_y", a.ambient_light_y.to_string());
+    }
+
     // ISO/IEC 14496-12 §12.4.2 / §8.4.5: when the track carries an
     // `hmhd` (HintMediaHeaderBox) — i.e. a hint track — surface its
     // protocol-independent streaming statistics on `params.options`:
@@ -7902,6 +7996,22 @@ pub fn parse_trep_box(body: &[u8]) -> Result<TrepRecord> {
     parse_trep(body)
 }
 
+/// Parse a standalone `amve` (AmbientViewingEnvironmentBox, ISO/IEC
+/// 14496-12 post-2015 addition) body from `body` (the 8 bytes after the
+/// plain 8-byte box header — `amve` is a `Box`, not a `FullBox`, so
+/// there is no version/flags preamble).
+///
+/// Exposed as a public entry point so tooling that already has the box's
+/// payload bytes in hand (an HDR-metadata extractor, a HEIF/AVIF
+/// item-property reader carrying the same box, a fixture validator) can
+/// recover the `(ambient_illuminance, ambient_light_x, ambient_light_y)`
+/// triple without re-running `open()`. Returns `Err` for a body shorter
+/// than the fixed 8-byte layout; trailing bytes beyond byte 8 (reserved
+/// for a future edition) are ignored.
+pub fn parse_amve_box(body: &[u8]) -> Result<AmveRecord> {
+    parse_amve(body).ok_or_else(|| Error::invalid("MP4: amve too short"))
+}
+
 use std::io::Read;
 
 fn read_bytes_vec<R: Read + ?Sized>(r: &mut R, n: usize) -> Result<Vec<u8>> {
@@ -8083,6 +8193,7 @@ mod tests {
             sub_tracks: Vec::new(),
             cslg: None,
             vmhd: None,
+            amve: None,
             hmhd: None,
             dref: None,
             stsh: Vec::new(),
@@ -10564,6 +10675,171 @@ mod tests {
         let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
         assert_eq!(info.params.options.get("vmhd_graphicsmode"), None);
         assert_eq!(info.params.options.get("vmhd_opcolor"), None);
+    }
+
+    /// Build an 8-byte `amve` body (AmbientViewingEnvironmentBox):
+    /// `ambient_illuminance` u32 + `ambient_light_x` u16 +
+    /// `ambient_light_y` u16, all big-endian.
+    fn amve_body(illum: u32, x: u16, y: u16) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&illum.to_be_bytes());
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out
+    }
+
+    /// Build a 78-byte `VisualSampleEntry` preamble with `width` /
+    /// `height` set, followed by any child boxes already in `children`.
+    fn video_sample_entry_body(width: u16, height: u16, children: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 6]); // reserved
+        out.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+        out.extend_from_slice(&[0u8; 16]); // pre_defined + reserved
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // horizresolution 72dpi
+        out.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // vertresolution 72dpi
+        out.extend_from_slice(&[0u8; 4]); // reserved
+        out.extend_from_slice(&1u16.to_be_bytes()); // frame_count
+        out.extend_from_slice(&[0u8; 32]); // compressorname
+        out.extend_from_slice(&0x0018u16.to_be_bytes()); // depth
+        out.extend_from_slice(&0xFFFFu16.to_be_bytes()); // pre_defined = -1
+        debug_assert_eq!(out.len(), 78);
+        out.extend_from_slice(children);
+        out
+    }
+
+    /// `parse_amve` decodes the BT.2035 reference-environment worked
+    /// example (10 lux, D65 chromaticity) field-for-field.
+    #[test]
+    fn parse_amve_bt2035_example() {
+        // 10 lux → 100000 (0.0001 lux/unit); x = 0.3127 → 15635; y =
+        // 0.3290 → 16450 (0.00002/unit).
+        let body = amve_body(100_000, 15_635, 16_450);
+        let rec = super::parse_amve(&body).expect("amve should parse");
+        assert_eq!(rec.ambient_illuminance, 100_000);
+        assert_eq!(rec.ambient_light_x, 15_635);
+        assert_eq!(rec.ambient_light_y, 16_450);
+    }
+
+    /// `parse_amve` ignores bytes past the fixed 8-byte body (reserved for
+    /// a future edition) rather than failing.
+    #[test]
+    fn parse_amve_tolerates_trailing_bytes() {
+        let mut body = amve_body(7, 1, 2);
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let rec = super::parse_amve(&body).expect("amve should parse");
+        assert_eq!(rec.ambient_illuminance, 7);
+        assert_eq!(rec.ambient_light_x, 1);
+        assert_eq!(rec.ambient_light_y, 2);
+    }
+
+    /// A body shorter than the fixed 8-byte layout is rejected.
+    #[test]
+    fn parse_amve_rejects_short_body() {
+        assert!(super::parse_amve(&[0u8; 7]).is_none());
+        assert!(super::parse_amve(&[]).is_none());
+        // The public entry returns Err for the same case.
+        assert!(super::parse_amve_box(&[0u8; 7]).is_err());
+    }
+
+    /// The public `parse_amve_box` entry decodes a well-formed body.
+    #[test]
+    fn parse_amve_box_public_entry() {
+        let body = amve_body(50_000, 25_000, 30_000);
+        let rec = super::parse_amve_box(&body).expect("amve should parse");
+        assert_eq!(rec.ambient_illuminance, 50_000);
+        assert_eq!(rec.ambient_light_x, 25_000);
+        assert_eq!(rec.ambient_light_y, 30_000);
+    }
+
+    /// `parse_video_sample_entry` lands an `amve` child box on the track.
+    #[test]
+    fn parse_video_sample_entry_picks_up_amve() {
+        let amve = wrap_box_full_size(b"amve", &amve_body(100_000, 15_635, 16_450));
+        let entry = video_sample_entry_body(1920, 1080, &amve);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        super::parse_video_sample_entry(&entry, &mut t).unwrap();
+
+        assert_eq!(t.width, Some(1920));
+        assert_eq!(t.height, Some(1080));
+        let a = t.amve.expect("amve should be parsed");
+        assert_eq!(a.ambient_illuminance, 100_000);
+        assert_eq!(a.ambient_light_x, 15_635);
+        assert_eq!(a.ambient_light_y, 16_450);
+    }
+
+    /// First `amve` wins when two sample-entry child boxes carry one.
+    #[test]
+    fn parse_video_sample_entry_amve_first_wins() {
+        let mut children = wrap_box_full_size(b"amve", &amve_body(1, 2, 3));
+        children.extend(wrap_box_full_size(b"amve", &amve_body(9, 9, 9)));
+        let entry = video_sample_entry_body(640, 480, &children);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        super::parse_video_sample_entry(&entry, &mut t).unwrap();
+        let a = t.amve.expect("amve should be parsed");
+        assert_eq!(a.ambient_illuminance, 1);
+        assert_eq!(a.ambient_light_x, 2);
+        assert_eq!(a.ambient_light_y, 3);
+    }
+
+    /// A malformed (too-short) `amve` child box is dropped silently — the
+    /// sample entry still parses (width/height land) with no `amve`.
+    #[test]
+    fn parse_video_sample_entry_drops_malformed_amve() {
+        let amve = wrap_box_full_size(b"amve", &[0u8; 4]); // too short
+        let entry = video_sample_entry_body(1280, 720, &amve);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        super::parse_video_sample_entry(&entry, &mut t).unwrap();
+        assert_eq!(t.width, Some(1280));
+        assert!(t.amve.is_none());
+    }
+
+    /// Surfacing: a parsed `amve` exposes the three raw fields (decimal)
+    /// on `params.options`.
+    #[test]
+    fn build_stream_info_surfaces_amve_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"hvc1";
+        t.timescale = 1000;
+        t.amve = Some(super::AmveRecord {
+            ambient_illuminance: 100_000,
+            ambient_light_x: 15_635,
+            ambient_light_y: 16_450,
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("amve_ambient_illuminance"),
+            Some("100000")
+        );
+        assert_eq!(
+            info.params.options.get("amve_ambient_light_x"),
+            Some("15635")
+        );
+        assert_eq!(
+            info.params.options.get("amve_ambient_light_y"),
+            Some("16450")
+        );
+    }
+
+    /// Absence: a track with no `amve` emits none of the `amve_*` keys.
+    #[test]
+    fn build_stream_info_no_amve_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("amve_ambient_illuminance"), None);
+        assert_eq!(info.params.options.get("amve_ambient_light_x"), None);
+        assert_eq!(info.params.options.get("amve_ambient_light_y"), None);
     }
 
     /// Build a `dref` body: FullBox(0,0) preamble + entry_count + the
