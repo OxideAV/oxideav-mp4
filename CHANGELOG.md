@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Round 320 — csgp CompactSampleToGroupBox builder (sample_groups::build_csgp) + public parse_csgp_box read entry point (ISO/IEC 14496-12:2020 §8.9.5)
 - Round 314 — Hint Media Header Box (hmhd) typed accessor (ISO/IEC 14496-12 §12.4.2)
 
 ## [0.0.9](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.8...v0.0.9) - 2026-06-15

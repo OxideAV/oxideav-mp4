@@ -618,7 +618,10 @@ Sample-entry FourCCs resolve to these codec ids:
   (`count` = `sample_count`, the index list = the pattern's per-sample
   indices; 0 = "no group", fragment-local high-bit kept verbatim). It
   shares `grouping_type` with the matching `sgpd_<m>`. Absent `csgp`,
-  no keys are emitted.
+  no keys are emitted. The structured record is reachable via the public
+  `oxideav_mp4::demux::parse_csgp_box(&[u8])` entry point (typed
+  `CsgpBox` / `CsgpPattern`) for tooling holding the box body; the
+  write side is `sample_groups::build_csgp` (see Muxer below).
 - Sub-sample information (ISO/IEC 14496-12 §8.7.7, `subs`): a track's
   `stbl/subs` SubSampleInformationBox is an optional sparse table
   describing how selected samples decompose into smaller,
@@ -911,6 +914,26 @@ is opaque to the container — callers supply already-serialised
 `sbgp` chooses v0 (no `grouping_type_parameter`) or v1 (`Some(_)`) per
 §8.9.2; a `group_description_index` ≥ `0x10001` (movie-fragment-local
 per §8.9.4) is written verbatim, the muxer does not resolve it.
+
+The compact form `csgp` (CompactSampleToGroupBox, ISO/IEC
+14496-12:2020 §8.9.5) has a matching builder
+`oxideav_mp4::sample_groups::build_csgp(&CompactSampleToGroup)`,
+the byte-exact inverse of the demuxer's `parse_csgp` (round-tripped in
+tests through the public `oxideav_mp4::demux::parse_csgp_box` entry
+point). `CompactSampleToGroup` carries a `grouping_type`, an optional
+`grouping_type_parameter`, and a list of `CompactSampleToGroupPattern`
+(each a `sample_count` plus a per-pattern `indices` run). The three
+bit-field width codes (`index_size_code` / `count_size_code` /
+`pattern_size_code`) are chosen automatically as the narrowest §8.9.5
+widths — `width = 4 << code`, i.e. 4/8/16/32 bits — that hold every
+value present, and packed into the overloaded `FullBox.flags` field
+together with the `grouping_type_parameter_present` bit. From
+`pattern_count` onward the `(pattern_length, sample_count)` array and
+the flattened index run are bit-packed MSB-first with no byte alignment
+between fields (the trailing partial byte is zero-padded). A
+`sample_group_description_index` ≥ `0x8000_0000` (the fragment-local
+high bit, §8.9.4) is written verbatim; the builder does not synthesise
+it.
 
 ### Seek strategy
 

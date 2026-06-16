@@ -1137,32 +1137,32 @@ struct SgpdBox {
 /// `pattern_length` per-sample `sample_group_description_index` values,
 /// replicated across `sample_count` consecutive groups of that length.
 #[derive(Clone, Debug, Default)]
-struct CsgpPattern {
+pub struct CsgpPattern {
     /// `sample_count[i]` — number of consecutive groups (each
     /// `pattern_length` samples long) that replay this pattern. The
     /// pattern covers `sample_count * pattern_length` samples in total.
-    sample_count: u32,
+    pub sample_count: u32,
     /// `sample_group_description_index[i][1..=pattern_length]` — one
     /// index per sample of the pattern. Index 0 means "member of no
     /// group of this type"; when the box lives in a `traf`, the index's
     /// most-significant bit (for the field's width) distinguishes a
     /// fragment-local description (set) from a global one (clear). The
     /// raw value is preserved verbatim; the demuxer does not resolve it.
-    indices: Vec<u32>,
+    pub indices: Vec<u32>,
 }
 
 /// Parsed `csgp` (CompactSampleToGroupBox, ISO/IEC 14496-12:2020 §8.9.5).
 #[derive(Clone, Debug, Default)]
-struct CsgpBox {
+pub struct CsgpBox {
     /// Four-byte grouping type linking this box to the `sgpd` of the
     /// same type — identical role to `sbgp.grouping_type`.
-    grouping_type: [u8; 4],
+    pub grouping_type: [u8; 4],
     /// `grouping_type_parameter` — present only when the flag layout's
     /// presence bit is set, selecting one of several alternative
     /// groupings of the same type. `None` when the bit is clear.
-    grouping_type_parameter: Option<u32>,
+    pub grouping_type_parameter: Option<u32>,
     /// The repeating index patterns, in disk order.
-    patterns: Vec<CsgpPattern>,
+    pub patterns: Vec<CsgpPattern>,
 }
 
 /// One sub-sample of a `subs` (SubSampleInformationBox, §8.7.7) entry.
@@ -4268,7 +4268,7 @@ impl<'a> BitCursor<'a> {
 /// group of this type"; in a `traf` the field's most-significant bit
 /// distinguishes a fragment-local description (set) from a global one
 /// (clear). The demuxer does not resolve fragment-local references.
-fn parse_csgp(body: &[u8]) -> Result<CsgpBox> {
+pub fn parse_csgp(body: &[u8]) -> Result<CsgpBox> {
     if body.len() < 4 {
         return Err(Error::invalid("MP4: csgp too short"));
     }
@@ -7867,6 +7867,24 @@ pub fn parse_pdin_box(body: &[u8]) -> Result<PdinRecord> {
 /// `level_count = 0`.
 pub fn parse_leva_box(body: &[u8]) -> Result<LevaRecord> {
     parse_leva(body)
+}
+
+/// Parse a standalone `csgp` (CompactSampleToGroupBox, ISO/IEC
+/// 14496-12:2020 §8.9.5) body from `body` (the bytes after the 8/16-byte
+/// box header).
+///
+/// Exposed as a public entry point so tooling that already has the box's
+/// payload bytes in hand (a DASH packager, a sample-group editor, a
+/// fixture validator) can recover the bit-packed pattern table without
+/// re-running `open()`, and so the write side
+/// (`sample_groups::build_csgp`) can be round-trip tested against the
+/// canonical reader. Returns `Err` for a body shorter than the 4-byte
+/// FullBox preamble or with any truncated bit-packed field. The returned
+/// [`CsgpBox`] preserves every `sample_group_description_index` verbatim
+/// (including the fragment-local high bit when the box came from a
+/// `traf`).
+pub fn parse_csgp_box(body: &[u8]) -> Result<CsgpBox> {
+    parse_csgp(body)
 }
 
 /// Parse a standalone `trep` (TrackExtensionPropertiesBox, ISO/IEC

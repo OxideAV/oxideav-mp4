@@ -84,7 +84,7 @@
 //! first few seconds) is free to do so. The demuxer just surfaces the
 //! pair verbatim.
 
-use crate::boxes::{SBGP, SGPD};
+use crate::boxes::{CSGP, SBGP, SGPD};
 
 /// One `sbgp` (SampleToGroupBox) to emit on a track.
 ///
@@ -268,6 +268,190 @@ fn entries_common_length(entries: &[Vec<u8>]) -> Option<usize> {
     }
 }
 
+/// One pattern of a [`CompactSampleToGroup`] (`csgp`, §8.9.5): a run of
+/// `indices.len()` per-sample `sample_group_description_index` values
+/// (the *pattern*), replicated across `sample_count` consecutive groups
+/// of that length. The pattern therefore covers `sample_count *
+/// indices.len()` samples in total.
+///
+/// `pattern_length` is implicit from `indices.len()` (the builder writes
+/// it), matching the read side which reconstructs it the same way.
+#[derive(Clone, Debug, Default)]
+pub struct CompactSampleToGroupPattern {
+    /// `sample_count[i]` — number of consecutive groups (each
+    /// `indices.len()` samples long) that replay this pattern.
+    pub sample_count: u32,
+    /// `sample_group_description_index[i][1..=pattern_length]` — one
+    /// index per sample of the pattern. `0` means "member of no group of
+    /// this type"; in a `traf` the index's most-significant bit (for the
+    /// chosen field width) distinguishes a fragment-local description
+    /// (set) from a global one (clear). The raw value is written
+    /// verbatim — the builder does not synthesise the fragment-local bit.
+    pub indices: Vec<u32>,
+}
+
+/// One `csgp` (CompactSampleToGroupBox, ISO/IEC 14496-12:2020 §8.9.5) to
+/// emit on a track — the compact alternative to [`SampleToGroup`].
+///
+/// Where `sbgp` emits one `(sample_count, group_description_index)` pair
+/// per run, `csgp` groups samples into a small set of **patterns** that
+/// are each replicated across the track: pattern `i` replays its
+/// `indices` for `sample_count[i]` consecutive groups. A track whose
+/// per-sample group membership is periodic (the common reason to pick the
+/// compact form) shrinks dramatically — the index run is bit-packed at
+/// the narrowest width that fits.
+///
+/// Pairs with an `sgpd` of the same `grouping_type` exactly like `sbgp`.
+#[derive(Clone, Debug, Default)]
+pub struct CompactSampleToGroup {
+    /// Four-byte grouping type matching the paired `sgpd`.
+    pub grouping_type: [u8; 4],
+    /// `grouping_type_parameter` — selects an alternative grouping of the
+    /// same type. `Some(_)` sets the flag-layout presence bit and emits
+    /// the optional `u32` field; `None` omits it.
+    pub grouping_type_parameter: Option<u32>,
+    /// The repeating index patterns, in emit order.
+    pub patterns: Vec<CompactSampleToGroupPattern>,
+}
+
+/// Map a maximum field value to the narrowest §8.9.5 2-bit size code.
+///
+/// The width function is `width = 4 << code` (code 0→4, 1→8, 2→16,
+/// 3→32 bits). The smallest code whose width holds `max` is chosen so a
+/// `csgp` is as compact as the data allows; an all-zero column still
+/// picks code 0 (4 bits), the spec's minimum width.
+fn size_code_for(max: u32) -> u8 {
+    if max <= 0xF {
+        0
+    } else if max <= 0xFF {
+        1
+    } else if max <= 0xFFFF {
+        2
+    } else {
+        3
+    }
+}
+
+/// MSB-first big-endian bit writer — the inverse of the demuxer's
+/// `BitCursor`. Accumulates bits into a byte buffer; the final partial
+/// byte is zero-padded on `finish` so the box body stays byte-aligned
+/// (§8.9.5 leaves no defined meaning for trailing pad bits, matching the
+/// read side which simply stops once every declared field is consumed).
+struct BitWriter {
+    out: Vec<u8>,
+    /// Bits already filled in the in-progress final byte (0..=7); `0`
+    /// means the buffer is byte-aligned and a fresh byte starts the next
+    /// write.
+    bits_filled: u8,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        BitWriter {
+            out: Vec::new(),
+            bits_filled: 0,
+        }
+    }
+
+    /// Write the low `n` bits (0..=32) of `value`, MSB-first. `n == 0`
+    /// writes nothing.
+    fn write(&mut self, value: u32, n: u32) {
+        debug_assert!(n <= 32);
+        for i in (0..n).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            if self.bits_filled == 0 {
+                self.out.push(0);
+            }
+            let last = self.out.len() - 1;
+            self.out[last] |= bit << (7 - self.bits_filled);
+            self.bits_filled = (self.bits_filled + 1) & 7;
+        }
+    }
+
+    /// Zero-pad the final partial byte and return the buffer.
+    fn finish(self) -> Vec<u8> {
+        self.out
+    }
+}
+
+/// Serialise a [`CompactSampleToGroup`] into a complete `csgp` box ready
+/// to append to a track's `stbl` (or a `traf`) body.
+///
+/// The three bit-field width codes (for `sample_group_description_index`,
+/// `sample_count`, and `pattern_length`) are chosen automatically as the
+/// narrowest §8.9.5 widths that hold every value present, and packed into
+/// the `FullBox.flags` field together with the
+/// `grouping_type_parameter_present` bit:
+///
+/// ```text
+///     index_size_code                 = flags[0..1]   (2 bits)
+///     count_size_code                 = flags[2..3]   (2 bits)
+///     pattern_size_code               = flags[4..5]   (2 bits)
+///     grouping_type_parameter_present = flags[6]       (1 bit)
+/// ```
+///
+/// The fixed-width header fields (`grouping_type`, optional
+/// `grouping_type_parameter`, `pattern_count`) are byte-aligned `u32`s;
+/// from `pattern_count` onward the `(pattern_length, sample_count)` array
+/// and then the flattened index run are bit-packed MSB-first at the
+/// chosen widths (no byte alignment between fields), the exact inverse of
+/// `demux::parse_csgp`. The returned slice includes the 8-byte ISO BMFF
+/// box header (`size:u32 + type='csgp'`).
+pub fn build_csgp(c: &CompactSampleToGroup) -> Vec<u8> {
+    let max_pattern_length = c
+        .patterns
+        .iter()
+        .map(|p| p.indices.len() as u32)
+        .max()
+        .unwrap_or(0);
+    let max_sample_count = c.patterns.iter().map(|p| p.sample_count).max().unwrap_or(0);
+    let max_index = c
+        .patterns
+        .iter()
+        .flat_map(|p| p.indices.iter().copied())
+        .max()
+        .unwrap_or(0);
+
+    let pattern_size_code = size_code_for(max_pattern_length);
+    let count_size_code = size_code_for(max_sample_count);
+    let index_size_code = size_code_for(max_index);
+    let pattern_w = 4u32 << pattern_size_code;
+    let count_w = 4u32 << count_size_code;
+    let index_w = 4u32 << index_size_code;
+
+    let gtpp = c.grouping_type_parameter.is_some();
+    // FullBox flags: index[0..1], count[2..3], pattern[4..5], gtpp[6].
+    let flags: u32 = (index_size_code as u32)
+        | ((count_size_code as u32) << 2)
+        | ((pattern_size_code as u32) << 4)
+        | (if gtpp { 1 } else { 0 } << 6);
+
+    let mut body = Vec::new();
+    body.push(0); // version 0
+    body.extend_from_slice(&flags.to_be_bytes()[1..]); // 24-bit flags
+    body.extend_from_slice(&c.grouping_type);
+    if let Some(p) = c.grouping_type_parameter {
+        body.extend_from_slice(&p.to_be_bytes());
+    }
+    body.extend_from_slice(&(c.patterns.len() as u32).to_be_bytes());
+
+    // Bit-packed region: all (pattern_length, sample_count) pairs first,
+    // then every pattern's index run flattened in order.
+    let mut bits = BitWriter::new();
+    for p in &c.patterns {
+        bits.write(p.indices.len() as u32, pattern_w);
+        bits.write(p.sample_count, count_w);
+    }
+    for p in &c.patterns {
+        for &idx in &p.indices {
+            bits.write(idx, index_w);
+        }
+    }
+    body.extend_from_slice(&bits.finish());
+
+    wrap(&CSGP, &body)
+}
+
 fn wrap(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let total = (8 + body.len()) as u32;
     let mut out = Vec::with_capacity(total as usize);
@@ -436,5 +620,159 @@ mod tests {
         assert_eq!(entries_common_length(&[vec![1, 2]]), Some(2));
         assert_eq!(entries_common_length(&[vec![1, 2], vec![3, 4]]), Some(2));
         assert_eq!(entries_common_length(&[vec![1], vec![2, 3]]), None);
+    }
+
+    #[test]
+    fn size_code_for_picks_narrowest_width() {
+        assert_eq!(size_code_for(0), 0); // all-zero still 4 bits
+        assert_eq!(size_code_for(0xF), 0); // 4-bit boundary
+        assert_eq!(size_code_for(0x10), 1); // needs 8 bits
+        assert_eq!(size_code_for(0xFF), 1);
+        assert_eq!(size_code_for(0x100), 2); // needs 16 bits
+        assert_eq!(size_code_for(0xFFFF), 2);
+        assert_eq!(size_code_for(0x1_0000), 3); // needs 32 bits
+        assert_eq!(size_code_for(u32::MAX), 3);
+    }
+
+    #[test]
+    fn bit_writer_msb_first() {
+        let mut w = BitWriter::new();
+        // 0b101 then 0b01 → 0b10101 padded to 0b1010_1000 = 0xA8.
+        w.write(0b101, 3);
+        w.write(0b01, 2);
+        let out = w.finish();
+        assert_eq!(out, vec![0xA8]);
+    }
+
+    #[test]
+    fn csgp_4bit_widths_byte_exact() {
+        // One pattern: pattern_length = 2, sample_count = 3, indices
+        // [1, 2]. All values ≤ 0xF → every size code is 0 (4-bit width),
+        // so flags = 0 and the bit-packed region is:
+        //   pattern_length=2 (4b) sample_count=3 (4b) → 0x23
+        //   idx[0]=1 (4b) idx[1]=2 (4b)               → 0x12
+        let c = CompactSampleToGroup {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            patterns: vec![CompactSampleToGroupPattern {
+                sample_count: 3,
+                indices: vec![1, 2],
+            }],
+        };
+        let b = build_csgp(&c);
+        // size = 8 (hdr) + 4 (full) + 4 (gt) + 4 (pattern_count) + 2 (bits)
+        assert_eq!(b.len(), 22);
+        assert_eq!(&b[0..4], &22u32.to_be_bytes());
+        assert_eq!(&b[4..8], b"csgp");
+        assert_eq!(&b[8..12], &[0, 0, 0, 0]); // version 0 + flags 0
+        assert_eq!(&b[12..16], b"roll");
+        assert_eq!(&b[16..20], &1u32.to_be_bytes()); // pattern_count
+        assert_eq!(b[20], 0x23); // pattern_length=2 | sample_count=3
+        assert_eq!(b[21], 0x12); // idx 1 | idx 2
+    }
+
+    #[test]
+    fn csgp_flags_encode_size_codes() {
+        // Force distinct codes: index needs 8 bits (0x10), count needs
+        // 16 bits (0x100), pattern_length is 1 → 4 bits.
+        let c = CompactSampleToGroup {
+            grouping_type: *b"sync",
+            grouping_type_parameter: None,
+            patterns: vec![CompactSampleToGroupPattern {
+                sample_count: 0x100,
+                indices: vec![0x10],
+            }],
+        };
+        let b = build_csgp(&c);
+        // flags: index_size_code=1 (bits0..1), count_size_code=2
+        // (bits2..3), pattern_size_code=0 (bits4..5), gtpp=0.
+        let flags = u32::from_be_bytes([0, b[9], b[10], b[11]]);
+        assert_eq!(flags & 0x3, 1); // index_size_code
+        assert_eq!((flags >> 2) & 0x3, 2); // count_size_code
+        assert_eq!((flags >> 4) & 0x3, 0); // pattern_size_code
+        assert_eq!((flags >> 6) & 0x1, 0); // gtpp
+    }
+
+    #[test]
+    fn csgp_with_grouping_type_parameter_sets_presence_bit() {
+        let c = CompactSampleToGroup {
+            grouping_type: *b"rap ",
+            grouping_type_parameter: Some(7),
+            patterns: vec![CompactSampleToGroupPattern {
+                sample_count: 1,
+                indices: vec![1],
+            }],
+        };
+        let b = build_csgp(&c);
+        let flags = u32::from_be_bytes([0, b[9], b[10], b[11]]);
+        assert_eq!((flags >> 6) & 0x1, 1); // gtpp bit set
+        assert_eq!(&b[12..16], b"rap ");
+        assert_eq!(&b[16..20], &7u32.to_be_bytes()); // grouping_type_parameter
+        assert_eq!(&b[20..24], &1u32.to_be_bytes()); // pattern_count
+    }
+
+    #[test]
+    fn csgp_empty_patterns_legal() {
+        let c = CompactSampleToGroup {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            patterns: vec![],
+        };
+        let b = build_csgp(&c);
+        // size = 8 + 4 + 4 + 4 = 20, pattern_count = 0, no bit region.
+        assert_eq!(b.len(), 20);
+        assert_eq!(&b[16..20], &0u32.to_be_bytes());
+    }
+
+    /// Build → parse round-trip through the canonical demuxer reader for
+    /// a spread of widths, the grouping_type_parameter, multiple
+    /// patterns, and the fragment-local high bit.
+    #[test]
+    fn csgp_roundtrip_through_parser() {
+        let cases = vec![
+            CompactSampleToGroup {
+                grouping_type: *b"roll",
+                grouping_type_parameter: None,
+                patterns: vec![CompactSampleToGroupPattern {
+                    sample_count: 3,
+                    indices: vec![1, 2],
+                }],
+            },
+            CompactSampleToGroup {
+                grouping_type: *b"rap ",
+                grouping_type_parameter: Some(42),
+                patterns: vec![
+                    CompactSampleToGroupPattern {
+                        sample_count: 0x100,
+                        indices: vec![0x10, 0, 0xFF],
+                    },
+                    CompactSampleToGroupPattern {
+                        sample_count: 1,
+                        indices: vec![0x1_0000],
+                    },
+                ],
+            },
+            CompactSampleToGroup {
+                grouping_type: *b"sync",
+                grouping_type_parameter: None,
+                // fragment-local high bit set on an 8-bit-wide index.
+                patterns: vec![CompactSampleToGroupPattern {
+                    sample_count: 5,
+                    indices: vec![0x8000_0001],
+                }],
+            },
+        ];
+        for c in &cases {
+            let bytes = build_csgp(c);
+            // Strip the 8-byte box header — parse_csgp_box takes the body.
+            let parsed = crate::demux::parse_csgp_box(&bytes[8..]).unwrap();
+            assert_eq!(parsed.grouping_type, c.grouping_type);
+            assert_eq!(parsed.grouping_type_parameter, c.grouping_type_parameter);
+            assert_eq!(parsed.patterns.len(), c.patterns.len());
+            for (pp, cp) in parsed.patterns.iter().zip(&c.patterns) {
+                assert_eq!(pp.sample_count, cp.sample_count);
+                assert_eq!(pp.indices, cp.indices);
+            }
+        }
     }
 }
