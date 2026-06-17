@@ -853,6 +853,28 @@ Sample-entry FourCCs resolve to these codec ids:
   complementary to the mastering-display (`mdcv`) / content-light-level
   (`clli`) metadata, which describe the *content's* mastering
   environment rather than the *viewer's* ambient one.
+- Bit rate (ISO/IEC 14496-12 §8.5.2, `btrt`): a `SampleEntry` (video /
+  audio / metadata / text) may carry, optionally, a `BitRateBox` — a
+  plain `Box` (no FullBox version/flags) with a fixed 12-byte body of
+  three big-endian `u32`s: `bufferSizeDB` (size of the decoding buffer
+  for the elementary stream, in bytes), `maxBitrate` (maximum rate in
+  bits/second over any one-second window), and `avgBitrate` (average
+  rate in bits/second over the whole presentation). It is the
+  codec-agnostic carriage of the same three bandwidth quantities the
+  MPEG-4 `esds` `DecoderConfigDescriptor` carries, usable by sample
+  entries that have no `esds` (`avc1` / `hvc1` / `av01` video, `Opus` /
+  `fLaC` audio, …). The three raw integers are surfaced verbatim on
+  `params.options` as `btrt_buffer_size_db`, `btrt_max_bitrate`, and
+  `btrt_avg_bitrate` (decimal) — an ABR packager validating a producer's
+  declared rates, or a player sizing its receive buffer, reads them
+  directly. The first `btrt` met on the active sample entry (`[0]`) wins
+  (one per elementary stream); a body shorter than the fixed 12 bytes is
+  dropped without aborting the open (the box is informational), and
+  trailing bytes beyond byte 12 are ignored. The structured record is
+  reachable via the public `oxideav_mp4::demux::parse_btrt_box(&[u8])`
+  entry point (typed `BtrtRecord` with `buffer_size_db`, `max_bitrate`,
+  `avg_bitrate`) for tooling holding the box body. Absent `btrt`, none
+  of the keys are emitted.
 
 ### Muxer
 

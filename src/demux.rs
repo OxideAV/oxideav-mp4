@@ -598,6 +598,31 @@ pub struct AmveRecord {
     pub ambient_light_y: u16,
 }
 
+/// Decoded `btrt` (BitRateBox, ISO/IEC 14496-12 §8.5.2).
+///
+/// A plain `Box` (NOT a `FullBox` — there is no `version` / `flags`
+/// byte) that may appear, optionally, at the end of any `SampleEntry`
+/// (video / audio / metadata / text). The body is a fixed 12 bytes of
+/// three big-endian `u32`s: the decoding buffer size and the elementary
+/// stream's maximum / average bit rate. It carries the same three
+/// bandwidth quantities that the MPEG-4 `esds`
+/// `DecoderConfigDescriptor` carries (`bufferSizeDB` / `maxBitrate` /
+/// `avgBitrate`), but in a codec-agnostic box usable by sample entries
+/// that do not carry an `esds` (e.g. `avc1` / `hvc1` / `av01` video,
+/// `Opus` / `fLaC` audio).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BtrtRecord {
+    /// Size of the decoding buffer for the elementary stream, in bytes
+    /// (§8.5.2.3 `bufferSizeDB`).
+    pub buffer_size_db: u32,
+    /// Maximum rate, in bits/second, over any window of one second
+    /// (§8.5.2.3 `maxBitrate`).
+    pub max_bitrate: u32,
+    /// Average rate, in bits/second, over the entire presentation
+    /// (§8.5.2.3 `avgBitrate`).
+    pub avg_bitrate: u32,
+}
+
 /// One `(rate, initial_delay)` pair from a `pdin`
 /// ProgressiveDownloadInfoBox (ISO/IEC 14496-12 §8.1.3).
 ///
@@ -971,6 +996,13 @@ struct Track {
     /// `amve`, the first encountered wins (a single nominal environment
     /// per track).
     amve: Option<AmveRecord>,
+    /// §8.5.2 — `btrt` (BitRateBox) found inside the track's active
+    /// `SampleEntry` (`[0]`). Carries `bufferSizeDB` / `maxBitrate` /
+    /// `avgBitrate`, the codec-agnostic bandwidth descriptor a player or
+    /// ABR packager reads without an `esds`. `None` when the sample
+    /// entry omits it (common). When several sample entries each carry a
+    /// `btrt`, the first encountered (on the active entry) wins.
+    btrt: Option<BtrtRecord>,
     /// §12.4.2 / §8.4.5 — `hmhd` (HintMediaHeaderBox). Present for hint
     /// tracks (a `hdlr` of type `hint`); the spec marks exactly one
     /// media header mandatory inside `minf`, and a hint track uses this
@@ -2036,6 +2068,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         cslg: None,
         vmhd: None,
         amve: None,
+        btrt: None,
         hmhd: None,
         dref: None,
         stsh: Vec::new(),
@@ -3529,6 +3562,14 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             // it themselves. For decoders that don't need it the bytes
             // are harmless extra context.
             b"dac3" | b"dec3" => t.extradata = body,
+            // BitRateBox (ISO/IEC 14496-12 §8.5.2) — optional, at the end
+            // of any sample entry including audio. First wins; short body
+            // dropped (informational).
+            b"btrt" if t.btrt.is_none() => {
+                if let Some(rec) = parse_btrt(&body) {
+                    t.btrt = Some(rec);
+                }
+            }
             _ => {}
         }
     }
@@ -3730,6 +3771,16 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
                     t.amve = Some(rec);
                 }
             }
+            // BitRateBox (ISO/IEC 14496-12 §8.5.2) — an optional plain
+            // Box (no FullBox version/flags) at the end of the sample
+            // entry carrying `bufferSizeDB` / `maxBitrate` / `avgBitrate`.
+            // First one on the active entry wins; a short body is dropped
+            // (informational — it never aborts the open).
+            b"btrt" if t.btrt.is_none() => {
+                if let Some(rec) = parse_btrt(&body) {
+                    t.btrt = Some(rec);
+                }
+            }
             _ => {}
         }
     }
@@ -3755,6 +3806,30 @@ fn parse_amve(body: &[u8]) -> Option<AmveRecord> {
         ambient_illuminance,
         ambient_light_x,
         ambient_light_y,
+    })
+}
+
+/// Parse a `btrt` (BitRateBox, ISO/IEC 14496-12 §8.5.2) body — the 12
+/// bytes after the plain 8-byte box header (`btrt` is a `Box`, not a
+/// `FullBox`, so there is no version/flags preamble).
+///
+/// The body is exactly three big-endian `u32`s: `bufferSizeDB`,
+/// `maxBitrate`, `avgBitrate`. Returns `None` for a body shorter than
+/// 12 bytes (a truncated box). Trailing bytes beyond byte 12 — none are
+/// defined by §8.5.2, but a future edition could append fields — are
+/// ignored so an extended box still parses, matching the `parse_amve`
+/// posture.
+fn parse_btrt(body: &[u8]) -> Option<BtrtRecord> {
+    if body.len() < 12 {
+        return None;
+    }
+    let buffer_size_db = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    let max_bitrate = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    let avg_bitrate = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+    Some(BtrtRecord {
+        buffer_size_db,
+        max_bitrate,
+        avg_bitrate,
     })
 }
 
@@ -6892,6 +6967,27 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             .insert("amve_ambient_light_y", a.ambient_light_y.to_string());
     }
 
+    // ISO/IEC 14496-12 §8.5.2: when the track's active `SampleEntry`
+    // carried a `btrt` (BitRateBox), surface its three bandwidth fields
+    // on `params.options` as `btrt_buffer_size_db` (decoding buffer size
+    // in bytes), `btrt_max_bitrate`, and `btrt_avg_bitrate` (bits/second,
+    // over any one-second window / the whole presentation), all decimal.
+    // An ABR packager or buffer-sizing player reads these directly
+    // without parsing an `esds` (the box is codec-agnostic and present on
+    // sample entries that carry no MPEG-4 descriptor). Absent `btrt`,
+    // none of the keys are emitted.
+    if let Some(b) = &t.btrt {
+        params
+            .options
+            .insert("btrt_buffer_size_db", b.buffer_size_db.to_string());
+        params
+            .options
+            .insert("btrt_max_bitrate", b.max_bitrate.to_string());
+        params
+            .options
+            .insert("btrt_avg_bitrate", b.avg_bitrate.to_string());
+    }
+
     // ISO/IEC 14496-12 §12.4.2 / §8.4.5: when the track carries an
     // `hmhd` (HintMediaHeaderBox) — i.e. a hint track — surface its
     // protocol-independent streaming statistics on `params.options`:
@@ -8012,6 +8108,20 @@ pub fn parse_amve_box(body: &[u8]) -> Result<AmveRecord> {
     parse_amve(body).ok_or_else(|| Error::invalid("MP4: amve too short"))
 }
 
+/// Parse a standalone `btrt` (BitRateBox, ISO/IEC 14496-12 §8.5.2) body
+/// from `body` (the 12 bytes after the plain 8-byte box header — `btrt`
+/// is a `Box`, not a `FullBox`, so there is no version/flags preamble).
+///
+/// Exposed as a public entry point so tooling that already has the box's
+/// payload bytes in hand (a bitrate / bandwidth extractor, an ABR
+/// packager validating a producer's declared rates, a fixture checker)
+/// can recover the `(buffer_size_db, max_bitrate, avg_bitrate)` triple
+/// without re-running `open()`. Returns `Err` for a body shorter than
+/// the fixed 12-byte layout; trailing bytes beyond byte 12 are ignored.
+pub fn parse_btrt_box(body: &[u8]) -> Result<BtrtRecord> {
+    parse_btrt(body).ok_or_else(|| Error::invalid("MP4: btrt too short"))
+}
+
 use std::io::Read;
 
 fn read_bytes_vec<R: Read + ?Sized>(r: &mut R, n: usize) -> Result<Vec<u8>> {
@@ -8194,6 +8304,7 @@ mod tests {
             cslg: None,
             vmhd: None,
             amve: None,
+            btrt: None,
             hmhd: None,
             dref: None,
             stsh: Vec::new(),
@@ -10840,6 +10951,158 @@ mod tests {
         assert_eq!(info.params.options.get("amve_ambient_illuminance"), None);
         assert_eq!(info.params.options.get("amve_ambient_light_x"), None);
         assert_eq!(info.params.options.get("amve_ambient_light_y"), None);
+    }
+
+    /// Build a 12-byte `btrt` body (BitRateBox): `bufferSizeDB` +
+    /// `maxBitrate` + `avgBitrate`, all big-endian u32.
+    fn btrt_body(buf: u32, max: u32, avg: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12);
+        out.extend_from_slice(&buf.to_be_bytes());
+        out.extend_from_slice(&max.to_be_bytes());
+        out.extend_from_slice(&avg.to_be_bytes());
+        out
+    }
+
+    /// `parse_btrt` decodes the three big-endian u32 fields field-for-field.
+    #[test]
+    fn parse_btrt_three_u32_fields() {
+        let body = btrt_body(65_536, 5_000_000, 3_200_000);
+        let rec = super::parse_btrt(&body).expect("btrt should parse");
+        assert_eq!(rec.buffer_size_db, 65_536);
+        assert_eq!(rec.max_bitrate, 5_000_000);
+        assert_eq!(rec.avg_bitrate, 3_200_000);
+    }
+
+    /// `parse_btrt` ignores bytes past the fixed 12-byte body rather than
+    /// failing, matching the `parse_amve` posture.
+    #[test]
+    fn parse_btrt_tolerates_trailing_bytes() {
+        let mut body = btrt_body(1, 2, 3);
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let rec = super::parse_btrt(&body).expect("btrt should parse");
+        assert_eq!(rec.buffer_size_db, 1);
+        assert_eq!(rec.max_bitrate, 2);
+        assert_eq!(rec.avg_bitrate, 3);
+    }
+
+    /// A body shorter than the fixed 12 bytes is rejected; the public
+    /// entry returns `Err` for the same input.
+    #[test]
+    fn parse_btrt_rejects_short_body() {
+        assert!(super::parse_btrt(&[0u8; 11]).is_none());
+        assert!(super::parse_btrt(&[]).is_none());
+        assert!(super::parse_btrt_box(&[0u8; 11]).is_err());
+    }
+
+    /// The public `parse_btrt_box` entry decodes a well-formed body.
+    #[test]
+    fn parse_btrt_box_public_entry() {
+        let body = btrt_body(8_192, 1_500_000, 900_000);
+        let rec = super::parse_btrt_box(&body).expect("btrt should parse");
+        assert_eq!(rec.buffer_size_db, 8_192);
+        assert_eq!(rec.max_bitrate, 1_500_000);
+        assert_eq!(rec.avg_bitrate, 900_000);
+    }
+
+    /// `parse_video_sample_entry` lands a `btrt` child box on the track.
+    #[test]
+    fn parse_video_sample_entry_picks_up_btrt() {
+        let btrt = wrap_box_full_size(b"btrt", &btrt_body(131_072, 8_000_000, 6_000_000));
+        let entry = video_sample_entry_body(3840, 2160, &btrt);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        super::parse_video_sample_entry(&entry, &mut t).unwrap();
+
+        assert_eq!(t.width, Some(3840));
+        let b = t.btrt.expect("btrt should be parsed");
+        assert_eq!(b.buffer_size_db, 131_072);
+        assert_eq!(b.max_bitrate, 8_000_000);
+        assert_eq!(b.avg_bitrate, 6_000_000);
+    }
+
+    /// First `btrt` wins when two sample-entry child boxes carry one.
+    #[test]
+    fn parse_video_sample_entry_btrt_first_wins() {
+        let mut children = wrap_box_full_size(b"btrt", &btrt_body(1, 2, 3));
+        children.extend(wrap_box_full_size(b"btrt", &btrt_body(9, 9, 9)));
+        let entry = video_sample_entry_body(640, 480, &children);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        super::parse_video_sample_entry(&entry, &mut t).unwrap();
+        let b = t.btrt.expect("btrt should be parsed");
+        assert_eq!(b.buffer_size_db, 1);
+        assert_eq!(b.max_bitrate, 2);
+        assert_eq!(b.avg_bitrate, 3);
+    }
+
+    /// A malformed (too-short) `btrt` child box is dropped silently — the
+    /// sample entry still parses (width/height land) with no `btrt`.
+    #[test]
+    fn parse_video_sample_entry_drops_malformed_btrt() {
+        let btrt = wrap_box_full_size(b"btrt", &[0u8; 8]); // too short
+        let entry = video_sample_entry_body(1280, 720, &btrt);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        super::parse_video_sample_entry(&entry, &mut t).unwrap();
+        assert_eq!(t.width, Some(1280));
+        assert!(t.btrt.is_none());
+    }
+
+    /// `parse_audio_sample_entry` also lands a `btrt` (the box is
+    /// codec-agnostic and may follow any sample entry, §8.5.2).
+    #[test]
+    fn parse_audio_sample_entry_picks_up_btrt() {
+        let btrt = wrap_box_full_size(b"btrt", &btrt_body(4_096, 256_000, 192_000));
+        let mut entry = audio_sample_entry_body(2, 1);
+        entry.extend_from_slice(&btrt);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Audio;
+        super::parse_audio_sample_entry(&entry, &mut t).unwrap();
+
+        assert_eq!(t.channels, Some(2));
+        let b = t.btrt.expect("btrt should be parsed");
+        assert_eq!(b.buffer_size_db, 4_096);
+        assert_eq!(b.max_bitrate, 256_000);
+        assert_eq!(b.avg_bitrate, 192_000);
+    }
+
+    /// Surfacing: a parsed `btrt` exposes the three fields (decimal) on
+    /// `params.options`.
+    #[test]
+    fn build_stream_info_surfaces_btrt_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.btrt = Some(super::BtrtRecord {
+            buffer_size_db: 131_072,
+            max_bitrate: 8_000_000,
+            avg_bitrate: 6_000_000,
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("btrt_buffer_size_db"),
+            Some("131072")
+        );
+        assert_eq!(info.params.options.get("btrt_max_bitrate"), Some("8000000"));
+        assert_eq!(info.params.options.get("btrt_avg_bitrate"), Some("6000000"));
+    }
+
+    /// Absence: a track with no `btrt` emits none of the `btrt_*` keys.
+    #[test]
+    fn build_stream_info_no_btrt_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("btrt_buffer_size_db"), None);
+        assert_eq!(info.params.options.get("btrt_max_bitrate"), None);
+        assert_eq!(info.params.options.get("btrt_avg_bitrate"), None);
     }
 
     /// Build a `dref` body: FullBox(0,0) preamble + entry_count + the

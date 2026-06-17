@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Round 329 — Bit Rate Box (btrt) inside any SampleEntry: typed BtrtRecord + public parse_btrt_box, surfaced on params.options as btrt_buffer_size_db / btrt_max_bitrate / btrt_avg_bitrate (ISO/IEC 14496-12 §8.5.2)
 - Round 325 — Ambient Viewing Environment Box (amve) inside VisualSampleEntry: typed AmveRecord + public parse_amve_box, surfaced on params.options as amve_ambient_illuminance / amve_ambient_light_x / amve_ambient_light_y (ISO/IEC 14496-12 post-2015 / ISO/IEC 23091-3)
 - Round 320 — csgp CompactSampleToGroupBox builder (sample_groups::build_csgp) + public parse_csgp_box read entry point (ISO/IEC 14496-12:2020 §8.9.5)
 - Round 314 — Hint Media Header Box (hmhd) typed accessor (ISO/IEC 14496-12 §12.4.2)
