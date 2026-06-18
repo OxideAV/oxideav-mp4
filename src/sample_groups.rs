@@ -310,6 +310,15 @@ pub struct CompactSampleToGroup {
     /// same type. `Some(_)` sets the flag-layout presence bit and emits
     /// the optional `u32` field; `None` omits it.
     pub grouping_type_parameter: Option<u32>,
+    /// `index_msb_indicates_fragment_local_description` — flag-layout
+    /// **bit 7** (§8.9.5). Set it (only legal when emitting into a `traf`)
+    /// to declare that the most-significant bit of each index is a
+    /// fragment-local-vs-global `sgpd` source selector. The builder writes
+    /// each index value verbatim; it does not synthesise the selector bit,
+    /// so a caller that sets this must pre-set the high bit on indices that
+    /// should reference the fragment-local `sgpd`. Defaults to `false`
+    /// (`stbl` form / no MSB special-casing).
+    pub index_msb_indicates_fragment_local_description: bool,
     /// The repeating index patterns, in emit order.
     pub patterns: Vec<CompactSampleToGroupPattern>,
 }
@@ -384,10 +393,11 @@ impl BitWriter {
 /// `grouping_type_parameter_present` bit:
 ///
 /// ```text
-///     index_size_code                 = flags[0..1]   (2 bits)
-///     count_size_code                 = flags[2..3]   (2 bits)
-///     pattern_size_code               = flags[4..5]   (2 bits)
-///     grouping_type_parameter_present = flags[6]       (1 bit)
+///     index_size_code                              = flags[0..1] (2 bits)
+///     count_size_code                              = flags[2..3] (2 bits)
+///     pattern_size_code                            = flags[4..5] (2 bits)
+///     grouping_type_parameter_present              = flags[6]     (1 bit)
+///     index_msb_indicates_fragment_local_description = flags[7]   (1 bit)
 /// ```
 ///
 /// The fixed-width header fields (`grouping_type`, optional
@@ -420,11 +430,17 @@ pub fn build_csgp(c: &CompactSampleToGroup) -> Vec<u8> {
     let index_w = 4u32 << index_size_code;
 
     let gtpp = c.grouping_type_parameter.is_some();
-    // FullBox flags: index[0..1], count[2..3], pattern[4..5], gtpp[6].
+    // FullBox flags: index[0..1], count[2..3], pattern[4..5], gtpp[6],
+    // index_msb_indicates_fragment_local_description[7] (§8.9.5).
     let flags: u32 = (index_size_code as u32)
         | ((count_size_code as u32) << 2)
         | ((pattern_size_code as u32) << 4)
-        | (if gtpp { 1 } else { 0 } << 6);
+        | (if gtpp { 1 } else { 0 } << 6)
+        | (if c.index_msb_indicates_fragment_local_description {
+            1
+        } else {
+            0
+        } << 7);
 
     let mut body = Vec::new();
     body.push(0); // version 0
@@ -654,6 +670,7 @@ mod tests {
         let c = CompactSampleToGroup {
             grouping_type: *b"roll",
             grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: false,
             patterns: vec![CompactSampleToGroupPattern {
                 sample_count: 3,
                 indices: vec![1, 2],
@@ -678,6 +695,7 @@ mod tests {
         let c = CompactSampleToGroup {
             grouping_type: *b"sync",
             grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: false,
             patterns: vec![CompactSampleToGroupPattern {
                 sample_count: 0x100,
                 indices: vec![0x10],
@@ -698,6 +716,7 @@ mod tests {
         let c = CompactSampleToGroup {
             grouping_type: *b"rap ",
             grouping_type_parameter: Some(7),
+            index_msb_indicates_fragment_local_description: false,
             patterns: vec![CompactSampleToGroupPattern {
                 sample_count: 1,
                 indices: vec![1],
@@ -716,6 +735,7 @@ mod tests {
         let c = CompactSampleToGroup {
             grouping_type: *b"roll",
             grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: false,
             patterns: vec![],
         };
         let b = build_csgp(&c);
@@ -733,6 +753,7 @@ mod tests {
             CompactSampleToGroup {
                 grouping_type: *b"roll",
                 grouping_type_parameter: None,
+                index_msb_indicates_fragment_local_description: false,
                 patterns: vec![CompactSampleToGroupPattern {
                     sample_count: 3,
                     indices: vec![1, 2],
@@ -741,6 +762,7 @@ mod tests {
             CompactSampleToGroup {
                 grouping_type: *b"rap ",
                 grouping_type_parameter: Some(42),
+                index_msb_indicates_fragment_local_description: false,
                 patterns: vec![
                     CompactSampleToGroupPattern {
                         sample_count: 0x100,
@@ -755,6 +777,7 @@ mod tests {
             CompactSampleToGroup {
                 grouping_type: *b"sync",
                 grouping_type_parameter: None,
+                index_msb_indicates_fragment_local_description: false,
                 // fragment-local high bit set on an 8-bit-wide index.
                 patterns: vec![CompactSampleToGroupPattern {
                     sample_count: 5,

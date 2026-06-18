@@ -1231,8 +1231,93 @@ pub struct CsgpBox {
     /// presence bit is set, selecting one of several alternative
     /// groupings of the same type. `None` when the bit is clear.
     pub grouping_type_parameter: Option<u32>,
+    /// `index_msb_indicates_fragment_local_description` — flag layout
+    /// **bit 7** (`flags & 0x80`). When set (legal only inside a `traf`),
+    /// the most-significant bit of each `sample_group_description_index`,
+    /// at the field's [`index_field_bits`] width, is a *source selector*
+    /// rather than part of the index value: MSB = 0 → the index refers to
+    /// the `trak`/`moov`-level `sgpd` (global); MSB = 1 → it refers to the
+    /// fragment-local `sgpd` inside the enclosing `traf`. When clear, the
+    /// index is a plain `sgpd` index with no MSB special-casing. The
+    /// indices in [`CsgpPattern::indices`] are always preserved verbatim;
+    /// use [`CsgpPattern::resolve_index`] to split a stored index into its
+    /// (fragment-local, value) parts according to this flag and width.
+    pub index_msb_indicates_fragment_local_description: bool,
+    /// Bit width (`4`, `8`, `16`, or `32`) of each
+    /// `sample_group_description_index` field on disk — `4 << index_size_code`
+    /// where `index_size_code = flags & 0x3`. The MSB convention of
+    /// [`index_msb_indicates_fragment_local_description`] locates the
+    /// source-selector bit at position `index_field_bits - 1`, so a
+    /// resolver needs this to mask it correctly.
+    pub index_field_bits: u8,
     /// The repeating index patterns, in disk order.
     pub patterns: Vec<CsgpPattern>,
+}
+
+/// One resolved `sample_group_description_index` from a `csgp` whose
+/// [`CsgpBox::index_msb_indicates_fragment_local_description`] flag is
+/// set: the source-selector MSB has been split off from the index value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CsgpResolvedIndex {
+    /// `true` when the field's MSB was set: the index refers to a
+    /// description in the **fragment-local** `sgpd` (inside the enclosing
+    /// `traf`). `false` → the **global** (`trak`/`moov`-level) `sgpd`.
+    /// Always `false` when the box's flag is clear.
+    pub fragment_local: bool,
+    /// The group-description index with the source-selector MSB stripped
+    /// (1-based into the chosen `sgpd`; `0` means "member of no group").
+    /// When the box's flag is clear this is the verbatim stored value.
+    pub value: u32,
+}
+
+impl CsgpPattern {
+    /// Resolve the `n`-th stored index of this pattern against the box's
+    /// MSB convention.
+    ///
+    /// When `index_msb_indicates_fragment_local_description` is set (only
+    /// legal inside a `traf`), the most-significant bit of the field — at
+    /// `index_field_bits` width — selects the `sgpd` source and is
+    /// stripped from the value (ISO/IEC 14496-12:2020 §8.9.5). When it is
+    /// clear, the index is returned verbatim with `fragment_local =
+    /// false`. Returns `None` if `n` is out of range.
+    pub fn resolve_index(
+        &self,
+        n: usize,
+        index_msb_indicates_fragment_local_description: bool,
+        index_field_bits: u8,
+    ) -> Option<CsgpResolvedIndex> {
+        let raw = *self.indices.get(n)?;
+        Some(resolve_csgp_index(
+            raw,
+            index_msb_indicates_fragment_local_description,
+            index_field_bits,
+        ))
+    }
+}
+
+/// Split a raw `csgp` index into its (fragment-local, value) parts.
+///
+/// Shared by [`CsgpPattern::resolve_index`]. With the MSB convention
+/// active, the selector bit sits at `index_field_bits - 1`; it is read
+/// and masked off. A `index_field_bits` of 0 (degenerate) is treated as
+/// "no MSB", returning the value verbatim.
+fn resolve_csgp_index(
+    raw: u32,
+    msb_is_fragment_local: bool,
+    index_field_bits: u8,
+) -> CsgpResolvedIndex {
+    if !msb_is_fragment_local || index_field_bits == 0 || index_field_bits > 32 {
+        return CsgpResolvedIndex {
+            fragment_local: false,
+            value: raw,
+        };
+    }
+    let msb_pos = index_field_bits - 1;
+    let msb_mask = 1u32 << msb_pos;
+    CsgpResolvedIndex {
+        fragment_local: raw & msb_mask != 0,
+        value: raw & (msb_mask - 1),
+    }
 }
 
 /// One sub-sample of a `subs` (SubSampleInformationBox, §8.7.7) entry.
@@ -4425,6 +4510,9 @@ pub fn parse_csgp(body: &[u8]) -> Result<CsgpBox> {
     let count_size_code = ((flags >> 2) & 0x3) as u8;
     let pattern_size_code = ((flags >> 4) & 0x3) as u8;
     let gtpp = (flags >> 6) & 0x1 == 1;
+    // Flag layout bit 7 (§8.9.5): when set, the MSB of each index is a
+    // fragment-local-vs-global source selector (only legal in a `traf`).
+    let index_msb_indicates_fragment_local_description = (flags >> 7) & 0x1 == 1;
     let width = |code: u8| -> u32 { 4u32 << code };
     let index_w = width(index_size_code);
     let count_w = width(count_size_code);
@@ -4491,6 +4579,8 @@ pub fn parse_csgp(body: &[u8]) -> Result<CsgpBox> {
     Ok(CsgpBox {
         grouping_type,
         grouping_type_parameter,
+        index_msb_indicates_fragment_local_description,
+        index_field_bits: index_w as u8,
         patterns,
     })
 }
@@ -7163,6 +7253,12 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         let mut v = render_grouping_type(&cg.grouping_type);
         if let Some(p) = cg.grouping_type_parameter {
             v.push_str(&format!(" param={}", p));
+        }
+        // §8.9.5 flag bit 7: when set, the high bit of each index is a
+        // fragment-local-vs-global source selector. Mark it so tooling
+        // reading the flat surface knows the indices need MSB resolution.
+        if cg.index_msb_indicates_fragment_local_description {
+            v.push_str(" fraglocal");
         }
         for pat in &cg.patterns {
             v.push(' ');
@@ -11697,6 +11793,89 @@ mod tests {
         body.extend_from_slice(&0x8000_0001u32.to_be_bytes()); // frag-local idx
         let cg = super::parse_csgp(&body).unwrap();
         assert_eq!(cg.patterns[0].indices, vec![0x8000_0001]);
+    }
+
+    /// §8.9.5 flag bit 7 — `index_msb_indicates_fragment_local_description`
+    /// is captured from `flags & 0x80`, the index field width is recorded,
+    /// and the per-index resolver splits the source-selector MSB off the
+    /// stored value while leaving the raw index verbatim.
+    #[test]
+    fn parse_csgp_captures_fragment_local_flag_and_resolves_msb() {
+        // 8-bit index width (index_size_code=1) + bit 7 set:
+        // flags = 1 | (0<<2) | (0<<4) | (1<<7) = 0x81. count/pattern at
+        // 4-bit (code 0). pattern_length=3, sample_count=2 → 0x32 byte.
+        // indices 0x80,0x01,0x83 each one byte (8-bit width).
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0x81]);
+        body.extend_from_slice(b"seig");
+        body.extend_from_slice(&1u32.to_be_bytes()); // pattern_count
+        body.push(0x32); // pattern_length=3 (4b) | sample_count=2 (4b)
+        body.extend_from_slice(&[0x80, 0x01, 0x83]); // three 8-bit indices
+        let cg = super::parse_csgp(&body).unwrap();
+
+        assert!(cg.index_msb_indicates_fragment_local_description);
+        assert_eq!(cg.index_field_bits, 8);
+        // Raw values preserved.
+        assert_eq!(cg.patterns[0].indices, vec![0x80, 0x01, 0x83]);
+
+        let pat = &cg.patterns[0];
+        let r0 = pat
+            .resolve_index(
+                0,
+                cg.index_msb_indicates_fragment_local_description,
+                cg.index_field_bits,
+            )
+            .unwrap();
+        assert!(r0.fragment_local);
+        assert_eq!(r0.value, 0);
+        let r1 = pat
+            .resolve_index(
+                1,
+                cg.index_msb_indicates_fragment_local_description,
+                cg.index_field_bits,
+            )
+            .unwrap();
+        assert!(!r1.fragment_local);
+        assert_eq!(r1.value, 1);
+        let r2 = pat
+            .resolve_index(
+                2,
+                cg.index_msb_indicates_fragment_local_description,
+                cg.index_field_bits,
+            )
+            .unwrap();
+        assert!(r2.fragment_local);
+        assert_eq!(r2.value, 3);
+    }
+
+    /// The resolver passes indices through verbatim when the flag is clear,
+    /// and handles every documented width's MSB position.
+    #[test]
+    fn resolve_csgp_index_width_aware() {
+        // Flag clear → verbatim, never fragment-local.
+        let r = super::resolve_csgp_index(0x8000_0001, false, 32);
+        assert!(!r.fragment_local);
+        assert_eq!(r.value, 0x8000_0001);
+
+        // 4-bit width: MSB at bit 3 (mask 0x8).
+        let r = super::resolve_csgp_index(0x9, true, 4);
+        assert!(r.fragment_local);
+        assert_eq!(r.value, 0x1);
+
+        // 16-bit width: MSB at bit 15 (mask 0x8000).
+        let r = super::resolve_csgp_index(0x8001, true, 16);
+        assert!(r.fragment_local);
+        assert_eq!(r.value, 0x1);
+
+        // 32-bit width: MSB at bit 31.
+        let r = super::resolve_csgp_index(0x8000_0005, true, 32);
+        assert!(r.fragment_local);
+        assert_eq!(r.value, 5);
+
+        // Degenerate width 0 → no MSB, verbatim.
+        let r = super::resolve_csgp_index(0xFF, true, 0);
+        assert!(!r.fragment_local);
+        assert_eq!(r.value, 0xFF);
     }
 
     /// A `csgp` truncated mid-index is rejected, not silently shortened.

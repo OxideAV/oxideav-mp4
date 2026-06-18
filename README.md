@@ -608,20 +608,30 @@ Sample-entry FourCCs resolve to these codec ids:
   overloaded to carry three 2-bit width selectors (`index_size_code`,
   `count_size_code`, `pattern_size_code`, each mapped to a field width
   via `width = 4 << code` → 4/8/16/32 bits) plus a
-  `grouping_type_parameter_present` bit. The body's variable-width
-  fields are bit-packed (no byte alignment between 4-/8-bit fields) and
-  read MSB-first: a `pattern_count`-long array of
+  `grouping_type_parameter_present` bit (bit 6) and an
+  `index_msb_indicates_fragment_local_description` bit (bit 7). The
+  body's variable-width fields are bit-packed (no byte alignment between
+  4-/8-bit fields) and read MSB-first: a `pattern_count`-long array of
   `(pattern_length, sample_count)` followed by the per-pattern
-  `sample_group_description_index` run. Each `csgp` is accumulated and
-  surfaced on `params.options` as `csgp_<n>`: the grouping type, an
-  optional `param=<P>`, then one `count*idx0,idx1,…` token per pattern
-  (`count` = `sample_count`, the index list = the pattern's per-sample
-  indices; 0 = "no group", fragment-local high-bit kept verbatim). It
-  shares `grouping_type` with the matching `sgpd_<m>`. Absent `csgp`,
-  no keys are emitted. The structured record is reachable via the public
+  `sample_group_description_index` run. When bit 7 is set (legal only in
+  a `traf`), the most-significant bit of each index — at the field's
+  on-disk width — is a fragment-local-vs-global `sgpd` source selector
+  rather than part of the index value; `CsgpBox` records the flag and the
+  index field width (`index_field_bits`), and
+  `CsgpPattern::resolve_index(n, flag, bits)` splits a stored index into
+  a `CsgpResolvedIndex { fragment_local, value }` while the raw indices
+  stay verbatim. Each `csgp` is accumulated and surfaced on
+  `params.options` as `csgp_<n>`: the grouping type, an optional
+  `param=<P>`, an optional `fraglocal` marker (bit 7 set), then one
+  `count*idx0,idx1,…` token per pattern (`count` = `sample_count`, the
+  index list = the pattern's per-sample indices; 0 = "no group",
+  fragment-local high-bit kept verbatim). It shares `grouping_type` with
+  the matching `sgpd_<m>`. Absent `csgp`, no keys are emitted. The
+  structured record is reachable via the public
   `oxideav_mp4::demux::parse_csgp_box(&[u8])` entry point (typed
-  `CsgpBox` / `CsgpPattern`) for tooling holding the box body; the
-  write side is `sample_groups::build_csgp` (see Muxer below).
+  `CsgpBox` / `CsgpPattern` / `CsgpResolvedIndex`) for tooling holding
+  the box body; the write side is `sample_groups::build_csgp` (see Muxer
+  below).
 - Sub-sample information (ISO/IEC 14496-12 §8.7.7, `subs`): a track's
   `stbl/subs` SubSampleInformationBox is an optional sparse table
   describing how selected samples decompose into smaller,
