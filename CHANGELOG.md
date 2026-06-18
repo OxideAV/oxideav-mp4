@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Round 337 — csgp pattern → sample expansion: `CsgpBox::resolve_samples(total_samples)` materialises one resolved `sample_group_description_index` per sample in decoding order — cycling each pattern's index run across its `sample_count` (cycle may end mid-pattern), padding trailing unmapped samples with the `sgpd` default (value 0), clamping a `sample_count` sum that overruns the track, and running every emitted index through the bit-7 fragment-local-vs-global MSB convention. Empty-index patterns map nothing rather than panicking (ISO/IEC 14496-12:2020 §8.9.5)
 - Round 335 — csgp index_msb_indicates_fragment_local_description (flag bit 7): CsgpBox now records the flag + index field width (index_field_bits); CsgpPattern::resolve_index splits the fragment-local-vs-global source-selector MSB into a CsgpResolvedIndex (raw indices stay verbatim); build_csgp emits bit 7; surfaced as a `fraglocal` marker on csgp_<n> (ISO/IEC 14496-12:2020 §8.9.5)
 - Round 329 — Bit Rate Box (btrt) inside any SampleEntry: typed BtrtRecord + public parse_btrt_box, surfaced on params.options as btrt_buffer_size_db / btrt_max_bitrate / btrt_avg_bitrate (ISO/IEC 14496-12 §8.5.2)
 - Round 325 — Ambient Viewing Environment Box (amve) inside VisualSampleEntry: typed AmveRecord + public parse_amve_box, surfaced on params.options as amve_ambient_illuminance / amve_ambient_light_x / amve_ambient_light_y (ISO/IEC 14496-12 post-2015 / ISO/IEC 23091-3)

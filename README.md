@@ -631,7 +631,16 @@ Sample-entry FourCCs resolve to these codec ids:
   `oxideav_mp4::demux::parse_csgp_box(&[u8])` entry point (typed
   `CsgpBox` / `CsgpPattern` / `CsgpResolvedIndex`) for tooling holding
   the box body; the write side is `sample_groups::build_csgp` (see Muxer
-  below).
+  below). `CsgpBox::resolve_samples(total_samples)` materialises the
+  compact patterns into one resolved index *per sample* in decoding order
+  — the same per-sample view `sbgp` already gives: each pattern's index
+  run is cycled across its `sample_count` (the cycle may end mid-pattern),
+  trailing samples not covered by any pattern take the `sgpd` default
+  (surfaced as `value == 0`, the "no group" sentinel the caller swaps for
+  the box's `default_group_description_index`), a `sample_count` sum that
+  overruns the track is clamped to `total_samples`, and every emitted
+  index is split through the bit-7 fragment-local-vs-global MSB
+  convention. An empty-index pattern maps nothing rather than panicking.
 - Sub-sample information (ISO/IEC 14496-12 §8.7.7, `subs`): a track's
   `stbl/subs` SubSampleInformationBox is an optional sparse table
   describing how selected samples decompose into smaller,

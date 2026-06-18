@@ -1320,6 +1320,72 @@ fn resolve_csgp_index(
     }
 }
 
+impl CsgpBox {
+    /// Expand the compact patterns into one resolved
+    /// `sample_group_description_index` per sample, in decoding order
+    /// (ISO/IEC 14496-12:2020 §8.9.5, "Pattern → sample mapping").
+    ///
+    /// `csgp` stores a small set of index *patterns* that are each cycled
+    /// across a run of samples; this method materialises the per-sample
+    /// mapping the same way `sbgp` already gives it, so a caller need not
+    /// re-derive the cycling rules:
+    ///
+    /// * Pattern `i` (with `pattern_length = indices.len()`) applies to its
+    ///   `sample_count[i]` samples. When `sample_count[i] > pattern_length`
+    ///   the index entries are **cycled** to cover all the samples; the
+    ///   cycle may end part-way through a pattern (no requirement that it
+    ///   divides evenly). When `sample_count[i] == pattern_length` the
+    ///   pattern is used once, un-repeated.
+    /// * A pattern with an empty index run (`pattern_length == 0`) cannot
+    ///   be cycled, so it contributes nothing and its `sample_count` is
+    ///   skipped (a malformed-but-bounded input rather than a hard error).
+    /// * If the sum of `sample_count[i]` is **less than** `total_samples`,
+    ///   the trailing unmapped samples take the `sgpd` default group, which
+    ///   this method surfaces as a resolved index with `value == 0`
+    ///   (`fragment_local == false`) — "member of no group of this type",
+    ///   exactly the same sentinel an explicit `0` index carries. The
+    ///   caller substitutes the `sgpd` `default_group_description_index`
+    ///   (if any) for those zeros, identically to the `sbgp` default rule.
+    /// * If the sum **exceeds** `total_samples` the reader behaviour is
+    ///   undefined per the spec; we clamp to `total_samples` so the output
+    ///   never exceeds the track's real sample count.
+    ///
+    /// Each emitted index is run through the box's MSB convention via
+    /// [`resolve_csgp_index`], so fragment-local vs global selection is
+    /// already split out (see
+    /// [`CsgpBox::index_msb_indicates_fragment_local_description`]).
+    pub fn resolve_samples(&self, total_samples: usize) -> Vec<CsgpResolvedIndex> {
+        let mut out: Vec<CsgpResolvedIndex> = Vec::with_capacity(total_samples);
+        'patterns: for pat in &self.patterns {
+            let plen = pat.indices.len();
+            if plen == 0 {
+                // No index entries to cycle — this pattern maps nothing.
+                continue;
+            }
+            for s in 0..pat.sample_count as usize {
+                if out.len() >= total_samples {
+                    break 'patterns;
+                }
+                let raw = pat.indices[s % plen];
+                out.push(resolve_csgp_index(
+                    raw,
+                    self.index_msb_indicates_fragment_local_description,
+                    self.index_field_bits,
+                ));
+            }
+        }
+        // Trailing samples not covered by any pattern take the sgpd default
+        // (surfaced as value 0 = "no group"); pad up to total_samples.
+        while out.len() < total_samples {
+            out.push(CsgpResolvedIndex {
+                fragment_local: false,
+                value: 0,
+            });
+        }
+        out
+    }
+}
+
 /// One sub-sample of a `subs` (SubSampleInformationBox, §8.7.7) entry.
 ///
 /// Fields decoded from the on-wire `unsigned int(16 or 32) subsample_size;
@@ -11876,6 +11942,150 @@ mod tests {
         let r = super::resolve_csgp_index(0xFF, true, 0);
         assert!(!r.fragment_local);
         assert_eq!(r.value, 0xFF);
+    }
+
+    /// §8.9.5 pattern → sample expansion: a pattern whose `sample_count`
+    /// exceeds its `pattern_length` cycles its index entries across the
+    /// samples, ending mid-pattern when the count does not divide evenly.
+    #[test]
+    fn csgp_resolve_samples_cycles_pattern() {
+        // Single pattern: indices [10, 20, 30], sample_count = 7. The
+        // length-3 run cycles: 10,20,30,10,20,30,10.
+        let cg = super::CsgpBox {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: false,
+            index_field_bits: 16,
+            patterns: vec![super::CsgpPattern {
+                sample_count: 7,
+                indices: vec![10, 20, 30],
+            }],
+        };
+        let resolved = cg.resolve_samples(7);
+        let values: Vec<u32> = resolved.iter().map(|r| r.value).collect();
+        assert_eq!(values, vec![10, 20, 30, 10, 20, 30, 10]);
+        assert!(resolved.iter().all(|r| !r.fragment_local));
+    }
+
+    /// §8.9.5: two patterns concatenate, each cycled across its own
+    /// `sample_count`, and `sample_count == pattern_length` uses the
+    /// pattern once un-repeated.
+    #[test]
+    fn csgp_resolve_samples_multi_pattern() {
+        let cg = super::CsgpBox {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: false,
+            index_field_bits: 16,
+            patterns: vec![
+                // length 2, count 2 → used once: 1,2
+                super::CsgpPattern {
+                    sample_count: 2,
+                    indices: vec![1, 2],
+                },
+                // length 1, count 3 → cycled: 9,9,9
+                super::CsgpPattern {
+                    sample_count: 3,
+                    indices: vec![9],
+                },
+            ],
+        };
+        let values: Vec<u32> = cg.resolve_samples(5).iter().map(|r| r.value).collect();
+        assert_eq!(values, vec![1, 2, 9, 9, 9]);
+    }
+
+    /// §8.9.5: when the patterns cover fewer than `total_samples` samples,
+    /// the trailing samples take the `sgpd` default — surfaced as value 0.
+    #[test]
+    fn csgp_resolve_samples_pads_trailing_default() {
+        let cg = super::CsgpBox {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: false,
+            index_field_bits: 16,
+            patterns: vec![super::CsgpPattern {
+                sample_count: 2,
+                indices: vec![5],
+            }],
+        };
+        // 2 mapped + 3 trailing defaults = 5.
+        let values: Vec<u32> = cg.resolve_samples(5).iter().map(|r| r.value).collect();
+        assert_eq!(values, vec![5, 5, 0, 0, 0]);
+    }
+
+    /// §8.9.5: a sum of `sample_count` exceeding `total_samples` is clamped
+    /// so the output never overruns the track's real sample count.
+    #[test]
+    fn csgp_resolve_samples_clamps_overflow() {
+        let cg = super::CsgpBox {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: false,
+            index_field_bits: 16,
+            patterns: vec![super::CsgpPattern {
+                sample_count: 100,
+                indices: vec![7],
+            }],
+        };
+        let resolved = cg.resolve_samples(3);
+        assert_eq!(resolved.len(), 3);
+        assert!(resolved.iter().all(|r| r.value == 7));
+    }
+
+    /// §8.9.5 expansion honours the fragment-local MSB convention: each
+    /// emitted index is split into (fragment_local, value) per the box's
+    /// flag and field width.
+    #[test]
+    fn csgp_resolve_samples_resolves_fragment_local_msb() {
+        // 8-bit indices, bit-7 flag set: 0x81 = frag-local value 1,
+        // 0x02 = global value 2.
+        let cg = super::CsgpBox {
+            grouping_type: *b"seig",
+            grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: true,
+            index_field_bits: 8,
+            patterns: vec![super::CsgpPattern {
+                sample_count: 4,
+                indices: vec![0x81, 0x02],
+            }],
+        };
+        let resolved = cg.resolve_samples(4);
+        assert_eq!(resolved.len(), 4);
+        assert!(resolved[0].fragment_local);
+        assert_eq!(resolved[0].value, 1);
+        assert!(!resolved[1].fragment_local);
+        assert_eq!(resolved[1].value, 2);
+        // Cycle repeats.
+        assert!(resolved[2].fragment_local);
+        assert_eq!(resolved[2].value, 1);
+        assert!(!resolved[3].fragment_local);
+        assert_eq!(resolved[3].value, 2);
+    }
+
+    /// §8.9.5: a pattern with an empty index run cannot be cycled and
+    /// contributes nothing — its `sample_count` is skipped without panic.
+    #[test]
+    fn csgp_resolve_samples_empty_pattern_skipped() {
+        let cg = super::CsgpBox {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: false,
+            index_field_bits: 16,
+            patterns: vec![
+                super::CsgpPattern {
+                    sample_count: 5,
+                    indices: vec![],
+                },
+                super::CsgpPattern {
+                    sample_count: 2,
+                    indices: vec![3],
+                },
+            ],
+        };
+        // Empty pattern maps nothing; second pattern maps 3,3; the rest
+        // of total_samples=4 pads with the default 0.
+        let values: Vec<u32> = cg.resolve_samples(4).iter().map(|r| r.value).collect();
+        assert_eq!(values, vec![3, 3, 0, 0]);
     }
 
     /// A `csgp` truncated mid-index is rejected, not silently shortened.
