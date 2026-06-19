@@ -40,6 +40,35 @@ use crate::muxer::{
 use crate::options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
 use crate::sample_entries::sample_entry_for;
 
+/// A queued `prft` (ProducerReferenceTimeBox, ISO/IEC 14496-12 §8.16.5)
+/// to emit immediately before the next fragment's `moof`.
+///
+/// Set via [`FragmentedMuxer::set_next_segment_prft`]; consumed (cleared)
+/// when that fragment is flushed, so each call annotates exactly one
+/// `moof`. The box relates UTC wall-clock time (`ntp_timestamp`, NTP
+/// 64-bit format) to a point on the reference track's media clock
+/// (`media_time`), letting a DASH/CMAF client correlate live-edge media
+/// time to absolute time without parsing sample data.
+#[derive(Clone, Copy, Debug)]
+pub struct PrftRequest {
+    /// `track_ID` of the reference track this box annotates.
+    pub reference_track_id: u32,
+    /// UTC time in NTP 64-bit format (high 32 bits = seconds since
+    /// 1900-01-01, low 32 bits = fractional seconds).
+    pub ntp_timestamp: u64,
+    /// The same instant on the reference track's media clock (decode
+    /// time, in the track's media timescale). Written as `u32` when it
+    /// fits and `force_v1` is false, else as `u64` (box version 1).
+    pub media_time: u64,
+    /// 24-bit FullBox `flags` (2022-edition annotation bits; `0` for the
+    /// 2015 edition). Only the low three bytes are written.
+    pub flags: u32,
+    /// Force box version 1 (64-bit `media_time`) even when `media_time`
+    /// would fit in `u32`. Lets a producer keep a uniform v1 layout
+    /// across a stream whose early `media_time`s happen to be small.
+    pub force_v1: bool,
+}
+
 /// One sample queued in a track's pending fragment.
 #[derive(Clone, Debug)]
 struct PendingSample {
@@ -184,6 +213,7 @@ pub fn open_fragmented_typed(
         header_written: false,
         trailer_written: false,
         styp_override: None,
+        pending_prft: None,
     })
 }
 
@@ -208,6 +238,11 @@ pub struct FragmentedMuxer {
     /// the next `flush_fragment`. Set via
     /// [`Self::write_fragmented_segment_with_styp`].
     styp_override: Option<([u8; 4], Vec<[u8; 4]>)>,
+    /// When `Some`, the next emitted fragment gets a `prft`
+    /// (ProducerReferenceTimeBox) written after any `sidx`/`styp` and
+    /// immediately before the `moof`; consumed (cleared) on the next
+    /// `flush_fragment`. Set via [`Self::set_next_segment_prft`].
+    pending_prft: Option<PrftRequest>,
 }
 
 impl Muxer for FragmentedMuxer {
@@ -381,6 +416,66 @@ impl FragmentedMuxer {
         self.styp_override = Some((major_brand, compat_brands.to_vec()));
     }
 
+    /// Queue a `prft` (ProducerReferenceTimeBox, ISO/IEC 14496-12
+    /// §8.16.5) to be written immediately before the *next* fragment's
+    /// `moof`.
+    ///
+    /// `prft` relates UTC wall-clock time (`ntp_timestamp`, in NTP
+    /// 64-bit 32.32 fixed-point format — high 32 bits seconds since
+    /// 1900-01-01, low 32 bits fractional seconds) to a point on the
+    /// reference track's media clock (`media_time`, in that track's media
+    /// timescale, decode time). A DASH/CMAF client uses it to map the
+    /// live-edge media time back to absolute time without parsing sample
+    /// data.
+    ///
+    /// Per §8.16.5 the box relates to the next `moof` in bitstream order
+    /// and must follow any `styp`/`sidx`; this method records the request
+    /// and the next `flush_fragment` emits it in that position. The
+    /// request is consumed (cleared) once that fragment is flushed, so
+    /// each call annotates exactly one fragment. Calling it again before
+    /// the next flush replaces the pending request.
+    ///
+    /// The box version is chosen automatically: version 0 (`u32`
+    /// `media_time`) when `media_time` fits in 32 bits, version 1 (`u64`)
+    /// otherwise. `flags` carries the 2022-edition annotation bits (pass
+    /// `0` for the 2015-edition layout); only the low three bytes are
+    /// written into the 24-bit FullBox `flags` field.
+    pub fn set_next_segment_prft(
+        &mut self,
+        reference_track_id: u32,
+        ntp_timestamp: u64,
+        media_time: u64,
+        flags: u32,
+    ) {
+        self.pending_prft = Some(PrftRequest {
+            reference_track_id,
+            ntp_timestamp,
+            media_time,
+            flags,
+            force_v1: false,
+        });
+    }
+
+    /// Like [`Self::set_next_segment_prft`] but forces box version 1
+    /// (64-bit `media_time`) regardless of the magnitude of
+    /// `media_time`. Use this to keep a uniform v1 layout across a stream
+    /// whose early `media_time` values happen to fit in `u32`.
+    pub fn set_next_segment_prft_v1(
+        &mut self,
+        reference_track_id: u32,
+        ntp_timestamp: u64,
+        media_time: u64,
+        flags: u32,
+    ) {
+        self.pending_prft = Some(PrftRequest {
+            reference_track_id,
+            ntp_timestamp,
+            media_time,
+            flags,
+            force_v1: true,
+        });
+    }
+
     /// Return true when the cadence policy says it's time to emit a
     /// fragment after the current packet.
     ///
@@ -503,7 +598,16 @@ impl FragmentedMuxer {
                     .map(|b| build_styp(b).len() as u64)
                     .unwrap_or(0)
             };
-            let subsegment_size = styp_size + moof_size + mdat_size;
+            // A queued `prft` is written inside this subsegment (between
+            // styp and moof), so its size counts toward the sidx
+            // referenced_size — otherwise a byte-range fetch driven by the
+            // sidx would fall short of the moof.
+            let prft_size: u64 = self
+                .pending_prft
+                .as_ref()
+                .map(|p| build_prft(p).len() as u64)
+                .unwrap_or(0);
+            let subsegment_size = styp_size + prft_size + moof_size + mdat_size;
             // EPT for this fragment on the anchor (first contributing) track
             // is the bmdt the track entered the fragment with.
             let anchor_idx = self
@@ -548,6 +652,15 @@ impl FragmentedMuxer {
         } else if let Some(brand) = &self.frag_options.styp {
             let styp = build_styp(brand);
             self.output.write_all(&styp)?;
+        }
+
+        // Optional `prft` (ProducerReferenceTimeBox §8.16.5). Per spec it
+        // relates to the *next* moof and must follow any styp/sidx, so it
+        // is written here, immediately before the moof. Consumed (cleared)
+        // so each request annotates exactly one fragment.
+        if let Some(prft) = self.pending_prft.take() {
+            let bytes = build_prft(&prft);
+            self.output.write_all(&bytes)?;
         }
 
         // Record the absolute byte offset of the moof BEFORE writing it —
@@ -912,6 +1025,40 @@ fn build_tfhd(t: &FragTrackState, defaults: FragmentDefaults) -> Vec<u8> {
         body.extend_from_slice(&f.to_be_bytes());
     }
     wrap_box(b"tfhd", &body)
+}
+
+/// §8.16.5 `prft` — ProducerReferenceTimeBox.
+///
+/// `FullBox('prft', version, flags)` whose body is `reference_track_ID`
+/// (`u32`), `ntp_timestamp` (`u64`, NTP 64-bit 32.32 fixed-point), then
+/// `media_time` (`u32` when `version == 0`, `u64` when `version == 1`).
+/// `flags` is `0` in the 2015 edition; the 2022 edition defines named
+/// annotation bits (encoder-input/output, finalization, file-write,
+/// arbitrary-association) that we pass through verbatim without changing
+/// the body layout. The box relates to the *next* `moof` in bitstream
+/// order, so the muxer emits it after any `sidx`/`styp` and immediately
+/// before the `moof`.
+fn build_prft(req: &PrftRequest) -> Vec<u8> {
+    // version 1 iff media_time doesn't fit in u32; the caller can also
+    // force v1 by setting `force_v1`.
+    let version: u8 = if req.force_v1 || req.media_time > u32::MAX as u64 {
+        1
+    } else {
+        0
+    };
+    let mut body = Vec::with_capacity(if version == 0 { 20 } else { 24 });
+    body.push(version);
+    // 24-bit flags, big-endian (low three bytes of req.flags).
+    let f = req.flags.to_be_bytes();
+    body.extend_from_slice(&[f[1], f[2], f[3]]);
+    body.extend_from_slice(&req.reference_track_id.to_be_bytes());
+    body.extend_from_slice(&req.ntp_timestamp.to_be_bytes());
+    if version == 0 {
+        body.extend_from_slice(&(req.media_time as u32).to_be_bytes());
+    } else {
+        body.extend_from_slice(&req.media_time.to_be_bytes());
+    }
+    wrap_box(b"prft", &body)
 }
 
 /// §8.8.12 `tfdt` — TrackFragmentDecodeTimeBox. Always v1 (u64 bmdt) so
