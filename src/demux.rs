@@ -4575,6 +4575,15 @@ pub fn parse_csgp(body: &[u8]) -> Result<CsgpBox> {
     let index_size_code = (flags & 0x3) as u8;
     let count_size_code = ((flags >> 2) & 0x3) as u8;
     let pattern_size_code = ((flags >> 4) & 0x3) as u8;
+    // §8.9.5 constraint: `pattern_size_code` and `count_size_code` must
+    // agree on whether the 4-bit width (code 0) is used — a 4-bit/non-4-bit
+    // mix is an invalid file. Reject it rather than mis-pack the interleaved
+    // (pattern_length, sample_count) pairs at disagreeing widths.
+    if (pattern_size_code == 0) != (count_size_code == 0) {
+        return Err(Error::invalid(
+            "MP4: csgp pattern_size_code/count_size_code disagree on 4-bit width",
+        ));
+    }
     let gtpp = (flags >> 6) & 0x1 == 1;
     // Flag layout bit 7 (§8.9.5): when set, the MSB of each index is a
     // fragment-local-vs-global source selector (only legal in a `traf`).
@@ -12105,6 +12114,54 @@ mod tests {
     #[test]
     fn parse_csgp_too_short() {
         assert!(super::parse_csgp(&[0u8, 0]).is_err());
+    }
+
+    /// §8.9.5: `pattern_size_code` and `count_size_code` must agree on
+    /// whether the 4-bit width is used. A box with `pattern_size_code = 0`
+    /// (4-bit) but `count_size_code = 1` (8-bit) is an invalid file and is
+    /// rejected rather than mis-decoded.
+    #[test]
+    fn parse_csgp_mixed_4bit_width_rejected() {
+        // flags = count_size_code(1) << 2 = 0x04: pattern_size_code = 0,
+        // count_size_code = 1, index_size_code = 0 → a 4/non-4 mix.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0x04]);
+        body.extend_from_slice(b"roll");
+        body.extend_from_slice(&0u32.to_be_bytes()); // pattern_count = 0
+        let err = super::parse_csgp(&body);
+        assert!(err.is_err(), "mixed 4-bit/non-4-bit width must be rejected");
+    }
+
+    /// The mirror case — `pattern_size_code = 1` (8-bit), `count_size_code
+    /// = 0` (4-bit) — is equally invalid and rejected.
+    #[test]
+    fn parse_csgp_mixed_4bit_width_rejected_other_way() {
+        // flags = pattern_size_code(1) << 4 = 0x10.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8, 0, 0, 0x10]);
+        body.extend_from_slice(b"roll");
+        body.extend_from_slice(&0u32.to_be_bytes()); // pattern_count = 0
+        assert!(super::parse_csgp(&body).is_err());
+    }
+
+    /// Both codes at 0 (4-bit) agree and parse fine; both ≥ 1 agree and
+    /// parse fine. (Guards against the constraint check over-rejecting.)
+    #[test]
+    fn parse_csgp_agreeing_widths_accepted() {
+        // both 4-bit (flags = 0), pattern_count = 0.
+        let mut both_4 = Vec::new();
+        both_4.extend_from_slice(&[0u8, 0, 0, 0]);
+        both_4.extend_from_slice(b"roll");
+        both_4.extend_from_slice(&0u32.to_be_bytes());
+        assert!(super::parse_csgp(&both_4).is_ok());
+
+        // both 8-bit: pattern_size_code = 1 (<<4 = 0x10), count_size_code =
+        // 1 (<<2 = 0x04) → flags = 0x14, pattern_count = 0.
+        let mut both_8 = Vec::new();
+        both_8.extend_from_slice(&[0u8, 0, 0, 0x14]);
+        both_8.extend_from_slice(b"roll");
+        both_8.extend_from_slice(&0u32.to_be_bytes());
+        assert!(super::parse_csgp(&both_8).is_ok());
     }
 
     /// `parse_stbl` accumulates multiple `sbgp`/`sgpd` instances (one per

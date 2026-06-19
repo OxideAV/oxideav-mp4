@@ -611,7 +611,13 @@ Sample-entry FourCCs resolve to these codec ids:
   `grouping_type_parameter_present` bit (bit 6) and an
   `index_msb_indicates_fragment_local_description` bit (bit 7). The
   body's variable-width fields are bit-packed (no byte alignment between
-  4-/8-bit fields) and read MSB-first: a `pattern_count`-long array of
+  4-/8-bit fields) and read MSB-first. The §8.9.5 constraint that
+  `pattern_size_code` and `count_size_code` must agree on whether the
+  4-bit width (code 0) is used is enforced on both sides: a box that
+  mixes 4-bit and non-4-bit between the two is rejected by the parser,
+  and the builder promotes a 4-bit code off code 0 if the other would be
+  wider so it never emits the invalid mix. The decoded body is a
+  `pattern_count`-long array of
   `(pattern_length, sample_count)` followed by the per-pattern
   `sample_group_description_index` run. When bit 7 is set (legal only in
   a `traf`), the most-significant bit of each index — at the field's

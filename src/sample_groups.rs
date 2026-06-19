@@ -422,9 +422,19 @@ pub fn build_csgp(c: &CompactSampleToGroup) -> Vec<u8> {
         .max()
         .unwrap_or(0);
 
-    let pattern_size_code = size_code_for(max_pattern_length);
-    let count_size_code = size_code_for(max_sample_count);
+    let mut pattern_size_code = size_code_for(max_pattern_length);
+    let mut count_size_code = size_code_for(max_sample_count);
     let index_size_code = size_code_for(max_index);
+    // §8.9.5 constraint: `pattern_size_code` and `count_size_code` must
+    // agree on whether the 4-bit width (code 0) is used — a 4-bit/non-4-bit
+    // mix is an invalid file. When exactly one of the two would pick code 0
+    // (4 bits) while the other needs a wider field, promote the 4-bit one to
+    // code 1 (8 bits) so the emitted box satisfies the constraint. (Both at
+    // code 0, or both ≥ code 1, already agree and are left untouched.)
+    if (pattern_size_code == 0) != (count_size_code == 0) {
+        pattern_size_code = pattern_size_code.max(1);
+        count_size_code = count_size_code.max(1);
+    }
     let pattern_w = 4u32 << pattern_size_code;
     let count_w = 4u32 << count_size_code;
     let index_w = 4u32 << index_size_code;
@@ -690,25 +700,59 @@ mod tests {
 
     #[test]
     fn csgp_flags_encode_size_codes() {
-        // Force distinct codes: index needs 8 bits (0x10), count needs
-        // 16 bits (0x100), pattern_length is 1 → 4 bits.
+        // Force distinct codes where pattern and count already AGREE on
+        // not-4-bit (both ≥ code 1), so no §8.9.5 promotion applies:
+        // index needs 8 bits (0x10 → code 1), count needs 16 bits (0x100
+        // → code 2), pattern_length is 0x20 → needs 8 bits (code 1).
         let c = CompactSampleToGroup {
             grouping_type: *b"sync",
             grouping_type_parameter: None,
             index_msb_indicates_fragment_local_description: false,
             patterns: vec![CompactSampleToGroupPattern {
                 sample_count: 0x100,
-                indices: vec![0x10],
+                // 0x20 entries → pattern_length = 0x20 needs 8-bit (code 1).
+                indices: vec![0x10; 0x20],
             }],
         };
         let b = build_csgp(&c);
         // flags: index_size_code=1 (bits0..1), count_size_code=2
-        // (bits2..3), pattern_size_code=0 (bits4..5), gtpp=0.
+        // (bits2..3), pattern_size_code=1 (bits4..5), gtpp=0.
         let flags = u32::from_be_bytes([0, b[9], b[10], b[11]]);
         assert_eq!(flags & 0x3, 1); // index_size_code
         assert_eq!((flags >> 2) & 0x3, 2); // count_size_code
-        assert_eq!((flags >> 4) & 0x3, 0); // pattern_size_code
+        assert_eq!((flags >> 4) & 0x3, 1); // pattern_size_code (not 4-bit)
         assert_eq!((flags >> 6) & 0x1, 0); // gtpp
+    }
+
+    /// §8.9.5 constraint: `pattern_size_code` and `count_size_code` must
+    /// agree on 4-bit usage. Here `pattern_length` fits in 4 bits (max 2)
+    /// but `sample_count` needs 8 bits (0x100 → 16-bit, actually code 2),
+    /// so the builder must NOT leave `pattern_size_code` at 0 (4-bit) — it
+    /// promotes it off 4-bit so the emitted box is valid, and the result
+    /// re-parses through the now-strict reader.
+    #[test]
+    fn csgp_builder_avoids_mixed_4bit_width() {
+        let c = CompactSampleToGroup {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: false,
+            patterns: vec![CompactSampleToGroupPattern {
+                sample_count: 0x100, // needs 16-bit (code 2)
+                indices: vec![1, 2], // pattern_length = 2 fits 4-bit
+            }],
+        };
+        let b = build_csgp(&c);
+        let flags = u32::from_be_bytes([0, b[9], b[10], b[11]]);
+        let pattern_code = (flags >> 4) & 0x3;
+        let count_code = (flags >> 2) & 0x3;
+        // count needs ≥ code 2; pattern must NOT stay at 4-bit (code 0).
+        assert!(count_code >= 2);
+        assert_ne!(pattern_code, 0, "pattern_size_code must not stay 4-bit");
+        // And the produced box round-trips through the strict parser.
+        let parsed = crate::demux::parse_csgp_box(&b[8..]).expect("must re-parse");
+        assert_eq!(parsed.patterns.len(), 1);
+        assert_eq!(parsed.patterns[0].sample_count, 0x100);
+        assert_eq!(parsed.patterns[0].indices, vec![1, 2]);
     }
 
     #[test]
