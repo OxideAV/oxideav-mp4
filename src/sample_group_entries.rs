@@ -34,7 +34,9 @@ use oxideav_core::{Error, Result};
 
 /// The four-byte `grouping_type` selecting one of the §10 entry layouts.
 ///
-/// `from_blob` / `to_blob` route to the matching typed parser/builder.
+/// [`from_fourcc`](Self::from_fourcc) maps an on-wire FourCC to its
+/// variant; [`decode_sample_group_entry`] routes a `(grouping_type, blob)`
+/// pair to the matching typed parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleGroupGroupingType {
     /// `roll` — VisualRollRecoveryEntry / AudioRollRecoveryEntry (§10.1).
@@ -82,6 +84,68 @@ impl SampleGroupGroupingType {
             Self::Sap => *b"sap ",
         }
     }
+}
+
+/// One decoded §10 sample-group description entry, tagged by its
+/// grouping type. The output of [`decode_sample_group_entry`] — the
+/// single typed dispatch point for the base-spec grouping types.
+///
+/// `roll` and `prol` both decode to [`SampleGroupEntry::Roll`] (their wire
+/// layout is identical); a caller distinguishes recovery-roll from
+/// pre-roll by the grouping type it passed in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SampleGroupEntry {
+    /// `roll` or `prol` (§10.1).
+    Roll(RollRecoveryEntry),
+    /// `rash` (§10.2).
+    RateShare(RateShareEntry),
+    /// `alst` (§10.3).
+    AlternativeStartup(AlternativeStartupEntry),
+    /// `rap ` (§10.4).
+    RandomAccessPoint(VisualRandomAccessEntry),
+    /// `tele` (§10.5).
+    TemporalLevel(TemporalLevelEntry),
+    /// `sap ` (§10.6).
+    Sap(SapEntry),
+}
+
+/// Decode one `sgpd` entry blob against its four-byte `grouping_type`.
+///
+/// Routes `(grouping_type, blob)` to the matching §10 typed parser and
+/// wraps the result in [`SampleGroupEntry`]. Returns `Ok(None)` for a
+/// grouping type the base specification does not define (a codec-binding
+/// type like `sync`, or the CENC `seig` — see [`crate::cenc::parse_seig`]):
+/// the caller keeps treating those entries as opaque blobs. Returns
+/// `Err(_)` only when the grouping type *is* a base-spec §10 type but the
+/// blob is malformed for that layout.
+///
+/// `blob` is exactly one entry's payload — the same bytes the demuxer
+/// stores per `sgpd` entry (rendered as the hex in each `sgpd_<n>`
+/// metadata token).
+pub fn decode_sample_group_entry(
+    grouping_type: &[u8; 4],
+    blob: &[u8],
+) -> Result<Option<SampleGroupEntry>> {
+    let Some(gt) = SampleGroupGroupingType::from_fourcc(grouping_type) else {
+        return Ok(None);
+    };
+    let entry = match gt {
+        SampleGroupGroupingType::Roll | SampleGroupGroupingType::Prol => {
+            SampleGroupEntry::Roll(parse_roll(blob)?)
+        }
+        SampleGroupGroupingType::RateShare => SampleGroupEntry::RateShare(parse_rash(blob)?),
+        SampleGroupGroupingType::AlternativeStartup => {
+            SampleGroupEntry::AlternativeStartup(parse_alst(blob)?)
+        }
+        SampleGroupGroupingType::RandomAccessPoint => {
+            SampleGroupEntry::RandomAccessPoint(parse_rap(blob)?)
+        }
+        SampleGroupGroupingType::TemporalLevel => {
+            SampleGroupEntry::TemporalLevel(parse_tele(blob)?)
+        }
+        SampleGroupGroupingType::Sap => SampleGroupEntry::Sap(parse_sap(blob)?),
+    };
+    Ok(Some(entry))
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +854,94 @@ mod tests {
         blob.extend_from_slice(&500u32.to_be_bytes());
         blob.extend_from_slice(&40u16.to_be_bytes());
         assert!(parse_rash(&blob).is_err());
+    }
+
+    #[test]
+    fn decode_dispatch_routes_each_type() {
+        // roll and prol both decode to the Roll variant.
+        let roll_blob = build_roll(&RollRecoveryEntry { roll_distance: -2 });
+        assert_eq!(
+            decode_sample_group_entry(b"roll", &roll_blob).unwrap(),
+            Some(SampleGroupEntry::Roll(RollRecoveryEntry {
+                roll_distance: -2
+            }))
+        );
+        assert_eq!(
+            decode_sample_group_entry(b"prol", &roll_blob).unwrap(),
+            Some(SampleGroupEntry::Roll(RollRecoveryEntry {
+                roll_distance: -2
+            }))
+        );
+
+        let rap_blob = build_rap(&VisualRandomAccessEntry {
+            num_leading_samples_known: true,
+            num_leading_samples: 1,
+        });
+        assert!(matches!(
+            decode_sample_group_entry(b"rap ", &rap_blob).unwrap(),
+            Some(SampleGroupEntry::RandomAccessPoint(_))
+        ));
+
+        let tele_blob = build_tele(&TemporalLevelEntry {
+            level_independently_decodable: true,
+        });
+        assert!(matches!(
+            decode_sample_group_entry(b"tele", &tele_blob).unwrap(),
+            Some(SampleGroupEntry::TemporalLevel(_))
+        ));
+
+        let sap_blob = build_sap(&SapEntry {
+            dependent_flag: false,
+            sap_type: 3,
+        });
+        assert!(matches!(
+            decode_sample_group_entry(b"sap ", &sap_blob).unwrap(),
+            Some(SampleGroupEntry::Sap(_))
+        ));
+
+        let alst_blob = build_alst(&AlternativeStartupEntry {
+            first_output_sample: 1,
+            sample_offsets: vec![0],
+            output_rate_pieces: vec![],
+        });
+        assert!(matches!(
+            decode_sample_group_entry(b"alst", &alst_blob).unwrap(),
+            Some(SampleGroupEntry::AlternativeStartup(_))
+        ));
+
+        let rash_blob = build_rash(&RateShareEntry {
+            single_target_rate_share: Some(50),
+            operation_points: vec![],
+            maximum_bitrate: 0,
+            minimum_bitrate: 0,
+            discard_priority: 1,
+        });
+        assert!(matches!(
+            decode_sample_group_entry(b"rash", &rash_blob).unwrap(),
+            Some(SampleGroupEntry::RateShare(_))
+        ));
+    }
+
+    #[test]
+    fn decode_unknown_type_is_none() {
+        // Non-base-spec grouping types stay opaque (Ok(None)), even with a
+        // non-empty blob — the caller keeps the verbatim bytes.
+        assert_eq!(
+            decode_sample_group_entry(b"sync", &[0x12, 0x34]).unwrap(),
+            None
+        );
+        assert_eq!(
+            decode_sample_group_entry(b"seig", &[0u8; 20]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_malformed_base_type_errors() {
+        // A recognised §10 type with a too-short blob surfaces the parse
+        // error rather than masking it as None.
+        assert!(decode_sample_group_entry(b"roll", &[]).is_err());
+        assert!(decode_sample_group_entry(b"rap ", &[]).is_err());
     }
 
     #[test]
