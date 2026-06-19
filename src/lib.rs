@@ -14,6 +14,7 @@ pub mod frag;
 pub mod muxer;
 pub mod options;
 mod sample_entries;
+pub mod sample_group_entries;
 pub mod sample_groups;
 pub mod styp;
 
