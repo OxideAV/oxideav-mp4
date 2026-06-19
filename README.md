@@ -603,6 +603,36 @@ Sample-entry FourCCs resolve to these codec ids:
   they are surfaced verbatim for a layer that knows the
   `grouping_type` semantics. Absent both boxes, none of the keys are
   emitted.
+- Typed §10 sample-group description entries (`sample_group_entries`
+  module): a typed interpretation layer over the opaque `sgpd` entry
+  blobs above, covering every `grouping_type` the **base** ISO/IEC
+  14496-12 standard defines in §10 — `roll` / `prol` `RollRecoveryEntry`
+  (signed `roll_distance`, §10.1.1), `rash` `RateShareEntry` (the
+  single- and multi-operation-point wire shapes keyed by
+  `operation_point_count`, §10.2.2), `alst` `AlternativeStartupEntry`
+  (the variable `roll_count`-long `sample_offset[]` array plus the
+  optional output-rate tail read "until the end of the structure",
+  §10.3.2), `rap ` `VisualRandomAccessEntry`
+  (`num_leading_samples_known` + 7-bit `num_leading_samples`, §10.4.2),
+  `tele` `TemporalLevelEntry` (`level_independently_decodable`,
+  §10.5.2), and `sap ` `SAPEntry` (`dependent_flag` + 4-bit `SAP_type`,
+  §10.6.2). Each type has a `parse_*` decoder and a `build_*` builder
+  that round-trip byte-exact; `decode_sample_group_entry(grouping_type,
+  blob)` is the single typed dispatch point — it routes a
+  `(grouping_type, blob)` pair (the same per-entry bytes the `sgpd_<n>`
+  metadata renders as hex) to the matching parser and returns
+  `Ok(Some(SampleGroupEntry))`, `Ok(None)` for a grouping type the base
+  spec does not define (a codec-binding type like `sync`, or the CENC
+  `seig` — handled by `cenc::parse_seig`), so a caller keeps the
+  verbatim blob for those, and `Err(_)` only when a recognised §10 type
+  carries a malformed payload. Bit-packed single-byte entries ignore
+  reserved bits on read (§10.6.3 "allow and ignore reserved") and mask
+  sub-byte fields to their declared widths on build; the parsers
+  tolerate trailing bytes from a future edition except where the tail
+  carries meaning (`alst`'s output-rate pieces, `rash`'s point list).
+  This mirrors the `seig` precedent — typed grouping-type interpretation
+  layered above the container boundary, leaving the demuxer's opaque-blob
+  `sgpd_<n>` surface unchanged.
 - Compact sample-to-group (ISO/IEC 14496-12:2020 §8.9.5, `csgp`): the
   compact alternative to `sbgp` is parsed. The `FullBox.flags` field is
   overloaded to carry three 2-bit width selectors (`index_size_code`,
