@@ -1003,6 +1003,22 @@ also exposed via the public `oxideav_mp4::styp` module —
 mirroring the read-side `parse_styp` in oxideav-mov so a producer
 round-tripping a parsed `Styp` can emit the same byte sequence.
 
+A `prft` (ProducerReferenceTimeBox, ISO/IEC 14496-12 §8.16.5) can be
+attached to the *next* fragment via
+`FragmentedMuxer::set_next_segment_prft(reference_track_id,
+ntp_timestamp, media_time, flags)` (or `..._prft_v1(..)` to force the
+64-bit-`media_time` version-1 layout). The box is written immediately
+before that fragment's `moof`, after any `sidx`/`styp` — the position
+§8.16.5 requires since `prft` relates to the next `moof` in bitstream
+order — and its size is folded into the enclosing `sidx`
+`referenced_size` so a byte-range fetch still reaches the `moof`. The
+request is consumed per fragment (one `prft` per `moof`). `ntp_timestamp`
+is NTP 64-bit 32.32 fixed-point (high 32 bits = seconds since 1900-01-01,
+low 32 bits = fractional seconds); `media_time` is the same instant on
+the reference track's media clock (decode time). The box version is
+auto-selected (v0 `u32` `media_time` when it fits, else v1 `u64`). This
+is the write-side dual of the read-side `parse_prft_box` / `PrftRecord`.
+
 #### Sample-group muxing
 
 Sample groups (`sbgp` / `sgpd`, ISO/IEC 14496-12 §8.9.2 / §8.9.3) are
@@ -1083,9 +1099,6 @@ first that applies:
 
 ### Not (yet) supported
 
-- Fragmented-MP4 *muxing* — the demuxer reads `moof`+`mdat`
-  segments, but the muxer only emits a single moov-at-end (or
-  faststart) shape.
 - In-pipeline CENC decryption — the AES-128 CTR / CBC driver
   exists (`cenc_cipher::decrypt_sample_in_place`, all four §10
   schemes), but the demuxer does not invoke it automatically:
