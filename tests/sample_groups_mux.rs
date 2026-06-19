@@ -50,6 +50,7 @@ fn mux_with_sample_groups(stream: &StreamInfo, tsg: TrackSampleGroups) -> Vec<u8
         let ws: Box<dyn WriteSeek> = Box::new(f);
         let opts = Mp4MuxerOptions {
             track_sample_groups: vec![tsg],
+            large_mdat: false,
             ..Mp4MuxerOptions::default()
         };
         let mut mux =

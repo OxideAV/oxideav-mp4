@@ -281,14 +281,27 @@ impl Muxer for Mp4Muxer {
             // mdat payload to the output.
             self.output.write_all(&ftyp)?;
 
-            // Start mdat as a streaming box with a 32-bit size placeholder.
-            // Over-4GiB mdat requires the 64-bit `largesize` form; we don't
-            // currently reserve space for it, so `write_trailer` errors out
-            // if the payload grows beyond 4 GiB.
+            // Start mdat as a streaming box. The header form is chosen up
+            // front because the payload streams to the output before its
+            // final size is known. Default: a 32-bit `size` placeholder
+            // (8-byte header) — patched at trailer time, errors out if the
+            // payload exceeds 4 GiB. With `large_mdat`: the §4.2 extended
+            // form `[size=1]["mdat"][largesize:u64]` (16-byte header), so
+            // the payload may grow past 4 GiB; the u64 `largesize` is
+            // patched at trailer time.
             let pos = self.output.stream_position()?;
             self.mdat_size_offset = pos;
-            self.output.write_all(&[0, 0, 0, 0])?;
-            self.output.write_all(b"mdat")?;
+            if self.options.large_mdat {
+                // size == 1 signals "read the 64-bit largesize after the
+                // type" (§4.2). The largesize placeholder is zeroed now and
+                // backfilled in write_trailer_direct.
+                self.output.write_all(&1u32.to_be_bytes())?;
+                self.output.write_all(b"mdat")?;
+                self.output.write_all(&[0u8; 8])?;
+            } else {
+                self.output.write_all(&[0, 0, 0, 0])?;
+                self.output.write_all(b"mdat")?;
+            }
             self.mdat_start_offset = self.output.stream_position()?;
         }
 
@@ -405,13 +418,24 @@ impl Mp4Muxer {
         // Patch mdat size header. Current position == end of mdat payload.
         let end_pos = self.output.stream_position()?;
         let mdat_total = end_pos - self.mdat_size_offset;
-        if mdat_total <= u32::MAX as u64 {
+        if self.options.large_mdat {
+            // Extended form: the 32-bit `size` field already holds `1`; the
+            // real size is the 8-byte `largesize` immediately after the
+            // 4-byte type (i.e. at `mdat_size_offset + 8`). `mdat_total`
+            // here counts the full 16-byte header + payload, which is what
+            // §4.2 says `largesize` reports (the box's total size).
+            self.output
+                .seek(SeekFrom::Start(self.mdat_size_offset + 8))?;
+            self.output.write_all(&mdat_total.to_be_bytes())?;
+            self.output.seek(SeekFrom::Start(end_pos))?;
+        } else if mdat_total <= u32::MAX as u64 {
             self.output.seek(SeekFrom::Start(self.mdat_size_offset))?;
             self.output.write_all(&(mdat_total as u32).to_be_bytes())?;
             self.output.seek(SeekFrom::Start(end_pos))?;
         } else {
             return Err(Error::unsupported(
-                "mp4 muxer: mdat > 4 GiB requires largesize header (not yet supported)",
+                "mp4 muxer: mdat > 4 GiB requires largesize header; \
+                 set Mp4MuxerOptions::large_mdat = true",
             ));
         }
 
@@ -438,19 +462,20 @@ impl Mp4Muxer {
     /// its size to pick `stco` vs `co64`, then adding the base offset.
     fn write_trailer_faststart(&mut self) -> Result<()> {
         let ftyp_size = self.ftyp_bytes.len() as u64;
-        let mdat_header_size: u64 = 8; // 32-bit placeholder (no largesize).
 
         let mdat_payload = self
             .mdat_buffer
             .take()
             .map(|c| c.into_inner())
             .unwrap_or_default();
-        let mdat_total = mdat_header_size + mdat_payload.len() as u64;
-        if mdat_total > u32::MAX as u64 {
-            return Err(Error::unsupported(
-                "mp4 muxer: faststart mdat > 4 GiB requires largesize header (not yet supported)",
-            ));
-        }
+        // faststart buffers the whole payload, so the size is known here:
+        // pick the §4.2 extended (16-byte) header when the caller asked for
+        // it OR when the compact 32-bit `size` would overflow. Otherwise the
+        // compact 8-byte header (byte-identical to the historical output).
+        let payload_len = mdat_payload.len() as u64;
+        let needs_large = self.options.large_mdat || (8 + payload_len) > u32::MAX as u64;
+        let mdat_header_size: u64 = if needs_large { 16 } else { 8 };
+        let mdat_total = mdat_header_size + payload_len;
 
         // Iteratively converge on moov_size. Because chunk-offset width (stco
         // 32-bit vs co64 64-bit) is chosen per build_moov call and depends on
@@ -493,9 +518,17 @@ impl Mp4Muxer {
         // moov followed by mdat (header + payload).
         self.output.seek(SeekFrom::Start(ftyp_size))?;
         self.output.write_all(&moov_bytes)?;
-        // mdat box: 32-bit size + "mdat" + payload.
-        self.output.write_all(&(mdat_total as u32).to_be_bytes())?;
-        self.output.write_all(b"mdat")?;
+        // mdat box header: compact 32-bit `size` or §4.2 extended
+        // `[size=1]["mdat"][largesize:u64]`, matching the size baked into
+        // the chunk offsets above (`mdat_header_size`).
+        if needs_large {
+            self.output.write_all(&1u32.to_be_bytes())?;
+            self.output.write_all(b"mdat")?;
+            self.output.write_all(&mdat_total.to_be_bytes())?;
+        } else {
+            self.output.write_all(&(mdat_total as u32).to_be_bytes())?;
+            self.output.write_all(b"mdat")?;
+        }
         self.output.write_all(&mdat_payload)?;
         Ok(())
     }

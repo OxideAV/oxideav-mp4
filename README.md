@@ -980,8 +980,17 @@ get no `edts`. Controlled by `Mp4MuxerOptions::write_edit_list`
 (default `true`).
 
 Chunk offsets auto-promote from `stco` (32-bit) to `co64` (64-bit) when
-any offset exceeds 4 GiB. The mdat box header stays 32-bit — files
-whose mdat payload exceeds 4 GiB fail at `write_trailer`.
+any offset exceeds 4 GiB. The `mdat` box header is 32-bit by default
+(byte-identical to the historical output for sub-4-GiB files); set
+`Mp4MuxerOptions::large_mdat = true` to reserve the ISO/IEC 14496-12
+§4.2 extended-size header (`[size=1]["mdat"][largesize:u64]`) so the
+media payload may exceed 4 GiB. Because the direct-write path streams
+`mdat` to the output before its final size is known, the header form is
+chosen up front from this flag; the faststart path (which buffers the
+payload) additionally promotes automatically when the compact 32-bit
+`size` would overflow. Without the flag, a direct-write `mdat` that
+grows past 4 GiB fails at `write_trailer` with a message pointing at
+`large_mdat`.
 
 #### Fragmented / DASH / CMAF segment writing
 
@@ -1115,8 +1124,6 @@ first that applies:
   `stsc.sample_description_index ≥ 2` or a fragment's
   `tfhd.sample_description_index` override is recorded/surfaced but not
   yet honoured to re-dispatch the codec mid-stream.
-- mdat payloads larger than 4 GiB (the 32-bit box header is not
-  promoted to `largesize`).
 
 ## Container registry
 

@@ -79,6 +79,7 @@ fn frag_options(emit_indexes: bool, styp: bool) -> (Mp4MuxerOptions, FragmentedO
         fragmented: Some(frag.clone()),
         write_edit_list: true,
         track_sample_groups: Vec::new(),
+        large_mdat: false,
     };
     (opts, frag)
 }

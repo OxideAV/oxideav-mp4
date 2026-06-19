@@ -197,6 +197,24 @@ pub struct Mp4MuxerOptions {
     /// [`TrackSampleGroups`] entry's `sbgp` / `sgpd` boxes are emitted
     /// into the target track's `stbl` after the chunk-offset table.
     pub track_sample_groups: Vec<TrackSampleGroups>,
+    /// Reserve a 64-bit `largesize` header for the `mdat` box so the
+    /// media payload may exceed 4 GiB (ISO/IEC 14496-12 §4.2 extended
+    /// size form: `size == 1` then an `unsigned int(64) largesize`).
+    ///
+    /// The plain 32-bit `mdat` header can only describe a box up to
+    /// `u32::MAX` bytes; without this flag the muxer errors at
+    /// `write_trailer` if the accumulated payload would overflow that.
+    /// Because the direct-write path streams `mdat` to the output before
+    /// the final size is known, the header form has to be chosen *up
+    /// front* — so a producer that expects a >4 GiB `mdat` (long
+    /// uncompressed captures, multi-hour high-bitrate masters) sets this
+    /// to `true` to reserve the 16-byte largesize header. The 8 extra
+    /// bytes are the only cost for files that stay under 4 GiB, so the
+    /// default is `false` (compact 32-bit header, byte-identical to the
+    /// historical output). `co64` chunk offsets are still chosen
+    /// automatically when any chunk offset itself exceeds `u32::MAX`,
+    /// independent of this flag.
+    pub large_mdat: bool,
 }
 
 impl Default for Mp4MuxerOptions {
@@ -207,6 +225,7 @@ impl Default for Mp4MuxerOptions {
             fragmented: None,
             write_edit_list: true,
             track_sample_groups: Vec::new(),
+            large_mdat: false,
         }
     }
 }

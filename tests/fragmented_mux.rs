@@ -76,6 +76,7 @@ fn fragmented_options(cadence: FragmentCadence) -> Mp4MuxerOptions {
         }),
         write_edit_list: true,
         track_sample_groups: Vec::new(),
+        large_mdat: false,
     }
 }
 
@@ -224,6 +225,7 @@ fn no_styp_when_disabled() {
             }),
             write_edit_list: true,
             track_sample_groups: Vec::new(),
+            large_mdat: false,
         };
         let stream = pcm_stream();
         let packets = make_pcm_packets(2, 1024);
@@ -294,6 +296,7 @@ fn faststart_and_fragmented_are_mutually_exclusive() {
         fragmented: Some(FragmentedOptions::default()),
         write_edit_list: true,
         track_sample_groups: Vec::new(),
+        large_mdat: false,
     };
     let cursor: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
     match open_with_options(cursor, std::slice::from_ref(&stream), opts) {
@@ -502,6 +505,7 @@ fn no_sidx_no_mfra_when_disabled() {
             }),
             write_edit_list: true,
             track_sample_groups: Vec::new(),
+            large_mdat: false,
         };
         let stream = pcm_stream();
         let packets = make_pcm_packets(4, 1024);
