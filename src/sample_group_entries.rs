@@ -127,6 +127,125 @@ pub fn build_roll(e: &RollRecoveryEntry) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// §10.3 Alternative startup sequence (`alst`)
+// ---------------------------------------------------------------------------
+
+/// One `(num_output_samples, num_total_samples)` piece of an
+/// [`AlternativeStartupEntry`]'s optional output-rate tail (§10.3.2 do-loop).
+///
+/// The alternative startup sequence is divided into consecutive pieces,
+/// each with a constant sample output rate (§10.3.3). `num_output_samples`
+/// is the number of output samples of the piece; `num_total_samples` is
+/// the total number of samples (including those not in the alternative
+/// startup sequence) spanned by the piece.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlstOutputRatePiece {
+    /// `num_output_samples[j]` (§10.3.3).
+    pub num_output_samples: u16,
+    /// `num_total_samples[j]` (§10.3.3).
+    pub num_total_samples: u16,
+}
+
+/// `alst` entry (§10.3.2): `AlternativeStartupEntry`.
+///
+/// Documents an alternative startup sequence enabling faster start-up
+/// for hierarchically-scalable streams (§10.3.4). The entry carries a
+/// `roll_count`-long table of decoding-time deltas plus an optional
+/// trailing run of output-rate pieces read "until the end of the
+/// structure" (§10.3.2 do-loop), so this entry is **length-sensitive**:
+/// the parser needs the exact entry blob (it consumes the output-rate
+/// pieces from whatever bytes remain after the fixed header + offset
+/// array).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlternativeStartupEntry {
+    /// `first_output_sample` (§10.3.3): the 1-based index of the first
+    /// sample intended for output among the samples in the alternative
+    /// startup sequence (the sync initial sample is index 1). When
+    /// `sample_offsets` is empty (`roll_count == 0`) the associated
+    /// sample does not belong to any alternative startup sequence and
+    /// the semantics of this field are unspecified (§10.3.3).
+    pub first_output_sample: u16,
+    /// `sample_offset[1..=roll_count]` (§10.3.3): the decoding-time delta
+    /// of the i-th sample in the alternative startup sequence relative to
+    /// its regular decoding time. `roll_count` is implicit from the
+    /// length of this vector. An empty vector means `roll_count == 0`.
+    pub sample_offsets: Vec<u32>,
+    /// The optional output-rate tail (§10.3.2 do-loop): zero or more
+    /// `(num_output_samples, num_total_samples)` pieces read until the end
+    /// of the entry. Empty when the producer wrote no tail.
+    pub output_rate_pieces: Vec<AlstOutputRatePiece>,
+}
+
+/// Parse an `alst` entry blob into an [`AlternativeStartupEntry`].
+///
+/// The optional output-rate tail is consumed from the bytes that remain
+/// after the fixed `roll_count` + `first_output_sample` header and the
+/// `roll_count`-long `sample_offset` array (§10.3.2 "until the end of the
+/// structure") — so the caller must pass exactly one entry's blob. A
+/// trailing partial piece (fewer than 4 bytes) is rejected: §10.3.2's
+/// do-loop pairs `num_output_samples` with `num_total_samples`, so an odd
+/// tail length is a framing error, not a future-edition extension.
+pub fn parse_alst(blob: &[u8]) -> Result<AlternativeStartupEntry> {
+    let read_u16 =
+        |o: usize| -> Option<u16> { blob.get(o..o + 2).map(|s| u16::from_be_bytes([s[0], s[1]])) };
+    let read_u32 = |o: usize| -> Option<u32> {
+        blob.get(o..o + 4)
+            .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let roll_count = read_u16(0)
+        .ok_or_else(|| Error::invalid("sgpd alst entry: roll_count truncated"))?
+        as usize;
+    let first_output_sample = read_u16(2)
+        .ok_or_else(|| Error::invalid("sgpd alst entry: first_output_sample truncated"))?;
+    let mut off = 4;
+    let mut sample_offsets = Vec::with_capacity(roll_count);
+    for _ in 0..roll_count {
+        let v = read_u32(off)
+            .ok_or_else(|| Error::invalid("sgpd alst entry: sample_offset truncated"))?;
+        sample_offsets.push(v);
+        off += 4;
+    }
+    // Optional output-rate tail: read 4-byte pieces until the entry ends.
+    let tail = &blob[off..];
+    if tail.len() % 4 != 0 {
+        return Err(Error::invalid(
+            "sgpd alst entry: output-rate tail not a whole number of (out,total) pieces",
+        ));
+    }
+    let mut output_rate_pieces = Vec::with_capacity(tail.len() / 4);
+    for chunk in tail.chunks_exact(4) {
+        output_rate_pieces.push(AlstOutputRatePiece {
+            num_output_samples: u16::from_be_bytes([chunk[0], chunk[1]]),
+            num_total_samples: u16::from_be_bytes([chunk[2], chunk[3]]),
+        });
+    }
+    Ok(AlternativeStartupEntry {
+        first_output_sample,
+        sample_offsets,
+        output_rate_pieces,
+    })
+}
+
+/// Serialise an [`AlternativeStartupEntry`] into its variable-length entry
+/// blob. `roll_count` is written from `sample_offsets.len()` (capped at
+/// `u16::MAX`).
+pub fn build_alst(e: &AlternativeStartupEntry) -> Vec<u8> {
+    let roll_count = e.sample_offsets.len().min(u16::MAX as usize) as u16;
+    let mut out =
+        Vec::with_capacity(4 + e.sample_offsets.len() * 4 + e.output_rate_pieces.len() * 4);
+    out.extend_from_slice(&roll_count.to_be_bytes());
+    out.extend_from_slice(&e.first_output_sample.to_be_bytes());
+    for &o in e.sample_offsets.iter().take(roll_count as usize) {
+        out.extend_from_slice(&o.to_be_bytes());
+    }
+    for p in &e.output_rate_pieces {
+        out.extend_from_slice(&p.num_output_samples.to_be_bytes());
+        out.extend_from_slice(&p.num_total_samples.to_be_bytes());
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // §10.4 Random access points (`rap `)
 // ---------------------------------------------------------------------------
 
@@ -392,5 +511,77 @@ mod tests {
     #[test]
     fn sap_rejects_empty() {
         assert!(parse_sap(&[]).is_err());
+    }
+
+    #[test]
+    fn alst_roundtrip_no_tail() {
+        let e = AlternativeStartupEntry {
+            first_output_sample: 2,
+            sample_offsets: vec![0, 10, 20],
+            output_rate_pieces: vec![],
+        };
+        let blob = build_alst(&e);
+        // roll_count=3, first_output_sample=2, then 3 u32 offsets = 4 + 12.
+        assert_eq!(blob.len(), 16);
+        assert_eq!(&blob[0..2], &3u16.to_be_bytes());
+        assert_eq!(&blob[2..4], &2u16.to_be_bytes());
+        assert_eq!(parse_alst(&blob).unwrap(), e);
+    }
+
+    #[test]
+    fn alst_roundtrip_with_tail() {
+        let e = AlternativeStartupEntry {
+            first_output_sample: 1,
+            sample_offsets: vec![0, 5],
+            output_rate_pieces: vec![
+                AlstOutputRatePiece {
+                    num_output_samples: 4,
+                    num_total_samples: 8,
+                },
+                AlstOutputRatePiece {
+                    num_output_samples: 2,
+                    num_total_samples: 3,
+                },
+            ],
+        };
+        let blob = build_alst(&e);
+        // 4 (hdr) + 2*4 (offsets) + 2*4 (pieces) = 20.
+        assert_eq!(blob.len(), 20);
+        assert_eq!(parse_alst(&blob).unwrap(), e);
+    }
+
+    #[test]
+    fn alst_roundtrip_roll_count_zero() {
+        // roll_count == 0: no alternative startup sequence; first_output
+        // semantics unspecified but the field still round-trips.
+        let e = AlternativeStartupEntry {
+            first_output_sample: 0,
+            sample_offsets: vec![],
+            output_rate_pieces: vec![],
+        };
+        let blob = build_alst(&e);
+        assert_eq!(blob.len(), 4);
+        assert_eq!(parse_alst(&blob).unwrap(), e);
+    }
+
+    #[test]
+    fn alst_rejects_truncated_offset_array() {
+        // roll_count says 2 but only one u32 of offsets present.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&2u16.to_be_bytes());
+        blob.extend_from_slice(&0u16.to_be_bytes());
+        blob.extend_from_slice(&7u32.to_be_bytes());
+        assert!(parse_alst(&blob).is_err());
+    }
+
+    #[test]
+    fn alst_rejects_odd_tail() {
+        // Header + one offset + a 2-byte dangling half-piece.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u16.to_be_bytes());
+        blob.extend_from_slice(&1u16.to_be_bytes());
+        blob.extend_from_slice(&0u32.to_be_bytes());
+        blob.extend_from_slice(&9u16.to_be_bytes());
+        assert!(parse_alst(&blob).is_err());
     }
 }
