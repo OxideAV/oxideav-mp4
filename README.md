@@ -713,11 +713,21 @@ Sample-entry FourCCs resolve to these codec ids:
   integers `"reference_track_ID ntp_timestamp media_time"`. Both v0
   (32-bit `media_time`) and v1 (64-bit `media_time`) layouts are
   read; v1 `media_time` is widened to `u64` so callers see one type
-  regardless. Absent `prft`, no keys are emitted. The structured
-  record is also reachable via the public
+  regardless. The 24-bit FullBox `flags` field — `0` in the 2015
+  edition, named annotation bits in the 2022 edition (`encoder_input_output`
+  0x1, `finalization_time` 0x2, `file_write_time` 0x4,
+  `arbitrary_association` 0x8, the combined `realtime_offset` mask 0x18)
+  describing what the NTP time represents — is captured verbatim and,
+  when any bit is set, appended to the surfaced value as trailing
+  space-separated name tokens after the three integers (the integer
+  prefix stays backward-compatible). Absent `prft`, no keys are
+  emitted. The structured record is also reachable via the public
   `oxideav_mp4::demux::parse_prft_box(&[u8])` entry point for tooling
   that wants the typed `PrftRecord` (`reference_track_id`,
-  `ntp_timestamp`, `media_time`, `version`) directly.
+  `ntp_timestamp`, `media_time`, `version`, `flags`) directly, with
+  `is_encoder_input_output()` / `is_finalization_time()` /
+  `is_file_write_time()` / `is_arbitrary_association()` /
+  `is_realtime_offset()` accessors for the 2022 flag bits.
 - Progressive download information (ISO/IEC 14496-12 §8.1.3, `pdin`): a
   top-level `FullBox(version = 0, flags = 0)` whose body is a sequence
   of `(rate, initial_delay)` u32 pairs (big-endian) — for each effective

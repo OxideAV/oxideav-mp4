@@ -299,16 +299,37 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     // with value "reference_track_ID ntp_timestamp media_time" — three
     // decimal integers, space-separated, mirroring the
     // `tref_<type>` / `sgpd_<n>` conventions used elsewhere in this
-    // crate. Callers wanting the structured record can use the public
-    // `parse_prft_box` entry point. Absent prft, no keys are emitted.
+    // crate. When the 2022-edition `flags` annotation bits are set, a
+    // trailing space-separated token list of the set names
+    // (`encoder_input_output`, `finalization_time`, `file_write_time`,
+    // `arbitrary_association`, `realtime_offset`) is appended; the
+    // three-integer prefix stays backward-compatible. Callers wanting the
+    // structured record can use the public `parse_prft_box` entry point.
+    // Absent prft, no keys are emitted.
     for (n, p) in prfts.iter().enumerate() {
-        metadata.push((
-            format!("prft_{n}"),
-            format!(
-                "{} {} {}",
-                p.reference_track_id, p.ntp_timestamp, p.media_time
-            ),
-        ));
+        let mut value = format!(
+            "{} {} {}",
+            p.reference_track_id, p.ntp_timestamp, p.media_time
+        );
+        // `realtime_offset` is the combined 0x18 mask; surface it instead
+        // of its two component bits when both are set.
+        if p.is_realtime_offset() {
+            value.push_str(" realtime_offset");
+        } else {
+            if p.is_finalization_time() {
+                value.push_str(" finalization_time");
+            }
+            if p.is_arbitrary_association() {
+                value.push_str(" arbitrary_association");
+            }
+        }
+        if p.is_encoder_input_output() {
+            value.push_str(" encoder_input_output");
+        }
+        if p.is_file_write_time() {
+            value.push_str(" file_write_time");
+        }
+        metadata.push((format!("prft_{n}"), value));
     }
 
     // Surface any parsed `ssix` SubsegmentIndexBoxes (§8.16.4) through
@@ -568,6 +589,47 @@ pub struct PrftRecord {
     /// Surfaced so callers can validate against `media_time`'s
     /// representable range when round-tripping.
     pub version: u8,
+    /// 24-bit FullBox `flags`. In the 2015 edition this is always `0`; the
+    /// 2022 edition defines named bits that annotate what the NTP time
+    /// represents (the body layout is unchanged either way). Preserved
+    /// verbatim so a 2022-aware consumer can interpret it via
+    /// [`PrftRecord::is_encoder_input_output`] / [`PrftRecord::is_finalization_time`]
+    /// / [`PrftRecord::is_file_write_time`] / [`PrftRecord::is_arbitrary_association`]
+    /// / [`PrftRecord::is_realtime_offset`]; a 2015-era consumer ignores it.
+    pub flags: u32,
+}
+
+impl PrftRecord {
+    /// `encoder_input_output` (`flags & 0x000001`, 2022 edition): the NTP
+    /// time is the frame's encoder input/output time.
+    pub fn is_encoder_input_output(&self) -> bool {
+        self.flags & 0x00_0001 != 0
+    }
+
+    /// `finalization_time` (`flags & 0x000002`, 2022 edition): the NTP
+    /// time is the finalization (segment-complete) time.
+    pub fn is_finalization_time(&self) -> bool {
+        self.flags & 0x00_0002 != 0
+    }
+
+    /// `file_write_time` (`flags & 0x000004`, 2022 edition): the NTP time
+    /// is the file/segment write time.
+    pub fn is_file_write_time(&self) -> bool {
+        self.flags & 0x00_0004 != 0
+    }
+
+    /// `arbitrary_association` (`flags & 0x000008`, 2022 edition): an
+    /// arbitrary association rather than the default "next moof".
+    pub fn is_arbitrary_association(&self) -> bool {
+        self.flags & 0x00_0008 != 0
+    }
+
+    /// `realtime_offset` (`flags & 0x000018`, 2022 edition): the combined
+    /// value used for real-time-offset signalling. This is a combined
+    /// mask, so all of its set bits must be present.
+    pub fn is_realtime_offset(&self) -> bool {
+        self.flags & 0x00_0018 == 0x00_0018
+    }
 }
 
 /// Decoded `amve` (AmbientViewingEnvironmentBox, ISO/IEC 14496-12
@@ -6400,7 +6462,10 @@ fn parse_prft(body: &[u8]) -> Result<Option<PrftRecord>> {
         return Err(Error::invalid("MP4: prft too short"));
     }
     let version = body[0];
-    // skip 3-byte flags (always 0 per §8.16.5.2)
+    // 24-bit flags: 0 in the 2015 edition, named annotation bits in the
+    // 2022 edition (the body layout is identical either way). Captured so
+    // a 2022-aware consumer can interpret what the NTP time represents.
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
     let reference_track_id = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
     let ntp_timestamp = u64::from_be_bytes([
         body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
@@ -6425,6 +6490,7 @@ fn parse_prft(body: &[u8]) -> Result<Option<PrftRecord>> {
         ntp_timestamp,
         media_time,
         version,
+        flags,
     }))
 }
 

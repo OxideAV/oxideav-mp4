@@ -486,6 +486,56 @@ fn prft_v0_round_trips() {
     assert_eq!(r.ntp_timestamp, ntp);
     assert_eq!(r.media_time, 48_000);
     assert_eq!(r.version, 0);
+    // 2015-edition box: flags are zero, every named annotation is unset.
+    assert_eq!(r.flags, 0);
+    assert!(!r.is_encoder_input_output());
+    assert!(!r.is_finalization_time());
+    assert!(!r.is_file_write_time());
+    assert!(!r.is_arbitrary_association());
+    assert!(!r.is_realtime_offset());
+}
+
+/// 2022-edition flag bits annotate what the NTP time represents; the
+/// body layout is unchanged, so the same parser reads them and exposes
+/// the named accessors (ISO/IEC 14496-12 §8.16.5, 2022 flag table).
+#[test]
+fn prft_2022_flag_bits_are_surfaced() {
+    // encoder_input_output (0x01).
+    let mut body = build_prft_v0(2, 1 << 32, 90_000);
+    body[3] = 0x01;
+    let r = parse_prft_box(&body).unwrap().unwrap();
+    assert_eq!(r.flags, 0x01);
+    assert!(r.is_encoder_input_output());
+    assert!(!r.is_finalization_time());
+
+    // finalization_time (0x02).
+    let mut body = build_prft_v0(2, 1 << 32, 90_000);
+    body[3] = 0x02;
+    let r = parse_prft_box(&body).unwrap().unwrap();
+    assert!(r.is_finalization_time());
+    assert!(!r.is_encoder_input_output());
+
+    // file_write_time (0x04).
+    let mut body = build_prft_v0(2, 1 << 32, 90_000);
+    body[3] = 0x04;
+    let r = parse_prft_box(&body).unwrap().unwrap();
+    assert!(r.is_file_write_time());
+
+    // arbitrary_association (0x08) — alone it does NOT imply the combined
+    // realtime_offset (0x18) mask.
+    let mut body = build_prft_v0(2, 1 << 32, 90_000);
+    body[3] = 0x08;
+    let r = parse_prft_box(&body).unwrap().unwrap();
+    assert!(r.is_arbitrary_association());
+    assert!(!r.is_realtime_offset());
+
+    // realtime_offset is the combined 0x18 mask (0x08 | 0x10): both bits
+    // must be present.
+    let mut body = build_prft_v0(2, 1 << 32, 90_000);
+    body[3] = 0x18;
+    let r = parse_prft_box(&body).unwrap().unwrap();
+    assert!(r.is_realtime_offset());
+    assert!(r.is_arbitrary_association()); // 0x08 component is set too
 }
 
 #[test]
