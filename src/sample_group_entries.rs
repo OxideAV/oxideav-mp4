@@ -127,6 +127,154 @@ pub fn build_roll(e: &RollRecoveryEntry) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// §10.2 Rate share (`rash`)
+// ---------------------------------------------------------------------------
+
+/// One operation point of a multi-point [`RateShareEntry`] (§10.2.2.2):
+/// an `(available_bitrate, target_rate_share)` pair.
+///
+/// Present only when `operation_point_count > 1` (the single-point form
+/// stores its `target_rate_share` directly and carries no
+/// `available_bitrate`). `available_bitrate` defines the operation point
+/// in kilobits/second; entries shall be strictly increasing (§10.2.2.3),
+/// though the parser does not enforce monotonicity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RateShareOperationPoint {
+    /// `available_bitrate` (§10.2.2.3): the total available bitrate (kbps)
+    /// that defines this operation point.
+    pub available_bitrate: u32,
+    /// `target_rate_share` (§10.2.2.3): the percentage of available
+    /// bandwidth to allocate to the media at this operation point. Zero
+    /// means "no information on the preferred rate share is provided".
+    pub target_rate_share: u16,
+}
+
+/// `rash` entry (§10.2.2.2): `RateShareEntry`.
+///
+/// Aids a server / player allocating bitrate across streams sharing a
+/// bandwidth resource (§10.2.1). The on-wire form has two shapes keyed by
+/// `operation_point_count`: a single operation point stores one bare
+/// `target_rate_share`; multiple points store an `(available_bitrate,
+/// target_rate_share)` pair each. Both shapes share the trailing
+/// `maximum_bitrate` / `minimum_bitrate` / `discard_priority` fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RateShareEntry {
+    /// The single-point `target_rate_share` when
+    /// `operation_point_count == 1`. `Some(_)` selects the single-point
+    /// wire shape; `None` selects the multi-point shape from
+    /// `operation_points`. Exactly one of `single_target_rate_share` /
+    /// a non-empty `operation_points` is meaningful — [`build_rash`]
+    /// prefers `single_target_rate_share` when set.
+    pub single_target_rate_share: Option<u16>,
+    /// The `(available_bitrate, target_rate_share)` operation points when
+    /// `operation_point_count > 1`. Empty for the single-point form.
+    pub operation_points: Vec<RateShareOperationPoint>,
+    /// `maximum_bitrate` (§10.2.2.3): a non-zero kbps upper threshold for
+    /// bandwidth allocation; 0 = "no information provided".
+    pub maximum_bitrate: u32,
+    /// `minimum_bitrate` (§10.2.2.3): a non-zero kbps lower threshold; 0 =
+    /// "no information provided".
+    pub minimum_bitrate: u32,
+    /// `discard_priority` (§10.2.2.3): the priority of the track when
+    /// tracks are discarded to meet rate-share constraints — the highest
+    /// value is discarded first.
+    pub discard_priority: u8,
+}
+
+/// Parse a `rash` entry blob into a [`RateShareEntry`].
+///
+/// The `operation_point_count` discriminator selects the single-point
+/// (one bare `target_rate_share`) or multi-point
+/// (`available_bitrate` + `target_rate_share` per point) wire shape per
+/// §10.2.2.2. A `operation_point_count == 0` is rejected (§10.2.2.3 fixes
+/// it non-zero); trailing bytes after `discard_priority` are ignored.
+pub fn parse_rash(blob: &[u8]) -> Result<RateShareEntry> {
+    let read_u16 =
+        |o: usize| -> Option<u16> { blob.get(o..o + 2).map(|s| u16::from_be_bytes([s[0], s[1]])) };
+    let read_u32 = |o: usize| -> Option<u32> {
+        blob.get(o..o + 4)
+            .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let op_count = read_u16(0)
+        .ok_or_else(|| Error::invalid("sgpd rash entry: operation_point_count truncated"))?;
+    if op_count == 0 {
+        return Err(Error::invalid(
+            "sgpd rash entry: operation_point_count must be non-zero (§10.2.2.3)",
+        ));
+    }
+    let mut off = 2;
+    let (single_target_rate_share, operation_points) = if op_count == 1 {
+        let t = read_u16(off)
+            .ok_or_else(|| Error::invalid("sgpd rash entry: target_rate_share truncated"))?;
+        off += 2;
+        (Some(t), Vec::new())
+    } else {
+        let mut pts = Vec::with_capacity(op_count as usize);
+        for _ in 0..op_count {
+            let ab = read_u32(off)
+                .ok_or_else(|| Error::invalid("sgpd rash entry: available_bitrate truncated"))?;
+            off += 4;
+            let t = read_u16(off)
+                .ok_or_else(|| Error::invalid("sgpd rash entry: target_rate_share truncated"))?;
+            off += 2;
+            pts.push(RateShareOperationPoint {
+                available_bitrate: ab,
+                target_rate_share: t,
+            });
+        }
+        (None, pts)
+    };
+    let maximum_bitrate = read_u32(off)
+        .ok_or_else(|| Error::invalid("sgpd rash entry: maximum_bitrate truncated"))?;
+    off += 4;
+    let minimum_bitrate = read_u32(off)
+        .ok_or_else(|| Error::invalid("sgpd rash entry: minimum_bitrate truncated"))?;
+    off += 4;
+    let discard_priority = *blob
+        .get(off)
+        .ok_or_else(|| Error::invalid("sgpd rash entry: discard_priority truncated"))?;
+    Ok(RateShareEntry {
+        single_target_rate_share,
+        operation_points,
+        maximum_bitrate,
+        minimum_bitrate,
+        discard_priority,
+    })
+}
+
+/// Serialise a [`RateShareEntry`] into its entry blob.
+///
+/// When `single_target_rate_share` is `Some(_)` the single-point wire
+/// shape is emitted (`operation_point_count = 1`); otherwise the
+/// multi-point shape is emitted with `operation_point_count =
+/// operation_points.len()` (at least 1 — an empty `operation_points` with
+/// no `single_target_rate_share` would be an invalid count-0 box, so the
+/// builder writes a single zero-share point to keep the box valid).
+pub fn build_rash(e: &RateShareEntry) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some(t) = e.single_target_rate_share {
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&t.to_be_bytes());
+    } else if e.operation_points.is_empty() {
+        // Avoid emitting the §10.2.2.3-invalid count-0 box: degrade to a
+        // single-point form with a zero (no-information) target share.
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+    } else {
+        let count = e.operation_points.len().min(u16::MAX as usize) as u16;
+        out.extend_from_slice(&count.to_be_bytes());
+        for p in e.operation_points.iter().take(count as usize) {
+            out.extend_from_slice(&p.available_bitrate.to_be_bytes());
+            out.extend_from_slice(&p.target_rate_share.to_be_bytes());
+        }
+    }
+    out.extend_from_slice(&e.maximum_bitrate.to_be_bytes());
+    out.extend_from_slice(&e.minimum_bitrate.to_be_bytes());
+    out.push(e.discard_priority);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // §10.3 Alternative startup sequence (`alst`)
 // ---------------------------------------------------------------------------
 
@@ -583,5 +731,82 @@ mod tests {
         blob.extend_from_slice(&0u32.to_be_bytes());
         blob.extend_from_slice(&9u16.to_be_bytes());
         assert!(parse_alst(&blob).is_err());
+    }
+
+    #[test]
+    fn rash_roundtrip_single_point() {
+        let e = RateShareEntry {
+            single_target_rate_share: Some(60),
+            operation_points: vec![],
+            maximum_bitrate: 2000,
+            minimum_bitrate: 100,
+            discard_priority: 128,
+        };
+        let blob = build_rash(&e);
+        // 2 (count) + 2 (target) + 4 (max) + 4 (min) + 1 (prio) = 13.
+        assert_eq!(blob.len(), 13);
+        assert_eq!(&blob[0..2], &1u16.to_be_bytes()); // operation_point_count
+        assert_eq!(parse_rash(&blob).unwrap(), e);
+    }
+
+    #[test]
+    fn rash_roundtrip_multi_point() {
+        let e = RateShareEntry {
+            single_target_rate_share: None,
+            operation_points: vec![
+                RateShareOperationPoint {
+                    available_bitrate: 500,
+                    target_rate_share: 40,
+                },
+                RateShareOperationPoint {
+                    available_bitrate: 1500,
+                    target_rate_share: 70,
+                },
+            ],
+            maximum_bitrate: 3000,
+            minimum_bitrate: 200,
+            discard_priority: 64,
+        };
+        let blob = build_rash(&e);
+        // 2 (count) + 2*(4+2) (points) + 4 + 4 + 1 = 23.
+        assert_eq!(blob.len(), 23);
+        assert_eq!(&blob[0..2], &2u16.to_be_bytes());
+        assert_eq!(parse_rash(&blob).unwrap(), e);
+    }
+
+    #[test]
+    fn rash_rejects_count_zero() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&0u16.to_be_bytes()); // operation_point_count = 0
+        blob.extend_from_slice(&[0u8; 9]); // max + min + prio
+        assert!(parse_rash(&blob).is_err());
+    }
+
+    #[test]
+    fn rash_rejects_truncated_points() {
+        // count = 2 but only one full point present.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&2u16.to_be_bytes());
+        blob.extend_from_slice(&500u32.to_be_bytes());
+        blob.extend_from_slice(&40u16.to_be_bytes());
+        assert!(parse_rash(&blob).is_err());
+    }
+
+    #[test]
+    fn rash_build_empty_degrades_to_single_zero() {
+        // No single share and no points → builder writes a valid count-1
+        // box with a zero (no-information) target share rather than an
+        // invalid count-0 box.
+        let e = RateShareEntry {
+            single_target_rate_share: None,
+            operation_points: vec![],
+            maximum_bitrate: 0,
+            minimum_bitrate: 0,
+            discard_priority: 128,
+        };
+        let blob = build_rash(&e);
+        assert_eq!(&blob[0..2], &1u16.to_be_bytes());
+        let parsed = parse_rash(&blob).unwrap();
+        assert_eq!(parsed.single_target_rate_share, Some(0));
     }
 }
