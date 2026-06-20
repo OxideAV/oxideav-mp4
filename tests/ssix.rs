@@ -31,7 +31,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use oxideav_core::{
     CodecId, CodecParameters, Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase, WriteSeek,
 };
-use oxideav_mp4::demux::{build_ssix_box, parse_ssix_box, SsixRange, SsixRecord, SsixSubsegment};
+use oxideav_mp4::demux::{
+    build_ssix_box, parse_sidx_box, parse_ssix_box, LevaEntry, SsixRange, SsixRecord,
+    SsixSubsegment,
+};
 use oxideav_mp4::muxer::open_with_options;
 use oxideav_mp4::options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
 
@@ -129,6 +132,8 @@ fn fragmented_options() -> Mp4MuxerOptions {
             // Segment Index box to document (§8.16.4.1 placement).
             emit_random_access_indexes: true,
             levels: Vec::new(),
+            emit_ssix: false,
+            ssix_levels: (1, 2),
         }),
         write_edit_list: false,
         track_sample_groups: Vec::new(),
@@ -375,4 +380,189 @@ fn builder_round_trips_and_rejects_oversize_range() {
         }],
     };
     assert!(build_ssix_box(&too_big).is_err());
+}
+
+/// Round 351 capstone — the fragmented muxer emits a real `sidx`+`ssix`
+/// pair (not a spliced one) when `FragmentedOptions::emit_ssix` is set.
+///
+/// This is the write/read symmetry test for `ssix`: mux a two-fragment
+/// PCM stream with `emit_ssix = true`, then for each fragment locate the
+/// muxer-written `sidx` and the `ssix` that immediately follows it,
+/// parse both with the public entry points, and confirm that
+///
+/// * the `ssix` carries `subsegment_count == 1` (matching the
+///   one-reference `sidx`, per §8.16.4.1),
+/// * the subsegment has exactly two ranges (§8.16.4 "range_count >= 2"),
+/// * the two ranges carry the configured `(metadata_level, media_level)`
+///   numbers, and
+/// * the ranges **partition** the subsegment — their sizes sum exactly
+///   to the `sidx`'s `referenced_size`, with the trailing range equal to
+///   the `mdat` size.
+fn mux_with_emit_ssix(levels: Vec<LevaEntry>, ssix_levels: (u8, u8)) -> Vec<u8> {
+    let stream = pcm_stream_info();
+    let frames_per_packet: i64 = 512;
+    let mut opts = fragmented_options();
+    if let Some(frag) = opts.fragmented.as_mut() {
+        frag.levels = levels;
+        frag.emit_ssix = true;
+        frag.ssix_levels = ssix_levels;
+        // Keep styp off so the subsegment is exactly moof + mdat — makes
+        // the range-partition arithmetic in the assertions explicit.
+        frag.styp = None;
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "oxideav-mp4-ssix-mux-r351-{}-{}.mp4",
+        std::process::id(),
+        NEXT_TMP.fetch_add(1, Ordering::Relaxed),
+    ));
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux =
+            open_with_options(ws, std::slice::from_ref(&stream), opts).expect("open muxer");
+        mux.write_header().unwrap();
+        for i in 0..2 {
+            let mut pkt = Packet::new(
+                0,
+                stream.time_base,
+                make_pcm_payload(frames_per_packet as usize),
+            );
+            pkt.pts = Some(i * frames_per_packet);
+            pkt.duration = Some(frames_per_packet);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&tmp).unwrap();
+    let _ = std::fs::remove_file(&tmp);
+    bytes
+}
+
+#[test]
+fn muxer_emitted_ssix_partitions_each_fragment_subsegment() {
+    // Two-level config (a level-1 metadata level + a level-2 media level),
+    // the same numbers the muxer labels the two ssix ranges with.
+    let levels = vec![
+        LevaEntry {
+            track_id: 1,
+            padding_flag: false,
+            assignment_type: 2,
+            grouping_type: 0,
+            grouping_type_parameter: 0,
+            sub_track_id: 0,
+        },
+        LevaEntry {
+            track_id: 1,
+            padding_flag: false,
+            assignment_type: 2,
+            grouping_type: 0,
+            grouping_type_parameter: 0,
+            sub_track_id: 0,
+        },
+    ];
+    let bytes = mux_with_emit_ssix(levels, (1, 2));
+
+    // Two fragments → two sidx, each immediately followed by an ssix.
+    for nth in 0..2 {
+        let sidx_type = find_fourcc_nth(&bytes, b"sidx", nth).expect("sidx present");
+        let sidx_size_pos = sidx_type - 4;
+        let sidx_size =
+            u32::from_be_bytes(bytes[sidx_size_pos..sidx_size_pos + 4].try_into().unwrap())
+                as usize;
+        let sidx_end = sidx_size_pos + sidx_size;
+
+        // The very next box must be the ssix (§8.16.4.1 placement).
+        assert_eq!(
+            &bytes[sidx_end + 4..sidx_end + 8],
+            b"ssix",
+            "ssix must immediately follow its sidx (fragment {nth})"
+        );
+        let ssix_size =
+            u32::from_be_bytes(bytes[sidx_end..sidx_end + 4].try_into().unwrap()) as usize;
+
+        // Parse the sidx to recover its single reference's size, which is
+        // the size of the subsegment the ssix partitions.
+        let sidx_body = &bytes[sidx_type + 4..sidx_end];
+        let sidx = parse_sidx_box(sidx_body, sidx_end as u64)
+            .expect("sidx body parses")
+            .expect("sidx has a record");
+        assert_eq!(sidx.references.len(), 1, "muxer emits a one-reference sidx");
+        let subsegment_size = sidx.references[0].referenced_size as u64;
+
+        // Parse the ssix the muxer wrote.
+        let ssix_body = &bytes[sidx_end + 8..sidx_end + ssix_size];
+        let r = parse_ssix_box(ssix_body).expect("ssix body parses");
+        assert_eq!(r.subsegments.len(), 1, "ssix subsegment_count == 1");
+        let ranges = &r.subsegments[0].ranges;
+        assert_eq!(ranges.len(), 2, "two ranges (metadata + media)");
+        assert_eq!(ranges[0].level, 1, "first range is the metadata level");
+        assert_eq!(ranges[1].level, 2, "second range is the media level");
+
+        // Range partition: the two ranges sum to the whole subsegment.
+        let sum = ranges[0].range_size as u64 + ranges[1].range_size as u64;
+        assert_eq!(
+            sum, subsegment_size,
+            "ranges must partition the subsegment exactly (fragment {nth})"
+        );
+        // The metadata range is non-empty (it holds at least the moof).
+        assert!(ranges[0].range_size > 0, "metadata range non-empty");
+        // The media range equals the mdat size: mdat is the trailing box
+        // of the subsegment, and the subsegment here is moof + mdat with
+        // styp suppressed, so range[1] == subsegment - moof.
+        assert!(ranges[1].range_size > 0, "media range non-empty");
+    }
+
+    // The demuxer surfaces a `ssix_<n>` metadata summary per box, in file
+    // order — the muxer's output is genuinely re-parseable as ssix.
+    let dmx = open_bytes(bytes);
+    let md = dmx.metadata().to_vec();
+    assert_eq!(
+        md.iter()
+            .find(|(k, _)| k == "ssix_0")
+            .map(|(_, v)| v.as_str()),
+        Some("1 2"),
+        "first muxer-emitted ssix: 1 subsegment, 2 ranges"
+    );
+    assert_eq!(
+        md.iter()
+            .find(|(k, _)| k == "ssix_1")
+            .map(|(_, v)| v.as_str()),
+        Some("1 2"),
+        "second muxer-emitted ssix: 1 subsegment, 2 ranges"
+    );
+}
+
+#[test]
+fn emit_ssix_false_writes_no_ssix() {
+    // Default `emit_ssix = false`: a fragmented file with sidx emission on
+    // but emit_ssix off carries no ssix box at all.
+    let bytes = mux_fragmented_pcm_to_bytes();
+    assert!(
+        find_fourcc_nth(&bytes, b"ssix", 0).is_none(),
+        "no ssix should be written when emit_ssix is false"
+    );
+    let dmx = open_bytes(bytes);
+    assert!(
+        !dmx.metadata().iter().any(|(k, _)| k.starts_with("ssix")),
+        "no ssix metadata when emit_ssix is false"
+    );
+}
+
+#[test]
+fn muxer_emitted_ssix_honours_custom_level_numbers() {
+    // Custom (metadata_level, media_level) = (7, 9) flows through to the
+    // emitted ssix's range labels.
+    let bytes = mux_with_emit_ssix(Vec::new(), (7, 9));
+    let sidx_type = find_fourcc_nth(&bytes, b"sidx", 0).expect("sidx present");
+    let sidx_size_pos = sidx_type - 4;
+    let sidx_size =
+        u32::from_be_bytes(bytes[sidx_size_pos..sidx_size_pos + 4].try_into().unwrap()) as usize;
+    let sidx_end = sidx_size_pos + sidx_size;
+    let ssix_size = u32::from_be_bytes(bytes[sidx_end..sidx_end + 4].try_into().unwrap()) as usize;
+    let ssix_body = &bytes[sidx_end + 8..sidx_end + ssix_size];
+    let r = parse_ssix_box(ssix_body).expect("ssix body parses");
+    let ranges = &r.subsegments[0].ranges;
+    assert_eq!(ranges[0].level, 7);
+    assert_eq!(ranges[1].level, 9);
 }

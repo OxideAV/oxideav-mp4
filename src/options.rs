@@ -138,6 +138,34 @@ pub struct FragmentedOptions {
     /// serialises whatever is supplied verbatim. Empty by default — most
     /// fragmented files don't declare levels.
     pub levels: Vec<crate::demux::LevaEntry>,
+    /// Emit an `ssix` (SubsegmentIndexBox, ISO/IEC 14496-12 §8.16.4)
+    /// immediately after each per-fragment `sidx`, partitioning the
+    /// fragment's single referenced subsegment into two level byte ranges
+    /// for partial-subsegment fetch (§8.16.4.1).
+    ///
+    /// Requires `emit_random_access_indexes == true` (the `ssix` documents
+    /// the preceding `sidx`); when `emit_random_access_indexes` is `false`,
+    /// this flag has no effect. Each emitted `ssix` carries
+    /// `subsegment_count == 1` (matching the one-reference `sidx`) with two
+    /// ranges that together cover the whole subsegment (`styp? + prft? +
+    /// moof + mdat`):
+    ///
+    /// 1. `level = ssix_levels.0` → the leading metadata bytes
+    ///    (`styp? + prft? + moof`),
+    /// 2. `level = ssix_levels.1` → the trailing media bytes (`mdat`).
+    ///
+    /// The two level numbers should match level numbers assigned by the
+    /// [`levels`](Self::levels) `leva`; the §8.16.4 "ranges partition the
+    /// subsegment / ≥ 2 ranges" constraint is satisfied by construction.
+    /// Default `false` (no `ssix`); when enabled the default
+    /// `ssix_levels` is `(1, 2)`.
+    pub emit_ssix: bool,
+    /// The two `ssix` level numbers `(metadata_level, media_level)` used
+    /// when [`emit_ssix`](Self::emit_ssix) is set: the first labels the
+    /// leading `styp? + prft? + moof` range, the second the trailing
+    /// `mdat` range. Defaults to `(1, 2)`. Ignored when `emit_ssix` is
+    /// `false`.
+    pub ssix_levels: (u8, u8),
 }
 
 impl Default for FragmentedOptions {
@@ -150,6 +178,8 @@ impl Default for FragmentedOptions {
             }),
             emit_random_access_indexes: true,
             levels: Vec::new(),
+            emit_ssix: false,
+            ssix_levels: (1, 2),
         }
     }
 }

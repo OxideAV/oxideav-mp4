@@ -70,6 +70,8 @@ fn frag_options(emit_indexes: bool, styp: bool) -> (Mp4MuxerOptions, FragmentedO
         },
         emit_random_access_indexes: emit_indexes,
         levels: Vec::new(),
+        emit_ssix: false,
+        ssix_levels: (1, 2),
     };
     let opts = Mp4MuxerOptions {
         brand: BrandPreset::Custom {

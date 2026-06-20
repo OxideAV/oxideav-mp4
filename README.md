@@ -1028,6 +1028,31 @@ the reference track's media clock (decode time). The box version is
 auto-selected (v0 `u32` `media_time` when it fits, else v1 `u64`). This
 is the write-side dual of the read-side `parse_prft_box` / `PrftRecord`.
 
+A `leva` (LevelAssignmentBox, ISO/IEC 14496-12 §8.8.13) is emitted inside
+the init-segment `mvex` (after the `trex` boxes) when
+`FragmentedOptions::levels` is non-empty — one `LevaEntry` per declared
+level, serialised through `demux::build_leva_box`. The level *order* in
+that slice is the level *number* a sibling `ssix` refers to. The default
+(empty) `levels` writes no `leva` and keeps the init segment
+byte-identical to before. This is the write-side dual of the read-side
+`parse_leva_box` / `LevaRecord`.
+
+An `ssix` (SubsegmentIndexBox, ISO/IEC 14496-12 §8.16.4) is emitted
+immediately after each per-fragment `sidx` when `FragmentedOptions::
+emit_ssix` is set (and `emit_random_access_indexes` is on, since the
+`ssix` documents that `sidx`). Each emitted `ssix` carries
+`subsegment_count == 1` — matching the one-reference `sidx` — and
+partitions the fragment's single subsegment (`styp? + prft? + moof +
+mdat`) into two level byte ranges that together cover every byte: the
+leading `styp? + prft? + moof` metadata range and the trailing `mdat`
+media range. The two level numbers are `FragmentedOptions::ssix_levels`
+(default `(1, 2)`). The §8.16.4 `range_count ≥ 2` minimum and the
+"ranges partition the subsegment" requirement hold by construction; a
+range exceeding the 24-bit `range_size` field is rejected rather than
+truncated. This is the write-side dual of the read-side `parse_ssix_box`
+/ `SsixRecord`, completing `leva`/`ssix` partial-subsegment-fetch
+read+write symmetry.
+
 #### Sample-group muxing
 
 Sample groups (`sbgp` / `sgpd`, ISO/IEC 14496-12 §8.9.2 / §8.9.3) are

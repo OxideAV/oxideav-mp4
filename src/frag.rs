@@ -641,6 +641,44 @@ impl FragmentedMuxer {
                 starts_sap,
             );
             self.output.write_all(&sidx)?;
+
+            // Optional `ssix` (SubsegmentIndexBox §8.16.4) documenting the
+            // `sidx` just written. It must immediately follow that `sidx`
+            // (§8.16.4.1) and carry `subsegment_count == reference_count`
+            // (1 here). The single subsegment is partitioned into two
+            // contiguous level ranges that together cover every byte:
+            //   range 1 = styp? + prft? + moof  (metadata level),
+            //   range 2 = mdat                  (media level).
+            // `range_size` is a 24-bit field; an mdat (or metadata run)
+            // larger than 16 MiB is rejected by `build_ssix_box` rather
+            // than silently truncated.
+            if self.frag_options.emit_ssix {
+                let (meta_level, media_level) = self.frag_options.ssix_levels;
+                let meta_size = styp_size + prft_size + moof_size;
+                // Guard the u64 → u32 narrowing before build_ssix_box's
+                // 24-bit check, so a >4 GiB range surfaces an error rather
+                // than wrapping. (Fragment subsegments are far smaller in
+                // practice; this is purely defensive.)
+                if meta_size > u32::MAX as u64 || mdat_size > u32::MAX as u64 {
+                    return Err(Error::invalid("MP4: ssix subsegment range exceeds 32 bits"));
+                }
+                let record = crate::demux::SsixRecord {
+                    subsegments: vec![crate::demux::SsixSubsegment {
+                        ranges: vec![
+                            crate::demux::SsixRange {
+                                level: meta_level,
+                                range_size: meta_size as u32,
+                            },
+                            crate::demux::SsixRange {
+                                level: media_level,
+                                range_size: mdat_size as u32,
+                            },
+                        ],
+                    }],
+                };
+                let ssix = crate::demux::build_ssix_box(&record)?;
+                self.output.write_all(&ssix)?;
+            }
         }
 
         // Optional styp. A per-segment override set via
