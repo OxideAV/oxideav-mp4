@@ -121,6 +121,23 @@ pub struct FragmentedOptions {
     /// multi-segment top-level sidx can be layered on by an outer
     /// segmenter if needed.
     pub emit_random_access_indexes: bool,
+    /// Per-level assignment entries for a `leva` (LevelAssignmentBox,
+    /// ISO/IEC 14496-12 §8.8.13) emitted inside the init `mvex`.
+    ///
+    /// When non-empty, the muxer writes one `leva` after the `trex` boxes
+    /// in `mvex`, advertising how the file's content is partitioned into
+    /// **levels** for partial-subsegment fetch. Each entry is a
+    /// [`demux::LevaEntry`](crate::demux::LevaEntry) (`track_id` +
+    /// `padding_flag` + `assignment_type` + the type-specific tail). The
+    /// level *order* in this slice is the level *number* a sibling `ssix`
+    /// SubsegmentIndexBox refers to (§8.16.4.2).
+    ///
+    /// The §8.8.13.3 conformance constraints (`level_count ≥ 2`, the
+    /// "zero or more of type 2/3 then zero or more of exactly one type"
+    /// ordering rule) are the caller's responsibility; the muxer
+    /// serialises whatever is supplied verbatim. Empty by default — most
+    /// fragmented files don't declare levels.
+    pub levels: Vec<crate::demux::LevaEntry>,
 }
 
 impl Default for FragmentedOptions {
@@ -132,6 +149,7 @@ impl Default for FragmentedOptions {
                 compatible: vec![*b"msdh", *b"msix"],
             }),
             emit_random_access_indexes: true,
+            levels: Vec::new(),
         }
     }
 }

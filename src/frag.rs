@@ -266,7 +266,7 @@ impl Muxer for FragmentedMuxer {
         // tables). trex defaults are zero until the first packet locks
         // them; this is legal — the per-sample fields in `trun` then
         // override the zeroes.
-        let moov = build_init_moov(&self.tracks)?;
+        let moov = build_init_moov(&self.tracks, &self.frag_options.levels)?;
         self.output.write_all(&moov)?;
 
         self.header_written = true;
@@ -780,7 +780,10 @@ fn build_styp(brand: &BrandPreset) -> Vec<u8> {
     wrap_box(b"styp", &body)
 }
 
-fn build_init_moov(tracks: &[FragTrackState]) -> Result<Vec<u8>> {
+fn build_init_moov(
+    tracks: &[FragTrackState],
+    levels: &[crate::demux::LevaEntry],
+) -> Result<Vec<u8>> {
     // Movie timescale: pick 1000 (matches the non-fragmented path).
     let movie_timescale: u32 = 1000;
 
@@ -789,7 +792,7 @@ fn build_init_moov(tracks: &[FragTrackState]) -> Result<Vec<u8>> {
     for t in tracks {
         moov_body.extend_from_slice(&build_trak_init(t.track_id, &t.base, movie_timescale)?);
     }
-    moov_body.extend_from_slice(&build_mvex(tracks));
+    moov_body.extend_from_slice(&build_mvex(tracks, levels)?);
     Ok(wrap_box(b"moov", &moov_body))
 }
 
@@ -808,7 +811,13 @@ fn build_trak_init(track_id: u32, t: &TrackState, movie_timescale: u32) -> Resul
 /// `mvex` (§8.8.1) container holding `trex` per track + an optional
 /// `mehd` (movie-extends header) carrying overall fragment duration —
 /// we omit `mehd` since fragment durations are unknown at init time.
-fn build_mvex(tracks: &[FragTrackState]) -> Vec<u8> {
+///
+/// When `levels` is non-empty, a `leva` (LevelAssignmentBox, §8.8.13) is
+/// appended after the `trex` boxes to declare how the file is partitioned
+/// into levels for partial-subsegment fetch (the level numbers a sibling
+/// `ssix` refers to). The `leva` is omitted entirely when no levels are
+/// configured, keeping the byte-identical default `mvex`.
+fn build_mvex(tracks: &[FragTrackState], levels: &[crate::demux::LevaEntry]) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     for t in tracks {
         body.extend_from_slice(&build_trex(
@@ -818,7 +827,13 @@ fn build_mvex(tracks: &[FragTrackState]) -> Vec<u8> {
             t.trex_default_sample_flags,
         ));
     }
-    wrap_box(b"mvex", &body)
+    if !levels.is_empty() {
+        let record = crate::demux::LevaRecord {
+            entries: levels.to_vec(),
+        };
+        body.extend_from_slice(&crate::demux::build_leva_box(&record)?);
+    }
+    Ok(wrap_box(b"mvex", &body))
 }
 
 /// §8.8.3 `trex` — TrackExtendsBox.

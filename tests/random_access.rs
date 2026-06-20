@@ -304,6 +304,7 @@ fn tfra_drives_seek_to_correct_keyframe() {
             // These tests synthesise their own mfra; suppress native
             // sidx + mfra emission so the appended boxes are the only ones.
             emit_random_access_indexes: false,
+            levels: Vec::new(),
         }),
         write_edit_list: true,
         track_sample_groups: Vec::new(),
@@ -406,6 +407,7 @@ fn mfra_in_fragmented_file_does_not_break_demux() {
             // These tests synthesise their own mfra; suppress native
             // sidx + mfra emission so the appended boxes are the only ones.
             emit_random_access_indexes: false,
+            levels: Vec::new(),
         }),
         write_edit_list: true,
         track_sample_groups: Vec::new(),
@@ -611,6 +613,7 @@ fn prft_in_file_is_surfaced_as_metadata() {
             cadence: FragmentCadence::EveryNPackets(2),
             styp: None,
             emit_random_access_indexes: false,
+            levels: Vec::new(),
         }),
         write_edit_list: true,
         track_sample_groups: Vec::new(),
@@ -751,6 +754,7 @@ fn sidx_drives_seek_to_correct_keyframe_when_no_mfra() {
             // sidx + mfra both emitted; we strip mfra below to force
             // the sidx fast-path.
             emit_random_access_indexes: true,
+            levels: Vec::new(),
         }),
         write_edit_list: true,
         track_sample_groups: Vec::new(),
@@ -859,6 +863,7 @@ fn seek_to_still_works_without_sidx_or_mfra() {
             cadence: FragmentCadence::EveryNPackets(1),
             styp: None,
             emit_random_access_indexes: false,
+            levels: Vec::new(),
         }),
         write_edit_list: true,
         track_sample_groups: Vec::new(),
@@ -922,6 +927,7 @@ fn sidx_with_wrong_reference_id_is_ignored() {
             cadence: FragmentCadence::EveryNPackets(1),
             styp: None,
             emit_random_access_indexes: true,
+            levels: Vec::new(),
         }),
         write_edit_list: true,
         track_sample_groups: Vec::new(),

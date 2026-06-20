@@ -174,6 +174,7 @@ fn fragmented_options() -> Mp4MuxerOptions {
             cadence: FragmentCadence::EveryNPackets(1),
             styp: None,
             emit_random_access_indexes: false,
+            levels: Vec::new(),
         }),
         write_edit_list: false,
         track_sample_groups: Vec::new(),
@@ -424,4 +425,107 @@ fn leva_public_entry_point_parses_standalone_body() {
         record.entries[1].grouping_type,
         u32::from_be_bytes(*b"tele")
     );
+}
+
+/// Round 351 — the fragmented muxer emits a real `leva` (not a spliced
+/// one) when `FragmentedOptions::levels` is non-empty, and the demuxer
+/// reads it back through the flat metadata channel. This is the
+/// write/read symmetry counterpart to the splice-based tests above:
+/// `build_leva_box` (the muxer's write primitive) and `parse_leva`
+/// (the demuxer's `mvex` walk) agree byte-for-byte.
+#[test]
+fn muxer_emitted_leva_reads_back_via_metadata() {
+    use oxideav_mp4::demux::LevaEntry;
+
+    let levels = vec![
+        // Two type-2 (level-by-track) entries followed by one type-0
+        // (sample-group) entry — a §8.8.13.3-conformant ordering.
+        LevaEntry {
+            track_id: 1,
+            padding_flag: false,
+            assignment_type: 2,
+            grouping_type: 0,
+            grouping_type_parameter: 0,
+            sub_track_id: 0,
+        },
+        LevaEntry {
+            track_id: 1,
+            padding_flag: true,
+            assignment_type: 2,
+            grouping_type: 0,
+            grouping_type_parameter: 0,
+            sub_track_id: 0,
+        },
+        LevaEntry {
+            track_id: 1,
+            padding_flag: false,
+            assignment_type: 0,
+            grouping_type: u32::from_be_bytes(*b"roll"),
+            grouping_type_parameter: 0,
+            sub_track_id: 0,
+        },
+    ];
+
+    let stream = pcm_stream_info();
+    let tmp = std::env::temp_dir().join(format!(
+        "oxideav-mp4-leva-mux-r351-{}-{}.mp4",
+        std::process::id(),
+        NEXT_TMP.fetch_add(1, Ordering::Relaxed),
+    ));
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut opts = fragmented_options();
+        if let Some(frag) = opts.fragmented.as_mut() {
+            frag.levels = levels.clone();
+        }
+        let mut mux =
+            open_with_options(ws, std::slice::from_ref(&stream), opts).expect("open muxer");
+        mux.write_header().unwrap();
+        for i in 0..2 {
+            let mut pkt = Packet::new(0, stream.time_base, make_pcm_payload(512));
+            pkt.pts = Some(i * 512);
+            pkt.duration = Some(512);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&tmp).unwrap();
+    let _ = std::fs::remove_file(&tmp);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux opens");
+    let md = dmx.metadata();
+    let count = md.iter().find(|(k, _)| k == "leva_count").map(|(_, v)| v);
+    assert_eq!(
+        count,
+        Some(&"3".to_string()),
+        "muxer-emitted leva should surface level_count = 3"
+    );
+    let get = |k: &str| md.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+    assert_eq!(get("leva_0"), Some("1 pad=0 at=2".to_string()));
+    assert_eq!(get("leva_1"), Some("1 pad=1 at=2".to_string()));
+    assert_eq!(
+        get("leva_2"),
+        Some(format!(
+            "1 pad=0 at=0 grouping_type={}",
+            u32::from_be_bytes(*b"roll")
+        )),
+    );
+}
+
+/// A fragmented file muxed with the default (empty) `levels` carries no
+/// `leva` at all — the byte-identical default `mvex` is preserved.
+#[test]
+fn muxer_without_levels_emits_no_leva() {
+    let bytes = mux_fragmented_pcm_to_bytes();
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux opens");
+    for (k, _) in dmx.metadata() {
+        assert!(
+            !k.starts_with("leva"),
+            "default muxer output must carry no leva box, found {k}"
+        );
+    }
 }

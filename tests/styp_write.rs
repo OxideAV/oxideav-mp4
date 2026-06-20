@@ -165,6 +165,7 @@ fn write_fragmented_segment_with_styp_overrides_one_segment() {
         // Disable sidx to keep the per-segment byte layout simple:
         // each segment is just `styp + moof + mdat`.
         emit_random_access_indexes: false,
+        levels: Vec::new(),
     };
     let path = std::env::temp_dir().join("oxideav-mp4-r127-styp-override.mp4");
     {
@@ -244,6 +245,7 @@ fn write_fragmented_segment_with_styp_emits_styp_when_preset_is_none() {
         cadence: FragmentCadence::EveryNPackets(1),
         styp: None,
         emit_random_access_indexes: false,
+        levels: Vec::new(),
     };
     let (mut mux, path) =
         open_to_tempfile("oxideav-mp4-r127-styp-preset-none.mp4", opts, frag_opts);
@@ -295,6 +297,7 @@ fn write_fragmented_segment_with_styp_precedes_moof() {
         cadence: FragmentCadence::EveryNPackets(1),
         styp: None,
         emit_random_access_indexes: false,
+        levels: Vec::new(),
     };
     let (mut mux, path) =
         open_to_tempfile("oxideav-mp4-r127-styp-precedes-moof.mp4", opts, frag_opts);
@@ -352,6 +355,7 @@ fn write_fragmented_segment_with_styp_empty_compat_emits_sixteen_bytes() {
         cadence: FragmentCadence::EveryNPackets(1),
         styp: None,
         emit_random_access_indexes: false,
+        levels: Vec::new(),
     };
     let (mut mux, path) =
         open_to_tempfile("oxideav-mp4-r127-styp-empty-compat.mp4", opts, frag_opts);

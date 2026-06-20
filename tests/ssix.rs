@@ -128,6 +128,7 @@ fn fragmented_options() -> Mp4MuxerOptions {
             // Emit a per-segment `sidx` so the spliced `ssix` has a
             // Segment Index box to document (§8.16.4.1 placement).
             emit_random_access_indexes: true,
+            levels: Vec::new(),
         }),
         write_edit_list: false,
         track_sample_groups: Vec::new(),
