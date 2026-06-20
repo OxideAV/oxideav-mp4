@@ -8296,6 +8296,59 @@ pub fn parse_leva_box(body: &[u8]) -> Result<LevaRecord> {
     parse_leva(body)
 }
 
+/// Serialise a [`LevaRecord`] into a complete `leva` box — 8-byte header
+/// (`[size:u32]['leva']`) plus the §8.8.13.2 v0 body — for fragmented-MP4
+/// emitters that declare per-level sample assignments in `mvex`.
+///
+/// The body is the §8.8.13.2 `FullBox(version = 0, flags = 0)` preamble,
+/// the one-byte `level_count`, then one variable-length entry per
+/// [`LevaEntry`]: `track_id`(u32), a packed
+/// `padding_flag<<7 | assignment_type` byte, and the assignment-type
+/// tail (`grouping_type` for type 0; `grouping_type` +
+/// `grouping_type_parameter` for type 1; nothing for types 2/3;
+/// `sub_track_id` for type 4; nothing for reserved types > 4 — the spec
+/// defines no tail length there, so none is written).
+///
+/// The caller owns the §8.8.13.3 conformance constraints the record type
+/// cannot express: `level_count` should be ≥ 2, and the
+/// `assignment_type` sequence should be "zero or more of type 2 or 3,
+/// followed by zero or more of exactly one type." `assignment_type`
+/// values above the 7-bit field (> 127) are rejected rather than
+/// silently truncated into the `padding_flag` bit.
+pub fn build_leva_box(record: &LevaRecord) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(8 + record.entries.len() * 9);
+    body.extend_from_slice(&[0u8; 4]); // FullBox(version = 0, flags = 0)
+    if record.entries.len() > u8::MAX as usize {
+        return Err(Error::invalid("MP4: leva level_count exceeds 255"));
+    }
+    body.push(record.entries.len() as u8);
+    for e in &record.entries {
+        if e.assignment_type > 0x7f {
+            return Err(Error::invalid(
+                "MP4: leva assignment_type exceeds the 7-bit field",
+            ));
+        }
+        body.extend_from_slice(&e.track_id.to_be_bytes());
+        let packed = (if e.padding_flag { 0x80 } else { 0 }) | (e.assignment_type & 0x7f);
+        body.push(packed);
+        match e.assignment_type {
+            0 => body.extend_from_slice(&e.grouping_type.to_be_bytes()),
+            1 => {
+                body.extend_from_slice(&e.grouping_type.to_be_bytes());
+                body.extend_from_slice(&e.grouping_type_parameter.to_be_bytes());
+            }
+            2 | 3 => {}
+            4 => body.extend_from_slice(&e.sub_track_id.to_be_bytes()),
+            _ => {}
+        }
+    }
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+    out.extend_from_slice(b"leva");
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
 /// Parse a standalone `csgp` (CompactSampleToGroupBox, ISO/IEC
 /// 14496-12:2020 §8.9.5) body from `body` (the bytes after the 8/16-byte
 /// box header).
@@ -13421,6 +13474,75 @@ mod tests {
         let r_internal = super::parse_ssix(body).unwrap();
         assert_eq!(r_public, r_internal);
         assert_eq!(r_public, record);
+    }
+
+    /// `build_leva_box` emits a box whose body round-trips through
+    /// `parse_leva_box` — covering every assignment_type tail (0 carries
+    /// grouping_type, 1 adds grouping_type_parameter, 2/3 are bare, 4
+    /// carries sub_track_id) plus the padding_flag bit packing.
+    #[test]
+    fn leva_build_round_trip_all_assignment_types() {
+        let record = super::LevaRecord {
+            entries: vec![
+                super::LevaEntry {
+                    track_id: 1,
+                    padding_flag: true,
+                    assignment_type: 2,
+                    grouping_type: 0,
+                    grouping_type_parameter: 0,
+                    sub_track_id: 0,
+                },
+                super::LevaEntry {
+                    track_id: 2,
+                    padding_flag: false,
+                    assignment_type: 0,
+                    grouping_type: u32::from_be_bytes(*b"rash"),
+                    grouping_type_parameter: 0,
+                    sub_track_id: 0,
+                },
+                super::LevaEntry {
+                    track_id: 3,
+                    padding_flag: true,
+                    assignment_type: 1,
+                    grouping_type: u32::from_be_bytes(*b"roll"),
+                    grouping_type_parameter: 9,
+                    sub_track_id: 0,
+                },
+                super::LevaEntry {
+                    track_id: 4,
+                    padding_flag: false,
+                    assignment_type: 4,
+                    grouping_type: 0,
+                    grouping_type_parameter: 0,
+                    sub_track_id: 77,
+                },
+            ],
+        };
+        let boxed = super::build_leva_box(&record).unwrap();
+        assert_eq!(&boxed[4..8], b"leva");
+        assert_eq!(
+            boxed.len(),
+            u32::from_be_bytes(boxed[..4].try_into().unwrap()) as usize
+        );
+        let parsed = super::parse_leva_box(&boxed[8..]).unwrap();
+        assert_eq!(parsed.entries, record.entries);
+    }
+
+    /// `build_leva_box` rejects an `assignment_type` that does not fit the
+    /// 7-bit field rather than corrupting it into the `padding_flag` bit.
+    #[test]
+    fn leva_build_rejects_oversized_assignment_type() {
+        let record = super::LevaRecord {
+            entries: vec![super::LevaEntry {
+                track_id: 1,
+                padding_flag: false,
+                assignment_type: 200,
+                grouping_type: 0,
+                grouping_type_parameter: 0,
+                sub_track_id: 0,
+            }],
+        };
+        assert!(super::build_leva_box(&record).is_err());
     }
 
     /// `(subsample_size16, priority, discardable, csp)` — one v0 sub-sample.
