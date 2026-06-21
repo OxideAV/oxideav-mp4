@@ -498,6 +498,16 @@ pub const ENCA: [u8; 4] = fourcc("enca");
 pub const ENCT: [u8; 4] = fourcc("enct");
 pub const ENCS: [u8; 4] = fourcc("encs");
 
+// `stvi` — StereoVideoBox (ISO/IEC 14496-12 §8.15.4.2). A `FullBox`
+// that sits inside the `schi` (SchemeInformationBox) of a sample
+// entry's `sinf` when the SchemeType is `stvi` (stereoscopic video,
+// §8.15.4.1). Indicates that decoded frames carry either two spatially
+// packed constituent frames (frame packing) or one of two views of a
+// stereo pair (left / right in different tracks). Parsed structurally
+// via `crate::demux`; this bare FourCC lets the sinf/schi walker
+// dispatch on it.
+pub const STVI: [u8; 4] = fourcc("stvi");
+
 // CENC boxes (ISO/IEC 23001-7). Parsed via the structured types in
 // `crate::cenc`; the bare FourCC constants here let the demux walker
 // dispatch on them.

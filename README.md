@@ -918,6 +918,39 @@ Sample-entry FourCCs resolve to these codec ids:
   complementary to the mastering-display (`mdcv`) / content-light-level
   (`clli`) metadata, which describe the *content's* mastering
   environment rather than the *viewer's* ambient one.
+- Stereo video (ISO/IEC 14496-12 §8.15.4.2, `stvi`): a video track that
+  uses the restricted-scheme `stvi` SchemeType (stereoscopic video,
+  §8.15.4.1) carries a `StereoVideoBox` inside its sample-entry
+  `sinf/schi`, indicating that decoded frames hold either two spatially
+  packed constituent frames forming a stereo pair (frame packing) or one
+  of two views of a stereo pair (left / right in different tracks). The
+  `FullBox(0, 0)` body is a packed `int(30) reserved` + `int(2)
+  single_view_allowed`, then `int(32) stereo_scheme`, `int(32) length`,
+  the `int(8)[length] stereo_indication_type` array, and optional
+  trailing boxes. `single_view_allowed` signals which view(s) may be
+  shown on a monoscopic single-view display (bit 0 = right view, bit 1 =
+  left view); `stereo_scheme` selects the arrangement vocabulary (1 =
+  the ISO/IEC 14496-10 frame-packing-arrangement SEI scheme, 2 = the
+  ISO/IEC 13818-2 Annex L arrangement type, 3 = the ISO/IEC 23000-11
+  scheme); `stereo_indication_type` is the scheme-specific arrangement
+  code (preserved verbatim — its detailed meaning is owned by the named
+  derived spec). The box is recovered from the `schi` of both encrypted
+  (`enc*`) and non-encrypted (sample-entry-resident `sinf`) video
+  entries; the first one encountered across a track's sample entries
+  wins. Surfaced on `params.options` as `stvi_single_view_allowed` and
+  `stvi_stereo_scheme` (decimal) plus `stvi_indication` (the raw
+  `stereo_indication_type` bytes as lowercase hex, omitted when the
+  indication is empty). The first 32-bit word's 30 reserved high bits
+  are masked off so a producer slip on them does not corrupt
+  `single_view_allowed`; a `length` that overruns the body is rejected
+  rather than reading past the end, and trailing optional `any_box`
+  bytes after the array are ignored. The structured record is reachable
+  via the public `oxideav_mp4::demux::parse_stvi_box(&[u8])` entry point
+  (typed `StviRecord` with `right_view_monoscopic_allowed()` /
+  `left_view_monoscopic_allowed()` accessors) for tooling holding the
+  box body. Absent `stvi`, none of the keys are emitted. The box version
+  is tolerated even if non-zero (the layout is unambiguous), matching the
+  `pdin` / `padb` posture.
 - Bit rate (ISO/IEC 14496-12 §8.5.2, `btrt`): a `SampleEntry` (video /
   audio / metadata / text) may carry, optionally, a `BitRateBox` — a
   plain `Box` (no FullBox version/flags) with a fixed 12-byte body of

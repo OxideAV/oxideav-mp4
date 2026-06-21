@@ -685,6 +685,62 @@ pub struct BtrtRecord {
     pub avg_bitrate: u32,
 }
 
+/// Decoded `stvi` (StereoVideoBox, ISO/IEC 14496-12 §8.15.4.2).
+///
+/// A `FullBox(version = 0, flags = 0)` that sits inside the
+/// `schi` (SchemeInformationBox) of a sample entry's `sinf` when the
+/// restricted-scheme SchemeType is `stvi` (stereoscopic video,
+/// §8.15.4.1). It indicates that decoded frames carry either two
+/// spatially packed constituent frames forming a stereo pair (frame
+/// packing) or one of two views of a stereo pair (left / right in
+/// different tracks).
+///
+/// The body is a packed `template int(30) reserved` plus `int(2)
+/// single_view_allowed`, then `int(32) stereo_scheme`, `int(32) length`,
+/// the `int(8)[length] stereo_indication_type` array, and optional
+/// trailing boxes. The container preserves `single_view_allowed`,
+/// `stereo_scheme`, and the raw `stereo_indication_type` bytes verbatim;
+/// their detailed interpretation is `stereo_scheme`-specific (§8.15.4.2.3
+/// routes to a table in ISO/IEC 14496-10 / 13818-2 / 23000-11) and is
+/// left to a downstream consumer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StviRecord {
+    /// `single_view_allowed` (§8.15.4.2.3), the low 2 bits after the
+    /// 30-bit reserved field. `0` → content may only be displayed on a
+    /// stereoscopic display; bit 0 (`& 1`) set → the right view may be
+    /// shown on a monoscopic single-view display; bit 1 (`& 2`) set →
+    /// the left view may be shown on a monoscopic single-view display.
+    pub single_view_allowed: u8,
+    /// `stereo_scheme` (§8.15.4.2.3) — the stereo arrangement scheme.
+    /// `1` = the frame-packing-arrangement SEI scheme of ISO/IEC
+    /// 14496-10; `2` = the Annex L arrangement-type scheme of ISO/IEC
+    /// 13818-2; `3` = the ISO/IEC 23000-11 scheme. Other values are
+    /// reserved; the raw integer is preserved verbatim.
+    pub stereo_scheme: u32,
+    /// The `stereo_indication_type` byte string (`length` bytes), whose
+    /// syntax depends on `stereo_scheme` (§8.15.4.2.3). Preserved
+    /// verbatim — for scheme 1/2 it is a big-endian `u32`
+    /// arrangement-type code, for scheme 3 it is two `u8`s
+    /// (composition-type + `is_left_first` in the LSB of the second).
+    pub stereo_indication_type: Vec<u8>,
+}
+
+impl StviRecord {
+    /// `true` when the right view of the stereo pair may be displayed on
+    /// a monoscopic single-view display (`single_view_allowed & 1`,
+    /// §8.15.4.2.3).
+    pub fn right_view_monoscopic_allowed(&self) -> bool {
+        self.single_view_allowed & 1 != 0
+    }
+
+    /// `true` when the left view of the stereo pair may be displayed on
+    /// a monoscopic single-view display (`single_view_allowed & 2`,
+    /// §8.15.4.2.3).
+    pub fn left_view_monoscopic_allowed(&self) -> bool {
+        self.single_view_allowed & 2 != 0
+    }
+}
+
 /// One `(rate, initial_delay)` pair from a `pdin`
 /// ProgressiveDownloadInfoBox (ISO/IEC 14496-12 §8.1.3).
 ///
@@ -1058,6 +1114,15 @@ struct Track {
     /// `amve`, the first encountered wins (a single nominal environment
     /// per track).
     amve: Option<AmveRecord>,
+    /// §8.15.4.2 — `stvi` (StereoVideoBox) found inside the track's
+    /// sample-entry `sinf/schi` when the restricted-scheme SchemeType is
+    /// `stvi` (stereoscopic video, §8.15.4.1). Carries
+    /// `single_view_allowed`, `stereo_scheme`, and the raw
+    /// `stereo_indication_type` bytes describing the stereo arrangement.
+    /// `None` for non-stereo tracks (the common case) or when the box is
+    /// absent / malformed. The first `stvi` encountered across the
+    /// track's sample entries wins.
+    stvi: Option<StviRecord>,
     /// §8.5.2 — `btrt` (BitRateBox) found inside the track's active
     /// `SampleEntry` (`[0]`). Carries `bufferSizeDB` / `maxBitrate` /
     /// `avgBitrate`, the codec-agnostic bandwidth descriptor a player or
@@ -2281,6 +2346,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         cslg: None,
         vmhd: None,
         amve: None,
+        stvi: None,
         btrt: None,
         hmhd: None,
         dref: None,
@@ -3492,6 +3558,9 @@ fn parse_stsd(body: &[u8], t: &mut Track) -> Result<()> {
         }
         t.protection_scheme = unwrap.scheme_type;
         t.tenc = unwrap.tenc;
+        if t.stvi.is_none() {
+            t.stvi = unwrap.stvi;
+        }
     }
     parse_sample_entry(&entry, t)?;
     Ok(())
@@ -3513,6 +3582,11 @@ struct SinfUnwrap {
     original_format: Option<[u8; 4]>,
     scheme_type: Option<[u8; 4]>,
     tenc: Option<TencBox>,
+    /// `stvi` (StereoVideoBox, §8.15.4.2) recovered from `sinf/schi`
+    /// when the SchemeType is `stvi` (stereoscopic video, §8.15.4.1).
+    /// `None` for non-stereo schemes (the common case) or a malformed
+    /// box.
+    stvi: Option<StviRecord>,
 }
 
 impl SinfUnwrap {
@@ -3521,6 +3595,7 @@ impl SinfUnwrap {
             original_format: None,
             scheme_type: None,
             tenc: None,
+            stvi: None,
         }
     }
 }
@@ -3593,11 +3668,15 @@ fn parse_sinf_body(body: &[u8]) -> Result<SinfUnwrap> {
             }
             SCHI => {
                 // ISO/IEC 23001-7 §4.1 — descend into schi to find
-                // `tenc`. A malformed tenc inside an otherwise valid
+                // `tenc` (CENC), and ISO/IEC 14496-12 §8.15.4.2 — the
+                // `stvi` (StereoVideoBox) of a `stvi`-scheme restricted
+                // entry. A malformed child inside an otherwise valid
                 // schi should not abort sinf parsing (it still has
-                // structural meaning via frma + schm), so we swallow
-                // a TencBox parse error and leave `out.tenc = None`.
-                out.tenc = walk_schi_for_tenc(&inner);
+                // structural meaning via frma + schm), so each is
+                // swallowed independently and left `None` on error.
+                let children = walk_schi(&inner);
+                out.tenc = children.tenc;
+                out.stvi = children.stvi;
             }
             _ => {}
         }
@@ -3605,23 +3684,46 @@ fn parse_sinf_body(body: &[u8]) -> Result<SinfUnwrap> {
     Ok(out)
 }
 
+/// Scheme-specific children recovered from a `schi`
+/// (SchemeInformationBox, ISO/IEC 14496-12 §8.12.6). Each field is
+/// independently `None` when its box was absent or malformed — a `schi`
+/// carries whichever children the active SchemeType defines.
+#[derive(Default)]
+struct SchiChildren {
+    /// `tenc` (TrackEncryptionBox, ISO/IEC 23001-7 §8.2) — CENC scheme.
+    tenc: Option<TencBox>,
+    /// `stvi` (StereoVideoBox, §8.15.4.2) — `stvi` stereoscopic scheme.
+    stvi: Option<StviRecord>,
+}
+
 /// Walk a `schi` (SchemeInformationBox, ISO/IEC 14496-12 §8.12.6)
-/// body looking for a `tenc` (TrackEncryptionBox, ISO/IEC 23001-7
-/// §8.2) child. Returns the parsed payload, or `None` if no tenc was
-/// present (or it was malformed — schi can legitimately carry other
-/// scheme-specific children).
-fn walk_schi_for_tenc(body: &[u8]) -> Option<TencBox> {
+/// body collecting the scheme-specific children this crate understands:
+/// the CENC `tenc` (TrackEncryptionBox, ISO/IEC 23001-7 §8.2) and the
+/// stereoscopic-video `stvi` (StereoVideoBox, §8.15.4.2). A `schi` is
+/// scheme-specific so it may legitimately carry neither (or other
+/// children we don't model); a malformed child is dropped without
+/// aborting the walk. The walk ends cleanly on a truncated header.
+fn walk_schi(body: &[u8]) -> SchiChildren {
+    let mut out = SchiChildren::default();
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
     while cur.position() < end {
-        let hdr = read_box_header(&mut cur).ok().flatten()?;
+        let hdr = match read_box_header(&mut cur) {
+            Ok(Some(h)) => h,
+            _ => break,
+        };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
-        let inner = read_bytes_vec(&mut cur, psz).ok()?;
-        if hdr.fourcc == TENC {
-            return parse_tenc(&inner).ok();
+        let inner = match read_bytes_vec(&mut cur, psz) {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        match hdr.fourcc {
+            TENC if out.tenc.is_none() => out.tenc = parse_tenc(&inner).ok(),
+            STVI if out.stvi.is_none() => out.stvi = parse_stvi(&inner),
+            _ => {}
         }
     }
-    None
+    out
 }
 
 fn parse_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
@@ -3994,6 +4096,20 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
                     t.btrt = Some(rec);
                 }
             }
+            // Restricted-scheme (§8.15) video — a non-encrypted
+            // `VisualSampleEntry` (e.g. a `resv` whose original FourCC is
+            // already preserved here, or any entry signalling a
+            // restricted scheme) carries its `sinf` directly as a child
+            // box rather than wrapped by an `enc*` outer FourCC. Descend
+            // it to recover an `stvi` (StereoVideoBox, §8.15.4.2) from
+            // the `schi` when the SchemeType is `stvi`. The `enc*` path
+            // (handled before `parse_sample_entry`) already populated
+            // `t.stvi` for protected entries — first one wins.
+            b"sinf" if t.stvi.is_none() => {
+                if let Ok(unwrap) = parse_sinf_body(&body) {
+                    t.stvi = unwrap.stvi;
+                }
+            }
             _ => {}
         }
     }
@@ -4043,6 +4159,58 @@ fn parse_btrt(body: &[u8]) -> Option<BtrtRecord> {
         buffer_size_db,
         max_bitrate,
         avg_bitrate,
+    })
+}
+
+/// Parse an `stvi` (StereoVideoBox, ISO/IEC 14496-12 §8.15.4.2) body —
+/// the bytes after the 4-byte FullBox version/flags preamble.
+///
+/// Layout (§8.15.4.2.2):
+///
+/// ```text
+/// template int(30) reserved = 0;
+/// int(2)  single_view_allowed;
+/// int(32) stereo_scheme;
+/// int(32) length;
+/// int(8)[length] stereo_indication_type;
+/// Box[] any_box;  // optional, ignored at this layer
+/// ```
+///
+/// The first 32-bit word packs the 30-bit reserved field (high bits)
+/// and the 2-bit `single_view_allowed` (low bits). The reserved bits
+/// are masked off so a producer slip on them does not corrupt the
+/// surfaced value. `length` is validated against the bytes actually
+/// present; a `length` that overruns the body is rejected (`None`)
+/// rather than reading past the end. Trailing `any_box` bytes after the
+/// `stereo_indication_type` array are ignored. Returns `None` for a
+/// body too short to hold the fixed 12-byte (preamble-relative) header.
+fn parse_stvi(body: &[u8]) -> Option<StviRecord> {
+    // 4-byte FullBox preamble + 4 (single_view_allowed word) + 4
+    // (stereo_scheme) + 4 (length) = 16 bytes minimum.
+    if body.len() < 16 {
+        return None;
+    }
+    // FullBox preamble: version (1) + flags (3). §8.15.4.2.2 pins
+    // version 0; we tolerate a non-zero version (the layout is
+    // unambiguous), matching the `parse_pdin` / `parse_padb` posture.
+    let svw = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    // Low 2 bits are `single_view_allowed`; the upper 30 are reserved.
+    let single_view_allowed = (svw & 0x3) as u8;
+    let stereo_scheme = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+    let length = u32::from_be_bytes([body[12], body[13], body[14], body[15]]) as usize;
+    let sit_start: usize = 16;
+    // `length` must not run past the bytes present (a truncated /
+    // forged length would otherwise read trailing `any_box` content or
+    // off the end).
+    let sit_end = sit_start.checked_add(length)?;
+    if sit_end > body.len() {
+        return None;
+    }
+    let stereo_indication_type = body[sit_start..sit_end].to_vec();
+    Some(StviRecord {
+        single_view_allowed,
+        stereo_scheme,
+        stereo_indication_type,
     })
 }
 
@@ -7198,6 +7366,36 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             .insert("amve_ambient_light_y", a.ambient_light_y.to_string());
     }
 
+    // ISO/IEC 14496-12 §8.15.4.2: when the track's sample-entry
+    // `sinf/schi` carried an `stvi` (StereoVideoBox) — i.e. the
+    // restricted-scheme SchemeType is `stvi` (stereoscopic video,
+    // §8.15.4.1) — surface its three fields on `params.options`:
+    // `stvi_single_view_allowed` (the 2-bit monoscopic-display
+    // permission), `stvi_stereo_scheme` (1 = 14496-10 frame-packing
+    // SEI, 2 = 13818-2 Annex L, 3 = 23000-11), both decimal, and
+    // `stvi_indication` (the raw `stereo_indication_type` bytes as
+    // lowercase hex — its meaning is `stereo_scheme`-specific, so it is
+    // preserved verbatim for a downstream consumer). The
+    // `stvi_indication` key is omitted when the indication is empty
+    // (`length == 0`). Absent `stvi`, none of the keys are emitted.
+    if let Some(s) = &t.stvi {
+        params.options.insert(
+            "stvi_single_view_allowed",
+            s.single_view_allowed.to_string(),
+        );
+        params
+            .options
+            .insert("stvi_stereo_scheme", s.stereo_scheme.to_string());
+        if !s.stereo_indication_type.is_empty() {
+            let mut hex = String::with_capacity(s.stereo_indication_type.len() * 2);
+            for b in &s.stereo_indication_type {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{b:02x}");
+            }
+            params.options.insert("stvi_indication", hex);
+        }
+    }
+
     // ISO/IEC 14496-12 §8.5.2: when the track's active `SampleEntry`
     // carried a `btrt` (BitRateBox), surface its three bandwidth fields
     // on `params.options` as `btrt_buffer_size_db` (decoding buffer size
@@ -8412,6 +8610,22 @@ pub fn parse_btrt_box(body: &[u8]) -> Result<BtrtRecord> {
     parse_btrt(body).ok_or_else(|| Error::invalid("MP4: btrt too short"))
 }
 
+/// Parse a standalone `stvi` (StereoVideoBox, ISO/IEC 14496-12
+/// §8.15.4.2) body from `body` (the bytes after the 4-byte FullBox
+/// version/flags preamble — `stvi` is a `FullBox`).
+///
+/// Exposed as a public entry point so tooling that already has the box's
+/// payload bytes in hand (a stereoscopic-video extractor, a
+/// restricted-scheme inspector, a fixture validator) can recover the
+/// `(single_view_allowed, stereo_scheme, stereo_indication_type)` triple
+/// without re-running `open()`. Returns `Err` for a body too short to
+/// hold the fixed header, or one whose `length` field overruns the bytes
+/// present; trailing optional `any_box` bytes after the
+/// `stereo_indication_type` array are ignored.
+pub fn parse_stvi_box(body: &[u8]) -> Result<StviRecord> {
+    parse_stvi(body).ok_or_else(|| Error::invalid("MP4: stvi malformed"))
+}
+
 use std::io::Read;
 
 fn read_bytes_vec<R: Read + ?Sized>(r: &mut R, n: usize) -> Result<Vec<u8>> {
@@ -8594,6 +8808,7 @@ mod tests {
             cslg: None,
             vmhd: None,
             amve: None,
+            stvi: None,
             btrt: None,
             hmhd: None,
             dref: None,
@@ -11393,6 +11608,201 @@ mod tests {
         assert_eq!(info.params.options.get("btrt_buffer_size_db"), None);
         assert_eq!(info.params.options.get("btrt_max_bitrate"), None);
         assert_eq!(info.params.options.get("btrt_avg_bitrate"), None);
+    }
+
+    /// Build an `stvi` (StereoVideoBox) body, FullBox-preamble-relative:
+    /// `int(30) reserved | int(2) single_view_allowed` (one big-endian
+    /// u32 word) + `int(32) stereo_scheme` + `int(32) length` +
+    /// `int(8)[length] stereo_indication_type`. The 4-byte FullBox
+    /// version/flags preamble is prepended (version 0, flags 0).
+    fn stvi_body(single_view_allowed: u8, stereo_scheme: u32, indication: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        // FullBox version 0, flags 0.
+        out.extend_from_slice(&[0u8; 4]);
+        // First word: reserved(30) high bits zero, single_view_allowed(2)
+        // low bits.
+        let word = (single_view_allowed as u32) & 0x3;
+        out.extend_from_slice(&word.to_be_bytes());
+        out.extend_from_slice(&stereo_scheme.to_be_bytes());
+        out.extend_from_slice(&(indication.len() as u32).to_be_bytes());
+        out.extend_from_slice(indication);
+        out
+    }
+
+    /// `parse_stvi` decodes a scheme-1 (14496-10 frame-packing) box: a
+    /// 4-byte `stereo_indication_type` carrying a u32 arrangement type.
+    #[test]
+    fn parse_stvi_scheme1_frame_packing() {
+        // single_view_allowed = 3 (both views OK on monoscopic);
+        // stereo_scheme = 1; indication = side-by-side type (3) as u32.
+        let body = stvi_body(3, 1, &3u32.to_be_bytes());
+        let rec = super::parse_stvi(&body).expect("stvi should parse");
+        assert_eq!(rec.single_view_allowed, 3);
+        assert_eq!(rec.stereo_scheme, 1);
+        assert_eq!(rec.stereo_indication_type, vec![0, 0, 0, 3]);
+        assert!(rec.right_view_monoscopic_allowed());
+        assert!(rec.left_view_monoscopic_allowed());
+    }
+
+    /// `parse_stvi` masks the 30 reserved high bits off the first word so
+    /// a producer slip on them does not corrupt `single_view_allowed`.
+    #[test]
+    fn parse_stvi_masks_reserved_bits() {
+        // scheme 3, 2-byte indication. The helper wrote 0x0000_0000 in
+        // the first word (bytes 4..8) for single_view_allowed = 0; set
+        // some reserved high bits there to prove they are masked off.
+        let mut body = stvi_body(0, 3, &[0x01, 0x00]);
+        body[4] = 0xFF;
+        body[5] = 0xFF;
+        body[6] = 0xFF;
+        body[7] = 0xFE; // low 2 bits = 0b10 → single_view_allowed = 2
+        let rec = super::parse_stvi(&body).expect("stvi should parse");
+        assert_eq!(rec.single_view_allowed, 2);
+        assert!(!rec.right_view_monoscopic_allowed());
+        assert!(rec.left_view_monoscopic_allowed());
+        assert_eq!(rec.stereo_scheme, 3);
+        assert_eq!(rec.stereo_indication_type, vec![0x01, 0x00]);
+    }
+
+    /// `parse_stvi` ignores trailing optional `any_box` bytes after the
+    /// `stereo_indication_type` array.
+    #[test]
+    fn parse_stvi_ignores_trailing_any_box() {
+        let mut body = stvi_body(1, 1, &4u32.to_be_bytes());
+        // Append a fake trailing box.
+        body.extend_from_slice(&8u32.to_be_bytes());
+        body.extend_from_slice(b"free");
+        let rec = super::parse_stvi(&body).expect("stvi should parse");
+        assert_eq!(rec.single_view_allowed, 1);
+        assert_eq!(rec.stereo_indication_type, vec![0, 0, 0, 4]);
+    }
+
+    /// A `length` that overruns the bytes present is rejected rather than
+    /// reading past the end or into trailing box content.
+    #[test]
+    fn parse_stvi_rejects_overrunning_length() {
+        let mut body = stvi_body(0, 1, &[]);
+        // Body now has length = 0; rewrite the length field (bytes 12..16)
+        // to claim 16 indication bytes that are not present.
+        body[12..16].copy_from_slice(&16u32.to_be_bytes());
+        assert!(super::parse_stvi(&body).is_none());
+    }
+
+    /// A body too short to hold the fixed header is rejected; the public
+    /// entry returns `Err` for the same input.
+    #[test]
+    fn parse_stvi_rejects_short_body() {
+        assert!(super::parse_stvi(&[0u8; 15]).is_none());
+        assert!(super::parse_stvi_box(&[0u8; 15]).is_err());
+    }
+
+    /// The public `parse_stvi_box` entry decodes a well-formed body.
+    #[test]
+    fn parse_stvi_box_public_entry() {
+        let body = stvi_body(2, 2, &7u32.to_be_bytes());
+        let rec = super::parse_stvi_box(&body).expect("stvi should parse");
+        assert_eq!(rec.single_view_allowed, 2);
+        assert_eq!(rec.stereo_scheme, 2);
+        assert_eq!(rec.stereo_indication_type, vec![0, 0, 0, 7]);
+    }
+
+    /// An empty `stereo_indication_type` (length 0) parses with an empty
+    /// byte vec.
+    #[test]
+    fn parse_stvi_empty_indication() {
+        let body = stvi_body(0, 99, &[]);
+        let rec = super::parse_stvi(&body).expect("stvi should parse");
+        assert_eq!(rec.stereo_scheme, 99);
+        assert!(rec.stereo_indication_type.is_empty());
+    }
+
+    /// `walk_schi` recovers an `stvi` child from a `schi` body.
+    #[test]
+    fn walk_schi_picks_up_stvi() {
+        let stvi = wrap_box_full_size(b"stvi", &stvi_body(1, 1, &3u32.to_be_bytes()));
+        let children = super::walk_schi(&stvi);
+        let s = children.stvi.expect("stvi should be parsed");
+        assert_eq!(s.single_view_allowed, 1);
+        assert_eq!(s.stereo_scheme, 1);
+        assert!(children.tenc.is_none());
+    }
+
+    /// A non-encrypted restricted-scheme video sample entry carries its
+    /// `sinf` directly as a child box: `parse_video_sample_entry`
+    /// descends it into `schi` and lands the `stvi` on the track.
+    #[test]
+    fn parse_video_sample_entry_picks_up_stvi_via_sinf() {
+        let stvi = wrap_box_full_size(b"stvi", &stvi_body(3, 1, &3u32.to_be_bytes()));
+        let schi = wrap_box_full_size(b"schi", &stvi);
+        let sinf = wrap_box_full_size(b"sinf", &schi);
+        let entry = video_sample_entry_body(1920, 1080, &sinf);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        super::parse_video_sample_entry(&entry, &mut t).unwrap();
+
+        assert_eq!(t.width, Some(1920));
+        let s = t.stvi.expect("stvi should be parsed");
+        assert_eq!(s.single_view_allowed, 3);
+        assert_eq!(s.stereo_scheme, 1);
+        assert_eq!(s.stereo_indication_type, vec![0, 0, 0, 3]);
+    }
+
+    /// Surfacing: a parsed `stvi` exposes its fields on `params.options`,
+    /// with the indication bytes as lowercase hex.
+    #[test]
+    fn build_stream_info_surfaces_stvi_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.stvi = Some(super::StviRecord {
+            single_view_allowed: 3,
+            stereo_scheme: 1,
+            stereo_indication_type: vec![0x00, 0x00, 0x00, 0x03],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("stvi_single_view_allowed"),
+            Some("3")
+        );
+        assert_eq!(info.params.options.get("stvi_stereo_scheme"), Some("1"));
+        assert_eq!(info.params.options.get("stvi_indication"), Some("00000003"));
+    }
+
+    /// An empty indication omits the `stvi_indication` key (the two
+    /// fixed-field keys still emit).
+    #[test]
+    fn build_stream_info_stvi_empty_indication_omits_hex() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.stvi = Some(super::StviRecord {
+            single_view_allowed: 0,
+            stereo_scheme: 2,
+            stereo_indication_type: Vec::new(),
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(
+            info.params.options.get("stvi_single_view_allowed"),
+            Some("0")
+        );
+        assert_eq!(info.params.options.get("stvi_stereo_scheme"), Some("2"));
+        assert_eq!(info.params.options.get("stvi_indication"), None);
+    }
+
+    /// Absence: a track with no `stvi` emits none of the `stvi_*` keys.
+    #[test]
+    fn build_stream_info_no_stvi_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("stvi_single_view_allowed"), None);
+        assert_eq!(info.params.options.get("stvi_stereo_scheme"), None);
+        assert_eq!(info.params.options.get("stvi_indication"), None);
     }
 
     /// Build a `dref` body: FullBox(0,0) preamble + entry_count + the
