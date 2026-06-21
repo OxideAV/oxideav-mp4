@@ -8626,6 +8626,39 @@ pub fn parse_stvi_box(body: &[u8]) -> Result<StviRecord> {
     parse_stvi(body).ok_or_else(|| Error::invalid("MP4: stvi malformed"))
 }
 
+/// Serialise a [`StviRecord`] into a complete `stvi` box — 8-byte header
+/// (`[size:u32]['stvi']`) plus the §8.15.4.2.2 `FullBox(version = 0,
+/// flags = 0)` body — for a restricted-scheme (`stvi` SchemeType) muxer
+/// that places it inside a sample entry's `sinf/schi`.
+///
+/// The body is the packed `reserved(30)` / `single_view_allowed(2)`
+/// word (only the low 2 bits of `single_view_allowed` are written; the
+/// reserved bits are zero per §8.15.4.2.3), the `stereo_scheme` u32, the
+/// `length` u32 derived from `stereo_indication_type.len()`, and the
+/// `stereo_indication_type` bytes verbatim. No trailing `any_box` is
+/// emitted. The byte-exact inverse of [`parse_stvi_box`] (which consumes
+/// the body after the 8-byte header) — a round-trip through the two
+/// preserves every field. `length` must fit a `u32`; an indication
+/// longer than `u32::MAX` is rejected.
+pub fn build_stvi_box(record: &StviRecord) -> Result<Vec<u8>> {
+    let length = record.stereo_indication_type.len();
+    if length > u32::MAX as usize {
+        return Err(Error::invalid("MP4: stvi indication exceeds u32 length"));
+    }
+    let body_len = 4 + 4 + 4 + 4 + length; // preamble + word + scheme + length + array
+    let mut out = Vec::with_capacity(8 + body_len);
+    out.extend_from_slice(&((8 + body_len) as u32).to_be_bytes());
+    out.extend_from_slice(b"stvi");
+    out.extend_from_slice(&[0u8; 4]); // FullBox version 0, flags 0
+                                      // First word: reserved(30) = 0 in the high bits, single_view_allowed
+                                      // in the low 2 bits.
+    out.extend_from_slice(&((record.single_view_allowed as u32) & 0x3).to_be_bytes());
+    out.extend_from_slice(&record.stereo_scheme.to_be_bytes());
+    out.extend_from_slice(&(length as u32).to_be_bytes());
+    out.extend_from_slice(&record.stereo_indication_type);
+    Ok(out)
+}
+
 use std::io::Read;
 
 fn read_bytes_vec<R: Read + ?Sized>(r: &mut R, n: usize) -> Result<Vec<u8>> {

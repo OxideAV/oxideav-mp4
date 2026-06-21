@@ -950,7 +950,12 @@ Sample-entry FourCCs resolve to these codec ids:
   `left_view_monoscopic_allowed()` accessors) for tooling holding the
   box body. Absent `stvi`, none of the keys are emitted. The box version
   is tolerated even if non-zero (the layout is unambiguous), matching the
-  `pdin` / `padb` posture.
+  `pdin` / `padb` posture. The matching write side is
+  `oxideav_mp4::demux::build_stvi_box(&StviRecord)` — the byte-exact
+  inverse of `parse_stvi_box`, emitting a complete `[size]['stvi']` box
+  with the §8.15.4.2.2 `FullBox(0, 0)` body for a restricted-scheme
+  (`stvi` SchemeType) muxer placing it inside a sample entry's
+  `sinf/schi`.
 - Bit rate (ISO/IEC 14496-12 §8.5.2, `btrt`): a `SampleEntry` (video /
   audio / metadata / text) may carry, optionally, a `BitRateBox` — a
   plain `Box` (no FullBox version/flags) with a fixed 12-byte body of
