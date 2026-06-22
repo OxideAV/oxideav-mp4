@@ -153,6 +153,7 @@ fn fragmented_options() -> Mp4MuxerOptions {
             levels: Vec::new(),
             emit_ssix: false,
             ssix_levels: (1, 2),
+            treps: Vec::new(),
         }),
         write_edit_list: false,
         track_sample_groups: Vec::new(),
@@ -392,4 +393,101 @@ fn assp_public_build_parse_round_trips() {
     let bytes = build_assp_box(&v1).expect("build v1 assp");
     let parsed = parse_assp_box(&bytes[8..]).expect("parse v1 assp");
     assert_eq!(parsed, v1);
+}
+
+/// Mux a tiny fragmented PCM stream with `treps` configured on the
+/// fragmented muxer, returning the file bytes. The muxer writes one
+/// `trep` per record inside the init-segment `mvex`.
+fn mux_fragmented_pcm_with_treps(treps: Vec<oxideav_mp4::demux::TrepRecord>) -> Vec<u8> {
+    let stream = pcm_stream_info();
+    let frames_per_packet: i64 = 512;
+    let tmp = std::env::temp_dir().join(format!(
+        "oxideav-mp4-trep-mux-r360-{}-{}.mp4",
+        std::process::id(),
+        NEXT_TMP.fetch_add(1, Ordering::Relaxed),
+    ));
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut opts = fragmented_options();
+        if let Some(fr) = opts.fragmented.as_mut() {
+            fr.treps = treps;
+        }
+        let mut mux =
+            open_with_options(ws, std::slice::from_ref(&stream), opts).expect("open muxer");
+        mux.write_header().unwrap();
+        for i in 0..2 {
+            let mut pkt = Packet::new(
+                0,
+                stream.time_base,
+                make_pcm_payload(frames_per_packet as usize),
+            );
+            pkt.pts = Some(i * frames_per_packet);
+            pkt.duration = Some(frames_per_packet);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&tmp).unwrap();
+    let _ = std::fs::remove_file(&tmp);
+    bytes
+}
+
+#[test]
+fn fragmented_muxer_emits_trep_with_assp_round_trip() {
+    // §8.8.15 / §8.8.16 — configure the fragmented muxer to emit a `trep`
+    // for track 1 carrying a typed v0 `assp`. The emitted init segment
+    // must read back through the demuxer's `mvex` walk: the flat `trep_0`
+    // metadata carries the track id + the assp offset, and `treps()`
+    // recovers the structured record.
+    use oxideav_mp4::demux::{AsspEntry, AsspRecord, TrepChild, TrepRecord};
+
+    let assp = AsspRecord {
+        version: 0,
+        entries: vec![AsspEntry {
+            grouping_type_parameter: None,
+            min_initial_alt_startup_offset: -4,
+        }],
+    };
+    let trep = TrepRecord {
+        track_id: 1,
+        children: vec![TrepChild {
+            fourcc: *b"assp",
+            payload_len: 0,
+            assp: Some(assp.clone()),
+        }],
+    };
+    let bytes = mux_fragmented_pcm_with_treps(vec![trep]);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux opens");
+    let md = dmx.metadata();
+    let get = |k: &str| md.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+    assert_eq!(
+        get("trep_0"),
+        Some("1 children=1 assp(off=-4)".to_string()),
+        "muxer-emitted trep+assp must read back on the flat metadata channel",
+    );
+    // Only one trep was configured.
+    assert!(
+        get("trep_1").is_none(),
+        "exactly one trep configured — no trep_1 key expected",
+    );
+    let _ = assp;
+}
+
+#[test]
+fn fragmented_muxer_no_treps_emits_no_trep_keys() {
+    // The default (empty `treps`) keeps the init segment free of `trep`
+    // boxes — no `trep_*` metadata keys.
+    let bytes = mux_fragmented_pcm_with_treps(Vec::new());
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux opens");
+    for (k, _) in dmx.metadata() {
+        assert!(
+            !k.starts_with("trep"),
+            "empty treps must emit no trep metadata, saw {k}",
+        );
+    }
 }

@@ -1108,6 +1108,18 @@ that slice is the level *number* a sibling `ssix` refers to. The default
 byte-identical to before. This is the write-side dual of the read-side
 `parse_leva_box` / `LevaRecord`.
 
+A `trep` (TrackExtensionPropertiesBox, ISO/IEC 14496-12 §8.8.15) is
+emitted inside the init-segment `mvex` (after the `trex` boxes and after
+any `leva`) for each record in `FragmentedOptions::treps` — one box per
+record, in slice order, serialised through `demux::build_trep_box`. Each
+record documents characteristics of one track in the subsequent
+fragments; the one base-spec-defined child, `assp` (Alternative Startup
+Sequence Properties Box, §8.8.16), is serialised from its typed
+`AsspRecord` when present on a `TrepChild`. The default (empty) `treps`
+writes no `trep` and keeps the init segment byte-identical to before.
+This is the write-side dual of the read-side `parse_trep_box` /
+`TrepRecord` (and `parse_assp_box` / `AsspRecord`).
+
 An `ssix` (SubsegmentIndexBox, ISO/IEC 14496-12 §8.16.4) is emitted
 immediately after each per-fragment `sidx` when `FragmentedOptions::
 emit_ssix` is set (and `emit_random_access_indexes` is on, since the

@@ -8747,6 +8747,60 @@ pub fn parse_trep_box(body: &[u8]) -> Result<TrepRecord> {
     parse_trep(body)
 }
 
+/// Serialise a [`TrepRecord`] into a complete `trep`
+/// (TrackExtensionPropertiesBox, ISO/IEC 14496-12 §8.8.15) box — 8-byte
+/// header (`[size:u32]['trep']`) plus the §8.8.15.2 `FullBox(version = 0,
+/// flags = 0)` body — for a muxer placing it inside the init-segment
+/// `mvex`.
+///
+/// The body is the FullBox preamble, the 4-byte `track_id`, then each
+/// child box in order. The one base-spec-defined child is `assp`
+/// (§8.8.16): when a [`TrepChild`] carries a `Some(AsspRecord)`, that
+/// record is serialised via [`build_assp_box`] (its `fourcc` is then
+/// required to be `assp`, and its `payload_len` is ignored — the bytes
+/// come from the typed record). A child with `assp == None` is emitted as
+/// an empty placeholder box of its `fourcc` with no payload; since this
+/// crate does not model arbitrary child payloads, a non-`assp` child with
+/// a non-zero `payload_len` is rejected rather than emitting a box whose
+/// declared length would not match its (absent) content.
+///
+/// A round-trip `parse_trep_box(&build_trep_box(rec)?[8..])` reproduces
+/// `rec` for records built from typed `assp` children (and bare-track-id
+/// records).
+pub fn build_trep_box(record: &TrepRecord) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+    body.extend_from_slice(&record.track_id.to_be_bytes());
+    for child in &record.children {
+        match &child.assp {
+            Some(a) => {
+                if &child.fourcc != b"assp" {
+                    return Err(Error::invalid(
+                        "MP4: trep child carries an AsspRecord but its fourcc is not 'assp'",
+                    ));
+                }
+                body.extend_from_slice(&build_assp_box(a)?);
+            }
+            None => {
+                if child.payload_len != 0 {
+                    return Err(Error::invalid(
+                        "MP4: trep child without a typed record must have payload_len == 0",
+                    ));
+                }
+                // Empty placeholder box: 8-byte header, no payload.
+                body.extend_from_slice(&8u32.to_be_bytes());
+                body.extend_from_slice(&child.fourcc);
+            }
+        }
+    }
+    let total = 8 + body.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(total as u32).to_be_bytes());
+    out.extend_from_slice(b"trep");
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
 /// Parse a standalone `assp` (AlternativeStartupSequencePropertiesBox,
 /// ISO/IEC 14496-12 §8.8.16) body from `body` (the bytes after the
 /// 8/16-byte box header — `assp` is a `FullBox`, so the body opens with
@@ -14260,6 +14314,80 @@ mod tests {
         assert_eq!(a.version, 0);
         assert_eq!(a.entries[0].min_initial_alt_startup_offset, -7);
         assert!(r.children[1].assp.is_none());
+    }
+
+    /// `build_trep_box` round-trips a `TrepRecord` carrying a typed `assp`
+    /// child (and a bare empty-payload child) through `parse_trep_box`.
+    #[test]
+    fn build_trep_box_round_trips_assp_child() {
+        let record = super::TrepRecord {
+            track_id: 5,
+            children: vec![
+                super::TrepChild {
+                    fourcc: *b"assp",
+                    payload_len: 0,
+                    assp: Some(super::AsspRecord {
+                        version: 1,
+                        entries: vec![super::AsspEntry {
+                            grouping_type_parameter: Some(2),
+                            min_initial_alt_startup_offset: -8,
+                        }],
+                    }),
+                },
+                super::TrepChild {
+                    fourcc: *b"zzzz",
+                    payload_len: 0,
+                    assp: None,
+                },
+            ],
+        };
+        let bytes = super::build_trep_box(&record).unwrap();
+        assert_eq!(&bytes[4..8], b"trep");
+        let reparsed = super::parse_trep_box(&bytes[8..]).unwrap();
+        assert_eq!(reparsed.track_id, 5);
+        assert_eq!(reparsed.children.len(), 2);
+        // The typed `assp` record round-trips verbatim (payload_len is a
+        // derived on-wire length the builder recomputes, so we compare
+        // the fourcc + typed record rather than the whole struct).
+        assert_eq!(&reparsed.children[0].fourcc, b"assp");
+        assert_eq!(reparsed.children[0].assp, record.children[0].assp);
+        // The opaque empty-payload child round-trips fourcc + zero length.
+        assert_eq!(&reparsed.children[1].fourcc, b"zzzz");
+        assert_eq!(reparsed.children[1].payload_len, 0);
+        assert!(reparsed.children[1].assp.is_none());
+    }
+
+    /// `build_trep_box` rejects a child whose `assp` record is set but
+    /// whose fourcc isn't `assp`, and a non-`assp` child with a non-zero
+    /// `payload_len` (the crate can't synthesise opaque child bytes).
+    #[test]
+    fn build_trep_box_rejects_inconsistent_children() {
+        // assp record under a non-assp fourcc
+        assert!(super::build_trep_box(&super::TrepRecord {
+            track_id: 1,
+            children: vec![super::TrepChild {
+                fourcc: *b"abcd",
+                payload_len: 0,
+                assp: Some(super::AsspRecord {
+                    version: 0,
+                    entries: vec![super::AsspEntry {
+                        grouping_type_parameter: None,
+                        min_initial_alt_startup_offset: 0,
+                    }],
+                }),
+            }],
+        })
+        .is_err());
+        // opaque child with non-zero payload_len
+        assert!(super::build_trep_box(&super::TrepRecord {
+            track_id: 1,
+            children: vec![super::TrepChild {
+                fourcc: *b"abcd",
+                payload_len: 4,
+                assp: None,
+            }],
+        })
+        .is_err());
     }
 
     /// `parse_ssix_box` (the public wrapper) routes through the same

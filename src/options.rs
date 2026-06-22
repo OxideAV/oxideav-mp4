@@ -166,6 +166,24 @@ pub struct FragmentedOptions {
     /// `mdat` range. Defaults to `(1, 2)`. Ignored when `emit_ssix` is
     /// `false`.
     pub ssix_levels: (u8, u8),
+    /// Per-track `trep` (TrackExtensionPropertiesBox, ISO/IEC 14496-12
+    /// §8.8.15) records emitted inside the init `mvex`.
+    ///
+    /// When non-empty, the muxer writes one `trep` per record after the
+    /// `trex` boxes (and after any `leva`), in slice order. Each record
+    /// is a [`demux::TrepRecord`](crate::demux::TrepRecord) carrying its
+    /// `track_id` and child boxes; the one base-spec-defined child,
+    /// `assp` (AlternativeStartupSequencePropertiesBox, §8.8.16), is
+    /// serialised from its typed [`AsspRecord`](crate::demux::AsspRecord)
+    /// when present on a [`TrepChild`](crate::demux::TrepChild). The
+    /// records read back through the demuxer's `mvex` walk (`trep_<n>`
+    /// metadata + `Mp4Demuxer::treps()`).
+    ///
+    /// §8.8.15.1 fixes quantity at zero or one `trep` per track; the
+    /// muxer serialises whatever is supplied verbatim (the per-track
+    /// uniqueness is the caller's responsibility). Empty by default —
+    /// most fragmented files don't declare track extension properties.
+    pub treps: Vec<crate::demux::TrepRecord>,
 }
 
 impl Default for FragmentedOptions {
@@ -180,6 +198,7 @@ impl Default for FragmentedOptions {
             levels: Vec::new(),
             emit_ssix: false,
             ssix_levels: (1, 2),
+            treps: Vec::new(),
         }
     }
 }
