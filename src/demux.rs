@@ -290,6 +290,34 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         for c in &t.children {
             use std::fmt::Write;
             let _ = write!(s, " {}", String::from_utf8_lossy(&c.fourcc));
+            // The one base-spec-defined child is `assp` (§8.8.16); when
+            // it decoded cleanly, append its min_initial_alt_startup
+            // offset(s) so a consumer reading the flat channel sees the
+            // alternative-startup bound without reaching for the typed
+            // record. v0 → "assp(off=<i>)"; v1 → one
+            // "<grouping_type_parameter>:<offset>" token per entry,
+            // e.g. "assp(0:-5 1:0)".
+            if let Some(a) = &c.assp {
+                if a.version == 0 {
+                    if let Some(e) = a.entries.first() {
+                        let _ = write!(s, "(off={})", e.min_initial_alt_startup_offset);
+                    }
+                } else {
+                    let _ = write!(s, "(");
+                    for (i, e) in a.entries.iter().enumerate() {
+                        if i > 0 {
+                            let _ = write!(s, " ");
+                        }
+                        let _ = write!(
+                            s,
+                            "{}:{}",
+                            e.grouping_type_parameter.unwrap_or(0),
+                            e.min_initial_alt_startup_offset
+                        );
+                    }
+                    let _ = write!(s, ")");
+                }
+            }
         }
         metadata.push((format!("trep_{n}"), s));
     }
@@ -855,14 +883,52 @@ pub struct LevaRecord {
     pub entries: Vec<LevaEntry>,
 }
 
+/// One `(grouping_type_parameter, min_initial_alt_startup_offset)` entry
+/// of a version-1 `assp` (Alternative Startup Sequence Properties Box,
+/// ISO/IEC 14496-12 §8.8.16). A version-0 `assp` carries a single
+/// implied entry with no `grouping_type_parameter`; see [`AsspRecord`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsspEntry {
+    /// §8.8.16.3 `grouping_type_parameter` — selects which one of the
+    /// alternative startup-sequence sample groupings this entry applies
+    /// to (v1 only; `None` for the single implied v0 entry).
+    pub grouping_type_parameter: Option<u32>,
+    /// §8.8.16.3 `min_initial_alt_startup_offset` — a signed lower bound
+    /// on `sample_offset[1]` of the referred `alst` (§10.3.2) sample
+    /// group description entries: no value shall be smaller than this.
+    pub min_initial_alt_startup_offset: i32,
+}
+
+/// Decoded `assp` (Alternative Startup Sequence Properties Box, ISO/IEC
+/// 14496-12 §8.8.16).
+///
+/// A `FullBox('assp', version, 0)` nested inside a `trep`
+/// (TrackExtensionPropertiesBox, §8.8.15) that indicates the properties
+/// of the alternative startup sequence (`alst`, §10.3.2) sample groups
+/// in the subsequent track fragments of the `trep`'s track. §8.8.16.1
+/// pins the version to track the `sbgp` version used for the `alst`
+/// grouping: version 0 when the `alst` `sbgp` is v0 (one implied entry,
+/// no `grouping_type_parameter`); version 1 when the `alst` `sbgp` is v1
+/// (a `num_entries`-long list keyed by `grouping_type_parameter`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsspRecord {
+    /// FullBox `version` — 0 (single implied entry) or 1 (keyed list).
+    pub version: u8,
+    /// The per-grouping entries. Version 0 yields exactly one entry with
+    /// `grouping_type_parameter == None`; version 1 yields `num_entries`
+    /// entries, each carrying its own `grouping_type_parameter`.
+    pub entries: Vec<AsspEntry>,
+}
+
 /// One child box recorded inside a `trep` (TrackExtensionPropertiesBox,
 /// ISO/IEC 14496-12 §8.8.15). The box body is "any number of boxes"
 /// (§8.8.15.2) — the demuxer records each child's type and payload
-/// length without interpreting it, so a downstream consumer can spot,
-/// for example, an `assp` (Alternative Startup Sequence Properties Box,
-/// §8.8.16) without this crate having to model every box that might be
-/// nested. The structured nesting stays opaque here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// length, and additionally decodes the one child the base spec defines
+/// here, `assp` (Alternative Startup Sequence Properties Box, §8.8.16),
+/// into a typed [`AsspRecord`] (in [`TrepChild::assp`]). Any other child
+/// stays opaque (type + length only) so a downstream consumer can still
+/// spot it without this crate modelling every box that might be nested.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrepChild {
     /// The child box's four-character type code, verbatim on the wire.
     pub fourcc: [u8; 4],
@@ -872,6 +938,12 @@ pub struct TrepChild {
     /// reflects what was readable, not necessarily the producer's
     /// declared length.
     pub payload_len: usize,
+    /// The typed `assp` record when this child is an `assp`
+    /// (Alternative Startup Sequence Properties Box, §8.8.16) whose body
+    /// parsed cleanly; `None` for any other child type or a malformed
+    /// `assp` (a malformed `assp` still contributes its type + length so
+    /// the child list stays faithful to the wire).
+    pub assp: Option<AsspRecord>,
 }
 
 /// Decoded `trep` (TrackExtensionPropertiesBox, ISO/IEC 14496-12
@@ -6459,9 +6531,19 @@ fn parse_trep(body: &[u8]) -> Result<TrepRecord> {
         let available = payload.len() - off;
         let effective = box_size.min(available);
         let payload_len = effective - header_len;
+        // The one base-spec-defined `trep` child is `assp` (§8.8.16);
+        // decode its body into a typed record. A malformed `assp` still
+        // contributes its type + length (assp = None) so the child list
+        // stays faithful to the wire and never aborts the trep parse.
+        let assp = if &fourcc == b"assp" {
+            parse_assp(&payload[off + header_len..off + effective]).ok()
+        } else {
+            None
+        };
         children.push(TrepChild {
             fourcc,
             payload_len,
+            assp,
         });
         off += effective;
         // If we clamped (the declared size ran past the parent), there
@@ -6472,6 +6554,91 @@ fn parse_trep(body: &[u8]) -> Result<TrepRecord> {
     }
 
     Ok(TrepRecord { track_id, children })
+}
+
+/// Parse an `assp` (AlternativeStartupSequencePropertiesBox, ISO/IEC
+/// 14496-12 §8.8.16) body — the bytes after the 8/16-byte box header.
+///
+/// Wire layout (§8.8.16.2):
+/// ```text
+/// FullBox('assp', version, 0) {
+///     if (version == 0) {
+///         signed int(32) min_initial_alt_startup_offset;
+///     } else if (version == 1) {
+///         unsigned int(32) num_entries;
+///         for (j = 1; j <= num_entries; j++) {
+///             unsigned int(32) grouping_type_parameter;
+///             signed int(32)   min_initial_alt_startup_offset;
+///         }
+///     }
+/// }
+/// ```
+///
+/// Only versions 0 and 1 are defined (§8.8.16.1 ties the box version to
+/// the `alst` `sbgp` version); any other version is rejected rather than
+/// mis-read. A truncated body — too short for the v0 fixed offset, the
+/// v1 `num_entries`, or a declared entry's 8 bytes — is rejected so a
+/// partial table never lies about the recorded bounds. `num_entries` is
+/// validated against the bytes actually present before allocation.
+fn parse_assp(body: &[u8]) -> Result<AsspRecord> {
+    if body.len() < 4 {
+        return Err(Error::invalid("MP4: assp too short for FullBox preamble"));
+    }
+    let version = body[0];
+    // flags (body[1..4]) are pinned to 0 by §8.8.16.2 and unused here.
+    let payload = &body[4..];
+    match version {
+        0 => {
+            if payload.len() < 4 {
+                return Err(Error::invalid("MP4: assp v0 truncated offset"));
+            }
+            let off = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            Ok(AsspRecord {
+                version,
+                entries: vec![AsspEntry {
+                    grouping_type_parameter: None,
+                    min_initial_alt_startup_offset: off,
+                }],
+            })
+        }
+        1 => {
+            if payload.len() < 4 {
+                return Err(Error::invalid("MP4: assp v1 truncated num_entries"));
+            }
+            let num_entries =
+                u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+            // Each entry is two 32-bit words (8 bytes). Reject a count
+            // that can't be backed by the remaining bytes before
+            // allocating.
+            let entries_bytes = &payload[4..];
+            if num_entries.saturating_mul(8) > entries_bytes.len() {
+                return Err(Error::invalid("MP4: assp v1 num_entries overruns body"));
+            }
+            let mut entries = Vec::with_capacity(num_entries);
+            let mut p = 0usize;
+            for _ in 0..num_entries {
+                let gtp = u32::from_be_bytes([
+                    entries_bytes[p],
+                    entries_bytes[p + 1],
+                    entries_bytes[p + 2],
+                    entries_bytes[p + 3],
+                ]);
+                let off = i32::from_be_bytes([
+                    entries_bytes[p + 4],
+                    entries_bytes[p + 5],
+                    entries_bytes[p + 6],
+                    entries_bytes[p + 7],
+                ]);
+                entries.push(AsspEntry {
+                    grouping_type_parameter: Some(gtp),
+                    min_initial_alt_startup_offset: off,
+                });
+                p += 8;
+            }
+            Ok(AsspRecord { version, entries })
+        }
+        v => Err(Error::invalid(format!("MP4: assp unsupported version {v}"))),
+    }
 }
 
 /// Parse a `leva` LevelAssignmentBox body (ISO/IEC 14496-12 §8.8.13).
@@ -8578,6 +8745,83 @@ pub fn parse_csgp_box(body: &[u8]) -> Result<CsgpBox> {
 /// its `track_id` with no child boxes.
 pub fn parse_trep_box(body: &[u8]) -> Result<TrepRecord> {
     parse_trep(body)
+}
+
+/// Parse a standalone `assp` (AlternativeStartupSequencePropertiesBox,
+/// ISO/IEC 14496-12 §8.8.16) body from `body` (the bytes after the
+/// 8/16-byte box header — `assp` is a `FullBox`, so the body opens with
+/// the 4-byte version/flags preamble).
+///
+/// Exposed as a public entry point so tooling that already has the box's
+/// payload bytes in hand (an alternative-startup-sequence analyser
+/// pairing this with the §10.3.2 `alst` sample group, a DASH packager,
+/// a fixture validator) can recover the typed [`AsspRecord`] without
+/// re-running `open()`. The demuxer also fills this in automatically for
+/// the `assp` child of any parsed `trep` (see [`TrepChild::assp`]).
+///
+/// Returns `Err` for a body shorter than the 4-byte FullBox preamble, a
+/// truncated v0 offset / v1 `num_entries`, a v1 `num_entries` that
+/// overruns the body, or an unsupported version (only 0 and 1 are
+/// defined by §8.8.16.1).
+pub fn parse_assp_box(body: &[u8]) -> Result<AsspRecord> {
+    parse_assp(body)
+}
+
+/// Serialise an [`AsspRecord`] into a complete `assp` box — 8-byte
+/// header (`[size:u32]['assp']`) plus the §8.8.16.2 `FullBox(version,
+/// flags = 0)` body — for a muxer placing it inside a `trep`
+/// (TrackExtensionPropertiesBox, §8.8.15).
+///
+/// The byte-exact inverse of [`parse_assp_box`]: a v0 record writes the
+/// single entry's `min_initial_alt_startup_offset`; a v1 record writes
+/// `num_entries` followed by each entry's `(grouping_type_parameter,
+/// min_initial_alt_startup_offset)` pair. Rejects a record whose
+/// `version` is neither 0 nor 1, a v0 record that does not carry exactly
+/// one entry, or a v0 entry that carries a `grouping_type_parameter`
+/// (which has no slot in the v0 wire layout) — the builder never emits a
+/// box that would not round-trip.
+pub fn build_assp_box(record: &AsspRecord) -> Result<Vec<u8>> {
+    let body: Vec<u8> = match record.version {
+        0 => {
+            if record.entries.len() != 1 {
+                return Err(Error::invalid("MP4: assp v0 must carry exactly one entry"));
+            }
+            let e = &record.entries[0];
+            if e.grouping_type_parameter.is_some() {
+                return Err(Error::invalid(
+                    "MP4: assp v0 entry must not carry grouping_type_parameter",
+                ));
+            }
+            let mut b = Vec::with_capacity(4 + 4);
+            b.extend_from_slice(&[0, 0, 0, 0]); // version 0 + flags 0
+            b.extend_from_slice(&e.min_initial_alt_startup_offset.to_be_bytes());
+            b
+        }
+        1 => {
+            let num_entries = record.entries.len();
+            if num_entries > u32::MAX as usize {
+                return Err(Error::invalid("MP4: assp v1 num_entries exceeds u32"));
+            }
+            let mut b = Vec::with_capacity(4 + 4 + num_entries * 8);
+            b.extend_from_slice(&[1, 0, 0, 0]); // version 1 + flags 0
+            b.extend_from_slice(&(num_entries as u32).to_be_bytes());
+            for e in &record.entries {
+                let gtp = e.grouping_type_parameter.unwrap_or(0);
+                b.extend_from_slice(&gtp.to_be_bytes());
+                b.extend_from_slice(&e.min_initial_alt_startup_offset.to_be_bytes());
+            }
+            b
+        }
+        v => {
+            return Err(Error::invalid(format!("MP4: assp unsupported version {v}")));
+        }
+    };
+    let total = 8 + body.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(total as u32).to_be_bytes());
+    out.extend_from_slice(b"assp");
+    out.extend_from_slice(&body);
+    Ok(out)
 }
 
 /// Parse a standalone `amve` (AmbientViewingEnvironmentBox, ISO/IEC
@@ -13870,6 +14114,152 @@ mod tests {
         assert_eq!(r_public.track_id, r_internal.track_id);
         assert_eq!(r_public.children, r_internal.children);
         assert_eq!(r_public.track_id, 123);
+    }
+
+    // ---- assp (AlternativeStartupSequencePropertiesBox, §8.8.16) -------
+
+    /// A version-0 `assp` body decodes to a single implied entry carrying
+    /// the signed `min_initial_alt_startup_offset` and no
+    /// `grouping_type_parameter`.
+    #[test]
+    fn parse_assp_v0_single_offset() {
+        let mut body = vec![0u8; 4]; // version 0 + flags 0
+        body.extend_from_slice(&(-5i32).to_be_bytes());
+        let r = super::parse_assp(&body).unwrap();
+        assert_eq!(r.version, 0);
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].grouping_type_parameter, None);
+        assert_eq!(r.entries[0].min_initial_alt_startup_offset, -5);
+    }
+
+    /// A version-1 `assp` body decodes `num_entries` keyed
+    /// `(grouping_type_parameter, offset)` pairs in order.
+    #[test]
+    fn parse_assp_v1_keyed_entries() {
+        let mut body = vec![1u8, 0, 0, 0]; // version 1 + flags 0
+        body.extend_from_slice(&2u32.to_be_bytes()); // num_entries
+        body.extend_from_slice(&7u32.to_be_bytes());
+        body.extend_from_slice(&(-3i32).to_be_bytes());
+        body.extend_from_slice(&9u32.to_be_bytes());
+        body.extend_from_slice(&100i32.to_be_bytes());
+        let r = super::parse_assp(&body).unwrap();
+        assert_eq!(r.version, 1);
+        assert_eq!(r.entries.len(), 2);
+        assert_eq!(r.entries[0].grouping_type_parameter, Some(7));
+        assert_eq!(r.entries[0].min_initial_alt_startup_offset, -3);
+        assert_eq!(r.entries[1].grouping_type_parameter, Some(9));
+        assert_eq!(r.entries[1].min_initial_alt_startup_offset, 100);
+    }
+
+    /// A truncated v0 offset, a truncated v1 `num_entries`, a v1
+    /// `num_entries` that overruns the body, and an unsupported version
+    /// are all rejected.
+    #[test]
+    fn parse_assp_rejects_malformed() {
+        // too short for the FullBox preamble
+        assert!(super::parse_assp(&[0u8; 3]).is_err());
+        // v0 with no offset
+        assert!(super::parse_assp(&[0u8; 4]).is_err());
+        // v1 with no num_entries
+        assert!(super::parse_assp(&[1u8, 0, 0, 0]).is_err());
+        // v1 declaring 4 entries but carrying bytes for one
+        let mut overrun = vec![1u8, 0, 0, 0];
+        overrun.extend_from_slice(&4u32.to_be_bytes());
+        overrun.extend_from_slice(&[0u8; 8]);
+        assert!(super::parse_assp(&overrun).is_err());
+        // unsupported version 2
+        assert!(super::parse_assp(&[2u8, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    /// `build_assp_box` is the byte-exact inverse of `parse_assp_box` for
+    /// both versions (modulo the 8-byte box header the builder prepends).
+    #[test]
+    fn assp_build_parse_round_trip() {
+        for record in [
+            super::AsspRecord {
+                version: 0,
+                entries: vec![super::AsspEntry {
+                    grouping_type_parameter: None,
+                    min_initial_alt_startup_offset: -42,
+                }],
+            },
+            super::AsspRecord {
+                version: 1,
+                entries: vec![
+                    super::AsspEntry {
+                        grouping_type_parameter: Some(0),
+                        min_initial_alt_startup_offset: 0,
+                    },
+                    super::AsspEntry {
+                        grouping_type_parameter: Some(0xDEAD_BEEF),
+                        min_initial_alt_startup_offset: i32::MIN,
+                    },
+                ],
+            },
+        ] {
+            let bytes = super::build_assp_box(&record).unwrap();
+            assert_eq!(&bytes[4..8], b"assp");
+            assert_eq!(
+                u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize,
+                bytes.len()
+            );
+            let reparsed = super::parse_assp_box(&bytes[8..]).unwrap();
+            assert_eq!(reparsed, record);
+        }
+    }
+
+    /// `build_assp_box` rejects records that cannot round-trip: a v0
+    /// record with a `grouping_type_parameter`, a v0 record with ≠ 1
+    /// entry, or an unsupported version.
+    #[test]
+    fn assp_build_rejects_invalid_records() {
+        // v0 entry carrying a grouping_type_parameter (no v0 wire slot)
+        assert!(super::build_assp_box(&super::AsspRecord {
+            version: 0,
+            entries: vec![super::AsspEntry {
+                grouping_type_parameter: Some(1),
+                min_initial_alt_startup_offset: 0,
+            }],
+        })
+        .is_err());
+        // v0 with two entries
+        assert!(super::build_assp_box(&super::AsspRecord {
+            version: 0,
+            entries: vec![
+                super::AsspEntry {
+                    grouping_type_parameter: None,
+                    min_initial_alt_startup_offset: 0,
+                };
+                2
+            ],
+        })
+        .is_err());
+        // unsupported version
+        assert!(super::build_assp_box(&super::AsspRecord {
+            version: 9,
+            entries: vec![],
+        })
+        .is_err());
+    }
+
+    /// When an `assp` child of a `trep` decodes cleanly, the `TrepChild`
+    /// carries the typed `AsspRecord`; a malformed `assp` (or any other
+    /// child type) leaves `assp = None`.
+    #[test]
+    fn parse_trep_decodes_assp_child() {
+        // A clean v0 assp body: version+flags (4) + offset (4) = 8 bytes.
+        let mut assp_body = vec![0u8; 4];
+        assp_body.extend_from_slice(&(-7i32).to_be_bytes());
+        let assp = build_child_box(b"assp", &assp_body);
+        // A different child stays opaque.
+        let other = build_child_box(b"xtra", &[0; 4]);
+        let body = build_trep(11, &[assp, other]);
+        let r = super::parse_trep(&body).unwrap();
+        assert_eq!(r.children.len(), 2);
+        let a = r.children[0].assp.as_ref().expect("assp should decode");
+        assert_eq!(a.version, 0);
+        assert_eq!(a.entries[0].min_initial_alt_startup_offset, -7);
+        assert!(r.children[1].assp.is_none());
     }
 
     /// `parse_ssix_box` (the public wrapper) routes through the same

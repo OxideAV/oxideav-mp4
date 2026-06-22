@@ -844,12 +844,17 @@ Sample-entry FourCCs resolve to these codec ids:
   track in the subsequent movie fragments. §8.8.15.1 fixes quantity at
   zero or more per `mvex` (zero or one per track); the `mvex` walker
   collects every instance in file order. The nested child boxes are
-  recorded by type + payload length only (`TrepChild`) — this crate does
-  not recurse into them, leaving their semantics to a downstream consumer
-  that recognises the specific child. Each `trep` is surfaced on
-  `Demuxer::metadata()` as `trep_<n>` (0-based file order) with value
-  `"<track_id> children=<k>[ <fourcc>...]"` — the track ID, the child
-  count, and each child's four-character type in order. The structured
+  recorded by type + payload length (`TrepChild`), and the one child the
+  base spec defines here — `assp` (Alternative Startup Sequence
+  Properties Box, §8.8.16) — is additionally decoded into a typed
+  `AsspRecord` on `TrepChild::assp`; any other child stays opaque,
+  leaving its semantics to a downstream consumer that recognises it. Each
+  `trep` is surfaced on `Demuxer::metadata()` as `trep_<n>` (0-based file
+  order) with value `"<track_id> children=<k>[ <fourcc>...]"` — the track
+  ID, the child count, and each child's four-character type in order. A
+  cleanly-decoded `assp` child appends its `min_initial_alt_startup`
+  offset(s) after the `assp` token: `assp(off=<i>)` for v0, or
+  `assp(<grouping_type_parameter>:<offset> ...)` for v1. The structured
   record is reachable via the public
   `oxideav_mp4::demux::parse_trep_box(&[u8])` entry point (for tooling
   holding the box's payload bytes) and via
@@ -863,6 +868,34 @@ Sample-entry FourCCs resolve to these codec ids:
   cleanly. The 64-bit `largesize` child form (`size == 1`) is read via
   its 16-byte header. The version byte is tolerated even if non-zero,
   matching the `parse_leva` posture.
+- Alternative startup sequence properties (ISO/IEC 14496-12 §8.8.16,
+  `assp`): a `FullBox('assp', version, 0)` nested inside a `trep`
+  (§8.8.15) that indicates the properties of the alternative startup
+  sequence (`alst`, §10.3.2) sample groups in the subsequent track
+  fragments of the `trep`'s track. §8.8.16.1 ties the box version to the
+  `sbgp` version used for the `alst` grouping: version 0 (one implied
+  entry — a signed `min_initial_alt_startup_offset`, no
+  `grouping_type_parameter`) when the `alst` `sbgp` is v0; version 1 (a
+  `num_entries`-long list of `(grouping_type_parameter,
+  min_initial_alt_startup_offset)` pairs, one per alternative grouping)
+  when it is v1. `min_initial_alt_startup_offset` is a lower bound on
+  `sample_offset[1]` of the referred `alst` description entries: no value
+  shall be smaller (§8.8.16.3). The demuxer decodes the `assp` child of
+  any parsed `trep` into the typed `AsspRecord` (on `TrepChild::assp`)
+  and appends the offset(s) to the flat `trep_<n>` metadata after the
+  `assp` token (`assp(off=<i>)` for v0; `assp(<gtp>:<off> ...)` for v1).
+  The structured record is also reachable via the public
+  `oxideav_mp4::demux::parse_assp_box(&[u8])` entry point (typed
+  `AsspRecord` / `AsspEntry`) for tooling holding the box body. The
+  matching write side is `oxideav_mp4::demux::build_assp_box(&AsspRecord)`
+  — the byte-exact inverse of `parse_assp_box`, emitting a complete
+  `[size]['assp']` box for a muxer placing it inside a `trep`; it rejects
+  records that would not round-trip (a v0 entry carrying a
+  `grouping_type_parameter`, a v0 record without exactly one entry, or a
+  version other than 0/1). Only versions 0 and 1 are defined; a truncated
+  body, a v1 `num_entries` overrunning the body, or an unsupported
+  version are rejected at parse time (a malformed `assp` then leaves
+  `TrepChild::assp = None` while still contributing its type + length).
 - Subsegment index (ISO/IEC 14496-12 §8.16.4, `ssix`): the top-level
   `FullBox(version = 0, flags = 0)` that maps levels (as assigned by
   the §8.8.13 `leva` box above) to byte ranges of the subsegments

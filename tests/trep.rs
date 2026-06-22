@@ -309,3 +309,87 @@ fn trep_public_entry_point_parses_standalone_body() {
     assert_eq!(&record.children[0].fourcc, b"assp");
     assert_eq!(record.children[0].payload_len, 6);
 }
+
+#[test]
+fn trep_v0_assp_child_surfaces_offset_and_typed_record() {
+    // §8.8.16 — a clean v0 `assp` child carries a signed
+    // `min_initial_alt_startup_offset`. The demuxer decodes it into the
+    // typed `TrepChild::assp` and appends "(off=<i>)" to the flat
+    // `trep_<n>` metadata value.
+    let mut assp_body = vec![0u8; 4]; // FullBox(v=0, flags=0)
+    assp_body.extend_from_slice(&(-9i32).to_be_bytes());
+    let assp = child_box(b"assp", &assp_body);
+    let trep = build_trep_box(1, &[assp]);
+    let spliced = splice_into_mvex(&mux_fragmented_pcm_to_bytes(), &trep);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(spliced));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux opens");
+    let md = dmx.metadata();
+    let get = |k: &str| md.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+    assert_eq!(
+        get("trep_0"),
+        Some("1 children=1 assp(off=-9)".to_string()),
+        "v0 assp offset must surface on the flat trep metadata",
+    );
+}
+
+#[test]
+fn trep_v1_assp_child_surfaces_keyed_offsets() {
+    // §8.8.16 — a v1 `assp` child documents one entry per
+    // `grouping_type_parameter`. Each surfaces as "<gtp>:<offset>".
+    let mut assp_body = vec![1u8, 0, 0, 0]; // FullBox(v=1, flags=0)
+    assp_body.extend_from_slice(&2u32.to_be_bytes()); // num_entries
+    assp_body.extend_from_slice(&3u32.to_be_bytes()); // grouping_type_parameter
+    assp_body.extend_from_slice(&(-1i32).to_be_bytes());
+    assp_body.extend_from_slice(&4u32.to_be_bytes());
+    assp_body.extend_from_slice(&0i32.to_be_bytes());
+    let assp = child_box(b"assp", &assp_body);
+    let trep = build_trep_box(1, &[assp]);
+    let spliced = splice_into_mvex(&mux_fragmented_pcm_to_bytes(), &trep);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(spliced));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux opens");
+    let md = dmx.metadata();
+    let get = |k: &str| md.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+    assert_eq!(
+        get("trep_0"),
+        Some("1 children=1 assp(3:-1 4:0)".to_string()),
+        "v1 assp keyed offsets must surface on the flat trep metadata",
+    );
+}
+
+#[test]
+fn assp_public_build_parse_round_trips() {
+    use oxideav_mp4::demux::{build_assp_box, parse_assp_box, AsspEntry, AsspRecord};
+
+    // v0: a single implied entry.
+    let v0 = AsspRecord {
+        version: 0,
+        entries: vec![AsspEntry {
+            grouping_type_parameter: None,
+            min_initial_alt_startup_offset: -123,
+        }],
+    };
+    let bytes = build_assp_box(&v0).expect("build v0 assp");
+    assert_eq!(&bytes[4..8], b"assp");
+    let parsed = parse_assp_box(&bytes[8..]).expect("parse v0 assp");
+    assert_eq!(parsed, v0);
+
+    // v1: a keyed list.
+    let v1 = AsspRecord {
+        version: 1,
+        entries: vec![
+            AsspEntry {
+                grouping_type_parameter: Some(10),
+                min_initial_alt_startup_offset: 7,
+            },
+            AsspEntry {
+                grouping_type_parameter: Some(20),
+                min_initial_alt_startup_offset: -7,
+            },
+        ],
+    };
+    let bytes = build_assp_box(&v1).expect("build v1 assp");
+    let parsed = parse_assp_box(&bytes[8..]).expect("parse v1 assp");
+    assert_eq!(parsed, v1);
+}
