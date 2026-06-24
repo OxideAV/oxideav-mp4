@@ -180,7 +180,13 @@ Sample-entry FourCCs resolve to these codec ids:
   item's `construction_method` data origin) and
   `MetaItems::item_data_from_idat(id)` materialises an idat-resident
   item's concatenated bytes (with bounds checks). `meta_idat_len` is
-  surfaced on `Demuxer::metadata()` when an `idat` is present.
+  surfaced on `Demuxer::metadata()` when an `idat` is present. Write
+  counterparts `demux::build_iloc_box` / `build_pitm_box` /
+  `build_iinf_box` / `build_iref_box` / `build_idat_box` serialise each
+  box byte-exact (the inverse of the parsers), so a caller can assemble
+  a HEIF-style `meta` from `MetaItems` records; `build_iloc_box`
+  rejects records that would not round-trip (bad field width, a v0 item
+  with a non-zero construction method, etc.).
 - Extended language tag (ISO/IEC 14496-12 §8.4.6, `elng`): a track's
   `mdia/elng` ExtendedLanguageBox carries a NULL-terminated BCP 47
   (RFC 4646) tag richer than `mdhd`'s packed 3-char ISO 639-2 code

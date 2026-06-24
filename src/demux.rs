@@ -3086,6 +3086,228 @@ fn surface_meta_items(m: &MetaItems, metadata: &mut Vec<(String, String)>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// §8.11 meta-item box builders (write counterparts to the parsers above).
+// Each builder is the byte-exact inverse of its parser: a record produced
+// by `parse_*` re-serialises identically, and the muxer / a caller
+// assembling a HEIF `meta` box can emit valid §8.11 boxes.
+// ---------------------------------------------------------------------------
+
+/// Append `value` as a big-endian integer of `n` bytes (n ∈ {0, 4, 8})
+/// to `out`. A width of 0 writes nothing (the §8.11.3.3 implied-value
+/// convention). The low `n*8` bits of `value` are written.
+fn write_sized_be(out: &mut Vec<u8>, value: u64, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let bytes = value.to_be_bytes();
+    out.extend_from_slice(&bytes[8 - n..]);
+}
+
+/// Wrap a `body` in a complete `[size:u32][fourcc]` box header (32-bit
+/// size form). The §4.2 largesize form is not needed for the small meta
+/// boxes this module emits.
+fn wrap_box(fourcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let total = (8 + body.len()) as u32;
+    let mut v = Vec::with_capacity(8 + body.len());
+    v.extend_from_slice(&total.to_be_bytes());
+    v.extend_from_slice(fourcc);
+    v.extend_from_slice(body);
+    v
+}
+
+/// Build a complete `iloc` (ItemLocationBox, ISO/IEC 14496-12 §8.11.3)
+/// box. Field widths are taken from the record verbatim, so the output
+/// round-trips byte-exact through [`parse_iloc_box`].
+///
+/// Returns `None` when the record is internally inconsistent in a way
+/// that would not round-trip: a `*_size` outside {0, 4, 8}, a version 0
+/// item carrying a non-zero `construction_method` (the field does not
+/// exist on the wire for v0), or an `index_size > 0` on a version 0 box
+/// (the index nibble is reserved for v0).
+pub fn build_iloc_box(b: &IlocBox) -> Option<Vec<u8>> {
+    for &s in &[
+        b.offset_size,
+        b.length_size,
+        b.base_offset_size,
+        b.index_size,
+    ] {
+        if s != 0 && s != 4 && s != 8 {
+            return None;
+        }
+    }
+    if b.version > 2 {
+        return None;
+    }
+    if b.version == 0 && b.index_size != 0 {
+        return None;
+    }
+    let mut body = Vec::new();
+    body.push(b.version);
+    body.extend_from_slice(&[0, 0, 0]); // flags
+    body.push((b.offset_size << 4) | (b.length_size & 0x0F));
+    let lo = if b.version == 1 || b.version == 2 {
+        b.index_size & 0x0F
+    } else {
+        0
+    };
+    body.push((b.base_offset_size << 4) | lo);
+    if b.version < 2 {
+        write_sized_be(&mut body, b.items.len() as u64, 2);
+    } else {
+        write_sized_be(&mut body, b.items.len() as u64, 4);
+    }
+    for it in &b.items {
+        if b.version < 2 {
+            write_sized_be(&mut body, it.item_id as u64, 2);
+        } else {
+            write_sized_be(&mut body, it.item_id as u64, 4);
+        }
+        if b.version == 1 || b.version == 2 {
+            if it.construction_method > 0x0F {
+                return None;
+            }
+            // 12 reserved bits + 4-bit construction_method.
+            write_sized_be(&mut body, it.construction_method as u64, 2);
+        } else if it.construction_method != 0 {
+            return None;
+        }
+        write_sized_be(&mut body, it.data_reference_index as u64, 2);
+        write_sized_be(&mut body, it.base_offset, b.base_offset_size as usize);
+        write_sized_be(&mut body, it.extents.len() as u64, 2);
+        for ex in &it.extents {
+            if (b.version == 1 || b.version == 2) && b.index_size > 0 {
+                write_sized_be(&mut body, ex.extent_index, b.index_size as usize);
+            }
+            write_sized_be(&mut body, ex.extent_offset, b.offset_size as usize);
+            write_sized_be(&mut body, ex.extent_length, b.length_size as usize);
+        }
+    }
+    Some(wrap_box(&ILOC, &body))
+}
+
+/// Build a complete `pitm` (PrimaryItemBox, ISO/IEC 14496-12 §8.11.4)
+/// box. Uses version 0 (16-bit `item_ID`) when the ID fits in 16 bits,
+/// else version 1 (32-bit). Round-trips through [`parse_pitm_box`].
+pub fn build_pitm_box(item_id: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    if item_id <= u16::MAX as u32 {
+        body.push(0); // version 0
+        body.extend_from_slice(&[0, 0, 0]);
+        write_sized_be(&mut body, item_id as u64, 2);
+    } else {
+        body.push(1); // version 1
+        body.extend_from_slice(&[0, 0, 0]);
+        write_sized_be(&mut body, item_id as u64, 4);
+    }
+    wrap_box(&PITM, &body)
+}
+
+/// Build a single `infe` (ItemInfoEntry, ISO/IEC 14496-12 §8.11.6.2)
+/// box from an [`ItemInfoEntry`] record. Returns `None` for an
+/// unsupported version (only 0/1/2/3 are defined) or a name/type
+/// string containing an embedded NUL (which would corrupt the
+/// NUL-terminated framing).
+fn build_infe(e: &ItemInfoEntry) -> Option<Vec<u8>> {
+    if e.version > 3 {
+        return None;
+    }
+    for s in [&e.item_name, &e.content_type, &e.content_encoding] {
+        if s.as_bytes().contains(&0) {
+            return None;
+        }
+    }
+    let mut body = vec![e.version, 0, 0, 0];
+    if e.version == 0 || e.version == 1 {
+        write_sized_be(&mut body, e.item_id as u64, 2);
+        write_sized_be(&mut body, e.protection_index as u64, 2);
+        body.extend_from_slice(e.item_name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(e.content_type.as_bytes());
+        body.push(0);
+        if !e.content_encoding.is_empty() {
+            body.extend_from_slice(e.content_encoding.as_bytes());
+            body.push(0);
+        }
+    } else {
+        if e.version == 2 {
+            write_sized_be(&mut body, e.item_id as u64, 2);
+        } else {
+            write_sized_be(&mut body, e.item_id as u64, 4);
+        }
+        write_sized_be(&mut body, e.protection_index as u64, 2);
+        body.extend_from_slice(&e.item_type);
+        body.extend_from_slice(e.item_name.as_bytes());
+        body.push(0);
+        if &e.item_type == b"mime" {
+            body.extend_from_slice(e.content_type.as_bytes());
+            body.push(0);
+            if !e.content_encoding.is_empty() {
+                body.extend_from_slice(e.content_encoding.as_bytes());
+                body.push(0);
+            }
+        } else if &e.item_type == b"uri " {
+            body.extend_from_slice(e.content_encoding.as_bytes());
+            body.push(0);
+        }
+    }
+    Some(wrap_box(&INFE, &body))
+}
+
+/// Build a complete `iinf` (ItemInfoBox, ISO/IEC 14496-12 §8.11.6) box
+/// from an [`IinfBox`]. Uses version 0 (16-bit `entry_count`) when the
+/// entry count fits in 16 bits, else version 1 (32-bit). Returns `None`
+/// if any child `infe` cannot be serialised. Round-trips through
+/// [`parse_iinf_box`].
+pub fn build_iinf_box(b: &IinfBox) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    if b.entries.len() <= u16::MAX as usize {
+        body.push(0); // version 0
+        body.extend_from_slice(&[0, 0, 0]);
+        write_sized_be(&mut body, b.entries.len() as u64, 2);
+    } else {
+        body.push(1); // version 1
+        body.extend_from_slice(&[0, 0, 0]);
+        write_sized_be(&mut body, b.entries.len() as u64, 4);
+    }
+    for e in &b.entries {
+        body.extend_from_slice(&build_infe(e)?);
+    }
+    Some(wrap_box(&IINF, &body))
+}
+
+/// Build a complete `iref` (ItemReferenceBox, ISO/IEC 14496-12 §8.11.12)
+/// box from an [`IrefBox`]. The record's `version` selects 16-bit (v0)
+/// or 32-bit (v1) item IDs. Returns `None` for an unsupported version
+/// or a reference group whose `reference_count` overflows 16 bits.
+/// Round-trips through [`parse_iref_box`].
+pub fn build_iref_box(b: &IrefBox) -> Option<Vec<u8>> {
+    if b.version > 1 {
+        return None;
+    }
+    let id_bytes = if b.version == 0 { 2 } else { 4 };
+    let mut body = vec![b.version, 0, 0, 0];
+    for r in &b.references {
+        if r.to_item_ids.len() > u16::MAX as usize {
+            return None;
+        }
+        let mut sub = Vec::new();
+        write_sized_be(&mut sub, r.from_item_id as u64, id_bytes);
+        write_sized_be(&mut sub, r.to_item_ids.len() as u64, 2);
+        for &to in &r.to_item_ids {
+            write_sized_be(&mut sub, to as u64, id_bytes);
+        }
+        body.extend_from_slice(&wrap_box(&r.reference_type, &sub));
+    }
+    Some(wrap_box(&IREF, &body))
+}
+
+/// Build a complete `idat` (ItemDataBox, ISO/IEC 14496-12 §8.11.11) box
+/// wrapping the raw item bytes.
+pub fn build_idat_box(data: &[u8]) -> Vec<u8> {
+    wrap_box(&IDAT, data)
+}
+
 fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
     let mut t = Track {
         track_id: 0,
@@ -16694,6 +16916,219 @@ mod tests {
         meta.extend_from_slice(&idat);
         let mi = super::parse_meta_items(&meta);
         assert!(mi.item_data_from_idat(1).is_none());
+    }
+
+    // ---- builders: byte-exact round-trips ----
+
+    /// Strip the 8-byte `[size][fourcc]` header from a built box,
+    /// returning its body (what the `parse_*` entry points consume).
+    fn box_body(built: &[u8]) -> &[u8] {
+        &built[8..]
+    }
+
+    #[test]
+    fn build_iloc_round_trips_v0_v1_v2() {
+        let cases = [
+            super::IlocBox {
+                version: 0,
+                offset_size: 4,
+                length_size: 4,
+                base_offset_size: 0,
+                index_size: 0,
+                items: vec![super::IlocItem {
+                    item_id: 3,
+                    construction_method: 0,
+                    data_reference_index: 0,
+                    base_offset: 0,
+                    extents: vec![super::IlocExtent {
+                        extent_index: 0,
+                        extent_offset: 0x1234,
+                        extent_length: 0x56,
+                    }],
+                }],
+            },
+            super::IlocBox {
+                version: 1,
+                offset_size: 8,
+                length_size: 8,
+                base_offset_size: 4,
+                index_size: 4,
+                items: vec![super::IlocItem {
+                    item_id: 9,
+                    construction_method: 1,
+                    data_reference_index: 2,
+                    base_offset: 0x40,
+                    extents: vec![super::IlocExtent {
+                        extent_index: 5,
+                        extent_offset: 0x9999,
+                        extent_length: 0x1000,
+                    }],
+                }],
+            },
+            super::IlocBox {
+                version: 2,
+                offset_size: 4,
+                length_size: 4,
+                base_offset_size: 0,
+                index_size: 0,
+                items: vec![super::IlocItem {
+                    item_id: 0x0010_0000,
+                    construction_method: 0,
+                    data_reference_index: 0,
+                    base_offset: 0,
+                    extents: vec![super::IlocExtent {
+                        extent_index: 0,
+                        extent_offset: 7,
+                        extent_length: 8,
+                    }],
+                }],
+            },
+        ];
+        for c in cases {
+            let built = super::build_iloc_box(&c).expect("build");
+            let parsed = super::parse_iloc_box(box_body(&built)).expect("parse");
+            assert_eq!(parsed, c, "iloc v{} round-trip", c.version);
+        }
+    }
+
+    #[test]
+    fn build_iloc_rejects_inconsistent_records() {
+        // v0 with a non-zero construction_method cannot round-trip.
+        let bad = super::IlocBox {
+            version: 0,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 0,
+            index_size: 0,
+            items: vec![super::IlocItem {
+                item_id: 1,
+                construction_method: 1, // illegal for v0
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![],
+            }],
+        };
+        assert!(super::build_iloc_box(&bad).is_none());
+        // v0 with index_size != 0 (reserved nibble) is rejected.
+        let bad2 = super::IlocBox {
+            version: 0,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 0,
+            index_size: 4,
+            items: vec![],
+        };
+        assert!(super::build_iloc_box(&bad2).is_none());
+    }
+
+    #[test]
+    fn build_pitm_round_trips() {
+        let built = super::build_pitm_box(42);
+        assert_eq!(super::parse_pitm_box(box_body(&built)), Some(42));
+        let built = super::build_pitm_box(0x0010_0000);
+        assert_eq!(super::parse_pitm_box(box_body(&built)), Some(0x0010_0000));
+    }
+
+    #[test]
+    fn build_iinf_round_trips_mixed_versions() {
+        let b = super::IinfBox {
+            entries: vec![
+                super::ItemInfoEntry {
+                    item_id: 1,
+                    protection_index: 0,
+                    item_type: *b"hvc1",
+                    item_name: "primary".to_string(),
+                    content_type: String::new(),
+                    content_encoding: String::new(),
+                    version: 2,
+                },
+                super::ItemInfoEntry {
+                    item_id: 2,
+                    protection_index: 0,
+                    item_type: *b"mime",
+                    item_name: "meta".to_string(),
+                    content_type: "application/rdf+xml".to_string(),
+                    content_encoding: String::new(),
+                    version: 2,
+                },
+                super::ItemInfoEntry {
+                    item_id: 3,
+                    protection_index: 0,
+                    item_type: [0; 4],
+                    item_name: "legacy".to_string(),
+                    content_type: "image/jpeg".to_string(),
+                    content_encoding: String::new(),
+                    version: 0,
+                },
+            ],
+        };
+        let built = super::build_iinf_box(&b).expect("build");
+        let parsed = super::parse_iinf_box(box_body(&built)).expect("parse");
+        assert_eq!(parsed, b);
+    }
+
+    #[test]
+    fn build_iref_round_trips_v0_v1() {
+        let v0 = super::IrefBox {
+            version: 0,
+            references: vec![
+                super::ItemReference {
+                    reference_type: *b"dimg",
+                    from_item_id: 1,
+                    to_item_ids: vec![2, 3, 4],
+                },
+                super::ItemReference {
+                    reference_type: *b"thmb",
+                    from_item_id: 5,
+                    to_item_ids: vec![1],
+                },
+            ],
+        };
+        let built = super::build_iref_box(&v0).unwrap();
+        assert_eq!(super::parse_iref_box(box_body(&built)), Some(v0));
+
+        let v1 = super::IrefBox {
+            version: 1,
+            references: vec![super::ItemReference {
+                reference_type: *b"cdsc",
+                from_item_id: 0x0001_0000,
+                to_item_ids: vec![0x0002_0000],
+            }],
+        };
+        let built = super::build_iref_box(&v1).unwrap();
+        assert_eq!(super::parse_iref_box(box_body(&built)), Some(v1));
+    }
+
+    #[test]
+    fn build_idat_round_trips_through_meta_walk() {
+        // Assemble a meta with built iloc(method1) + built idat and
+        // confirm item_data_from_idat reads back the original bytes.
+        let payload: Vec<u8> = (10u8..30).collect();
+        let idat = super::build_idat_box(&payload);
+        let iloc = super::build_iloc_box(&super::IlocBox {
+            version: 1,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 0,
+            index_size: 0,
+            items: vec![super::IlocItem {
+                item_id: 1,
+                construction_method: 1,
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![super::IlocExtent {
+                    extent_index: 0,
+                    extent_offset: 3,
+                    extent_length: 5,
+                }],
+            }],
+        })
+        .unwrap();
+        let mut meta = vec![0u8, 0, 0, 0];
+        meta.extend_from_slice(&iloc);
+        meta.extend_from_slice(&idat);
+        let mi = super::parse_meta_items(&meta);
+        assert_eq!(mi.item_data_from_idat(1), Some(payload[3..8].to_vec()));
     }
 
     #[test]
