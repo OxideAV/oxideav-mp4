@@ -43,6 +43,11 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     // copies (a malformed file with two pdin boxes is no reason to
     // abort the open — the first is the one the spec endorses).
     let mut pdin: Option<PdinRecord> = None;
+    // §8.11 — file-level `meta` box item infrastructure (HEIF / MIAF).
+    // Quantity zero or one at the top level; the first instance wins. A
+    // `meta` may also appear inside `moov` / `trak` (handled in
+    // `parse_moov` / `parse_trak`); the file-level one is the HEIF home.
+    let mut meta_items = MetaItems::default();
     while let Some(hdr) = read_box_header(&mut *input)? {
         match hdr.fourcc {
             FTYP => {
@@ -129,6 +134,16 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                 let body = read_box_body(&mut *input, &hdr)?;
                 if let Some(r) = parse_prft(&body)? {
                     prfts.push(r);
+                }
+            }
+            // §8.11 — file-level `meta` box (HEIF / MIAF item catalogue).
+            // Parse the §8.11 item infrastructure (pitm / iloc / iinf /
+            // iref) the first time one is seen; subsequent copies (a
+            // malformed file with two file-level meta boxes) are skipped.
+            META => {
+                let body = read_box_body(&mut *input, &hdr)?;
+                if meta_items.is_empty() && meta_items.handler_type == [0; 4] {
+                    meta_items = parse_meta_items(&body);
                 }
             }
             _ => skip_box_body(&mut *input, &hdr)?,
@@ -235,6 +250,19 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
             ));
         }
     }
+
+    // Surface the file-level `meta` box item infrastructure (§8.11) on
+    // the flat metadata channel. The structured records are reachable
+    // via `Mp4Demuxer::meta_items()`; the flat surface mirrors the rest
+    // of this crate's string-keyed bag for tooling that prefers it.
+    // Emitted (only when the corresponding box was present):
+    //   - `meta_handler` = the `meta`'s hdlr handler_type FourCC
+    //   - `meta_primary_item` = the `pitm` primary item_ID
+    //   - `meta_item_count` = number of `iinf` `infe` entries
+    //   - `meta_item_<n>` = "id=<id> type=<fourcc|v0/1> name=<name>"
+    //   - `meta_iloc_count` = number of `iloc` item-location records
+    //   - `meta_iref_count` = number of `iref` reference groups
+    surface_meta_items(&meta_items, &mut metadata);
 
     // Surface a parsed `leva` (LevelAssignmentBox, §8.8.13) on the flat
     // metadata channel. Quantity is zero or one per file (§8.8.13.1);
@@ -488,6 +516,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         senc_records,
         sai_records,
         traf_sample_groups,
+        meta_items,
         movie_timescale: parsed.movie_timescale,
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
@@ -2405,6 +2434,554 @@ fn decode_utf8_or_utf16(buf: &[u8]) -> String {
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).trim().to_string()
+}
+
+// ===========================================================================
+// ISO/IEC 14496-12 §8.11 — `meta` item infrastructure (HEIF / MIAF family)
+// ===========================================================================
+//
+// A `meta` box describes a set of untimed *items* (still images, EXIF
+// blobs, XMP, derived images, …) rather than timed samples. The item
+// catalogue is spread across four sibling boxes inside the `meta`:
+//
+//   * `pitm` (PrimaryItemBox, §8.11.4) — names the primary item;
+//   * `iloc` (ItemLocationBox, §8.11.3) — where each item's bytes live;
+//   * `iinf` (ItemInfoBox, §8.11.6) — each item's type code + name;
+//   * `iref` (ItemReferenceBox, §8.11.12) — typed item→item links.
+//
+// This crate is a container: it surfaces the catalogue (so a HEIF reader
+// can locate, type and relate items) but does not itself decode an
+// item's codec payload. The structured records below are reachable via
+// `Mp4Demuxer::meta_items()` and the flat `meta_*` metadata keys.
+
+/// One extent of an item, per the `iloc` (ItemLocationBox, ISO/IEC
+/// 14496-12 §8.11.3) extent loop. An item's data is the concatenation of
+/// its extents in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IlocExtent {
+    /// `extent_index` (§8.11.3.3) — only meaningful for
+    /// `construction_method == 2` (item_offset); 0 when `index_size` was
+    /// 0 or the construction method does not use it.
+    pub extent_index: u64,
+    /// `extent_offset` — absolute offset of this extent's bytes from the
+    /// data origin selected by `construction_method`. 0 when
+    /// `offset_size` was 0 (the §8.11.3.3 "beginning of source" implied
+    /// value).
+    pub extent_offset: u64,
+    /// `extent_length` — length of this extent in bytes. 0 when
+    /// `length_size` was 0 (the §8.11.3.3 "entire length of source"
+    /// implied value).
+    pub extent_length: u64,
+}
+
+/// One item's location record, per the `iloc` per-item loop (ISO/IEC
+/// 14496-12 §8.11.3.2). The on-wire field widths (`offset_size`,
+/// `length_size`, `base_offset_size`, `index_size`) are box-global; the
+/// decoded values are widened to `u64` here so a consumer sees one type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IlocItem {
+    /// `item_ID` — the catalogue key. 16-bit on the wire for versions
+    /// 0/1, 32-bit for version 2; widened to `u32`.
+    pub item_id: u32,
+    /// `construction_method` (versions 1/2 only; 0 for version 0):
+    /// 0 = file offset, 1 = idat offset, 2 = item offset (§8.11.3.3).
+    pub construction_method: u8,
+    /// `data_reference_index` — 0 = this file, else a 1-based index into
+    /// the `dref` table (§8.11.3.3).
+    pub data_reference_index: u16,
+    /// `base_offset` — added to each extent offset (§8.11.3.3). 0 when
+    /// `base_offset_size` was 0.
+    pub base_offset: u64,
+    /// Extents in file order; their lengths sum to the item's total size.
+    pub extents: Vec<IlocExtent>,
+}
+
+/// Decoded `iloc` (ItemLocationBox, ISO/IEC 14496-12 §8.11.3).
+///
+/// Carries the box-global field-width selectors verbatim (so a consumer
+/// can reason about the on-wire encoding) plus one [`IlocItem`] per
+/// declared item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IlocBox {
+    /// FullBox version (0, 1, or 2). Versions 1/2 carry
+    /// `construction_method`; version 2 widens `item_ID` and `item_count`
+    /// to 32-bit.
+    pub version: u8,
+    /// `offset_size` — byte width of each `extent_offset` ({0, 4, 8}).
+    pub offset_size: u8,
+    /// `length_size` — byte width of each `extent_length` ({0, 4, 8}).
+    pub length_size: u8,
+    /// `base_offset_size` — byte width of `base_offset` ({0, 4, 8}).
+    pub base_offset_size: u8,
+    /// `index_size` — byte width of `extent_index` ({0, 4, 8}); 0 for
+    /// version 0 (where the nibble is a reserved field).
+    pub index_size: u8,
+    /// One record per declared item, in file order.
+    pub items: Vec<IlocItem>,
+}
+
+/// One item's information entry, decoded from an `infe` (ItemInfoEntry,
+/// ISO/IEC 14496-12 §8.11.6.2) inside `iinf`.
+///
+/// The base spec defines four `infe` versions. Versions 0/1 carry a
+/// `(protection_index, name, content_type, content_encoding)` shape with
+/// no `item_type` code; versions 2/3 carry a 32-bit `item_type` FourCC
+/// (e.g. `hvc1`, `Exif`, `mime`, `uri `) plus a name and — for `mime` /
+/// `uri ` types — a content-type or URI string. The fields that don't
+/// apply to a given version are left empty / zero.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ItemInfoEntry {
+    /// `item_ID` — matches an `iloc` `item_ID`.
+    pub item_id: u32,
+    /// `item_protection_index` — 0 = unprotected, else a 1-based index
+    /// into the `ipro` ItemProtectionBox (§8.11.6.3).
+    pub protection_index: u16,
+    /// `item_type` — the 32-bit type code (versions ≥ 2). All-zero for
+    /// versions 0/1 where the field does not exist on the wire.
+    pub item_type: [u8; 4],
+    /// `item_name` — a human-readable / symbolic name (may be empty).
+    pub item_name: String,
+    /// `content_type` — MIME type string (versions 0/1 always; versions
+    /// ≥ 2 only when `item_type == "mime"`). Empty when absent.
+    pub content_type: String,
+    /// `content_encoding` — optional encoding string (e.g. "gzip");
+    /// empty when absent. For `uri ` items (versions ≥ 2) this field
+    /// instead carries the `item_uri_type` string.
+    pub content_encoding: String,
+    /// FullBox version of the source `infe` (0, 1, 2, or 3).
+    pub version: u8,
+}
+
+/// Decoded `iinf` (ItemInfoBox, ISO/IEC 14496-12 §8.11.6).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct IinfBox {
+    /// One entry per `infe` child, in file order (the spec sorts by
+    /// increasing `item_ID`, but the demuxer preserves wire order).
+    pub entries: Vec<ItemInfoEntry>,
+}
+
+/// One typed group of item references sharing a `reference_type`, decoded
+/// from a `SingleItemTypeReferenceBox` inside `iref` (ISO/IEC 14496-12
+/// §8.11.12.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemReference {
+    /// The reference type FourCC (e.g. `dimg`, `thmb`, `cdsc`, `auxl`).
+    pub reference_type: [u8; 4],
+    /// `from_item_ID` — the item that refers to the others.
+    pub from_item_id: u32,
+    /// `to_item_ID`s — the items referred to, in file order.
+    pub to_item_ids: Vec<u32>,
+}
+
+/// Decoded `iref` (ItemReferenceBox, ISO/IEC 14496-12 §8.11.12).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrefBox {
+    /// FullBox version: 0 → 16-bit item IDs, 1 → 32-bit item IDs.
+    pub version: u8,
+    /// One group per `SingleItemTypeReferenceBox`, in file order.
+    pub references: Vec<ItemReference>,
+}
+
+/// A `meta` box's item infrastructure (ISO/IEC 14496-12 §8.11),
+/// collected together. Any of the four child boxes may be absent.
+#[derive(Clone, Debug, Default)]
+pub struct MetaItems {
+    /// `pitm` (§8.11.4) — the primary item's ID, if a `pitm` is present.
+    pub primary_item_id: Option<u32>,
+    /// The handler type from the `meta`'s `hdlr` (§8.4.3) — e.g. `pict`
+    /// for HEIF still images, `mdir` for iTunes metadata. All-zero when
+    /// no `hdlr` was found.
+    pub handler_type: [u8; 4],
+    /// `iloc` (§8.11.3), if present.
+    pub iloc: Option<IlocBox>,
+    /// `iinf` (§8.11.6), if present.
+    pub iinf: Option<IinfBox>,
+    /// `iref` (§8.11.12), if present.
+    pub iref: Option<IrefBox>,
+}
+
+impl MetaItems {
+    /// True when this `meta` box carries no item infrastructure at all
+    /// (no `pitm` / `iloc` / `iinf` / `iref`) — e.g. a plain iTunes
+    /// `meta` whose payload is just `hdlr` + `ilst`.
+    pub fn is_empty(&self) -> bool {
+        self.primary_item_id.is_none()
+            && self.iloc.is_none()
+            && self.iinf.is_none()
+            && self.iref.is_none()
+    }
+}
+
+/// Read a big-endian unsigned integer of `n` bytes (n ∈ {0, 4, 8}, the
+/// `iloc` field-width set) from `buf` at `pos`, advancing `pos`. A width
+/// of 0 yields 0 without consuming bytes (the §8.11.3.3 implied-value
+/// convention). Returns `None` if the field would overrun `buf`.
+fn read_sized_be(buf: &[u8], pos: &mut usize, n: usize) -> Option<u64> {
+    if n == 0 {
+        return Some(0);
+    }
+    if *pos + n > buf.len() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &b in &buf[*pos..*pos + n] {
+        v = (v << 8) | b as u64;
+    }
+    *pos += n;
+    Some(v)
+}
+
+/// Parse an `iloc` (ItemLocationBox, ISO/IEC 14496-12 §8.11.3) body
+/// (the bytes after the box header). Returns `None` on a truncated or
+/// malformed box rather than aborting the enclosing `meta` walk.
+pub fn parse_iloc_box(body: &[u8]) -> Option<IlocBox> {
+    if body.len() < 6 {
+        return None;
+    }
+    let version = body[0];
+    if version > 2 {
+        return None;
+    }
+    // body[1..4] are flags (must be 0 per §8.11.3.2); skipped.
+    let mut pos = 4usize;
+    let b = body[pos];
+    let offset_size = b >> 4;
+    let length_size = b & 0x0F;
+    pos += 1;
+    let b = body[pos];
+    let base_offset_size = b >> 4;
+    // The low nibble is `index_size` for versions 1/2, reserved (0) for 0.
+    let index_size = if version == 1 || version == 2 {
+        b & 0x0F
+    } else {
+        0
+    };
+    pos += 1;
+    // §8.11.3.2: each *_size must be one of {0, 4, 8}.
+    for &s in &[offset_size, length_size, base_offset_size, index_size] {
+        if s != 0 && s != 4 && s != 8 {
+            return None;
+        }
+    }
+    let item_count = if version < 2 {
+        read_sized_be(body, &mut pos, 2)?
+    } else {
+        read_sized_be(body, &mut pos, 4)?
+    };
+    let mut items = Vec::new();
+    for _ in 0..item_count {
+        let item_id = if version < 2 {
+            read_sized_be(body, &mut pos, 2)? as u32
+        } else {
+            read_sized_be(body, &mut pos, 4)? as u32
+        };
+        let construction_method = if version == 1 || version == 2 {
+            // unsigned int(12) reserved + unsigned int(4) construction_method
+            let w = read_sized_be(body, &mut pos, 2)?;
+            (w & 0x0F) as u8
+        } else {
+            0
+        };
+        let data_reference_index = read_sized_be(body, &mut pos, 2)? as u16;
+        let base_offset = read_sized_be(body, &mut pos, base_offset_size as usize)?;
+        let extent_count = read_sized_be(body, &mut pos, 2)?;
+        let mut extents = Vec::new();
+        for _ in 0..extent_count {
+            let extent_index = if (version == 1 || version == 2) && index_size > 0 {
+                read_sized_be(body, &mut pos, index_size as usize)?
+            } else {
+                0
+            };
+            let extent_offset = read_sized_be(body, &mut pos, offset_size as usize)?;
+            let extent_length = read_sized_be(body, &mut pos, length_size as usize)?;
+            extents.push(IlocExtent {
+                extent_index,
+                extent_offset,
+                extent_length,
+            });
+        }
+        items.push(IlocItem {
+            item_id,
+            construction_method,
+            data_reference_index,
+            base_offset,
+            extents,
+        });
+    }
+    Some(IlocBox {
+        version,
+        offset_size,
+        length_size,
+        base_offset_size,
+        index_size,
+        items,
+    })
+}
+
+/// Parse a `pitm` (PrimaryItemBox, ISO/IEC 14496-12 §8.11.4) body and
+/// return the primary `item_ID`. v0 → 16-bit, v≥1 → 32-bit.
+pub fn parse_pitm_box(body: &[u8]) -> Option<u32> {
+    if body.len() < 4 {
+        return None;
+    }
+    let version = body[0];
+    let mut pos = 4usize;
+    if version == 0 {
+        read_sized_be(body, &mut pos, 2).map(|v| v as u32)
+    } else {
+        read_sized_be(body, &mut pos, 4).map(|v| v as u32)
+    }
+}
+
+/// Read a NUL-terminated UTF-8 string starting at `pos`, advancing `pos`
+/// past the terminator. If no NUL is found before the end of `buf`, the
+/// remaining bytes are taken as the string and `pos` is set to the end.
+fn read_c_string_at(buf: &[u8], pos: &mut usize) -> String {
+    let start = *pos;
+    let mut i = start;
+    while i < buf.len() && buf[i] != 0 {
+        i += 1;
+    }
+    let s = String::from_utf8_lossy(&buf[start..i]).into_owned();
+    // Advance past the terminator (or to end if none).
+    *pos = if i < buf.len() { i + 1 } else { buf.len() };
+    s
+}
+
+/// Parse a single `infe` (ItemInfoEntry, ISO/IEC 14496-12 §8.11.6.2)
+/// body (bytes after the `infe` box header). Returns `None` on a
+/// truncated header.
+fn parse_infe(body: &[u8]) -> Option<ItemInfoEntry> {
+    if body.len() < 4 {
+        return None;
+    }
+    let version = body[0];
+    let mut pos = 4usize;
+    let mut e = ItemInfoEntry {
+        version,
+        ..Default::default()
+    };
+    if version == 0 || version == 1 {
+        e.item_id = read_sized_be(body, &mut pos, 2)? as u32;
+        e.protection_index = read_sized_be(body, &mut pos, 2)? as u16;
+        e.item_name = read_c_string_at(body, &mut pos);
+        e.content_type = read_c_string_at(body, &mut pos);
+        // content_encoding is optional; present only if bytes remain.
+        if pos < body.len() {
+            e.content_encoding = read_c_string_at(body, &mut pos);
+        }
+        // version 1 may carry an extension_type + extension; ignored here.
+    } else {
+        // version >= 2
+        e.item_id = if version == 2 {
+            read_sized_be(body, &mut pos, 2)? as u32
+        } else {
+            read_sized_be(body, &mut pos, 4)? as u32
+        };
+        e.protection_index = read_sized_be(body, &mut pos, 2)? as u16;
+        if pos + 4 > body.len() {
+            return None;
+        }
+        e.item_type.copy_from_slice(&body[pos..pos + 4]);
+        pos += 4;
+        e.item_name = read_c_string_at(body, &mut pos);
+        if &e.item_type == b"mime" {
+            e.content_type = read_c_string_at(body, &mut pos);
+            if pos < body.len() {
+                e.content_encoding = read_c_string_at(body, &mut pos);
+            }
+        } else if &e.item_type == b"uri " {
+            // item_uri_type → carried in content_encoding to avoid a
+            // separate field (documented on ItemInfoEntry).
+            e.content_encoding = read_c_string_at(body, &mut pos);
+        }
+    }
+    Some(e)
+}
+
+/// Parse an `iinf` (ItemInfoBox, ISO/IEC 14496-12 §8.11.6) body. Walks
+/// the child `infe` boxes. Malformed children are skipped; a truncated
+/// header aborts the walk gracefully (returns whatever parsed cleanly).
+pub fn parse_iinf_box(body: &[u8]) -> Option<IinfBox> {
+    if body.len() < 4 {
+        return None;
+    }
+    let version = body[0];
+    let mut pos = 4usize;
+    let entry_count = if version == 0 {
+        read_sized_be(body, &mut pos, 2)?
+    } else {
+        read_sized_be(body, &mut pos, 4)?
+    };
+    let mut out = IinfBox::default();
+    let mut cur = std::io::Cursor::new(&body[pos..]);
+    let region = &body[pos..];
+    let end = region.len() as u64;
+    let mut seen = 0u64;
+    while cur.position() < end && seen < entry_count {
+        let hdr = match read_box_header(&mut cur).ok().flatten() {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let start = cur.position() as usize;
+        if start + psz > region.len() {
+            break;
+        }
+        cur.set_position((start + psz) as u64);
+        if hdr.fourcc == INFE {
+            if let Some(e) = parse_infe(&region[start..start + psz]) {
+                out.entries.push(e);
+            }
+        }
+        seen += 1;
+    }
+    Some(out)
+}
+
+/// Parse an `iref` (ItemReferenceBox, ISO/IEC 14496-12 §8.11.12) body.
+/// Each child is a `SingleItemTypeReferenceBox` whose box type IS the
+/// reference type.
+pub fn parse_iref_box(body: &[u8]) -> Option<IrefBox> {
+    if body.len() < 4 {
+        return None;
+    }
+    let version = body[0];
+    if version > 1 {
+        return None;
+    }
+    let id_bytes = if version == 0 { 2usize } else { 4usize };
+    let region = &body[4..];
+    let mut cur = std::io::Cursor::new(region);
+    let end = region.len() as u64;
+    let mut references = Vec::new();
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur).ok().flatten() {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let start = cur.position() as usize;
+        if start + psz > region.len() {
+            break;
+        }
+        cur.set_position((start + psz) as u64);
+        let sub = &region[start..start + psz];
+        let mut p = 0usize;
+        let from_item_id = match read_sized_be(sub, &mut p, id_bytes) {
+            Some(v) => v as u32,
+            None => continue,
+        };
+        let ref_count = match read_sized_be(sub, &mut p, 2) {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut to_item_ids = Vec::new();
+        for _ in 0..ref_count {
+            match read_sized_be(sub, &mut p, id_bytes) {
+                Some(v) => to_item_ids.push(v as u32),
+                None => break,
+            }
+        }
+        references.push(ItemReference {
+            reference_type: hdr.fourcc,
+            from_item_id,
+            to_item_ids,
+        });
+    }
+    Some(IrefBox {
+        version,
+        references,
+    })
+}
+
+/// Walk a `meta` box body (bytes after its FullBox preamble removed by
+/// the caller is NOT assumed — this takes the full body and skips the
+/// 4-byte version/flags itself) and collect the §8.11 item
+/// infrastructure (`pitm` / `iloc` / `iinf` / `iref`) plus the `hdlr`
+/// handler type. Returns an all-`None` [`MetaItems`] for a plain iTunes
+/// `meta` (which carries only `hdlr` + `ilst`).
+pub fn parse_meta_items(body: &[u8]) -> MetaItems {
+    let mut out = MetaItems::default();
+    if body.len() < 4 {
+        return out;
+    }
+    let region = &body[4..];
+    let mut cur = std::io::Cursor::new(region);
+    let end = region.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur).ok().flatten() {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let start = cur.position() as usize;
+        if start + psz > region.len() {
+            break;
+        }
+        cur.set_position((start + psz) as u64);
+        let child = &region[start..start + psz];
+        match hdr.fourcc {
+            // §8.4.3 hdlr body: version/flags(4) + pre_defined(4) +
+            // handler_type(4) + … — capture handler_type.
+            HDLR if child.len() >= 12 => {
+                out.handler_type.copy_from_slice(&child[8..12]);
+            }
+            PITM => {
+                if let Some(id) = parse_pitm_box(child) {
+                    out.primary_item_id = Some(id);
+                }
+            }
+            ILOC => out.iloc = parse_iloc_box(child),
+            IINF => out.iinf = parse_iinf_box(child),
+            IREF => out.iref = parse_iref_box(child),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Append the flat `meta_*` metadata keys for a parsed file-level `meta`
+/// box (§8.11). No keys are emitted for an empty / absent `meta`.
+fn surface_meta_items(m: &MetaItems, metadata: &mut Vec<(String, String)>) {
+    if m.handler_type == [0; 4] && m.is_empty() {
+        return;
+    }
+    if m.handler_type != [0; 4] {
+        metadata.push((
+            "meta_handler".to_string(),
+            String::from_utf8_lossy(&m.handler_type).to_string(),
+        ));
+    }
+    if let Some(id) = m.primary_item_id {
+        metadata.push(("meta_primary_item".to_string(), id.to_string()));
+    }
+    if let Some(iinf) = m.iinf.as_ref() {
+        metadata.push((
+            "meta_item_count".to_string(),
+            iinf.entries.len().to_string(),
+        ));
+        for (n, e) in iinf.entries.iter().enumerate() {
+            let type_tok = if e.version >= 2 {
+                String::from_utf8_lossy(&e.item_type).to_string()
+            } else {
+                format!("v{}", e.version)
+            };
+            metadata.push((
+                format!("meta_item_{n}"),
+                format!("id={} type={} name={}", e.item_id, type_tok, e.item_name),
+            ));
+        }
+    }
+    if let Some(iloc) = m.iloc.as_ref() {
+        metadata.push(("meta_iloc_count".to_string(), iloc.items.len().to_string()));
+    }
+    if let Some(iref) = m.iref.as_ref() {
+        metadata.push((
+            "meta_iref_count".to_string(),
+            iref.references.len().to_string(),
+        ));
+    }
 }
 
 fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
@@ -8267,6 +8844,15 @@ struct Mp4Demuxer {
     /// `trak`/`stbl` level (the common case).
     #[allow(dead_code)]
     traf_sample_groups: Vec<TrafSampleGroupRecord>,
+    /// ISO/IEC 14496-12 §8.11 — the file-level `meta` box item
+    /// infrastructure (HEIF / MIAF item catalogue), if the file carries
+    /// one. Holds the primary item, item-location directory, item-info
+    /// entries, and item references. `MetaItems::default()` (all-`None`)
+    /// for a non-HEIF file or a plain iTunes-metadata `meta`. Reachable
+    /// via the public `Mp4Demuxer::meta_items()` accessor; also surfaced
+    /// on the flat metadata channel as `meta_*` keys.
+    #[allow(dead_code)]
+    meta_items: MetaItems,
     /// Per-track media timescale (1-based parallel to `track_ids`),
     /// needed to translate `tfra.time` (track timescale) to the seek-to
     /// caller's pts (also track timescale, but this lets us add unit
@@ -8417,6 +9003,19 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn traf_sample_groups(&self) -> &[TrafSampleGroupRecord] {
         &self.traf_sample_groups
+    }
+
+    /// ISO/IEC 14496-12 §8.11 — the file-level `meta` box item
+    /// infrastructure (HEIF / MIAF item catalogue): the primary item ID
+    /// (`pitm`), the item-location directory (`iloc`), item-info entries
+    /// (`iinf` / `infe`), and typed item references (`iref`), plus the
+    /// `meta`'s handler type. Returns an all-`None` [`MetaItems`] (via
+    /// [`MetaItems::is_empty`]) for a non-HEIF file or a `meta` that
+    /// carries only iTunes-style `hdlr` + `ilst`. The same data is also
+    /// surfaced on the flat metadata channel as `meta_*` keys.
+    #[allow(dead_code)]
+    pub fn meta_items(&self) -> &MetaItems {
+        &self.meta_items
     }
 }
 
@@ -15657,5 +16256,285 @@ mod tests {
             super::parse_sample_flags(raw),
             super::SampleFlags::from_u32(raw)
         );
+    }
+
+    // ----------------------------------------------------------------
+    // §8.11 meta item infrastructure (iloc / pitm / iinf / infe / iref)
+    // ----------------------------------------------------------------
+
+    /// Wrap `body` in a `[size][fourcc]` box header (32-bit size form).
+    fn box_bytes(fourcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let total = (8 + body.len()) as u32;
+        let mut v = total.to_be_bytes().to_vec();
+        v.extend_from_slice(fourcc);
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn parse_iloc_v0_single_extent() {
+        // version 0, offset_size=4 length_size=4 base_offset_size=0,
+        // item_count=1, item_ID=1, dref=0, extent_count=1,
+        // extent_offset=0x1000, extent_length=0x40.
+        let mut b = vec![0u8, 0, 0, 0]; // version/flags
+        b.push(0x44); // offset_size=4, length_size=4
+        b.push(0x00); // base_offset_size=0, reserved=0
+        b.extend_from_slice(&1u16.to_be_bytes()); // item_count
+        b.extend_from_slice(&1u16.to_be_bytes()); // item_ID
+        b.extend_from_slice(&0u16.to_be_bytes()); // data_reference_index
+                                                  // base_offset omitted (size 0)
+        b.extend_from_slice(&1u16.to_be_bytes()); // extent_count
+        b.extend_from_slice(&0x1000u32.to_be_bytes()); // extent_offset
+        b.extend_from_slice(&0x40u32.to_be_bytes()); // extent_length
+        let iloc = super::parse_iloc_box(&b).expect("iloc parses");
+        assert_eq!(iloc.version, 0);
+        assert_eq!(iloc.offset_size, 4);
+        assert_eq!(iloc.length_size, 4);
+        assert_eq!(iloc.base_offset_size, 0);
+        assert_eq!(iloc.items.len(), 1);
+        let it = &iloc.items[0];
+        assert_eq!(it.item_id, 1);
+        assert_eq!(it.construction_method, 0);
+        assert_eq!(it.base_offset, 0);
+        assert_eq!(it.extents.len(), 1);
+        assert_eq!(it.extents[0].extent_offset, 0x1000);
+        assert_eq!(it.extents[0].extent_length, 0x40);
+    }
+
+    #[test]
+    fn parse_iloc_v1_construction_method_and_index() {
+        // version 1, offset_size=8 length_size=8 base_offset_size=4
+        // index_size=4, item_count=1, item_ID=7, construction_method=1
+        // (idat), dref=0, base_offset=0x10, extent_count=1,
+        // extent_index=2, extent_offset=0x20, extent_length=0x30.
+        let mut b = vec![1u8, 0, 0, 0];
+        b.push(0x88); // offset_size=8, length_size=8
+        b.push(0x44); // base_offset_size=4, index_size=4
+        b.extend_from_slice(&1u16.to_be_bytes()); // item_count
+        b.extend_from_slice(&7u16.to_be_bytes()); // item_ID
+        b.extend_from_slice(&0x0001u16.to_be_bytes()); // reserved(12)+constr(4)=1
+        b.extend_from_slice(&0u16.to_be_bytes()); // dref
+        b.extend_from_slice(&0x10u32.to_be_bytes()); // base_offset (4)
+        b.extend_from_slice(&1u16.to_be_bytes()); // extent_count
+        b.extend_from_slice(&2u32.to_be_bytes()); // extent_index (4)
+        b.extend_from_slice(&0x20u64.to_be_bytes()); // extent_offset (8)
+        b.extend_from_slice(&0x30u64.to_be_bytes()); // extent_length (8)
+        let iloc = super::parse_iloc_box(&b).expect("iloc v1 parses");
+        assert_eq!(iloc.version, 1);
+        assert_eq!(iloc.index_size, 4);
+        let it = &iloc.items[0];
+        assert_eq!(it.item_id, 7);
+        assert_eq!(it.construction_method, 1);
+        assert_eq!(it.base_offset, 0x10);
+        assert_eq!(it.extents[0].extent_index, 2);
+        assert_eq!(it.extents[0].extent_offset, 0x20);
+        assert_eq!(it.extents[0].extent_length, 0x30);
+    }
+
+    #[test]
+    fn parse_iloc_v2_32bit_item_id() {
+        // version 2 widens item_count and item_ID to 32 bits.
+        let mut b = vec![2u8, 0, 0, 0];
+        b.push(0x44); // offset_size=4, length_size=4
+        b.push(0x00); // base_offset_size=0, index_size=0
+        b.extend_from_slice(&1u32.to_be_bytes()); // item_count (32-bit)
+        b.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // item_ID (32-bit)
+        b.extend_from_slice(&0x0000u16.to_be_bytes()); // reserved+constr=0
+        b.extend_from_slice(&0u16.to_be_bytes()); // dref
+        b.extend_from_slice(&1u16.to_be_bytes()); // extent_count
+        b.extend_from_slice(&0x55u32.to_be_bytes()); // extent_offset
+        b.extend_from_slice(&0x66u32.to_be_bytes()); // extent_length
+        let iloc = super::parse_iloc_box(&b).expect("iloc v2 parses");
+        assert_eq!(iloc.items[0].item_id, 0x0001_0000);
+        assert_eq!(iloc.items[0].extents[0].extent_offset, 0x55);
+    }
+
+    #[test]
+    fn parse_iloc_rejects_bad_field_width() {
+        // offset_size=5 is not in {0,4,8} → reject.
+        let mut b = vec![0u8, 0, 0, 0];
+        b.push(0x54); // offset_size=5 (invalid), length_size=4
+        b.push(0x00);
+        b.extend_from_slice(&0u16.to_be_bytes());
+        assert!(super::parse_iloc_box(&b).is_none());
+    }
+
+    #[test]
+    fn parse_pitm_v0_and_v1() {
+        let mut v0 = vec![0u8, 0, 0, 0];
+        v0.extend_from_slice(&0x1234u16.to_be_bytes());
+        assert_eq!(super::parse_pitm_box(&v0), Some(0x1234));
+        let mut v1 = vec![1u8, 0, 0, 0];
+        v1.extend_from_slice(&0x0001_2345u32.to_be_bytes());
+        assert_eq!(super::parse_pitm_box(&v1), Some(0x0001_2345));
+    }
+
+    #[test]
+    fn parse_iinf_v0_with_infe_v2() {
+        // iinf v0: entry_count(16)=1 then one infe v2 box.
+        // infe v2: item_ID(16)=1, prot_index(16)=0, item_type="hvc1",
+        // item_name="image\0".
+        let mut infe_body = vec![2u8, 0, 0, 0];
+        infe_body.extend_from_slice(&1u16.to_be_bytes());
+        infe_body.extend_from_slice(&0u16.to_be_bytes());
+        infe_body.extend_from_slice(b"hvc1");
+        infe_body.extend_from_slice(b"image\0");
+        let infe = box_bytes(b"infe", &infe_body);
+
+        let mut iinf_body = vec![0u8, 0, 0, 0];
+        iinf_body.extend_from_slice(&1u16.to_be_bytes()); // entry_count
+        iinf_body.extend_from_slice(&infe);
+
+        let iinf = super::parse_iinf_box(&iinf_body).expect("iinf parses");
+        assert_eq!(iinf.entries.len(), 1);
+        let e = &iinf.entries[0];
+        assert_eq!(e.item_id, 1);
+        assert_eq!(&e.item_type, b"hvc1");
+        assert_eq!(e.item_name, "image");
+        assert_eq!(e.version, 2);
+    }
+
+    #[test]
+    fn parse_infe_v0_name_and_content_type() {
+        // v0/v1 shape: item_ID(16), prot_index(16), item_name\0,
+        // content_type\0, content_encoding\0(optional).
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(&5u16.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(b"thumb\0");
+        body.extend_from_slice(b"image/jpeg\0");
+        // wrap + reparse via iinf to exercise parse_infe through public path
+        let infe = box_bytes(b"infe", &body);
+        let mut iinf_body = vec![0u8, 0, 0, 0];
+        iinf_body.extend_from_slice(&1u16.to_be_bytes());
+        iinf_body.extend_from_slice(&infe);
+        let iinf = super::parse_iinf_box(&iinf_body).unwrap();
+        let e = &iinf.entries[0];
+        assert_eq!(e.item_id, 5);
+        assert_eq!(e.item_name, "thumb");
+        assert_eq!(e.content_type, "image/jpeg");
+        assert_eq!(e.version, 0);
+        assert_eq!(&e.item_type, &[0u8; 4]);
+    }
+
+    #[test]
+    fn parse_iref_v0_groups() {
+        // iref v0: one dimg ref from item 1 to items {2,3}, one thmb
+        // ref from item 4 to item 1.
+        let mut dimg = 1u16.to_be_bytes().to_vec();
+        dimg.extend_from_slice(&2u16.to_be_bytes()); // ref_count
+        dimg.extend_from_slice(&2u16.to_be_bytes());
+        dimg.extend_from_slice(&3u16.to_be_bytes());
+        let dimg = box_bytes(b"dimg", &dimg);
+        let mut thmb = 4u16.to_be_bytes().to_vec();
+        thmb.extend_from_slice(&1u16.to_be_bytes());
+        thmb.extend_from_slice(&1u16.to_be_bytes());
+        let thmb = box_bytes(b"thmb", &thmb);
+        let mut body = vec![0u8, 0, 0, 0]; // version 0
+        body.extend_from_slice(&dimg);
+        body.extend_from_slice(&thmb);
+        let iref = super::parse_iref_box(&body).expect("iref parses");
+        assert_eq!(iref.version, 0);
+        assert_eq!(iref.references.len(), 2);
+        assert_eq!(&iref.references[0].reference_type, b"dimg");
+        assert_eq!(iref.references[0].from_item_id, 1);
+        assert_eq!(iref.references[0].to_item_ids, vec![2, 3]);
+        assert_eq!(&iref.references[1].reference_type, b"thmb");
+        assert_eq!(iref.references[1].from_item_id, 4);
+        assert_eq!(iref.references[1].to_item_ids, vec![1]);
+    }
+
+    #[test]
+    fn parse_iref_v1_32bit_ids() {
+        let mut g = 0x0001_0000u32.to_be_bytes().to_vec();
+        g.extend_from_slice(&1u16.to_be_bytes()); // ref_count
+        g.extend_from_slice(&0x0002_0000u32.to_be_bytes());
+        let g = box_bytes(b"cdsc", &g);
+        let mut body = vec![1u8, 0, 0, 0]; // version 1
+        body.extend_from_slice(&g);
+        let iref = super::parse_iref_box(&body).unwrap();
+        assert_eq!(iref.version, 1);
+        assert_eq!(iref.references[0].from_item_id, 0x0001_0000);
+        assert_eq!(iref.references[0].to_item_ids, vec![0x0002_0000]);
+    }
+
+    #[test]
+    fn parse_meta_items_full_heif_meta() {
+        // Assemble a meta body with hdlr(pict) + pitm + iloc + iinf + iref.
+        let mut hdlr = vec![0u8, 0, 0, 0]; // version/flags
+        hdlr.extend_from_slice(&[0, 0, 0, 0]); // pre_defined
+        hdlr.extend_from_slice(b"pict"); // handler_type
+        hdlr.extend_from_slice(&[0u8; 12]); // reserved
+        hdlr.push(0); // name terminator
+        let hdlr = box_bytes(b"hdlr", &hdlr);
+
+        let mut pitm = vec![0u8, 0, 0, 0];
+        pitm.extend_from_slice(&1u16.to_be_bytes());
+        let pitm = box_bytes(b"pitm", &pitm);
+
+        let mut iloc_body = vec![0u8, 0, 0, 0];
+        iloc_body.push(0x44);
+        iloc_body.push(0x00);
+        iloc_body.extend_from_slice(&1u16.to_be_bytes()); // item_count
+        iloc_body.extend_from_slice(&1u16.to_be_bytes()); // item_ID
+        iloc_body.extend_from_slice(&0u16.to_be_bytes()); // dref
+        iloc_body.extend_from_slice(&1u16.to_be_bytes()); // extent_count
+        iloc_body.extend_from_slice(&0x100u32.to_be_bytes());
+        iloc_body.extend_from_slice(&0x10u32.to_be_bytes());
+        let iloc = box_bytes(b"iloc", &iloc_body);
+
+        let mut infe_body = vec![2u8, 0, 0, 0];
+        infe_body.extend_from_slice(&1u16.to_be_bytes());
+        infe_body.extend_from_slice(&0u16.to_be_bytes());
+        infe_body.extend_from_slice(b"hvc1");
+        infe_body.extend_from_slice(b"\0");
+        let infe = box_bytes(b"infe", &infe_body);
+        let mut iinf_body = vec![0u8, 0, 0, 0];
+        iinf_body.extend_from_slice(&1u16.to_be_bytes());
+        iinf_body.extend_from_slice(&infe);
+        let iinf = box_bytes(b"iinf", &iinf_body);
+
+        let mut dimg = 1u16.to_be_bytes().to_vec();
+        dimg.extend_from_slice(&1u16.to_be_bytes());
+        dimg.extend_from_slice(&2u16.to_be_bytes());
+        let dimg = box_bytes(b"dimg", &dimg);
+        let mut iref_body = vec![0u8, 0, 0, 0];
+        iref_body.extend_from_slice(&dimg);
+        let iref = box_bytes(b"iref", &iref_body);
+
+        // meta body = version/flags(4) + children.
+        let mut meta = vec![0u8, 0, 0, 0];
+        meta.extend_from_slice(&hdlr);
+        meta.extend_from_slice(&pitm);
+        meta.extend_from_slice(&iloc);
+        meta.extend_from_slice(&iinf);
+        meta.extend_from_slice(&iref);
+
+        let mi = super::parse_meta_items(&meta);
+        assert_eq!(&mi.handler_type, b"pict");
+        assert_eq!(mi.primary_item_id, Some(1));
+        assert_eq!(mi.iloc.as_ref().unwrap().items.len(), 1);
+        assert_eq!(mi.iinf.as_ref().unwrap().entries[0].item_name, "");
+        assert_eq!(&mi.iinf.as_ref().unwrap().entries[0].item_type, b"hvc1");
+        assert_eq!(mi.iref.as_ref().unwrap().references.len(), 1);
+        assert!(!mi.is_empty());
+    }
+
+    #[test]
+    fn parse_meta_items_plain_itunes_is_empty() {
+        // A meta with just hdlr(mdir) + ilst carries no §8.11 items.
+        let mut hdlr = vec![0u8, 0, 0, 0];
+        hdlr.extend_from_slice(&[0, 0, 0, 0]);
+        hdlr.extend_from_slice(b"mdir");
+        hdlr.extend_from_slice(&[0u8; 12]);
+        hdlr.push(0);
+        let hdlr = box_bytes(b"hdlr", &hdlr);
+        let ilst = box_bytes(b"ilst", &[]);
+        let mut meta = vec![0u8, 0, 0, 0];
+        meta.extend_from_slice(&hdlr);
+        meta.extend_from_slice(&ilst);
+        let mi = super::parse_meta_items(&meta);
+        assert_eq!(&mi.handler_type, b"mdir");
+        assert!(mi.is_empty());
     }
 }

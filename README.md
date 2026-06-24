@@ -157,6 +157,23 @@ Sample-entry FourCCs resolve to these codec ids:
   (or the first keyframe of the stream if none qualify).
 - Metadata: 3GPP `udta` boxes (`titl`/`auth`/…) and iTunes-style
   `meta`/`ilst` are surfaced via `Demuxer::metadata()`.
+- HEIF / MIAF item catalogue (ISO/IEC 14496-12 §8.11): a *file-level*
+  `meta` box's item infrastructure is decoded into the public
+  `demux::MetaItems` record — `pitm` (PrimaryItemBox §8.11.4), `iloc`
+  (ItemLocationBox §8.11.3, the full v0/v1/v2 field-width-selector +
+  construction-method + per-extent layout), `iinf`/`infe` (ItemInfoBox
+  §8.11.6, every `infe` version 0–3, including the v2/3 32-bit
+  `item_type` FourCC) and `iref` (ItemReferenceBox §8.11.12, typed
+  from→to item-ID groups), plus the `meta`'s `hdlr` handler type. The
+  structured records are reachable via `Mp4Demuxer::meta_items()`; a
+  flat summary appears on `Demuxer::metadata()` as `meta_handler` /
+  `meta_primary_item` / `meta_item_count` / `meta_item_<n>` /
+  `meta_iloc_count` / `meta_iref_count`. A plain iTunes `meta` (just
+  `hdlr` + `ilst`) carries no §8.11 items and emits no `meta_*` keys.
+  The standalone parsers `demux::parse_iloc_box` / `parse_pitm_box` /
+  `parse_iinf_box` / `parse_iref_box` / `parse_meta_items` are public.
+  This crate surfaces the item *catalogue* (locate / type / relate the
+  items); it does not decode an item's codec payload.
 - Extended language tag (ISO/IEC 14496-12 §8.4.6, `elng`): a track's
   `mdia/elng` ExtendedLanguageBox carries a NULL-terminated BCP 47
   (RFC 4646) tag richer than `mdhd`'s packed 3-char ISO 639-2 code

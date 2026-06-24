@@ -328,6 +328,29 @@ pub const UDTA: [u8; 4] = fourcc("udta");
 pub const META: [u8; 4] = fourcc("meta");
 pub const ILST: [u8; 4] = fourcc("ilst");
 pub const DATA: [u8; 4] = fourcc("data");
+/// `pitm` — Primary Item Box (ISO/IEC 14496-12 §8.11.4). Sits inside a
+/// `meta` box; quantity zero or one. Names the item that holds (or
+/// points at) the primary resource of the meta box's handler.
+pub const PITM: [u8; 4] = fourcc("pitm");
+/// `iloc` — Item Location Box (ISO/IEC 14496-12 §8.11.3). Sits inside a
+/// `meta` box; quantity zero or one. A directory mapping each item ID to
+/// the byte extents (offset + length) that hold its data.
+pub const ILOC: [u8; 4] = fourcc("iloc");
+/// `iinf` — Item Information Box (ISO/IEC 14496-12 §8.11.6). Sits inside
+/// a `meta` box; quantity zero or one. Array of `infe` entries naming
+/// and typing the items declared by a sibling `iloc`.
+pub const IINF: [u8; 4] = fourcc("iinf");
+/// `infe` — Item Info Entry (ISO/IEC 14496-12 §8.11.6). One per item
+/// inside `iinf`; FullBox carrying the item's ID, type code, and name.
+pub const INFE: [u8; 4] = fourcc("infe");
+/// `iref` — Item Reference Box (ISO/IEC 14496-12 §8.11.12). Sits inside
+/// a `meta` box; quantity zero or one. Collects typed from→to item-ID
+/// links (e.g. `dimg` derivation, `thmb` thumbnail, `cdsc` description).
+pub const IREF: [u8; 4] = fourcc("iref");
+/// `idat` — Item Data Box (ISO/IEC 14496-12 §8.11.11). Sits inside a
+/// `meta` box; quantity zero or one. Holds the bytes of items whose
+/// `iloc` construction_method is 1 (idat-relative).
+pub const IDAT: [u8; 4] = fourcc("idat");
 /// `kind` — Track Kind Box (ISO/IEC 14496-12 §8.10.4). Sits inside a
 /// track-level `udta` and labels the track's role with a (schemeURI,
 /// value) pair. Both strings are NULL-terminated C strings; `value`
