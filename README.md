@@ -1078,9 +1078,12 @@ Sample-entry FourCCs resolve to these codec ids:
   (or `colr_icc_len` for an ICC profile). The first of each on the
   active entry wins (the spec lists `colr` boxes most-accurate-first).
   Public standalone parsers `demux::parse_pasp_box` / `parse_clap_box` /
-  `parse_colr_box` decode each box body. A renderer reads the display
-  aspect / crop rectangle and an HDR pipeline reads the colour signalling
-  straight from the container. Absent the box, no keys are emitted.
+  `parse_colr_box` decode each box body, and write counterparts
+  `demux::build_pasp_box` / `build_clap_box` / `build_colr_box` emit
+  each box byte-exact (the inverse of the parsers). A renderer reads the
+  display aspect / crop rectangle and an HDR pipeline reads the colour
+  signalling straight from the container. Absent the box, no keys are
+  emitted.
 
 ### Muxer
 

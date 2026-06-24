@@ -10236,6 +10236,70 @@ pub fn parse_colr_box(body: &[u8]) -> Result<ColrRecord> {
     parse_colr(body).ok_or_else(|| Error::invalid("MP4: colr malformed"))
 }
 
+/// Build a complete `pasp` (PixelAspectRatioBox, ISO/IEC 14496-12
+/// §12.1.4) box from a [`PaspRecord`]. The byte-exact inverse of
+/// [`parse_pasp_box`].
+pub fn build_pasp_box(r: &PaspRecord) -> Vec<u8> {
+    let mut body = r.h_spacing.to_be_bytes().to_vec();
+    body.extend_from_slice(&r.v_spacing.to_be_bytes());
+    wrap_box(b"pasp", &body)
+}
+
+/// Build a complete `clap` (CleanApertureBox, ISO/IEC 14496-12 §12.1.4)
+/// box from a [`ClapRecord`]. The byte-exact inverse of
+/// [`parse_clap_box`].
+pub fn build_clap_box(r: &ClapRecord) -> Vec<u8> {
+    let mut body = Vec::with_capacity(32);
+    for v in [
+        r.width_n,
+        r.width_d,
+        r.height_n,
+        r.height_d,
+        r.horiz_off_n,
+        r.horiz_off_d,
+        r.vert_off_n,
+        r.vert_off_d,
+    ] {
+        body.extend_from_slice(&v.to_be_bytes());
+    }
+    wrap_box(b"clap", &body)
+}
+
+/// Build a complete `colr` (ColourInformationBox, ISO/IEC 14496-12
+/// §12.1.5) box from a [`ColrRecord`]. The byte-exact inverse of
+/// [`parse_colr_box`] (an `nclx` box's seven reserved low bits are
+/// written as 0, matching the parser's mask).
+pub fn build_colr_box(r: &ColrRecord) -> Vec<u8> {
+    let mut body = Vec::new();
+    match r {
+        ColrRecord::Nclx {
+            colour_primaries,
+            transfer_characteristics,
+            matrix_coefficients,
+            full_range,
+        } => {
+            body.extend_from_slice(b"nclx");
+            body.extend_from_slice(&colour_primaries.to_be_bytes());
+            body.extend_from_slice(&transfer_characteristics.to_be_bytes());
+            body.extend_from_slice(&matrix_coefficients.to_be_bytes());
+            body.push(if *full_range { 0x80 } else { 0x00 });
+        }
+        ColrRecord::RestrictedIcc(d) => {
+            body.extend_from_slice(b"rICC");
+            body.extend_from_slice(d);
+        }
+        ColrRecord::UnrestrictedIcc(d) => {
+            body.extend_from_slice(b"prof");
+            body.extend_from_slice(d);
+        }
+        ColrRecord::Other { colour_type, data } => {
+            body.extend_from_slice(colour_type);
+            body.extend_from_slice(data);
+        }
+    }
+    wrap_box(b"colr", &body)
+}
+
 /// Parse a standalone `stvi` (StereoVideoBox, ISO/IEC 14496-12
 /// §8.15.4.2) body from `body` (the bytes after the 4-byte FullBox
 /// version/flags preamble — `stvi` is a `FullBox`).
@@ -13257,6 +13321,47 @@ mod tests {
             o => panic!("expected Other, got {o:?}"),
         }
         assert!(super::parse_colr(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn build_pasp_clap_colr_round_trip() {
+        let p = super::PaspRecord {
+            h_spacing: 64,
+            v_spacing: 45,
+        };
+        let built = super::build_pasp_box(&p);
+        assert_eq!(super::parse_pasp_box(&built[8..]).unwrap(), p);
+
+        let c = super::ClapRecord {
+            width_n: 1920,
+            width_d: 1,
+            height_n: 1080,
+            height_d: 1,
+            horiz_off_n: 3,
+            horiz_off_d: 2,
+            vert_off_n: 5,
+            vert_off_d: 4,
+        };
+        let built = super::build_clap_box(&c);
+        assert_eq!(super::parse_clap_box(&built[8..]).unwrap(), c);
+
+        for colr in [
+            super::ColrRecord::Nclx {
+                colour_primaries: 9,
+                transfer_characteristics: 16,
+                matrix_coefficients: 9,
+                full_range: true,
+            },
+            super::ColrRecord::UnrestrictedIcc(vec![1, 2, 3, 4]),
+            super::ColrRecord::RestrictedIcc(vec![9, 8, 7]),
+            super::ColrRecord::Other {
+                colour_type: *b"zzzz",
+                data: vec![0, 1, 2],
+            },
+        ] {
+            let built = super::build_colr_box(&colr);
+            assert_eq!(super::parse_colr_box(&built[8..]).unwrap(), colr);
+        }
     }
 
     #[test]
