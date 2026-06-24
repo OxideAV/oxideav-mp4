@@ -10,7 +10,9 @@ use oxideav_core::{
 };
 
 use oxideav_mp4::options::{Mp4MuxerOptions, TrackSampleGroups};
-use oxideav_mp4::sample_groups::{SampleGroupDescription, SampleToGroup};
+use oxideav_mp4::sample_groups::{
+    CompactSampleToGroup, CompactSampleToGroupPattern, SampleGroupDescription, SampleToGroup,
+};
 
 fn pcm_stream() -> StreamInfo {
     let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
@@ -90,6 +92,7 @@ fn sgpd_then_sbgp_roundtrip_via_demux() {
         stream_index: 0,
         sbgp: vec![sbgp],
         sgpd: vec![sgpd],
+        csgp: vec![],
     };
     let bytes = mux_with_sample_groups(&stream, tsg);
 
@@ -117,6 +120,7 @@ fn sbgp_v1_grouping_type_parameter_preserved() {
             default_sample_description_index: None,
             entries: vec![vec![0x01]],
         }],
+        csgp: vec![],
     };
     let bytes = mux_with_sample_groups(&stream, tsg);
 
@@ -156,6 +160,7 @@ fn multiple_grouping_types_accumulate_in_order() {
                 entries: vec![vec![0xAA]],
             },
         ],
+        csgp: vec![],
     };
     let bytes = mux_with_sample_groups(&stream, tsg);
 
@@ -184,6 +189,7 @@ fn sgpd_v2_with_default_sample_description_index_roundtrips() {
             default_sample_description_index: Some(2),
             entries: vec![vec![0xCA, 0xFE], vec![0xBE, 0xEF]],
         }],
+        csgp: vec![],
     };
     let bytes = mux_with_sample_groups(&stream, tsg);
 
@@ -199,6 +205,160 @@ fn sgpd_v2_with_default_sample_description_index_roundtrips() {
     // that's what the demuxer surfaces today.
     assert_eq!(opts.get("sgpd_0"), Some("alst default=2 cafebeef"));
     assert_eq!(opts.get("sbgp_0"), Some("alst 4:1"));
+}
+
+#[test]
+fn csgp_after_sgpd_roundtrip_via_demux() {
+    // The compact alternative to `sbgp` (ISO/IEC 14496-12 §8.9.5). One
+    // pattern, replayed across a run of samples. `sgpd` declares the
+    // description table; `csgp` indexes into it compactly.
+    let sgpd = SampleGroupDescription {
+        grouping_type: *b"roll",
+        default_sample_description_index: None,
+        entries: vec![vec![0xFF, 0xFB], vec![0x00, 0x05]],
+    };
+    let csgp = CompactSampleToGroup {
+        grouping_type: *b"roll",
+        grouping_type_parameter: None,
+        index_msb_indicates_fragment_local_description: false,
+        // pattern [1, 2] replayed for 3 consecutive groups (= 6 samples).
+        patterns: vec![CompactSampleToGroupPattern {
+            sample_count: 3,
+            indices: vec![1, 2],
+        }],
+    };
+    let stream = pcm_stream();
+    let tsg = TrackSampleGroups {
+        stream_index: 0,
+        sbgp: vec![],
+        sgpd: vec![sgpd],
+        csgp: vec![csgp],
+    };
+    let bytes = mux_with_sample_groups(&stream, tsg);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let opts = &dmx.streams()[0].params.options;
+    assert_eq!(opts.get("sgpd_0"), Some("roll fffb 0005"));
+    // Demuxer renders `csgp_<n>` as `<gt>[ param=P][ fraglocal] count*i0,i1`.
+    assert_eq!(opts.get("csgp_0"), Some("roll 3*1,2"));
+    // No `sbgp_` keys — this track used the compact form only.
+    assert!(!opts.iter().any(|(k, _)| k.starts_with("sbgp_")));
+}
+
+#[test]
+fn csgp_with_grouping_type_parameter_and_multi_pattern_roundtrip() {
+    let stream = pcm_stream();
+    let tsg = TrackSampleGroups {
+        stream_index: 0,
+        sbgp: vec![],
+        sgpd: vec![SampleGroupDescription {
+            grouping_type: *b"rap ",
+            default_sample_description_index: None,
+            entries: vec![vec![0x01], vec![0x02]],
+        }],
+        csgp: vec![CompactSampleToGroup {
+            grouping_type: *b"rap ",
+            grouping_type_parameter: Some(42),
+            index_msb_indicates_fragment_local_description: false,
+            patterns: vec![
+                CompactSampleToGroupPattern {
+                    sample_count: 2,
+                    indices: vec![1, 2, 1],
+                },
+                CompactSampleToGroupPattern {
+                    sample_count: 1,
+                    indices: vec![2],
+                },
+            ],
+        }],
+    };
+    let bytes = mux_with_sample_groups(&stream, tsg);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let opts = &dmx.streams()[0].params.options;
+    assert_eq!(opts.get("sgpd_0"), Some("rap  01 02"));
+    assert_eq!(opts.get("csgp_0"), Some("rap  param=42 2*1,2,1 1*2"));
+}
+
+#[test]
+fn sbgp_and_csgp_distinct_grouping_types_coexist() {
+    // §8.9.5 forbids both forms for ONE grouping_type, but distinct
+    // grouping_types may each pick their own form on the same track.
+    let stream = pcm_stream();
+    let tsg = TrackSampleGroups {
+        stream_index: 0,
+        sbgp: vec![SampleToGroup {
+            grouping_type: *b"sync",
+            grouping_type_parameter: None,
+            entries: vec![(1, 1), (5, 0)],
+        }],
+        sgpd: vec![
+            SampleGroupDescription {
+                grouping_type: *b"roll",
+                default_sample_description_index: None,
+                entries: vec![vec![0xFF, 0xFB]],
+            },
+            SampleGroupDescription {
+                grouping_type: *b"sync",
+                default_sample_description_index: None,
+                entries: vec![vec![0xAA]],
+            },
+        ],
+        csgp: vec![CompactSampleToGroup {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: false,
+            patterns: vec![CompactSampleToGroupPattern {
+                sample_count: 6,
+                indices: vec![1],
+            }],
+        }],
+    };
+    let bytes = mux_with_sample_groups(&stream, tsg);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let opts = &dmx.streams()[0].params.options;
+    assert_eq!(opts.get("sgpd_0"), Some("roll fffb"));
+    assert_eq!(opts.get("sgpd_1"), Some("sync aa"));
+    assert_eq!(opts.get("sbgp_0"), Some("sync 1:1 5:0"));
+    assert_eq!(opts.get("csgp_0"), Some("roll 6*1"));
+}
+
+#[test]
+fn csgp_fragment_local_flag_preserved_in_stbl() {
+    // The fragment-local MSB flag is legal only inside a `traf`, but the
+    // muxer serialises it verbatim if a caller sets it — round-trip the
+    // flag bit and the high-bit-set index through the demuxer.
+    let stream = pcm_stream();
+    let tsg = TrackSampleGroups {
+        stream_index: 0,
+        sbgp: vec![],
+        sgpd: vec![SampleGroupDescription {
+            grouping_type: *b"seig",
+            default_sample_description_index: None,
+            entries: vec![vec![0x00]],
+        }],
+        csgp: vec![CompactSampleToGroup {
+            grouping_type: *b"seig",
+            grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: true,
+            // 8-bit-wide index with the high bit set (0x81) = fragment-local.
+            patterns: vec![CompactSampleToGroupPattern {
+                sample_count: 4,
+                indices: vec![0x81],
+            }],
+        }],
+    };
+    let bytes = mux_with_sample_groups(&stream, tsg);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let opts = &dmx.streams()[0].params.options;
+    // `fraglocal` marker + the raw 0x81 index preserved verbatim.
+    assert_eq!(opts.get("csgp_0"), Some("seig fraglocal 4*129"));
 }
 
 #[test]

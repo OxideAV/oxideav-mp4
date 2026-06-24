@@ -205,16 +205,21 @@ impl Default for FragmentedOptions {
 
 /// Per-track sample-group emission request.
 ///
-/// Each entry attaches an `sbgp` (SampleToGroupBox) and / or `sgpd`
-/// (SampleGroupDescriptionBox) pair into one track's `stbl`. The two
-/// halves share `grouping_type`; the writer simply serialises whatever
-/// the caller supplies — content interpretation belongs to a layer
-/// that knows the grouping-type semantics (per ISO/IEC 14496-12 §8.9).
+/// Each entry attaches an `sbgp` (SampleToGroupBox), `csgp`
+/// (CompactSampleToGroupBox) and / or `sgpd` (SampleGroupDescriptionBox)
+/// box into one track's `stbl`. The halves share `grouping_type`; the
+/// writer simply serialises whatever the caller supplies — content
+/// interpretation belongs to a layer that knows the grouping-type
+/// semantics (per ISO/IEC 14496-12 §8.9).
 ///
 /// Multiple `TrackSampleGroups` entries may target the same
 /// `stream_index`; they accumulate in encounter order. The muxer
-/// emits all `sgpd` boxes first, then all `sbgp` boxes, after the
-/// chunk-offset table inside each track's `stbl`.
+/// emits all `sgpd` boxes first, then all `sbgp` boxes, then all
+/// `csgp` boxes, after the chunk-offset table inside each track's
+/// `stbl`. `sbgp` and `csgp` are *alternative* encodings of the same
+/// per-sample → group mapping (§8.9.5: "at most one `csgp` *or* `sbgp`
+/// with a given `grouping_type` may exist per track"); a caller picks
+/// one form per `grouping_type` and never both.
 #[derive(Clone, Debug, Default)]
 pub struct TrackSampleGroups {
     /// Index into the muxer's `streams` slice (the stream slot that
@@ -224,6 +229,12 @@ pub struct TrackSampleGroups {
     pub sbgp: Vec<crate::sample_groups::SampleToGroup>,
     /// `sgpd` boxes to emit for this track. Order is preserved.
     pub sgpd: Vec<crate::sample_groups::SampleGroupDescription>,
+    /// `csgp` (CompactSampleToGroupBox, §8.9.5) boxes to emit for this
+    /// track — the compact, bit-packed alternative to `sbgp` for tracks
+    /// whose per-sample group membership is periodic. Order is preserved
+    /// and they follow any `sbgp`. Use `csgp` *or* `sbgp` for a given
+    /// `grouping_type`, never both.
+    pub csgp: Vec<crate::sample_groups::CompactSampleToGroup>,
 }
 
 /// Runtime options controlling how the MP4 muxer shapes its output.

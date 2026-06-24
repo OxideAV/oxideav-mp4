@@ -1050,6 +1050,28 @@ version 1 (64-bit) for over-32-bit durations. Tracks starting at PTS 0
 get no `edts`. Controlled by `Mp4MuxerOptions::write_edit_list`
 (default `true`).
 
+Sample groups (`sbgp` / `sgpd` / `csgp`, ISO/IEC 14496-12 §8.9.2 /
+§8.9.3 / §8.9.5) are emitted per-track when supplied via
+`Mp4MuxerOptions::track_sample_groups` (a list of `TrackSampleGroups`,
+each keyed by `stream_index`). Inside each track's `stbl`, after the
+chunk-offset table, the muxer writes all `sgpd` description boxes first
+(so the tables an index box references are declared ahead of it), then
+`sbgp` run-length maps, then `csgp` compact maps. `sbgp` and `csgp` are
+*alternative* encodings of the same per-sample → group mapping — §8.9.5
+permits at most one form per `grouping_type`, so a caller picks one
+form per `grouping_type` and never both, while distinct `grouping_type`s
+on the same track may each pick their own form. The `csgp` width codes
+(index / count / pattern) are chosen automatically as the narrowest
+§8.9.5 widths that hold every value and packed into `FullBox.flags`
+alongside the `grouping_type_parameter_present` and
+`index_msb_indicates_fragment_local_description` bits; the
+pattern-vs-count 4-bit-agreement constraint is satisfied by promoting a
+lone 4-bit code off code 0 if its partner is wider. Each emitted box
+round-trips byte-exact back through the demuxer's `sbgp_<n>` /
+`sgpd_<n>` / `csgp_<n>` metadata surface. The stateless byte builders
+(`sample_groups::build_sbgp` / `build_sgpd` / `build_csgp`) are public
+for callers assembling boxes outside the muxer.
+
 Chunk offsets auto-promote from `stco` (32-bit) to `co64` (64-bit) when
 any offset exceeds 4 GiB. The `mdat` box header is 32-bit by default
 (byte-identical to the historical output for sub-4-GiB files); set
