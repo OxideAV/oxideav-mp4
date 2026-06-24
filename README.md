@@ -173,7 +173,14 @@ Sample-entry FourCCs resolve to these codec ids:
   The standalone parsers `demux::parse_iloc_box` / `parse_pitm_box` /
   `parse_iinf_box` / `parse_iref_box` / `parse_meta_items` are public.
   This crate surfaces the item *catalogue* (locate / type / relate the
-  items); it does not decode an item's codec payload.
+  items); it does not decode an item's codec payload. The `idat`
+  (ItemDataBox §8.11.11) bytes are captured into `MetaItems::idat`;
+  `MetaItems::item_byte_ranges(id)` resolves an item's extents to
+  `(offset, length)` pairs (base-offset folded in, relative to the
+  item's `construction_method` data origin) and
+  `MetaItems::item_data_from_idat(id)` materialises an idat-resident
+  item's concatenated bytes (with bounds checks). `meta_idat_len` is
+  surfaced on `Demuxer::metadata()` when an `idat` is present.
 - Extended language tag (ISO/IEC 14496-12 §8.4.6, `elng`): a track's
   `mdia/elng` ExtendedLanguageBox carries a NULL-terminated BCP 47
   (RFC 4646) tag richer than `mdhd`'s packed 3-char ISO 639-2 code

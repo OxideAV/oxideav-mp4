@@ -2598,17 +2598,113 @@ pub struct MetaItems {
     pub iinf: Option<IinfBox>,
     /// `iref` (§8.11.12), if present.
     pub iref: Option<IrefBox>,
+    /// `idat` (ItemDataBox, §8.11.11) bytes, if present. Items whose
+    /// `iloc` `construction_method == 1` address their extents relative
+    /// to the start of this buffer (the §8.11.3.3 idat data origin).
+    /// Empty when no `idat` box is present.
+    pub idat: Vec<u8>,
+}
+
+/// A resolved byte range for one item extent, relative to a data origin
+/// determined by the item's `construction_method` (ISO/IEC 14496-12
+/// §8.11.3.3). For `construction_method == 0` (file) the range is an
+/// absolute file offset; for `construction_method == 1` (idat) it is an
+/// offset into the `meta` box's `idat` buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ItemByteRange {
+    /// Start offset (from the data origin selected by the construction
+    /// method). `base_offset + extent_offset`.
+    pub offset: u64,
+    /// Length in bytes.
+    pub length: u64,
 }
 
 impl MetaItems {
     /// True when this `meta` box carries no item infrastructure at all
-    /// (no `pitm` / `iloc` / `iinf` / `iref`) — e.g. a plain iTunes
-    /// `meta` whose payload is just `hdlr` + `ilst`.
+    /// (no `pitm` / `iloc` / `iinf` / `iref` / `idat`) — e.g. a plain
+    /// iTunes `meta` whose payload is just `hdlr` + `ilst`.
     pub fn is_empty(&self) -> bool {
         self.primary_item_id.is_none()
             && self.iloc.is_none()
             && self.iinf.is_none()
             && self.iref.is_none()
+            && self.idat.is_empty()
+    }
+
+    /// Look up an item's `iloc` location record by item ID.
+    pub fn iloc_item(&self, item_id: u32) -> Option<&IlocItem> {
+        self.iloc
+            .as_ref()?
+            .items
+            .iter()
+            .find(|it| it.item_id == item_id)
+    }
+
+    /// Look up an item's `iinf` info entry by item ID.
+    pub fn item_info(&self, item_id: u32) -> Option<&ItemInfoEntry> {
+        self.iinf
+            .as_ref()?
+            .entries
+            .iter()
+            .find(|e| e.item_id == item_id)
+    }
+
+    /// Resolve the byte ranges of an item's extents, applying the item's
+    /// `base_offset` (§8.11.3.3) to each extent offset. The returned
+    /// ranges are relative to the data origin selected by the item's
+    /// `construction_method` (file offset for 0, `idat` offset for 1);
+    /// callers using method 0 add the file base, callers using method 1
+    /// index into [`MetaItems::idat`].
+    ///
+    /// Returns `None` when the item ID is not in `iloc`. An empty extent
+    /// list yields an empty vec.
+    pub fn item_byte_ranges(&self, item_id: u32) -> Option<Vec<ItemByteRange>> {
+        let it = self.iloc_item(item_id)?;
+        Some(
+            it.extents
+                .iter()
+                .map(|ex| ItemByteRange {
+                    offset: it.base_offset.saturating_add(ex.extent_offset),
+                    length: ex.extent_length,
+                })
+                .collect(),
+        )
+    }
+
+    /// Materialise the bytes of an item whose data is stored inside the
+    /// `meta` box's `idat` (ItemDataBox, §8.11.11) — i.e. whose `iloc`
+    /// `construction_method == 1`. The item's extents are concatenated
+    /// in order. Returns `None` when:
+    ///   * the item ID is not in `iloc`,
+    ///   * the item's construction method is not 1 (idat), or
+    ///   * any extent range overruns the available `idat` bytes.
+    ///
+    /// Items addressed by file offset (`construction_method == 0`) are
+    /// not resolved here — the demuxer does not re-read the input for
+    /// untimed items; use [`MetaItems::item_byte_ranges`] to obtain
+    /// their absolute file offsets and read them externally.
+    pub fn item_data_from_idat(&self, item_id: u32) -> Option<Vec<u8>> {
+        let it = self.iloc_item(item_id)?;
+        if it.construction_method != 1 {
+            return None;
+        }
+        let mut out = Vec::new();
+        for ex in &it.extents {
+            let start = it.base_offset.checked_add(ex.extent_offset)? as usize;
+            // length 0 means "entire source" for a single-extent item
+            // (§8.11.3.3); for idat that is the rest of the buffer.
+            let len = if ex.extent_length == 0 && it.extents.len() == 1 {
+                self.idat.len().checked_sub(start)?
+            } else {
+                ex.extent_length as usize
+            };
+            let end = start.checked_add(len)?;
+            if end > self.idat.len() {
+                return None;
+            }
+            out.extend_from_slice(&self.idat[start..end]);
+        }
+        Some(out)
     }
 }
 
@@ -2935,6 +3031,9 @@ pub fn parse_meta_items(body: &[u8]) -> MetaItems {
             ILOC => out.iloc = parse_iloc_box(child),
             IINF => out.iinf = parse_iinf_box(child),
             IREF => out.iref = parse_iref_box(child),
+            // §8.11.11 ItemDataBox — raw bytes; the data origin for
+            // construction_method 1 (idat) items.
+            IDAT => out.idat = child.to_vec(),
             _ => {}
         }
     }
@@ -2981,6 +3080,9 @@ fn surface_meta_items(m: &MetaItems, metadata: &mut Vec<(String, String)>) {
             "meta_iref_count".to_string(),
             iref.references.len().to_string(),
         ));
+    }
+    if !m.idat.is_empty() {
+        metadata.push(("meta_idat_len".to_string(), m.idat.len().to_string()));
     }
 }
 
@@ -16518,6 +16620,80 @@ mod tests {
         assert_eq!(&mi.iinf.as_ref().unwrap().entries[0].item_type, b"hvc1");
         assert_eq!(mi.iref.as_ref().unwrap().references.len(), 1);
         assert!(!mi.is_empty());
+    }
+
+    #[test]
+    fn meta_items_idat_resolution_and_lookups() {
+        // meta with iloc (method 1 / idat) for item 1 (offset 4, len 6)
+        // + idat box of 16 bytes + iinf naming item 1.
+        let idat_payload: Vec<u8> = (0u8..16).collect();
+        let idat = box_bytes(b"idat", &idat_payload);
+
+        let mut iloc = vec![1u8, 0, 0, 0]; // version 1 (needs constr method)
+        iloc.push(0x44); // offset_size=4, length_size=4
+        iloc.push(0x00); // base_offset_size=0, index_size=0
+        iloc.extend_from_slice(&1u16.to_be_bytes()); // item_count
+        iloc.extend_from_slice(&1u16.to_be_bytes()); // item_ID
+        iloc.extend_from_slice(&0x0001u16.to_be_bytes()); // reserved+constr=1
+        iloc.extend_from_slice(&0u16.to_be_bytes()); // dref
+        iloc.extend_from_slice(&1u16.to_be_bytes()); // extent_count
+        iloc.extend_from_slice(&4u32.to_be_bytes()); // extent_offset
+        iloc.extend_from_slice(&6u32.to_be_bytes()); // extent_length
+        let iloc = box_bytes(b"iloc", &iloc);
+
+        let mut infe = vec![2u8, 0, 0, 0];
+        infe.extend_from_slice(&1u16.to_be_bytes());
+        infe.extend_from_slice(&0u16.to_be_bytes());
+        infe.extend_from_slice(b"Exif");
+        infe.extend_from_slice(b"exif\0");
+        let infe = box_bytes(b"infe", &infe);
+        let mut iinf = vec![0u8, 0, 0, 0];
+        iinf.extend_from_slice(&1u16.to_be_bytes());
+        iinf.extend_from_slice(&infe);
+        let iinf = box_bytes(b"iinf", &iinf);
+
+        let mut meta = vec![0u8, 0, 0, 0];
+        meta.extend_from_slice(&iloc);
+        meta.extend_from_slice(&iinf);
+        meta.extend_from_slice(&idat);
+        let mi = super::parse_meta_items(&meta);
+
+        assert_eq!(mi.idat.len(), 16);
+        // item_data_from_idat concatenates the extent (offset 4, len 6).
+        assert_eq!(mi.item_data_from_idat(1), Some(vec![4u8, 5, 6, 7, 8, 9]));
+        // byte ranges reflect base_offset(0) + extent_offset(4).
+        let ranges = mi.item_byte_ranges(1).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].offset, 4);
+        assert_eq!(ranges[0].length, 6);
+        // lookups by ID.
+        assert_eq!(mi.iloc_item(1).unwrap().construction_method, 1);
+        assert_eq!(mi.item_info(1).unwrap().item_name, "exif");
+        assert!(mi.iloc_item(99).is_none());
+        // a file-method item would not resolve via idat.
+        assert!(mi.item_data_from_idat(99).is_none());
+    }
+
+    #[test]
+    fn meta_items_idat_overrun_rejected() {
+        // extent runs past the 4-byte idat → resolution returns None.
+        let idat = box_bytes(b"idat", &[1u8, 2, 3, 4]);
+        let mut iloc = vec![1u8, 0, 0, 0];
+        iloc.push(0x44);
+        iloc.push(0x00);
+        iloc.extend_from_slice(&1u16.to_be_bytes());
+        iloc.extend_from_slice(&1u16.to_be_bytes());
+        iloc.extend_from_slice(&0x0001u16.to_be_bytes()); // constr=1
+        iloc.extend_from_slice(&0u16.to_be_bytes());
+        iloc.extend_from_slice(&1u16.to_be_bytes());
+        iloc.extend_from_slice(&2u32.to_be_bytes()); // offset 2
+        iloc.extend_from_slice(&10u32.to_be_bytes()); // length 10 (overruns)
+        let iloc = box_bytes(b"iloc", &iloc);
+        let mut meta = vec![0u8, 0, 0, 0];
+        meta.extend_from_slice(&iloc);
+        meta.extend_from_slice(&idat);
+        let mi = super::parse_meta_items(&meta);
+        assert!(mi.item_data_from_idat(1).is_none());
     }
 
     #[test]
