@@ -687,3 +687,132 @@ fn mehd_absent_keeps_existing_mvhd_fallback_and_emits_no_key() {
         "absent mehd must not emit a metadata key"
     );
 }
+
+/// Build one `moof` + `mdat` pair whose `traf` carries `extra_traf_boxes`
+/// (e.g. fragment-local `sgpd` / `sbgp` / `csgp`) after the `trun`.
+/// The §8.9 sample-group boxes have no on-wire ordering dependency on the
+/// `trun`, so appending them keeps the `data_offset` arithmetic identical
+/// in both passes.
+fn moof_mdat_pair_with_traf_boxes(
+    seq: u32,
+    track_id: u32,
+    default_dur: u32,
+    bmdt: u64,
+    payload_chunks: &[Vec<u8>],
+    extra_traf_boxes: &[u8],
+) -> Vec<u8> {
+    let sizes: Vec<u32> = payload_chunks.iter().map(|p| p.len() as u32).collect();
+
+    let build_traf = |data_offset: i32| -> Vec<u8> {
+        let mut traf_body = Vec::new();
+        traf_body.extend_from_slice(&tfhd_default_base_is_moof(track_id, default_dur));
+        traf_body.extend_from_slice(&tfdt_v1(bmdt));
+        traf_body.extend_from_slice(&trun_sized(data_offset, &sizes));
+        traf_body.extend_from_slice(extra_traf_boxes);
+        boxed(b"traf", &traf_body)
+    };
+
+    // Pass 1: placeholder data_offset to size the moof.
+    let mut moof_body = Vec::new();
+    moof_body.extend_from_slice(&mfhd(seq));
+    moof_body.extend_from_slice(&build_traf(0));
+    let moof_size = boxed(b"moof", &moof_body).len() as i32;
+
+    // Pass 2: real data_offset = moof_size + 8 (mdat header).
+    let mut moof_body = Vec::new();
+    moof_body.extend_from_slice(&mfhd(seq));
+    moof_body.extend_from_slice(&build_traf(moof_size + 8));
+    let moof = boxed(b"moof", &moof_body);
+    assert_eq!(moof.len() as i32, moof_size, "moof size shifted");
+
+    let mut mdat_body = Vec::new();
+    for p in payload_chunks {
+        mdat_body.extend_from_slice(p);
+    }
+    let mdat = boxed(b"mdat", &mdat_body);
+
+    let mut out = Vec::with_capacity(moof.len() + mdat.len());
+    out.extend_from_slice(&moof);
+    out.extend_from_slice(&mdat);
+    out
+}
+
+/// A `traf` carrying a fragment-local `sgpd` + `csgp` (§8.9.3 / §8.9.5,
+/// the `csgp` bit-7 fragment-local convention is only legal here) is
+/// surfaced through the `frag_sample_group_<n>` metadata key, and the
+/// fragment's samples still decode normally past the sample-group boxes.
+/// (The structured `Mp4Demuxer::traf_sample_groups()` records are
+/// exercised by a unit test in `src/demux.rs`; the demuxer is returned as
+/// a `Box<dyn Demuxer>` here, so the integration layer checks the
+/// metadata surface — matching the `leva` / `pdin` test convention.)
+#[test]
+fn traf_local_sgpd_and_csgp_surface_per_fragment() {
+    use oxideav_mp4::sample_groups::{
+        build_csgp, build_sgpd, CompactSampleToGroup, CompactSampleToGroupPattern,
+        SampleGroupDescription,
+    };
+
+    let track_id = 1u32;
+    let timescale = 48_000u32;
+    let default_dur = 1u32;
+
+    // Fragment-local sgpd (`seig`-style description blob) + csgp with the
+    // fragment-local MSB flag set on an 8-bit-wide index (0x81).
+    let sgpd = build_sgpd(&SampleGroupDescription {
+        grouping_type: *b"seig",
+        default_sample_description_index: None,
+        entries: vec![vec![0x00, 0x01]],
+    });
+    let csgp = build_csgp(&CompactSampleToGroup {
+        grouping_type: *b"seig",
+        grouping_type_parameter: None,
+        index_msb_indicates_fragment_local_description: true,
+        patterns: vec![CompactSampleToGroupPattern {
+            sample_count: 2,
+            indices: vec![0x81],
+        }],
+    });
+    let mut extra = Vec::new();
+    extra.extend_from_slice(&sgpd);
+    extra.extend_from_slice(&csgp);
+
+    let frag: Vec<Vec<u8>> = (0..2u8).map(|i| vec![i; 4]).collect();
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp());
+    file.extend_from_slice(&moov_audio(timescale, track_id, default_dur));
+    file.extend_from_slice(&moof_mdat_pair_with_traf_boxes(
+        1,
+        track_id,
+        default_dur,
+        0,
+        &frag,
+        &extra,
+    ));
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+
+    // Flat metadata summary is available before walking packets.
+    let summary = dmx
+        .metadata()
+        .iter()
+        .find(|(k, _)| k == "frag_sample_group_0")
+        .map(|(_, v)| v.clone());
+    assert_eq!(
+        summary.as_deref(),
+        Some("track=0 seq=1 sgpd=1 sbgp=0 csgp=1")
+    );
+
+    // The samples still decode normally — sample-group boxes don't disturb
+    // the trun walk.
+    let mut n = 0;
+    loop {
+        match dmx.next_packet() {
+            Ok(_) => n += 1,
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    assert_eq!(n, 2, "two fragmented samples still served");
+}

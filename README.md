@@ -730,6 +730,26 @@ Sample-entry FourCCs resolve to these codec ids:
   reachable through the public `Mp4Demuxer::sai_records()` accessor on
   the demuxer (downcast). Absent `saiz` / `saio`, no keys are emitted
   and `sai_records()` is empty.
+- Fragment-local sample groups (ISO/IEC 14496-12 §8.9.2 / §8.9.3 /
+  §8.9.5 inside `traf`): a movie fragment may carry its own `sgpd`
+  description table plus `sbgp` / `csgp` per-sample maps, so a
+  fragment can declare **fragment-local** group descriptions and map
+  its samples into either those or the `trak`-level (global) ones.
+  The `csgp` bit-7 `index_msb_indicates_fragment_local_description`
+  flag — whose whole purpose is this `traf` case (§8.9.5 makes it legal
+  only here) — then selects the source per index. Each `traf`'s
+  sample-group boxes are parsed verbatim (the same `parse_sbgp` /
+  `parse_sgpd` / `parse_csgp` the `stbl`-level surface uses) and
+  collected into a `TrafSampleGroupRecord` keyed by `(track_idx,
+  moof_sequence)`. A per-`traf` summary is surfaced through
+  `Demuxer::metadata()` as `frag_sample_group_<n>` (`"track=<t>
+  seq=<s> sgpd=<n> sbgp=<m> csgp=<k>"`); the structured records (typed
+  `SbgpBox` / `SgpdBox` / `CsgpBox`, on-wire values preserved — the
+  most common use is CENC `seig` key rotation across a fragment's
+  samples) are reachable through the public
+  `Mp4Demuxer::traf_sample_groups()` accessor (downcast). The boxes do
+  not disturb the `trun` sample walk. Absent fragment-local sample
+  groups, no keys are emitted and `traf_sample_groups()` is empty.
 - Producer reference time (ISO/IEC 14496-12 §8.16.5, `prft`): a
   top-level FullBox carrying a UTC wall-clock instant in NTP 64-bit
   format (RFC 5905 — high 32 bits = seconds since 1900-01-01 UTC,

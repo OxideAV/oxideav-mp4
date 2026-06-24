@@ -166,6 +166,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     let mut senc_records: Vec<SencRecord> = Vec::new();
     let mut sai_records: Vec<SaiRecord> = Vec::new();
     let mut moof_psshes: Vec<MoofPsshRecord> = Vec::new();
+    let mut traf_sample_groups: Vec<TrafSampleGroupRecord> = Vec::new();
     for moof in &moofs {
         parse_moof(
             moof,
@@ -175,6 +176,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
             &mut senc_records,
             &mut sai_records,
             &mut moof_psshes,
+            &mut traf_sample_groups,
         )?;
     }
 
@@ -447,6 +449,26 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         ));
     }
 
+    // §8.9 — per-fragment sample-group summary, one `frag_sample_group_<n>`
+    // key per `traf` that carried at least one `sgpd` / `sbgp` / `csgp`.
+    // Format: "track=<t> seq=<s> sgpd=<n> sbgp=<m> csgp=<k>" so a caller
+    // knows the box counts on this fragment without consuming the public
+    // record vector. Structured records are reachable via
+    // `Mp4Demuxer::traf_sample_groups()`.
+    for (n, r) in traf_sample_groups.iter().enumerate() {
+        metadata.push((
+            format!("frag_sample_group_{n}"),
+            format!(
+                "track={} seq={} sgpd={} sbgp={} csgp={}",
+                r.track_idx,
+                r.moof_sequence,
+                r.sgpd.len(),
+                r.sbgp.len(),
+                r.csgp.len(),
+            ),
+        ));
+    }
+
     Ok(Box::new(Mp4Demuxer {
         input,
         streams,
@@ -465,6 +487,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         moof_psshes,
         senc_records,
         sai_records,
+        traf_sample_groups,
         movie_timescale: parsed.movie_timescale,
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
@@ -1370,36 +1393,36 @@ struct SdtpEntry {
 
 /// Parsed `sbgp` (SampleToGroupBox, ISO/IEC 14496-12 §8.9.2).
 #[derive(Clone, Debug, Default)]
-struct SbgpBox {
+pub struct SbgpBox {
     /// Four-byte grouping type identifying which `sgpd` (same type) this
     /// box indexes — e.g. `rap `, `roll`, `sync`, `tele`, `alst`.
-    grouping_type: [u8; 4],
+    pub grouping_type: [u8; 4],
     /// `grouping_type_parameter` — present only in version 1, selecting
     /// one of several alternative groupings of the same type. `None` for
     /// version 0.
-    grouping_type_parameter: Option<u32>,
+    pub grouping_type_parameter: Option<u32>,
     /// Run-length `(sample_count, group_description_index)` pairs. A
     /// `group_description_index` of 0 means "member of no group of this
     /// type"; an index ≥ 0x10001 (movie-fragment-local) is preserved
     /// verbatim — the demuxer does not resolve fragment-local groups.
-    entries: Vec<(u32, u32)>,
+    pub entries: Vec<(u32, u32)>,
 }
 
 /// Parsed `sgpd` (SampleGroupDescriptionBox, ISO/IEC 14496-12 §8.9.3).
 #[derive(Clone, Debug, Default)]
-struct SgpdBox {
+pub struct SgpdBox {
     /// Four-byte grouping type linking this description table to the
     /// `sbgp` of the same type.
-    grouping_type: [u8; 4],
+    pub grouping_type: [u8; 4],
     /// `default_sample_description_index` (version ≥ 2): the group entry
     /// applied to samples not mapped by any `sbgp`. 0 (the default)
     /// means "no group of this type"; absent in versions 0/1.
-    default_sample_description_index: Option<u32>,
+    pub default_sample_description_index: Option<u32>,
     /// Per-group descriptive entries, each a grouping-type-specific
     /// opaque payload preserved verbatim. The container does not
     /// interpret them — interpretation belongs to the layer that knows
     /// the `grouping_type` semantics.
-    entries: Vec<Vec<u8>>,
+    pub entries: Vec<Vec<u8>>,
 }
 
 /// One pattern of a `csgp` (CompactSampleToGroupBox, §8.9.5): a run of
@@ -5463,6 +5486,46 @@ pub struct MoofPsshRecord {
     pub pssh: PsshBox,
 }
 
+/// One per-fragment ISO/IEC 14496-12 §8.9 sample-group record collected
+/// from inside a `traf` (Track Fragment Box).
+///
+/// §8.9.2 / §8.9.3 / §8.9.5 permit `sbgp` / `csgp` and `sgpd` to live in
+/// a `traf` as well as in `stbl`: a movie fragment can carry its own
+/// **fragment-local** group descriptions (its own `sgpd`) and a
+/// per-sample mapping (`sbgp` or `csgp`) into either the fragment-local
+/// `sgpd` or the `trak`-level (global) one. The `csgp` bit-7
+/// `index_msb_indicates_fragment_local_description` flag exists precisely
+/// for this `traf` case (§8.9.5: "legal only inside a `traf`"). The
+/// demuxer collects each `traf`'s sample-group boxes verbatim, keyed by
+/// `(track_idx, moof_sequence)`, so a downstream layer can resolve
+/// per-fragment grouping (most commonly CENC `seig` key rotation across
+/// a fragment's samples) without re-walking the file. The bytes are not
+/// interpreted here — the parsed `SampleToGroup` / `CompactSampleToGroup`
+/// / `SampleGroupDescription` records preserve their on-wire values and
+/// the grouping-type semantics belong to the caller (mirroring the
+/// `stbl`-level surface).
+#[derive(Clone, Debug)]
+pub struct TrafSampleGroupRecord {
+    /// `track_idx` of the matching stream in the demuxer's `streams()`
+    /// list (0-based).
+    pub track_idx: u32,
+    /// `mfhd.sequence_number` of the enclosing `moof`. Surfaced so a
+    /// caller replaying out of order can re-key.
+    pub moof_sequence: u32,
+    /// Fragment-local `sgpd` (SampleGroupDescriptionBox §8.9.3)
+    /// descriptions, in `traf` order. These shadow the `trak`-level
+    /// `sgpd` of the same `grouping_type` for samples in this fragment
+    /// whose mapping selects the fragment-local source.
+    pub sgpd: Vec<SgpdBox>,
+    /// `sbgp` (SampleToGroupBox §8.9.2) per-sample run-length maps, in
+    /// `traf` order.
+    pub sbgp: Vec<SbgpBox>,
+    /// `csgp` (CompactSampleToGroupBox §8.9.5) compact maps, in `traf`
+    /// order. The MSB-fragment-local convention (bit 7) is meaningful
+    /// here — see [`CsgpBox::index_msb_indicates_fragment_local_description`].
+    pub csgp: Vec<CsgpBox>,
+}
+
 /// Walk one `moof` box, locating its `traf` children and stitching the
 /// fragmented samples into the per-track sample list.
 ///
@@ -5499,6 +5562,7 @@ fn parse_moof(
     senc_records: &mut Vec<SencRecord>,
     sai_records: &mut Vec<SaiRecord>,
     moof_psshes: &mut Vec<MoofPsshRecord>,
+    traf_sample_groups: &mut Vec<TrafSampleGroupRecord>,
 ) -> Result<()> {
     let mut cur = std::io::Cursor::new(&moof.body);
     let end = moof.body.len() as u64;
@@ -5537,6 +5601,7 @@ fn parse_moof(
                     moof_sequence,
                     senc_records,
                     sai_records,
+                    traf_sample_groups,
                 )?;
             }
             PSSH => {
@@ -5740,7 +5805,8 @@ pub fn parse_sample_flags(raw: u32) -> SampleFlags {
     SampleFlags::from_u32(raw)
 }
 
-#[allow(clippy::too_many_arguments)] // tfhd / tfdt / senc / saiz / saio inputs are independent state carried through the same walk; bundling them into a struct hides the per-box ownership and obscures the moof→traf data flow
+#[allow(clippy::too_many_arguments)]
+// tfhd / tfdt / senc / saiz / saio / sample-group inputs are independent state carried through the same walk; bundling them into a struct hides the per-box ownership and obscures the moof→traf data flow
 fn parse_traf(
     body: &[u8],
     moof_start: u64,
@@ -5750,6 +5816,7 @@ fn parse_traf(
     moof_sequence: u32,
     senc_records: &mut Vec<SencRecord>,
     sai_records: &mut Vec<SaiRecord>,
+    traf_sample_groups: &mut Vec<TrafSampleGroupRecord>,
 ) -> Result<()> {
     // First pass: read tfhd + tfdt before the trun(s) so each trun
     // has the full default context. Also pick up senc (ISO/IEC 23001-7
@@ -5761,6 +5828,13 @@ fn parse_traf(
     let mut senc_body: Option<Vec<u8>> = None;
     let mut frag_saiz: Vec<TrafSaiz> = Vec::new();
     let mut frag_saio: Vec<TrafSaio> = Vec::new();
+    // §8.9 — fragment-local sample-group boxes. A `traf` may carry its
+    // own `sgpd` descriptions plus `sbgp` / `csgp` per-sample maps (the
+    // `csgp` bit-7 fragment-local convention is only legal here). Collect
+    // them verbatim; the grouping-type semantics belong to the caller.
+    let mut frag_sgpd: Vec<SgpdBox> = Vec::new();
+    let mut frag_sbgp: Vec<SbgpBox> = Vec::new();
+    let mut frag_csgp: Vec<CsgpBox> = Vec::new();
 
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
@@ -5814,6 +5888,27 @@ fn parse_traf(
                     offsets: sb.offsets,
                 });
             }
+            // §8.9.3 / §8.9.2 / §8.9.5 — fragment-local sample-group
+            // boxes. A malformed box is dropped (the fragment's samples
+            // are still usable); a well-formed one is preserved verbatim.
+            SGPD => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                if let Ok(g) = parse_sgpd(&b) {
+                    frag_sgpd.push(g);
+                }
+            }
+            SBGP => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                if let Ok(g) = parse_sbgp(&b) {
+                    frag_sbgp.push(g);
+                }
+            }
+            CSGP => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                if let Ok(g) = parse_csgp(&b) {
+                    frag_csgp.push(g);
+                }
+            }
             // We only resolve trun's in the second pass; skip here.
             TRUN => skip_cursor_bytes(&mut cur, psz),
             _ => skip_cursor_bytes(&mut cur, psz),
@@ -5858,6 +5953,20 @@ fn parse_traf(
             moof_sequence,
             saiz: frag_saiz,
             saio: frag_saio,
+        });
+    }
+
+    // §8.9 — record this traf's fragment-local sample-group boxes (if
+    // any) keyed by `(track_idx, moof_sequence)`, so a downstream layer
+    // can resolve per-fragment grouping (e.g. CENC `seig` key rotation)
+    // without re-walking the file.
+    if !frag_sgpd.is_empty() || !frag_sbgp.is_empty() || !frag_csgp.is_empty() {
+        traf_sample_groups.push(TrafSampleGroupRecord {
+            track_idx: state.track_idx as u32,
+            moof_sequence,
+            sgpd: frag_sgpd,
+            sbgp: frag_sbgp,
+            csgp: frag_csgp,
         });
     }
 
@@ -8151,6 +8260,13 @@ struct Mp4Demuxer {
     /// files have no aux-info at all).
     #[allow(dead_code)]
     sai_records: Vec<SaiRecord>,
+    /// ISO/IEC 14496-12 §8.9 per-fragment sample-group records. One per
+    /// `traf` that carried at least one `sgpd` / `sbgp` / `csgp` box,
+    /// keyed by `(track_idx, moof_sequence)`. Empty in non-fragmented
+    /// files and in fragmented files that carry sample groups only at
+    /// `trak`/`stbl` level (the common case).
+    #[allow(dead_code)]
+    traf_sample_groups: Vec<TrafSampleGroupRecord>,
     /// Per-track media timescale (1-based parallel to `track_ids`),
     /// needed to translate `tfra.time` (track timescale) to the seek-to
     /// caller's pts (also track timescale, but this lets us add unit
@@ -8280,6 +8396,27 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn sai_records(&self) -> &[SaiRecord] {
         &self.sai_records
+    }
+
+    /// ISO/IEC 14496-12 §8.9 — per-fragment sample-group records, one
+    /// per `traf` that carried at least one `sgpd` / `sbgp` / `csgp`
+    /// box. A movie fragment may declare its own **fragment-local**
+    /// group descriptions (§8.9.3 `sgpd` inside `traf`) and map its
+    /// samples into either those or the `trak`-level descriptions via a
+    /// `sbgp` (§8.9.2) or `csgp` (§8.9.5) — the `csgp` bit-7
+    /// `index_msb_indicates_fragment_local_description` flag selects the
+    /// source per index and is only legal in this `traf` context. Each
+    /// record references this demuxer's `streams()` list via `track_idx`
+    /// and the containing `mfhd.sequence_number` via `moof_sequence`; the
+    /// parsed boxes preserve their on-wire values verbatim (grouping-type
+    /// semantics belong to the caller, mirroring the `stbl`-level
+    /// surface). Most commonly populated for CENC `seig` key rotation
+    /// across a fragment's samples. Empty in non-fragmented files and in
+    /// fragmented files carrying sample groups only at `trak`/`stbl`
+    /// level (the common case).
+    #[allow(dead_code)]
+    pub fn traf_sample_groups(&self) -> &[TrafSampleGroupRecord] {
+        &self.traf_sample_groups
     }
 }
 
@@ -15088,6 +15225,7 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut moof_psshes,
+            &mut Vec::new(),
         )
         .expect("moof walk succeeds");
 
@@ -15138,6 +15276,7 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut moof_psshes,
+            &mut Vec::new(),
         )
         .expect("moof walk succeeds");
 
@@ -15195,6 +15334,7 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut moof_psshes,
+            &mut Vec::new(),
         )
         .expect("moof walk succeeds");
 
@@ -15230,9 +15370,130 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut moof_psshes,
+            &mut Vec::new(),
         )
         .expect("walk succeeds despite bad pssh");
         assert!(moof_psshes.is_empty(), "malformed pssh dropped silently");
+    }
+
+    /// §8.9 — a `traf` carrying a fragment-local `sgpd` + `sbgp` + `csgp`
+    /// is collected into a `TrafSampleGroupRecord` keyed by
+    /// `(track_idx, moof_sequence)`, with each box's values preserved
+    /// verbatim. Exercises the structured-record side that the
+    /// integration test (which only sees `Box<dyn Demuxer>`) cannot reach.
+    #[test]
+    fn parse_traf_collects_fragment_local_sample_groups() {
+        // tfhd: FullBox(flags=0) + track_ID = 1. No optional fields.
+        let mut tfhd_body = vec![0u8, 0, 0, 0];
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes());
+        let tfhd = wrap_box(b"tfhd", &tfhd_body);
+
+        // sgpd / sbgp / csgp built via the public sample_groups builders.
+        let sgpd =
+            crate::sample_groups::build_sgpd(&crate::sample_groups::SampleGroupDescription {
+                grouping_type: *b"seig",
+                default_sample_description_index: None,
+                entries: vec![vec![0x00, 0x01]],
+            });
+        let sbgp = crate::sample_groups::build_sbgp(&crate::sample_groups::SampleToGroup {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            entries: vec![(2, 1)],
+        });
+        let csgp = crate::sample_groups::build_csgp(&crate::sample_groups::CompactSampleToGroup {
+            grouping_type: *b"seig",
+            grouping_type_parameter: None,
+            index_msb_indicates_fragment_local_description: true,
+            patterns: vec![crate::sample_groups::CompactSampleToGroupPattern {
+                sample_count: 2,
+                indices: vec![0x81],
+            }],
+        });
+
+        let mut traf_body = Vec::new();
+        traf_body.extend_from_slice(&tfhd);
+        traf_body.extend_from_slice(&sgpd);
+        traf_body.extend_from_slice(&sbgp);
+        traf_body.extend_from_slice(&csgp);
+
+        let mut track = fresh_track();
+        track.track_id = 1;
+        let tracks = [track];
+
+        let mut samples: Vec<super::SampleRef> = Vec::new();
+        let mut next_dts: Vec<i64> = vec![0];
+        let mut senc: Vec<super::SencRecord> = Vec::new();
+        let mut sai: Vec<super::SaiRecord> = Vec::new();
+        let mut groups: Vec<super::TrafSampleGroupRecord> = Vec::new();
+
+        super::parse_traf(
+            &traf_body,
+            0,
+            &tracks,
+            &mut samples,
+            &mut next_dts,
+            9,
+            &mut senc,
+            &mut sai,
+            &mut groups,
+        )
+        .expect("traf walk succeeds");
+
+        assert_eq!(groups.len(), 1);
+        let r = &groups[0];
+        assert_eq!(r.track_idx, 0);
+        assert_eq!(r.moof_sequence, 9);
+        assert_eq!(r.sgpd.len(), 1);
+        assert_eq!(r.sgpd[0].grouping_type, *b"seig");
+        assert_eq!(r.sgpd[0].entries, vec![vec![0x00, 0x01]]);
+        assert_eq!(r.sbgp.len(), 1);
+        assert_eq!(r.sbgp[0].grouping_type, *b"roll");
+        assert_eq!(r.sbgp[0].entries, vec![(2, 1)]);
+        assert_eq!(r.csgp.len(), 1);
+        assert_eq!(r.csgp[0].grouping_type, *b"seig");
+        assert!(r.csgp[0].index_msb_indicates_fragment_local_description);
+        assert_eq!(r.csgp[0].patterns[0].sample_count, 2);
+        assert_eq!(r.csgp[0].patterns[0].indices, vec![0x81]);
+        // 0x81 at 8-bit width → fragment_local, value 1.
+        let resolved = r.csgp[0].patterns[0]
+            .resolve_index(0, true, r.csgp[0].index_field_bits)
+            .unwrap();
+        assert!(resolved.fragment_local);
+        assert_eq!(resolved.value, 1);
+    }
+
+    /// A `traf` with no sample-group boxes contributes no
+    /// `TrafSampleGroupRecord`.
+    #[test]
+    fn parse_traf_without_sample_groups_records_nothing() {
+        let mut tfhd_body = vec![0u8, 0, 0, 0];
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes());
+        let traf_body = wrap_box(b"tfhd", &tfhd_body);
+
+        let mut track = fresh_track();
+        track.track_id = 1;
+        let tracks = [track];
+
+        let mut samples: Vec<super::SampleRef> = Vec::new();
+        let mut next_dts: Vec<i64> = vec![0];
+        let mut senc: Vec<super::SencRecord> = Vec::new();
+        let mut sai: Vec<super::SaiRecord> = Vec::new();
+        let mut groups: Vec<super::TrafSampleGroupRecord> = Vec::new();
+
+        super::parse_traf(
+            &traf_body,
+            0,
+            &tracks,
+            &mut samples,
+            &mut next_dts,
+            1,
+            &mut senc,
+            &mut sai,
+            &mut groups,
+        )
+        .expect("traf walk succeeds");
+
+        assert!(groups.is_empty());
     }
 
     // ----- §8.8.3.1 sample_flags typed accessor -----------------------------
