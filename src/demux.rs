@@ -765,6 +765,67 @@ pub struct BtrtRecord {
     pub avg_bitrate: u32,
 }
 
+/// Decoded `pasp` (PixelAspectRatioBox, ISO/IEC 14496-12 §12.1.4). A
+/// plain `Box` (no FullBox preamble) inside a `VisualSampleEntry`
+/// declaring the relative width / height of a pixel — the ratio a
+/// renderer applies to obtain the display aspect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaspRecord {
+    /// `hSpacing` — relative width of a pixel (§12.1.4.3).
+    pub h_spacing: u32,
+    /// `vSpacing` — relative height of a pixel (§12.1.4.3). Same units
+    /// as `h_spacing`.
+    pub v_spacing: u32,
+}
+
+/// Decoded `clap` (CleanApertureBox, ISO/IEC 14496-12 §12.1.4). A plain
+/// `Box` inside a `VisualSampleEntry` giving the clean-aperture
+/// rectangle as four (numerator, denominator) fractions: the active
+/// picture region after overscan / edge artefacts are cropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClapRecord {
+    /// `cleanApertureWidthN` / `cleanApertureWidthD` — clean aperture
+    /// width as a fraction in counted pixels (§12.1.4.3). `D` is positive.
+    pub width_n: u32,
+    pub width_d: u32,
+    /// `cleanApertureHeightN` / `cleanApertureHeightD` — clean aperture
+    /// height fraction (§12.1.4.3). `D` is positive.
+    pub height_n: u32,
+    pub height_d: u32,
+    /// `horizOffN` / `horizOffD` — horizontal offset of the clean
+    /// aperture centre minus `(width-1)/2`, as a fraction (typically 0).
+    pub horiz_off_n: u32,
+    pub horiz_off_d: u32,
+    /// `vertOffN` / `vertOffD` — vertical offset of the clean aperture
+    /// centre minus `(height-1)/2`, as a fraction (typically 0).
+    pub vert_off_n: u32,
+    pub vert_off_d: u32,
+}
+
+/// Decoded `colr` (ColourInformationBox, ISO/IEC 14496-12 §12.1.5). A
+/// plain `Box` inside a `VisualSampleEntry`. The first 32 bits are a
+/// `colour_type`; the payload that follows depends on it. The three
+/// base-spec types are modelled; an unknown type keeps the raw payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColrRecord {
+    /// `nclx` (§12.1.5.2) — on-screen colours: `colour_primaries`,
+    /// `transfer_characteristics`, `matrix_coefficients` (each a
+    /// 16-bit code from ISO/IEC 23091-2), plus a `full_range_flag`.
+    Nclx {
+        colour_primaries: u16,
+        transfer_characteristics: u16,
+        matrix_coefficients: u16,
+        full_range: bool,
+    },
+    /// `rICC` (§12.1.5.2) — a restricted ICC profile (Monochrome or
+    /// Three-Component Matrix-Based input profile); raw profile bytes.
+    RestrictedIcc(Vec<u8>),
+    /// `prof` (§12.1.5.2) — an unrestricted ICC profile; raw bytes.
+    UnrestrictedIcc(Vec<u8>),
+    /// Any other `colour_type`; the FourCC + the bytes that followed it.
+    Other { colour_type: [u8; 4], data: Vec<u8> },
+}
+
 /// Decoded `stvi` (StereoVideoBox, ISO/IEC 14496-12 §8.15.4.2).
 ///
 /// A `FullBox(version = 0, flags = 0)` that sits inside the
@@ -1254,6 +1315,17 @@ struct Track {
     /// entry omits it (common). When several sample entries each carry a
     /// `btrt`, the first encountered (on the active entry) wins.
     btrt: Option<BtrtRecord>,
+    /// §12.1.4 — `pasp` (PixelAspectRatioBox) in the track's active
+    /// `VisualSampleEntry`. `None` for non-video tracks or when absent
+    /// (square pixels). First one encountered wins.
+    pasp: Option<PaspRecord>,
+    /// §12.1.4 — `clap` (CleanApertureBox) in the active
+    /// `VisualSampleEntry`. `None` when absent. First one wins.
+    clap: Option<ClapRecord>,
+    /// §12.1.5 — `colr` (ColourInformationBox) in the active
+    /// `VisualSampleEntry`. `None` when absent. The spec permits several
+    /// `colr` boxes (most-accurate first); the first encountered wins.
+    colr: Option<ColrRecord>,
     /// §12.4.2 / §8.4.5 — `hmhd` (HintMediaHeaderBox). Present for hint
     /// tracks (a `hdlr` of type `hint`); the spec marks exactly one
     /// media header mandatory inside `minf`, and a hint track uses this
@@ -3344,6 +3416,9 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         amve: None,
         stvi: None,
         btrt: None,
+        pasp: None,
+        clap: None,
+        colr: None,
         hmhd: None,
         dref: None,
         stsh: Vec::new(),
@@ -5092,6 +5167,28 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
                     t.btrt = Some(rec);
                 }
             }
+            // PixelAspectRatioBox (§12.1.4) — a plain Box (no FullBox
+            // preamble), 8-byte body (hSpacing / vSpacing). First one on
+            // the active entry wins; a short body is dropped.
+            b"pasp" if t.pasp.is_none() => {
+                if let Some(rec) = parse_pasp(&body) {
+                    t.pasp = Some(rec);
+                }
+            }
+            // CleanApertureBox (§12.1.4) — a plain Box, 32-byte body of
+            // four (N, D) fractions. First one wins; short body dropped.
+            b"clap" if t.clap.is_none() => {
+                if let Some(rec) = parse_clap(&body) {
+                    t.clap = Some(rec);
+                }
+            }
+            // ColourInformationBox (§12.1.5) — a plain Box; the spec
+            // allows several (most-accurate first), the first wins here.
+            b"colr" if t.colr.is_none() => {
+                if let Some(rec) = parse_colr(&body) {
+                    t.colr = Some(rec);
+                }
+            }
             // Restricted-scheme (§8.15) video — a non-encrypted
             // `VisualSampleEntry` (e.g. a `resv` whose original FourCC is
             // already preserved here, or any entry signalling a
@@ -5156,6 +5253,73 @@ fn parse_btrt(body: &[u8]) -> Option<BtrtRecord> {
         max_bitrate,
         avg_bitrate,
     })
+}
+
+/// Parse a `pasp` (PixelAspectRatioBox, ISO/IEC 14496-12 §12.1.4) body —
+/// the 8 bytes after the plain box header (`pasp` is a `Box`, not a
+/// `FullBox`). `None` for a body shorter than 8 bytes.
+pub fn parse_pasp(body: &[u8]) -> Option<PaspRecord> {
+    if body.len() < 8 {
+        return None;
+    }
+    Some(PaspRecord {
+        h_spacing: u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
+        v_spacing: u32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+    })
+}
+
+/// Parse a `clap` (CleanApertureBox, ISO/IEC 14496-12 §12.1.4) body —
+/// the 32 bytes (eight u32s) after the plain box header. `None` for a
+/// body shorter than 32 bytes.
+pub fn parse_clap(body: &[u8]) -> Option<ClapRecord> {
+    if body.len() < 32 {
+        return None;
+    }
+    let u = |i: usize| u32::from_be_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+    Some(ClapRecord {
+        width_n: u(0),
+        width_d: u(4),
+        height_n: u(8),
+        height_d: u(12),
+        horiz_off_n: u(16),
+        horiz_off_d: u(20),
+        vert_off_n: u(24),
+        vert_off_d: u(28),
+    })
+}
+
+/// Parse a `colr` (ColourInformationBox, ISO/IEC 14496-12 §12.1.5) body
+/// — the bytes after the plain box header (`colr` is a `Box`). The first
+/// four bytes are the `colour_type`; the remaining payload depends on
+/// it (§12.1.5.2). `None` for a body shorter than the 4-byte type, or a
+/// truncated `nclx` payload.
+pub fn parse_colr(body: &[u8]) -> Option<ColrRecord> {
+    if body.len() < 4 {
+        return None;
+    }
+    let colour_type = [body[0], body[1], body[2], body[3]];
+    let rest = &body[4..];
+    match &colour_type {
+        b"nclx" => {
+            // colour_primaries(16) + transfer(16) + matrix(16) +
+            // full_range_flag(1) + reserved(7).
+            if rest.len() < 7 {
+                return None;
+            }
+            Some(ColrRecord::Nclx {
+                colour_primaries: u16::from_be_bytes([rest[0], rest[1]]),
+                transfer_characteristics: u16::from_be_bytes([rest[2], rest[3]]),
+                matrix_coefficients: u16::from_be_bytes([rest[4], rest[5]]),
+                full_range: rest[6] & 0x80 != 0,
+            })
+        }
+        b"rICC" => Some(ColrRecord::RestrictedIcc(rest.to_vec())),
+        b"prof" => Some(ColrRecord::UnrestrictedIcc(rest.to_vec())),
+        _ => Some(ColrRecord::Other {
+            colour_type,
+            data: rest.to_vec(),
+        }),
+    }
 }
 
 /// Parse an `stvi` (StereoVideoBox, ISO/IEC 14496-12 §8.15.4.2) body —
@@ -8594,6 +8758,89 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             .insert("btrt_avg_bitrate", b.avg_bitrate.to_string());
     }
 
+    // ISO/IEC 14496-12 §12.1.4 — `pasp` (PixelAspectRatioBox): surface
+    // the pixel aspect ratio on `params.options` as `pasp_h_spacing` /
+    // `pasp_v_spacing` (decimal). A renderer multiplies the stored
+    // sample dimensions by this ratio to obtain the display aspect.
+    // Absent `pasp`, square pixels are implied and no keys are emitted.
+    if let Some(p) = &t.pasp {
+        params
+            .options
+            .insert("pasp_h_spacing", p.h_spacing.to_string());
+        params
+            .options
+            .insert("pasp_v_spacing", p.v_spacing.to_string());
+    }
+
+    // ISO/IEC 14496-12 §12.1.4 — `clap` (CleanApertureBox): surface the
+    // clean-aperture rectangle as four `N/D` fractions on
+    // `params.options` (`clap_width` / `clap_height` / `clap_horiz_off`
+    // / `clap_vert_off`, each "<N>/<D>"). The active picture region after
+    // overscan / edge artefacts are cropped. Absent `clap`, no keys.
+    if let Some(c) = &t.clap {
+        params
+            .options
+            .insert("clap_width", format!("{}/{}", c.width_n, c.width_d));
+        params
+            .options
+            .insert("clap_height", format!("{}/{}", c.height_n, c.height_d));
+        params.options.insert(
+            "clap_horiz_off",
+            format!("{}/{}", c.horiz_off_n, c.horiz_off_d),
+        );
+        params.options.insert(
+            "clap_vert_off",
+            format!("{}/{}", c.vert_off_n, c.vert_off_d),
+        );
+    }
+
+    // ISO/IEC 14496-12 §12.1.5 — `colr` (ColourInformationBox): surface
+    // the colour description on `params.options`. For an `nclx` box the
+    // three 16-bit ISO/IEC 23091-2 codes + the range flag are emitted as
+    // `colr_type=nclx`, `colr_primaries`, `colr_transfer`, `colr_matrix`
+    // (decimal), and `colr_full_range` ("0"/"1"). For an ICC profile
+    // (`rICC` / `prof`) only `colr_type` + `colr_icc_len` (profile byte
+    // length) are emitted (the raw profile is reachable via the typed
+    // record). An unknown colour type emits `colr_type=<fourcc>`.
+    if let Some(c) = &t.colr {
+        match c {
+            ColrRecord::Nclx {
+                colour_primaries,
+                transfer_characteristics,
+                matrix_coefficients,
+                full_range,
+            } => {
+                params.options.insert("colr_type", "nclx".to_string());
+                params
+                    .options
+                    .insert("colr_primaries", colour_primaries.to_string());
+                params
+                    .options
+                    .insert("colr_transfer", transfer_characteristics.to_string());
+                params
+                    .options
+                    .insert("colr_matrix", matrix_coefficients.to_string());
+                params
+                    .options
+                    .insert("colr_full_range", (*full_range as u8).to_string());
+            }
+            ColrRecord::RestrictedIcc(d) => {
+                params.options.insert("colr_type", "rICC".to_string());
+                params.options.insert("colr_icc_len", d.len().to_string());
+            }
+            ColrRecord::UnrestrictedIcc(d) => {
+                params.options.insert("colr_type", "prof".to_string());
+                params.options.insert("colr_icc_len", d.len().to_string());
+            }
+            ColrRecord::Other { colour_type, .. } => {
+                params.options.insert(
+                    "colr_type",
+                    String::from_utf8_lossy(colour_type).to_string(),
+                );
+            }
+        }
+    }
+
     // ISO/IEC 14496-12 §12.4.2 / §8.4.5: when the track carries an
     // `hmhd` (HintMediaHeaderBox) — i.e. a hint track — surface its
     // protocol-independent streaming statistics on `params.options`:
@@ -9968,6 +10215,27 @@ pub fn parse_btrt_box(body: &[u8]) -> Result<BtrtRecord> {
     parse_btrt(body).ok_or_else(|| Error::invalid("MP4: btrt too short"))
 }
 
+/// Parse a standalone `pasp` (PixelAspectRatioBox, ISO/IEC 14496-12
+/// §12.1.4) body. `Err` for a body shorter than the fixed 8-byte
+/// layout; trailing bytes are ignored.
+pub fn parse_pasp_box(body: &[u8]) -> Result<PaspRecord> {
+    parse_pasp(body).ok_or_else(|| Error::invalid("MP4: pasp too short"))
+}
+
+/// Parse a standalone `clap` (CleanApertureBox, ISO/IEC 14496-12
+/// §12.1.4) body. `Err` for a body shorter than the fixed 32-byte
+/// (eight u32) layout; trailing bytes are ignored.
+pub fn parse_clap_box(body: &[u8]) -> Result<ClapRecord> {
+    parse_clap(body).ok_or_else(|| Error::invalid("MP4: clap too short"))
+}
+
+/// Parse a standalone `colr` (ColourInformationBox, ISO/IEC 14496-12
+/// §12.1.5) body. `Err` for a body shorter than the 4-byte
+/// `colour_type` or with a truncated `nclx` payload.
+pub fn parse_colr_box(body: &[u8]) -> Result<ColrRecord> {
+    parse_colr(body).ok_or_else(|| Error::invalid("MP4: colr malformed"))
+}
+
 /// Parse a standalone `stvi` (StereoVideoBox, ISO/IEC 14496-12
 /// §8.15.4.2) body from `body` (the bytes after the 4-byte FullBox
 /// version/flags preamble — `stvi` is a `FullBox`).
@@ -10201,6 +10469,9 @@ mod tests {
             amve: None,
             stvi: None,
             btrt: None,
+            pasp: None,
+            clap: None,
+            colr: None,
             hmhd: None,
             dref: None,
             stsh: Vec::new(),
@@ -12915,6 +13186,141 @@ mod tests {
         assert_eq!(b.buffer_size_db, 131_072);
         assert_eq!(b.max_bitrate, 8_000_000);
         assert_eq!(b.avg_bitrate, 6_000_000);
+    }
+
+    fn pasp_body(h: u32, v: u32) -> Vec<u8> {
+        let mut b = h.to_be_bytes().to_vec();
+        b.extend_from_slice(&v.to_be_bytes());
+        b
+    }
+
+    fn clap_body(vals: [u32; 8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in vals {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn parse_pasp_clap_colr_bodies() {
+        let p = super::parse_pasp(&pasp_body(16, 15)).unwrap();
+        assert_eq!(p.h_spacing, 16);
+        assert_eq!(p.v_spacing, 15);
+        assert!(super::parse_pasp(&[0u8; 4]).is_none());
+
+        let c = super::parse_clap(&clap_body([1920, 1, 1080, 1, 0, 1, 0, 1])).unwrap();
+        assert_eq!(c.width_n, 1920);
+        assert_eq!(c.height_n, 1080);
+        assert_eq!(c.horiz_off_d, 1);
+        assert!(super::parse_clap(&[0u8; 16]).is_none());
+
+        // nclx: BT.709 primaries(1)/transfer(1)/matrix(1), full-range set.
+        let mut nclx = b"nclx".to_vec();
+        nclx.extend_from_slice(&1u16.to_be_bytes());
+        nclx.extend_from_slice(&1u16.to_be_bytes());
+        nclx.extend_from_slice(&1u16.to_be_bytes());
+        nclx.push(0x80); // full_range_flag=1
+        match super::parse_colr(&nclx).unwrap() {
+            super::ColrRecord::Nclx {
+                colour_primaries,
+                transfer_characteristics,
+                matrix_coefficients,
+                full_range,
+            } => {
+                assert_eq!(colour_primaries, 1);
+                assert_eq!(transfer_characteristics, 1);
+                assert_eq!(matrix_coefficients, 1);
+                assert!(full_range);
+            }
+            other => panic!("expected nclx, got {other:?}"),
+        }
+
+        // prof: an ICC profile (raw bytes preserved).
+        let mut prof = b"prof".to_vec();
+        prof.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        match super::parse_colr(&prof).unwrap() {
+            super::ColrRecord::UnrestrictedIcc(d) => {
+                assert_eq!(d, vec![0xDE, 0xAD, 0xBE, 0xEF])
+            }
+            other => panic!("expected prof, got {other:?}"),
+        }
+
+        // unknown colour type → Other.
+        let mut other = b"xxxx".to_vec();
+        other.push(9);
+        match super::parse_colr(&other).unwrap() {
+            super::ColrRecord::Other { colour_type, data } => {
+                assert_eq!(&colour_type, b"xxxx");
+                assert_eq!(data, vec![9]);
+            }
+            o => panic!("expected Other, got {o:?}"),
+        }
+        assert!(super::parse_colr(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn parse_video_sample_entry_picks_up_pasp_clap_colr() {
+        let mut children = wrap_box_full_size(b"pasp", &pasp_body(40, 33));
+        children.extend(wrap_box_full_size(
+            b"clap",
+            &clap_body([1280, 1, 720, 1, 0, 1, 0, 1]),
+        ));
+        let mut nclx = b"nclx".to_vec();
+        nclx.extend_from_slice(&9u16.to_be_bytes()); // primaries BT.2020
+        nclx.extend_from_slice(&16u16.to_be_bytes()); // transfer PQ
+        nclx.extend_from_slice(&9u16.to_be_bytes()); // matrix BT.2020-NC
+        nclx.push(0x00); // full_range = 0
+        children.extend(wrap_box_full_size(b"colr", &nclx));
+        let entry = video_sample_entry_body(1280, 720, &children);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        super::parse_video_sample_entry(&entry, &mut t).unwrap();
+
+        assert_eq!(t.pasp.unwrap().h_spacing, 40);
+        assert_eq!(t.clap.unwrap().width_n, 1280);
+        match t.colr.unwrap() {
+            super::ColrRecord::Nclx {
+                colour_primaries,
+                full_range,
+                ..
+            } => {
+                assert_eq!(colour_primaries, 9);
+                assert!(!full_range);
+            }
+            o => panic!("expected nclx, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn build_stream_info_surfaces_pasp_clap_colr_options() {
+        let mut children = wrap_box_full_size(b"pasp", &pasp_body(64, 45));
+        children.extend(wrap_box_full_size(
+            b"clap",
+            &clap_body([1920, 1, 1080, 1, 0, 1, 0, 1]),
+        ));
+        let mut nclx = b"nclx".to_vec();
+        nclx.extend_from_slice(&1u16.to_be_bytes());
+        nclx.extend_from_slice(&1u16.to_be_bytes());
+        nclx.extend_from_slice(&1u16.to_be_bytes());
+        nclx.push(0x80);
+        children.extend(wrap_box_full_size(b"colr", &nclx));
+        let entry = video_sample_entry_body(1920, 1080, &children);
+
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        super::parse_video_sample_entry(&entry, &mut t).unwrap();
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        let o = &info.params.options;
+        assert_eq!(o.get("pasp_h_spacing"), Some("64"));
+        assert_eq!(o.get("pasp_v_spacing"), Some("45"));
+        assert_eq!(o.get("clap_width"), Some("1920/1"));
+        assert_eq!(o.get("clap_horiz_off"), Some("0/1"));
+        assert_eq!(o.get("colr_type"), Some("nclx"));
+        assert_eq!(o.get("colr_primaries"), Some("1"));
+        assert_eq!(o.get("colr_full_range"), Some("1"));
     }
 
     /// First `btrt` wins when two sample-entry child boxes carry one.

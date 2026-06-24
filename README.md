@@ -1061,6 +1061,26 @@ Sample-entry FourCCs resolve to these codec ids:
   entry point (typed `BtrtRecord` with `buffer_size_db`, `max_bitrate`,
   `avg_bitrate`) for tooling holding the box body. Absent `btrt`, none
   of the keys are emitted.
+- Picture geometry + colour (ISO/IEC 14496-12 §12.1.4–5, `pasp` / `clap`
+  / `colr`): a `VisualSampleEntry` may carry a `PixelAspectRatioBox`
+  (`pasp`, `hSpacing`/`vSpacing`), a `CleanApertureBox` (`clap`, the
+  eight-u32 width/height/horiz-off/vert-off `N/D` fractions defining the
+  active picture region), and one or more `ColourInformationBox`es
+  (`colr`). For `colr` the three base-spec colour types are modelled:
+  `nclx` (on-screen colours — `colour_primaries` / `transfer` /
+  `matrix` 16-bit codes from ISO/IEC 23091-2 + `full_range_flag`),
+  `rICC` / `prof` (restricted / unrestricted ICC profile, raw bytes
+  preserved), and an `Other` fall-back keeping an unknown type +
+  payload. Surfaced on `params.options` as `pasp_h_spacing` /
+  `pasp_v_spacing`; `clap_width` / `clap_height` / `clap_horiz_off` /
+  `clap_vert_off` (each `"<N>/<D>"`); and `colr_type` plus, for `nclx`,
+  `colr_primaries` / `colr_transfer` / `colr_matrix` / `colr_full_range`
+  (or `colr_icc_len` for an ICC profile). The first of each on the
+  active entry wins (the spec lists `colr` boxes most-accurate-first).
+  Public standalone parsers `demux::parse_pasp_box` / `parse_clap_box` /
+  `parse_colr_box` decode each box body. A renderer reads the display
+  aspect / crop rectangle and an HDR pipeline reads the colour signalling
+  straight from the container. Absent the box, no keys are emitted.
 
 ### Muxer
 
