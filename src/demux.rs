@@ -10532,6 +10532,28 @@ pub fn parse_pdin_box(body: &[u8]) -> Result<PdinRecord> {
     parse_pdin(body)
 }
 
+/// Serialise a `pdin` (ProgressiveDownloadInfoBox, ISO/IEC 14496-12
+/// §8.1.3) from its `(rate, initial_delay)` entries — the byte-exact
+/// inverse of [`parse_pdin_box`] (FullBox version 0, flags 0).
+///
+/// Layout (§8.1.3.2): the 4-byte FullBox preamble followed by one
+/// `(rate, initial_delay)` u32 pair per entry, each big-endian. `rate`
+/// is a download bitrate in bytes/second; `initial_delay` is the
+/// suggested initial playback delay (in the file's time-scale ticks)
+/// when downloading at that rate. The entries are written in supplied
+/// order — §8.1.3.3 expects them sorted by ascending `rate`, but this
+/// builder preserves the caller's order rather than re-sorting. An empty
+/// entry list yields a preamble-only box (a legal, content-free `pdin`).
+pub fn build_pdin_box(record: &PdinRecord) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + record.entries.len() * 8);
+    body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+    for e in &record.entries {
+        body.extend_from_slice(&e.rate.to_be_bytes());
+        body.extend_from_slice(&e.initial_delay.to_be_bytes());
+    }
+    wrap_box(&crate::boxes::PDIN, &body)
+}
+
 /// Parse a standalone `leva` (LevelAssignmentBox, ISO/IEC 14496-12
 /// §8.8.13) body from `body` (the bytes after the 8/16-byte box
 /// header).
@@ -16154,6 +16176,39 @@ mod tests {
     fn parse_pdin_empty_body_yields_empty_entries() {
         let body = build_pdin(&[]);
         let r = super::parse_pdin(&body).unwrap();
+        assert!(r.entries.is_empty());
+    }
+
+    /// `build_pdin_box` is the byte-exact inverse of `parse_pdin_box`: a
+    /// two-entry table re-parses to the same `(rate, initial_delay)` pairs
+    /// in order.
+    #[test]
+    fn build_pdin_box_round_trips() {
+        let record = super::PdinRecord {
+            entries: vec![
+                super::PdinEntry {
+                    rate: 125_000,
+                    initial_delay: 2_500,
+                },
+                super::PdinEntry {
+                    rate: 250_000,
+                    initial_delay: 1_200,
+                },
+            ],
+        };
+        let boxed = super::build_pdin_box(&record);
+        assert_eq!(&boxed[4..8], b"pdin");
+        let r = super::parse_pdin_box(&boxed[8..]).unwrap();
+        assert_eq!(r.entries, record.entries);
+    }
+
+    /// An empty entry list yields a preamble-only `pdin` (12 bytes:
+    /// 8-byte header + 4-byte FullBox preamble).
+    #[test]
+    fn build_pdin_box_empty() {
+        let boxed = super::build_pdin_box(&super::PdinRecord { entries: vec![] });
+        assert_eq!(boxed.len(), 12);
+        let r = super::parse_pdin_box(&boxed[8..]).unwrap();
         assert!(r.entries.is_empty());
     }
 
