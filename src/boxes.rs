@@ -424,6 +424,20 @@ pub const SNRO: [u8; 4] = fourcc("snro");
 /// of an `srtp` SRTP hint sample entry; FullBox carrying the four SRTP
 /// encryption/integrity algorithm identifiers plus a `schm`/`schi` pair.
 pub const SRPP: [u8; 4] = fourcc("srpp");
+/// `rtcp` — RTCP reception hint sample entry (ISO/IEC 14496-12 §9.4.2.3).
+/// Identical in structure to the RTP sample entry (`rtp `) but with no
+/// defined additional-data boxes; a distinct FourCC for RTCP reception
+/// hint tracks.
+pub const RTCP_HINT: [u8; 4] = fourcc("rtcp");
+/// `sm2t` — MPEG-2 TS server hint sample entry (ISO/IEC 14496-12
+/// §9.3.3.2). Carries the MPEG2TSSampleEntry body
+/// (hinttrackversion/highestcompatibleversion + preceding/trailing byte
+/// lengths + precomputed-only flag).
+pub const SM2T: [u8; 4] = fourcc("sm2t");
+/// `rm2t` — MPEG-2 TS reception hint sample entry (ISO/IEC 14496-12
+/// §9.3.3.2). Same MPEG2TSSampleEntry body as `sm2t`; a distinct FourCC
+/// for reception hint tracks.
+pub const RM2T: [u8; 4] = fourcc("rm2t");
 /// `kind` — Track Kind Box (ISO/IEC 14496-12 §8.10.4). Sits inside a
 /// track-level `udta` and labels the track's role with a (schemeURI,
 /// value) pair. Both strings are NULL-terminated C strings; `value`

@@ -1393,6 +1393,12 @@ struct Track {
     /// `srtp`). `None` for non-hint tracks or a hint track whose entry
     /// format is some other protocol (e.g. an MPEG-2 TS hint).
     rtp_hint: Option<crate::hint::RtpHintSampleEntry>,
+    /// §9.3.3.2 — the MPEG-2 TS server / reception hint sample entry
+    /// (`sm2t` / `rm2t`) from the track's active `stsd` entry, when
+    /// present. Carries the per-TS-packet preceding/trailing byte counts
+    /// and the precomputed-only flag. `None` for non-MPEG-2-TS-hint
+    /// tracks.
+    mpeg2ts_hint: Option<crate::hint::Mpeg2TsHintSampleEntry>,
     /// §8.7.2 — `dref` (DataReferenceBox) from the track's
     /// `minf/dinf/dref`. The table of media-data locations that every
     /// sample entry's 1-based `data_reference_index` (§8.5.2.2) selects
@@ -3623,6 +3629,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         colr: None,
         hmhd: None,
         rtp_hint: None,
+        mpeg2ts_hint: None,
         dref: None,
         stsh: Vec::new(),
         sbgp: Vec::new(),
@@ -5004,12 +5011,22 @@ fn parse_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
     if entry.len() < 8 {
         return Ok(());
     }
-    // §9.1.2 / §9.4.1.2 — RTP / SRTP / reception hint sample entries.
-    // A hint track's handler maps to MediaType::Data, so dispatch on the
-    // active stsd FourCC before the media-type switch. A malformed entry
-    // leaves `rtp_hint` None rather than aborting the open.
-    if matches!(t.codec_id_fourcc, RTP_HINT | SRTP_HINT | RRTP_HINT) {
+    // §9.1.2 / §9.4.1.2 / §9.4.2.3 — RTP / SRTP / RTP-reception / RTCP-
+    // reception hint sample entries. A hint track's handler maps to
+    // MediaType::Data, so dispatch on the active stsd FourCC before the
+    // media-type switch. A malformed entry leaves `rtp_hint` None rather
+    // than aborting the open. `rtcp` shares the `rtp ` body (§9.4.2.3).
+    if matches!(
+        t.codec_id_fourcc,
+        RTP_HINT | SRTP_HINT | RRTP_HINT | RTCP_HINT
+    ) {
         t.rtp_hint = crate::hint::parse_rtp_hint_sample_entry(t.codec_id_fourcc, entry);
+        return Ok(());
+    }
+    // §9.3.3.2 — MPEG-2 TS server (`sm2t`) / reception (`rm2t`) hint
+    // sample entries.
+    if matches!(t.codec_id_fourcc, SM2T | RM2T) {
+        t.mpeg2ts_hint = crate::hint::parse_mpeg2ts_hint_sample_entry(t.codec_id_fourcc, entry);
         return Ok(());
     }
     match t.media_type {
@@ -9112,6 +9129,33 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         }
     }
 
+    // ISO/IEC 14496-12 §9.3.3.2: when the track's active stsd entry is an
+    // MPEG-2 TS server / reception hint sample entry (`sm2t` / `rm2t`),
+    // surface its per-TS-packet framing on `params.options`:
+    // `m2t_hint_format` (the entry FourCC), `m2t_hint_preceding_bytes` /
+    // `m2t_hint_trailing_bytes` (recording-device bytes wrapped around
+    // each 188-byte TS packet), and `m2t_hint_precomputed` (`"true"` when
+    // the precomputed-only flag is set). A de-hinter reads these to strip
+    // the wrapping bytes before reassembling the TS.
+    if let Some(m) = &t.mpeg2ts_hint {
+        params.options.insert(
+            "m2t_hint_format",
+            String::from_utf8_lossy(&m.format).to_string(),
+        );
+        params.options.insert(
+            "m2t_hint_preceding_bytes",
+            m.preceding_bytes_len.to_string(),
+        );
+        params
+            .options
+            .insert("m2t_hint_trailing_bytes", m.trailing_bytes_len.to_string());
+        if m.precomputed_only {
+            params
+                .options
+                .insert("m2t_hint_precomputed", "true".to_string());
+        }
+    }
+
     // ISO/IEC 14496-12 §8.7.2: surface the DataReferenceBox (`dref`) so a
     // caller can resolve where each sample description's media data lives.
     // The 1-based `data_reference_index` on every sample entry (§8.5.2.2)
@@ -10806,6 +10850,7 @@ mod tests {
             colr: None,
             hmhd: None,
             rtp_hint: None,
+            mpeg2ts_hint: None,
             dref: None,
             stsh: Vec::new(),
             sbgp: Vec::new(),
@@ -14039,6 +14084,59 @@ mod tests {
         let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
         assert_eq!(info.params.options.get("rtp_hint_format"), None);
         assert_eq!(info.params.options.get("rtp_hint_max_packet_size"), None);
+    }
+
+    #[test]
+    fn build_stream_info_surfaces_mpeg2ts_hint_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Data;
+        t.codec_id_fourcc = *b"sm2t";
+        t.timescale = 90_000;
+        t.mpeg2ts_hint = Some(crate::hint::Mpeg2TsHintSampleEntry {
+            format: *b"sm2t",
+            data_reference_index: 1,
+            hint_track_version: 1,
+            highest_compatible_version: 1,
+            preceding_bytes_len: 4,
+            trailing_bytes_len: 16,
+            precomputed_only: true,
+            additional_data: vec![],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("m2t_hint_format"), Some("sm2t"));
+        assert_eq!(
+            info.params.options.get("m2t_hint_preceding_bytes"),
+            Some("4")
+        );
+        assert_eq!(
+            info.params.options.get("m2t_hint_trailing_bytes"),
+            Some("16")
+        );
+        assert_eq!(
+            info.params.options.get("m2t_hint_precomputed"),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn build_stream_info_mpeg2ts_hint_no_precomputed_omits_key() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Data;
+        t.codec_id_fourcc = *b"rm2t";
+        t.timescale = 90_000;
+        t.mpeg2ts_hint = Some(crate::hint::Mpeg2TsHintSampleEntry {
+            format: *b"rm2t",
+            data_reference_index: 1,
+            hint_track_version: 1,
+            highest_compatible_version: 1,
+            preceding_bytes_len: 0,
+            trailing_bytes_len: 0,
+            precomputed_only: false,
+            additional_data: vec![],
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("m2t_hint_format"), Some("rm2t"));
+        assert_eq!(info.params.options.get("m2t_hint_precomputed"), None);
     }
 
     /// Absence: a track with no `stvi` emits none of the `stvi_*` keys.

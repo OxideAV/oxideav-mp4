@@ -248,6 +248,87 @@ pub fn build_rtp_hint_sample_entry(e: &RtpHintSampleEntry) -> Vec<u8> {
     wrap(&e.format, &body)
 }
 
+/// Decoded MPEG-2 TS hint sample entry (ISO/IEC 14496-12 §9.3.3.2): the
+/// `sm2t` (server) / `rm2t` (reception) entry format for an MPEG-2
+/// Transport Stream hint track. The body adds preceding/trailing per-TS-
+/// packet byte counts and a precomputed-only flag to the common hint
+/// sample-entry preamble.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mpeg2TsHintSampleEntry {
+    /// The sample-entry FourCC: `sm2t` (server) or `rm2t` (reception).
+    pub format: [u8; 4],
+    /// `data_reference_index` from the §8.5.2.2 SampleEntry preamble.
+    pub data_reference_index: u16,
+    /// `hinttrackversion` (currently 1).
+    pub hint_track_version: u16,
+    /// `highestcompatibleversion`.
+    pub highest_compatible_version: u16,
+    /// `precedingbyteslen` — bytes preceding each MPEG-2 TS packet (e.g.
+    /// a recording-device timecode).
+    pub preceding_bytes_len: u8,
+    /// `trailingbyteslen` — bytes following each MPEG-2 TS packet (e.g. a
+    /// checksum).
+    pub trailing_bytes_len: u8,
+    /// `precomputed_only_flag` — the top bit of the next byte; when set,
+    /// the associated samples are purely precomputed (§9.3.3.3).
+    pub precomputed_only: bool,
+    /// The trailing `additionaldata` box bytes, verbatim (PSI/SI static
+    /// metadata boxes — kept opaque so the entry round-trips byte-exact).
+    pub additional_data: Vec<u8>,
+}
+
+/// Parse an MPEG-2 TS hint sample entry (`sm2t` / `rm2t`) from its full
+/// box payload (the bytes after the `[size][format]` header). `None` on
+/// truncation of the fixed preamble.
+pub fn parse_mpeg2ts_hint_sample_entry(
+    format: [u8; 4],
+    entry: &[u8],
+) -> Option<Mpeg2TsHintSampleEntry> {
+    let mut p = 0usize;
+    // §8.5.2.2 SampleEntry preamble: 6 reserved + data_reference_index.
+    if entry.len() < 8 {
+        return None;
+    }
+    p += 6;
+    let data_reference_index = rd_u16(entry, &mut p)?;
+    let hint_track_version = rd_u16(entry, &mut p)?;
+    let highest_compatible_version = rd_u16(entry, &mut p)?;
+    // precedingbyteslen(8) + trailingbyteslen(8) + flag/reserved(8).
+    if p + 3 > entry.len() {
+        return None;
+    }
+    let preceding_bytes_len = entry[p];
+    let trailing_bytes_len = entry[p + 1];
+    let precomputed_only = entry[p + 2] & 0x80 != 0;
+    p += 3;
+    Some(Mpeg2TsHintSampleEntry {
+        format,
+        data_reference_index,
+        hint_track_version,
+        highest_compatible_version,
+        preceding_bytes_len,
+        trailing_bytes_len,
+        precomputed_only,
+        additional_data: entry[p..].to_vec(),
+    })
+}
+
+/// Serialise an MPEG-2 TS hint sample entry. The byte-exact inverse of
+/// [`parse_mpeg2ts_hint_sample_entry`] (the 7 reserved low bits of the
+/// flag byte are written as 0, matching the parser's mask).
+pub fn build_mpeg2ts_hint_sample_entry(e: &Mpeg2TsHintSampleEntry) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0u8; 6]); // reserved
+    body.extend_from_slice(&e.data_reference_index.to_be_bytes());
+    body.extend_from_slice(&e.hint_track_version.to_be_bytes());
+    body.extend_from_slice(&e.highest_compatible_version.to_be_bytes());
+    body.push(e.preceding_bytes_len);
+    body.push(e.trailing_bytes_len);
+    body.push(if e.precomputed_only { 0x80 } else { 0x00 });
+    body.extend_from_slice(&e.additional_data);
+    wrap(&e.format, &body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +439,75 @@ mod tests {
         // Only the 8-byte SampleEntry preamble, no version fields.
         let short = [0u8; 8];
         assert!(parse_rtp_hint_sample_entry(*b"rtp ", &short).is_none());
+    }
+
+    #[test]
+    fn rtcp_entry_uses_rtp_body() {
+        // §9.4.2.3: rtcp is structurally identical to rtp ; no defined
+        // additional-data boxes, but tims may still be carried.
+        let e = RtpHintSampleEntry {
+            format: *b"rtcp",
+            data_reference_index: 1,
+            hint_track_version: 1,
+            highest_compatible_version: 1,
+            max_packet_size: 1500,
+            timescale: Some(90_000),
+            time_offset: None,
+            sequence_offset: None,
+            srpp: None,
+        };
+        let bytes = build_rtp_hint_sample_entry(&e);
+        let body = unwrap_box(&bytes, b"rtcp");
+        assert_eq!(parse_rtp_hint_sample_entry(*b"rtcp", body).unwrap(), e);
+    }
+
+    #[test]
+    fn mpeg2ts_server_entry_round_trips() {
+        let e = Mpeg2TsHintSampleEntry {
+            format: *b"sm2t",
+            data_reference_index: 1,
+            hint_track_version: 1,
+            highest_compatible_version: 1,
+            preceding_bytes_len: 4,
+            trailing_bytes_len: 16,
+            precomputed_only: true,
+            additional_data: vec![],
+        };
+        let bytes = build_mpeg2ts_hint_sample_entry(&e);
+        let body = unwrap_box(&bytes, b"sm2t");
+        assert_eq!(parse_mpeg2ts_hint_sample_entry(*b"sm2t", body).unwrap(), e);
+    }
+
+    #[test]
+    fn mpeg2ts_reception_entry_round_trips_with_additional_data() {
+        // A trailing opaque additionaldata box (e.g. a PSI/SI metadata box).
+        let extra = wrap(b"abcd", &[1, 2, 3]);
+        let e = Mpeg2TsHintSampleEntry {
+            format: *b"rm2t",
+            data_reference_index: 1,
+            hint_track_version: 1,
+            highest_compatible_version: 1,
+            preceding_bytes_len: 0,
+            trailing_bytes_len: 0,
+            precomputed_only: false,
+            additional_data: extra.clone(),
+        };
+        let bytes = build_mpeg2ts_hint_sample_entry(&e);
+        let body = unwrap_box(&bytes, b"rm2t");
+        let parsed = parse_mpeg2ts_hint_sample_entry(*b"rm2t", body).unwrap();
+        assert_eq!(parsed, e);
+        assert!(!parsed.precomputed_only);
+        assert_eq!(parsed.additional_data, extra);
+    }
+
+    #[test]
+    fn mpeg2ts_entry_truncated_rejected() {
+        // Preamble present but the 3 fixed bytes missing.
+        let mut short = vec![0u8; 6];
+        short.extend_from_slice(&1u16.to_be_bytes()); // dref
+        short.extend_from_slice(&1u16.to_be_bytes()); // version
+        short.extend_from_slice(&1u16.to_be_bytes()); // highest
+        assert!(parse_mpeg2ts_hint_sample_entry(*b"sm2t", &short).is_none());
     }
 
     #[test]
