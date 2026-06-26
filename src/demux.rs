@@ -1789,39 +1789,39 @@ impl CsgpBox {
 /// `subsample_size` field is 16-bit at version 0 and widens to 32-bit at
 /// version 1; we always store as `u32` so callers handle one shape.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SubSampleEntry {
+pub struct SubSampleEntry {
     /// §8.7.7.3 — size in bytes of the sub-sample.
-    subsample_size: u32,
+    pub subsample_size: u32,
     /// §8.7.7.3 — degradation priority. Higher = more important to
     /// decoded quality. Codec-specific scale; the container does not
     /// interpret it.
-    subsample_priority: u8,
+    pub subsample_priority: u8,
     /// §8.7.7.3 — `0` = required to decode the current sample; non-zero
     /// = optional (e.g. an SEI message that only enhances output).
-    discardable: u8,
+    pub discardable: u8,
     /// §8.7.7.3 — opaque codec-specific blob (4 bytes). For AVC
     /// (ISO/IEC 14496-15) this encodes NAL-unit role / dependency
     /// information; absent a codec-specific binding the field is `0`.
-    codec_specific_parameters: u32,
+    pub codec_specific_parameters: u32,
 }
 
 /// One entry of a `subs` (SubSampleInformationBox, §8.7.7) — a single
 /// sample's sub-sample table together with the sparse delta that
 /// addresses it.
 #[derive(Clone, Debug, Default)]
-struct SubsEntry {
+pub struct SubsEntry {
     /// §8.7.7.3 — sample-number delta from the previous entry's sample
     /// (or from sample 0 for the first entry). The decoded absolute
     /// sample numbers are *not* materialised — callers walking the table
     /// can accumulate them themselves.
-    sample_delta: u32,
+    pub sample_delta: u32,
     /// The sub-samples of this entry's sample, in disk order. May be
     /// empty (`subsample_count == 0`) per §8.7.7.1 — in that case the
     /// addressed sample has no sub-sample structure but is still
     /// enumerated by the table (the spec permits this shape so a
     /// producer can document "this sample is monolithic" alongside
     /// genuinely sub-divided neighbours).
-    subsamples: Vec<SubSampleEntry>,
+    pub subsamples: Vec<SubSampleEntry>,
 }
 
 /// Parsed `subs` (SubSampleInformationBox, ISO/IEC 14496-12 §8.7.7).
@@ -1834,16 +1834,16 @@ struct SubsEntry {
 /// We preserve both as-recorded so codec-specific consumers can pick
 /// the table whose semantics they understand.
 #[derive(Clone, Debug, Default)]
-struct SubsBox {
+pub struct SubsBox {
     /// FullBox version (0 or 1) — determines `subsample_size` width on
     /// disk. We normalise to `u32` in `SubSampleEntry::subsample_size`.
-    version: u8,
+    pub version: u8,
     /// FullBox flags — codec-specific. Distinguishes co-resident `subs`
     /// boxes per §8.7.7.1.
-    flags: u32,
+    pub flags: u32,
     /// One entry per *addressed* sample (the table is sparse — samples
     /// with no `subs` row contribute nothing here).
-    entries: Vec<SubsEntry>,
+    pub entries: Vec<SubsEntry>,
 }
 
 /// Parsed `saiz` (SampleAuxiliaryInformationSizesBox, ISO/IEC 14496-12
@@ -6640,6 +6640,61 @@ fn parse_subs(body: &[u8]) -> Result<SubsBox> {
         flags,
         entries,
     })
+}
+
+/// Parse a standalone `subs` (SubSampleInformationBox, ISO/IEC 14496-12
+/// §8.7.7) body (the bytes after the box header) into a [`SubsBox`].
+///
+/// Exposed as a public entry point so a codec-aware layer (e.g. an AVC
+/// NAL-unit splitter reading `codec_specific_parameters`) can decode a
+/// `subs` table it already has in hand without re-running `open()`.
+/// Returns `Err` for a body shorter than the FullBox preamble +
+/// `entry_count`, or a body truncated mid-entry / mid-subsample.
+pub fn parse_subs_box(body: &[u8]) -> Result<SubsBox> {
+    parse_subs(body)
+}
+
+/// Serialise a `subs` (SubSampleInformationBox, ISO/IEC 14496-12 §8.7.7)
+/// from a [`SubsBox`] — the byte-exact inverse of [`parse_subs_box`].
+///
+/// Layout (§8.7.7.2): a FullBox preamble carrying the record's `version`
+/// (0 or 1) and its codec-owned 24-bit `flags` verbatim, the 32-bit
+/// `entry_count`, then per entry the 32-bit `sample_delta`, the 16-bit
+/// `subsample_count`, and per sub-sample the `subsample_size` (16-bit at
+/// version 0, 32-bit at version 1), `subsample_priority` (8-bit),
+/// `discardable` (8-bit) and `codec_specific_parameters` (32-bit).
+///
+/// Returns `None` when the record cannot be expressed on the wire and
+/// re-parse identically: a `version` other than 0/1; an `entry_count` or
+/// any `subsample_count` exceeding its 32-/16-bit field; or — at version
+/// 0 — a `subsample_size` exceeding `u16::MAX` (the v0 size field is
+/// 16-bit; the caller must use version 1).
+pub fn build_subs_box(record: &SubsBox) -> Option<Vec<u8>> {
+    if record.version > 1 {
+        return None;
+    }
+    let entry_count: u32 = record.entries.len().try_into().ok()?;
+    let mut body = Vec::with_capacity(8 + record.entries.len() * 6);
+    body.push(record.version);
+    body.extend_from_slice(&record.flags.to_be_bytes()[1..4]); // 24-bit flags
+    body.extend_from_slice(&entry_count.to_be_bytes());
+    for entry in &record.entries {
+        let subsample_count: u16 = entry.subsamples.len().try_into().ok()?;
+        body.extend_from_slice(&entry.sample_delta.to_be_bytes());
+        body.extend_from_slice(&subsample_count.to_be_bytes());
+        for sub in &entry.subsamples {
+            if record.version == 0 {
+                let size: u16 = sub.subsample_size.try_into().ok()?;
+                body.extend_from_slice(&size.to_be_bytes());
+            } else {
+                body.extend_from_slice(&sub.subsample_size.to_be_bytes());
+            }
+            body.push(sub.subsample_priority);
+            body.push(sub.discardable);
+            body.extend_from_slice(&sub.codec_specific_parameters.to_be_bytes());
+        }
+    }
+    Some(wrap_box(&SUBS, &body))
 }
 
 /// Parse `saiz` (SampleAuxiliaryInformationSizesBox, ISO/IEC 14496-12
@@ -17359,6 +17414,129 @@ mod tests {
         body.extend_from_slice(&1u16.to_be_bytes()); // subsample_count = 1
         body.extend_from_slice(&[0u8; 3]); // truncated subsample (need 8)
         assert!(super::parse_subs(&body).is_err());
+    }
+
+    /// `build_subs_box` is the byte-exact inverse of `parse_subs_box` for
+    /// a multi-entry version-0 table (sparse deltas, multiple sub-samples,
+    /// non-trivial codec_specific_parameters and flags).
+    #[test]
+    fn build_subs_box_v0_round_trips() {
+        let record = super::SubsBox {
+            version: 0,
+            flags: 0x00_aa_55,
+            entries: vec![
+                super::SubsEntry {
+                    sample_delta: 1,
+                    subsamples: vec![
+                        super::SubSampleEntry {
+                            subsample_size: 100,
+                            subsample_priority: 5,
+                            discardable: 0,
+                            codec_specific_parameters: 1,
+                        },
+                        super::SubSampleEntry {
+                            subsample_size: 50,
+                            subsample_priority: 4,
+                            discardable: 1,
+                            codec_specific_parameters: 2,
+                        },
+                    ],
+                },
+                super::SubsEntry {
+                    sample_delta: 2,
+                    subsamples: vec![super::SubSampleEntry {
+                        subsample_size: 80,
+                        subsample_priority: 6,
+                        discardable: 0,
+                        codec_specific_parameters: 0xdead_beef,
+                    }],
+                },
+            ],
+        };
+        let boxed = super::build_subs_box(&record).unwrap();
+        assert_eq!(&boxed[4..8], b"subs");
+        let s = super::parse_subs_box(&boxed[8..]).unwrap();
+        assert_eq!(s.version, 0);
+        assert_eq!(s.flags, 0x00_aa_55);
+        assert_eq!(s.entries.len(), 2);
+        assert_eq!(s.entries[0].subsamples[1].subsample_size, 50);
+        assert_eq!(s.entries[0].subsamples[1].discardable, 1);
+        assert_eq!(
+            s.entries[1].subsamples[0].codec_specific_parameters,
+            0xdead_beef
+        );
+    }
+
+    /// Version 1 widens `subsample_size` to 32-bit; a value above the
+    /// 16-bit ceiling round-trips through the builder.
+    #[test]
+    fn build_subs_box_v1_wide_size() {
+        let record = super::SubsBox {
+            version: 1,
+            flags: 0,
+            entries: vec![super::SubsEntry {
+                sample_delta: 1,
+                subsamples: vec![super::SubSampleEntry {
+                    subsample_size: 0x0001_2345,
+                    subsample_priority: 0,
+                    discardable: 0,
+                    codec_specific_parameters: 0,
+                }],
+            }],
+        };
+        let boxed = super::build_subs_box(&record).unwrap();
+        let s = super::parse_subs_box(&boxed[8..]).unwrap();
+        assert_eq!(s.version, 1);
+        assert_eq!(s.entries[0].subsamples[0].subsample_size, 0x0001_2345);
+    }
+
+    /// An empty entry list (a content-free `subs`) round-trips, and an
+    /// entry with a zero `subsample_count` is preserved.
+    #[test]
+    fn build_subs_box_empty_and_degenerate() {
+        let empty = super::build_subs_box(&super::SubsBox::default()).unwrap();
+        assert!(super::parse_subs_box(&empty[8..])
+            .unwrap()
+            .entries
+            .is_empty());
+        let degenerate = super::SubsBox {
+            version: 0,
+            flags: 0,
+            entries: vec![super::SubsEntry {
+                sample_delta: 5,
+                subsamples: vec![],
+            }],
+        };
+        let boxed = super::build_subs_box(&degenerate).unwrap();
+        let s = super::parse_subs_box(&boxed[8..]).unwrap();
+        assert_eq!(s.entries[0].sample_delta, 5);
+        assert!(s.entries[0].subsamples.is_empty());
+    }
+
+    /// A version-0 record whose `subsample_size` overflows the 16-bit v0
+    /// field is rejected (the caller must use version 1); an undefined
+    /// version is rejected.
+    #[test]
+    fn build_subs_box_rejects_inconsistent() {
+        let overflow = super::SubsBox {
+            version: 0,
+            flags: 0,
+            entries: vec![super::SubsEntry {
+                sample_delta: 1,
+                subsamples: vec![super::SubSampleEntry {
+                    subsample_size: 0x0001_0000,
+                    subsample_priority: 0,
+                    discardable: 0,
+                    codec_specific_parameters: 0,
+                }],
+            }],
+        };
+        assert!(super::build_subs_box(&overflow).is_none());
+        let bad_version = super::SubsBox {
+            version: 2,
+            ..super::SubsBox::default()
+        };
+        assert!(super::build_subs_box(&bad_version).is_none());
     }
 
     /// `parse_stbl` lands the `subs` on the track alongside the other
