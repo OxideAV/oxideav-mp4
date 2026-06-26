@@ -491,6 +491,45 @@ Sample-entry FourCCs resolve to these codec ids:
   posture; a body shorter than the full 20 bytes is rejected (a
   truncated tail would surface noise as a bitrate). Absent `hmhd`, none
   of the keys are emitted.
+- Hint sample entries (ISO/IEC 14496-12 §9.1.2 / §9.3.3.2 / §9.4): a
+  hint track's `stsd` entry is decoded when it is an RTP server (`rtp `),
+  SRTP (`srtp`), RTP reception (`rrtp`), or RTCP reception (`rtcp`)
+  entry — a shared body (`maxpacketsize` + the `additionaldata` boxes
+  `tims` timescale, `tsro` time offset, `snro` sequence offset, and for
+  `srtp` the `srpp` SRTPProcessBox) surfaced as `rtp_hint_format`,
+  `rtp_hint_max_packet_size`, `rtp_hint_timescale`,
+  `rtp_hint_time_offset`, `rtp_hint_sequence_offset`, and
+  `rtp_hint_srtp` — or an MPEG-2 TS server (`sm2t`) / reception (`rm2t`)
+  entry, whose per-TS-packet wrapper byte counts and precomputed-only
+  flag surface as `m2t_hint_format`, `m2t_hint_preceding_bytes`,
+  `m2t_hint_trailing_bytes`, and `m2t_hint_precomputed`. The full typed
+  records (with parse + build round-trip) live in the `hint` module.
+- Hint statistics (ISO/IEC 14496-12 §9.1.5, `hinf`): a hint track's
+  `udta/hinf` Hint Statistics Box is decoded into delivery totals — the
+  `trpy` / `nump` / `tpyl` (and `totl` / `npck` / `tpay` u32 variants)
+  byte/packet counts, `dmed` / `dimm` / `drep` media/immediate/repeated
+  byte totals, `maxr` max-rate windows, `pmax` largest packet, and
+  `payt` payload-ID rtpmap entries — surfaced as `hinf_bytes_sent`,
+  `hinf_packets_sent`, `hinf_payload_bytes`, `hinf_media_bytes`,
+  `hinf_immediate_bytes`, `hinf_repeated_bytes`, `hinf_largest_packet`,
+  `hinf_maxr_count`, and `hinf_payload_count` (absent sub-boxes omit
+  their keys). Full typed record + parse/build in the `hint` module.
+- FD (File Delivery) item information (ISO/IEC 14496-12 §8.13): a
+  file-level `meta`'s `fiin` FDItemInformationBox — the `paen` partition
+  entries (`fpar` File Partition + optional `fecr` FEC Reservoir + `fire`
+  File Reservoir boxes), plus optional `segr` FD session-group and `gitn`
+  group-name boxes — is parsed into `MetaItems::fiin` and summarised as
+  `meta_fiin_partitions` / `meta_fiin_session_groups` /
+  `meta_fiin_group_names`. The full typed records (with parse + build
+  round-trip, incl. the `feci` FEC Information Box, §9.2.4.7) live in the
+  `fd` module.
+- Additional metadata container (ISO/IEC 14496-12 §8.11.7 / §8.11.8,
+  `meco` / `mere`): a file-level `meco` AdditionalMetadataContainerBox is
+  parsed into a `MecoBox` carrying its additional `meta` boxes (each a
+  fully-decoded `MetaItems` with a distinct handler type) plus the `mere`
+  MetaboxRelationBoxes describing how same-level `meta` boxes relate,
+  surfaced as `meco_meta_count` / `meco_meta_<n>` / `meco_relation_count`
+  / `meco_relation_<n>`. Reachable via `Mp4Demuxer::meco()`.
 - Composition-to-decode (ISO/IEC 14496-12 §8.6.1.4, `cslg`): a
   track's `stbl/cslg` CompositionToDecodeBox documents the
   composition↔decode timeline relationship implied by a signed
