@@ -48,6 +48,11 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     // `meta` may also appear inside `moov` / `trak` (handled in
     // `parse_moov` / `parse_trak`); the file-level one is the HEIF home.
     let mut meta_items = MetaItems::default();
+    // §8.11.7 — file-level `meco` AdditionalMetadataContainerBox. Quantity
+    // zero or one at each level (§8.11.7.1); the first instance wins. Holds
+    // additional `meta` boxes (distinct handler types) plus `mere`
+    // relations. Default-empty when no `meco` is present.
+    let mut meco: MecoBox = MecoBox::default();
     while let Some(hdr) = read_box_header(&mut *input)? {
         match hdr.fourcc {
             FTYP => {
@@ -144,6 +149,15 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                 let body = read_box_body(&mut *input, &hdr)?;
                 if meta_items.is_empty() && meta_items.handler_type == [0; 4] {
                     meta_items = parse_meta_items(&body);
+                }
+            }
+            // §8.11.7 — file-level `meco` AdditionalMetadataContainerBox.
+            // Parse the first instance's additional `meta` boxes + `mere`
+            // relations; subsequent copies are skipped.
+            MECO => {
+                let body = read_box_body(&mut *input, &hdr)?;
+                if meco.is_empty() {
+                    meco = parse_meco_box(&body);
                 }
             }
             _ => skip_box_body(&mut *input, &hdr)?,
@@ -263,6 +277,44 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     //   - `meta_iloc_count` = number of `iloc` item-location records
     //   - `meta_iref_count` = number of `iref` reference groups
     surface_meta_items(&meta_items, &mut metadata);
+
+    // Surface a file-level `meco` (AdditionalMetadataContainerBox,
+    // §8.11.7) on the flat metadata channel. Emitted only when a `meco`
+    // was present and non-empty:
+    //   - `meco_meta_count` = number of additional `meta` boxes
+    //   - `meco_meta_<n>` = the additional `meta`'s handler_type FourCC
+    //   - `meco_relation_count` = number of `mere` relation boxes
+    //   - `meco_relation_<n>` = "<first>-<second>=<relation>" (the two
+    //     handler-type FourCCs and the §8.11.8.3 relation value)
+    // Structured records via `Mp4Demuxer::meco()`.
+    if !meco.is_empty() {
+        if !meco.metas.is_empty() {
+            metadata.push(("meco_meta_count".to_string(), meco.metas.len().to_string()));
+            for (n, m) in meco.metas.iter().enumerate() {
+                metadata.push((
+                    format!("meco_meta_{n}"),
+                    String::from_utf8_lossy(&m.handler_type).to_string(),
+                ));
+            }
+        }
+        if !meco.relations.is_empty() {
+            metadata.push((
+                "meco_relation_count".to_string(),
+                meco.relations.len().to_string(),
+            ));
+            for (n, r) in meco.relations.iter().enumerate() {
+                metadata.push((
+                    format!("meco_relation_{n}"),
+                    format!(
+                        "{}-{}={}",
+                        String::from_utf8_lossy(&r.first_metabox_handler_type),
+                        String::from_utf8_lossy(&r.second_metabox_handler_type),
+                        r.metabox_relation
+                    ),
+                ));
+            }
+        }
+    }
 
     // Surface a parsed `leva` (LevelAssignmentBox, §8.8.13) on the flat
     // metadata channel. Quantity is zero or one per file (§8.8.13.1);
@@ -517,6 +569,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         sai_records,
         traf_sample_groups,
         meta_items,
+        meco,
         movie_timescale: parsed.movie_timescale,
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
@@ -2656,7 +2709,7 @@ pub struct IrefBox {
 
 /// A `meta` box's item infrastructure (ISO/IEC 14496-12 §8.11),
 /// collected together. Any of the four child boxes may be absent.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MetaItems {
     /// `pitm` (§8.11.4) — the primary item's ID, if a `pitm` is present.
     pub primary_item_id: Option<u32>,
@@ -3408,6 +3461,118 @@ pub fn build_iref_box(b: &IrefBox) -> Option<Vec<u8>> {
 /// wrapping the raw item bytes.
 pub fn build_idat_box(data: &[u8]) -> Vec<u8> {
     wrap_box(&IDAT, data)
+}
+
+// ---------------------------------------------------------------------------
+// §8.11.7 / §8.11.8 — Additional Metadata Container Box (`meco`) and
+// Metabox Relation Box (`mere`). A `meco` (at File / `moov` / `trak`
+// level) holds one or more additional `meta` boxes — each with a distinct
+// handler type — that complement the primary `meta`, plus zero or more
+// `mere` boxes describing how two same-level `meta` boxes relate.
+// ---------------------------------------------------------------------------
+
+/// One `mere` MetaboxRelationBox (ISO/IEC 14496-12 §8.11.8). Names two
+/// same-level `meta` boxes by their `hdlr` handler types and records the
+/// relation between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MereRelation {
+    /// The first related `meta` box's handler type (§8.4.3), verbatim.
+    pub first_metabox_handler_type: [u8; 4],
+    /// The second related `meta` box's handler type, verbatim.
+    pub second_metabox_handler_type: [u8; 4],
+    /// Relation enum (§8.11.8.3): 1 unknown, 2 unrelated, 3 complementary,
+    /// 4 overlapping (neither preferred), 5 second is a subset of the
+    /// first (first preferred). Carried verbatim — values outside 1..=5
+    /// are preserved rather than rejected so a validator can flag them.
+    pub metabox_relation: u8,
+}
+
+/// Decoded `meco` AdditionalMetadataContainerBox (ISO/IEC 14496-12
+/// §8.11.7): the additional `meta` boxes plus the `mere` relation boxes
+/// that the container holds. The additional `meta` boxes are captured as
+/// fully-parsed [`MetaItems`] (handler type + any §8.11 item
+/// infrastructure they carry); a `meco`-resident `meta` is required to
+/// carry a primary item / primary data box (§8.11.7.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MecoBox {
+    /// The additional `meta` boxes, in file order. Each must have a
+    /// handler type distinct from the primary `meta` and from each other
+    /// (§8.11.7.1), but the parser does not enforce that — it captures
+    /// whatever is present.
+    pub metas: Vec<MetaItems>,
+    /// The `mere` relation boxes, in file order.
+    pub relations: Vec<MereRelation>,
+}
+
+impl MecoBox {
+    /// True when the container holds neither an additional `meta` nor a
+    /// `mere` — e.g. an empty / malformed `meco`.
+    pub fn is_empty(&self) -> bool {
+        self.metas.is_empty() && self.relations.is_empty()
+    }
+}
+
+/// Parse a `mere` body (the bytes after the `[size][mere]` header).
+/// `None` on truncation. The §8.11.8.2 body is two 32-bit handler-type
+/// codes plus a 1-byte relation, after the FullBox preamble.
+pub fn parse_mere_box(body: &[u8]) -> Option<MereRelation> {
+    // FullBox preamble (4) + first(4) + second(4) + relation(1) = 13.
+    if body.len() < 13 {
+        return None;
+    }
+    let mut first = [0u8; 4];
+    let mut second = [0u8; 4];
+    first.copy_from_slice(&body[4..8]);
+    second.copy_from_slice(&body[8..12]);
+    Some(MereRelation {
+        first_metabox_handler_type: first,
+        second_metabox_handler_type: second,
+        metabox_relation: body[12],
+    })
+}
+
+/// Serialise a `mere` box. The byte-exact inverse of [`parse_mere_box`]
+/// (FullBox version 0, flags 0).
+pub fn build_mere_box(r: &MereRelation) -> Vec<u8> {
+    let mut body = Vec::with_capacity(13);
+    body.extend_from_slice(&[0u8; 4]); // version/flags
+    body.extend_from_slice(&r.first_metabox_handler_type);
+    body.extend_from_slice(&r.second_metabox_handler_type);
+    body.push(r.metabox_relation);
+    wrap_box(&MERE, &body)
+}
+
+/// Parse a `meco` body. Walks its child boxes, decoding each `meta` into
+/// a [`MetaItems`] and each `mere` into a [`MereRelation`]; other boxes
+/// are ignored. A `meta` child's body opens with the FullBox preamble,
+/// matching the top-level `meta` walk.
+pub fn parse_meco_box(body: &[u8]) -> MecoBox {
+    let mut out = MecoBox::default();
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur).ok().flatten() {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let start = cur.position() as usize;
+        if start + psz > body.len() {
+            break;
+        }
+        cur.set_position((start + psz) as u64);
+        let child = &body[start..start + psz];
+        match hdr.fourcc {
+            META => out.metas.push(parse_meta_items(child)),
+            MERE => {
+                if let Some(r) = parse_mere_box(child) {
+                    out.relations.push(r);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
@@ -9454,6 +9619,14 @@ struct Mp4Demuxer {
     /// on the flat metadata channel as `meta_*` keys.
     #[allow(dead_code)]
     meta_items: MetaItems,
+    /// §8.11.7 file-level `meco` AdditionalMetadataContainerBox — the
+    /// additional `meta` boxes (distinct handler types) plus `mere`
+    /// relations that complement the primary `meta`. `MecoBox::default()`
+    /// (empty) when no `meco` is present. Reachable via the public
+    /// `Mp4Demuxer::meco()` accessor; also surfaced on the flat metadata
+    /// channel as `meco_*` keys.
+    #[allow(dead_code)]
+    meco: MecoBox,
     /// Per-track media timescale (1-based parallel to `track_ids`),
     /// needed to translate `tfra.time` (track timescale) to the seek-to
     /// caller's pts (also track timescale, but this lets us add unit
@@ -9617,6 +9790,19 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn meta_items(&self) -> &MetaItems {
         &self.meta_items
+    }
+
+    /// The file-level `meco` AdditionalMetadataContainerBox (ISO/IEC
+    /// 14496-12 §8.11.7), if one was present. The additional `meta` boxes
+    /// (each a fully-parsed [`MetaItems`] with a handler type distinct
+    /// from the primary `meta`) plus the `mere` relation boxes
+    /// (§8.11.8) describing how the same-level `meta` boxes relate.
+    /// Returns an empty [`MecoBox`] ([`MecoBox::is_empty`]) when no
+    /// `meco` was present. The same data is surfaced on the flat
+    /// metadata channel as `meco_*` keys.
+    #[allow(dead_code)]
+    pub fn meco(&self) -> &MecoBox {
+        &self.meco
     }
 }
 
@@ -17436,6 +17622,70 @@ mod tests {
         assert!(kv
             .iter()
             .any(|(k, v)| k == "meta_fiin_partitions" && v == "1"));
+    }
+
+    #[test]
+    fn mere_round_trips() {
+        let r = super::MereRelation {
+            first_metabox_handler_type: *b"mp7t",
+            second_metabox_handler_type: *b"mdir",
+            metabox_relation: 5,
+        };
+        let bytes = super::build_mere_box(&r);
+        // [size][mere] header then 13-byte body.
+        assert_eq!(&bytes[4..8], b"mere");
+        let body = &bytes[8..];
+        assert_eq!(body.len(), 13);
+        assert_eq!(super::parse_mere_box(body).unwrap(), r);
+    }
+
+    #[test]
+    fn mere_truncated_rejected() {
+        // FullBox preamble + only one handler type — short of 13 bytes.
+        assert!(super::parse_mere_box(&[0, 0, 0, 0, b'a', b'b', b'c', b'd']).is_none());
+    }
+
+    #[test]
+    fn meco_walk_collects_metas_and_relations() {
+        // meco body = two additional meta boxes (distinct handler types)
+        // + one mere relation between them.
+        fn meta_with_handler(h: &[u8; 4]) -> Vec<u8> {
+            let mut hdlr = vec![0u8, 0, 0, 0];
+            hdlr.extend_from_slice(&[0, 0, 0, 0]);
+            hdlr.extend_from_slice(h);
+            hdlr.extend_from_slice(&[0u8; 12]);
+            hdlr.push(0);
+            let hdlr = box_bytes(b"hdlr", &hdlr);
+            let mut meta = vec![0u8, 0, 0, 0];
+            meta.extend_from_slice(&hdlr);
+            box_bytes(b"meta", &meta)
+        }
+        let meta_a = meta_with_handler(b"mp7t");
+        let meta_b = meta_with_handler(b"mdir");
+        let mere = super::build_mere_box(&super::MereRelation {
+            first_metabox_handler_type: *b"mp7t",
+            second_metabox_handler_type: *b"mdir",
+            metabox_relation: 3,
+        });
+
+        let mut meco_body = Vec::new();
+        meco_body.extend_from_slice(&meta_a);
+        meco_body.extend_from_slice(&meta_b);
+        meco_body.extend_from_slice(&mere);
+
+        let meco = super::parse_meco_box(&meco_body);
+        assert!(!meco.is_empty());
+        assert_eq!(meco.metas.len(), 2);
+        assert_eq!(&meco.metas[0].handler_type, b"mp7t");
+        assert_eq!(&meco.metas[1].handler_type, b"mdir");
+        assert_eq!(meco.relations.len(), 1);
+        assert_eq!(meco.relations[0].metabox_relation, 3);
+        assert_eq!(&meco.relations[0].first_metabox_handler_type, b"mp7t");
+    }
+
+    #[test]
+    fn meco_empty_body_is_empty() {
+        assert!(super::parse_meco_box(&[]).is_empty());
     }
 
     #[test]

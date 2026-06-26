@@ -199,6 +199,55 @@ fn heif_meta_surfaces_item_catalogue() {
     assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
 }
 
+/// Build a top-level `meco` AdditionalMetadataContainerBox (§8.11.7)
+/// holding two additional `meta` boxes (distinct handler types) plus one
+/// `mere` relation (§8.11.8) between them.
+fn build_meco() -> Vec<u8> {
+    fn meta_with_handler(h: &[u8; 4]) -> Vec<u8> {
+        let mut hdlr = vec![0u8, 0, 0, 0];
+        hdlr.extend_from_slice(&[0, 0, 0, 0]);
+        hdlr.extend_from_slice(h);
+        hdlr.extend_from_slice(&[0u8; 12]);
+        hdlr.push(0);
+        let hdlr = box_bytes(b"hdlr", &hdlr);
+        let mut meta = vec![0u8, 0, 0, 0];
+        meta.extend_from_slice(&hdlr);
+        box_bytes(b"meta", &meta)
+    }
+    // mere: FullBox preamble + two handler types + relation byte.
+    let mut mere = vec![0u8, 0, 0, 0];
+    mere.extend_from_slice(b"mp7t");
+    mere.extend_from_slice(b"mdir");
+    mere.push(3); // complementary
+    let mere = box_bytes(b"mere", &mere);
+
+    let mut meco = Vec::new();
+    meco.extend_from_slice(&meta_with_handler(b"mp7t"));
+    meco.extend_from_slice(&meta_with_handler(b"mdir"));
+    meco.extend_from_slice(&mere);
+    box_bytes(b"meco", &meco)
+}
+
+#[test]
+fn meco_surfaces_additional_metas_and_relations() {
+    let spliced = splice_after_ftyp(&mux_pcm_to_bytes(), &build_meco());
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(spliced));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let md = dmx.metadata();
+
+    assert_eq!(md_get(md, "meco_meta_count"), Some(&"2".to_string()));
+    assert_eq!(md_get(md, "meco_meta_0"), Some(&"mp7t".to_string()));
+    assert_eq!(md_get(md, "meco_meta_1"), Some(&"mdir".to_string()));
+    assert_eq!(md_get(md, "meco_relation_count"), Some(&"1".to_string()));
+    assert_eq!(
+        md_get(md, "meco_relation_0"),
+        Some(&"mp7t-mdir=3".to_string())
+    );
+
+    // The real audio track is undisturbed.
+    assert_eq!(dmx.streams().len(), 1);
+}
+
 #[test]
 fn non_heif_file_emits_no_meta_keys() {
     // Vanilla muxer output carries no file-level HEIF `meta` box, so no
