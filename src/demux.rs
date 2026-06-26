@@ -1868,22 +1868,22 @@ pub struct SubsBox {
 /// permits `sample_count` < total stsz/stz2 count — auxiliary info
 /// supplied for the initial samples only) is preserved verbatim.
 #[derive(Clone, Debug, Default)]
-struct SaizBox {
+pub struct SaizBox {
     /// §8.7.8.3 `aux_info_type` — present only when `flags & 1` is set.
-    aux_info_type: Option<[u8; 4]>,
+    pub aux_info_type: Option<[u8; 4]>,
     /// §8.7.8.3 `aux_info_type_parameter` — present only when
     /// `flags & 1` is set; defaults to 0 when omitted.
-    aux_info_type_parameter: Option<u32>,
+    pub aux_info_type_parameter: Option<u32>,
     /// §8.7.8.3 `default_sample_info_size`; non-zero means a
     /// constant-size table and `per_sample` is empty.
-    default_sample_info_size: u8,
+    pub default_sample_info_size: u8,
     /// §8.7.8.3 `sample_count` — the declared number of samples this
     /// `saiz` covers (may be smaller than the track's full sample count
     /// per §8.7.8.3).
-    sample_count: u32,
+    pub sample_count: u32,
     /// §8.7.8.2 `sample_info_size[]` — populated only when
     /// `default_sample_info_size == 0`; otherwise empty.
-    per_sample: Vec<u8>,
+    pub per_sample: Vec<u8>,
 }
 
 /// Parsed `saio` (SampleAuxiliaryInformationOffsetsBox, ISO/IEC 14496-12
@@ -1904,20 +1904,20 @@ struct SaizBox {
 /// so a producer round-tripping back to disk can re-emit the same
 /// width.
 #[derive(Clone, Debug, Default)]
-struct SaioBox {
+pub struct SaioBox {
     /// FullBox version (0 or 1) — selects 32-bit / 64-bit on-disk
     /// offset width. Preserved so a round-trip can match the original
     /// layout.
-    version: u8,
+    pub version: u8,
     /// §8.7.9.3 `aux_info_type` — present only when `flags & 1` is set.
-    aux_info_type: Option<[u8; 4]>,
+    pub aux_info_type: Option<[u8; 4]>,
     /// §8.7.9.3 `aux_info_type_parameter` — present only when
     /// `flags & 1` is set; defaults to 0 when omitted.
-    aux_info_type_parameter: Option<u32>,
+    pub aux_info_type_parameter: Option<u32>,
     /// §8.7.9.2 `offset[entry_count]` — widened to u64 regardless of
     /// box version. Semantics depend on container: absolute file
     /// position inside `stbl`, base_data_offset-relative inside `traf`.
-    offsets: Vec<u64>,
+    pub offsets: Vec<u64>,
 }
 
 /// Parsed `cslg` (CompositionToDecodeBox, ISO/IEC 14496-12 §8.6.1.4).
@@ -6850,6 +6850,99 @@ fn parse_saio(body: &[u8]) -> Result<SaioBox> {
         aux_info_type_parameter,
         offsets,
     })
+}
+
+/// Parse a standalone `saiz` (SampleAuxiliaryInformationSizesBox, ISO/IEC
+/// 14496-12 §8.7.8) body (the bytes after the box header) into a
+/// [`SaizBox`]. Public entry point for CENC / DRM tooling that already
+/// holds the box payload.
+pub fn parse_saiz_box(body: &[u8]) -> Result<SaizBox> {
+    parse_saiz(body)
+}
+
+/// Parse a standalone `saio` (SampleAuxiliaryInformationOffsetsBox,
+/// ISO/IEC 14496-12 §8.7.9) body into a [`SaioBox`]. Public entry point
+/// paired with [`build_saio_box`].
+pub fn parse_saio_box(body: &[u8]) -> Result<SaioBox> {
+    parse_saio(body)
+}
+
+/// Serialise a `saiz` (SampleAuxiliaryInformationSizesBox, ISO/IEC
+/// 14496-12 §8.7.8) from a [`SaizBox`] — the byte-exact inverse of
+/// [`parse_saiz_box`].
+///
+/// The `aux_info_type` / `aux_info_type_parameter` key is written only
+/// when `aux_info_type` is `Some` (which sets `flags & 1`); the parameter
+/// defaults to 0 when omitted (§8.7.8.3). The body then carries the 8-bit
+/// `default_sample_info_size`, the 32-bit `sample_count`, and — only when
+/// `default_sample_info_size == 0` — the `per_sample` size table.
+///
+/// Returns `None` when the record cannot round-trip: a non-zero
+/// `default_sample_info_size` paired with a non-empty `per_sample` (the
+/// constant-size shortcut and the per-sample table are mutually
+/// exclusive), or — for a variable-size table — a `sample_count` that
+/// does not match `per_sample.len()`.
+pub fn build_saiz_box(record: &SaizBox) -> Option<Vec<u8>> {
+    if record.default_sample_info_size != 0 && !record.per_sample.is_empty() {
+        return None;
+    }
+    if record.default_sample_info_size == 0
+        && record.sample_count as usize != record.per_sample.len()
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    let flags: u32 = if record.aux_info_type.is_some() { 1 } else { 0 };
+    body.push(0); // version 0 (§8.7.8.2 defines only version 0)
+    body.extend_from_slice(&flags.to_be_bytes()[1..4]);
+    if let Some(t) = record.aux_info_type {
+        body.extend_from_slice(&t);
+        body.extend_from_slice(&record.aux_info_type_parameter.unwrap_or(0).to_be_bytes());
+    }
+    body.push(record.default_sample_info_size);
+    body.extend_from_slice(&record.sample_count.to_be_bytes());
+    if record.default_sample_info_size == 0 {
+        body.extend_from_slice(&record.per_sample);
+    }
+    Some(wrap_box(&SAIZ, &body))
+}
+
+/// Serialise a `saio` (SampleAuxiliaryInformationOffsetsBox, ISO/IEC
+/// 14496-12 §8.7.9) from a [`SaioBox`] — the byte-exact inverse of
+/// [`parse_saio_box`].
+///
+/// The `aux_info_type` key is written only when present (setting
+/// `flags & 1`), the parameter defaulting to 0 when omitted. The body
+/// then carries the 32-bit `entry_count` followed by the offset array,
+/// each written as a 32-bit field for version 0 or a 64-bit field for
+/// version 1 (§8.7.9.2).
+///
+/// Returns `None` for a `version` other than 0/1, an `offsets` count
+/// exceeding the 32-bit `entry_count`, or — at version 0 — an offset
+/// exceeding `u32::MAX` (the caller must use version 1).
+pub fn build_saio_box(record: &SaioBox) -> Option<Vec<u8>> {
+    if record.version > 1 {
+        return None;
+    }
+    let entry_count: u32 = record.offsets.len().try_into().ok()?;
+    let mut body = Vec::new();
+    let flags: u32 = if record.aux_info_type.is_some() { 1 } else { 0 };
+    body.push(record.version);
+    body.extend_from_slice(&flags.to_be_bytes()[1..4]);
+    if let Some(t) = record.aux_info_type {
+        body.extend_from_slice(&t);
+        body.extend_from_slice(&record.aux_info_type_parameter.unwrap_or(0).to_be_bytes());
+    }
+    body.extend_from_slice(&entry_count.to_be_bytes());
+    for &offset in &record.offsets {
+        if record.version == 0 {
+            let o: u32 = offset.try_into().ok()?;
+            body.extend_from_slice(&o.to_be_bytes());
+        } else {
+            body.extend_from_slice(&offset.to_be_bytes());
+        }
+    }
+    Some(wrap_box(&SAIO, &body))
 }
 
 /// Parse `cslg` (CompositionToDecodeBox, ISO/IEC 14496-12 §8.6.1.4).
@@ -17748,6 +17841,113 @@ mod tests {
         body.extend_from_slice(&1u32.to_be_bytes()); // only 1 follows
         let err = super::parse_saio(&body).expect_err("truncation must err");
         assert!(format!("{err}").contains("MP4: saio"));
+    }
+
+    /// `build_saiz_box` is the byte-exact inverse of `parse_saiz_box`
+    /// for a constant-size table without an aux-info-type key.
+    #[test]
+    fn build_saiz_box_constant_size_round_trips() {
+        let record = super::SaizBox {
+            aux_info_type: None,
+            aux_info_type_parameter: None,
+            default_sample_info_size: 8,
+            sample_count: 4,
+            per_sample: vec![],
+        };
+        let boxed = super::build_saiz_box(&record).unwrap();
+        assert_eq!(&boxed[4..8], b"saiz");
+        let s = super::parse_saiz_box(&boxed[8..]).unwrap();
+        assert_eq!(s.default_sample_info_size, 8);
+        assert_eq!(s.sample_count, 4);
+        assert!(s.aux_info_type.is_none());
+        assert!(s.per_sample.is_empty());
+    }
+
+    /// A variable-size `saiz` with a `(cenc, 7)` aux-info-type key round-
+    /// trips, including the per-sample size table.
+    #[test]
+    fn build_saiz_box_variable_with_aux_type() {
+        let record = super::SaizBox {
+            aux_info_type: Some(*b"cenc"),
+            aux_info_type_parameter: Some(7),
+            default_sample_info_size: 0,
+            sample_count: 3,
+            per_sample: vec![10, 20, 30],
+        };
+        let boxed = super::build_saiz_box(&record).unwrap();
+        let s = super::parse_saiz_box(&boxed[8..]).unwrap();
+        assert_eq!(s.aux_info_type, Some(*b"cenc"));
+        assert_eq!(s.aux_info_type_parameter, Some(7));
+        assert_eq!(s.sample_count, 3);
+        assert_eq!(s.per_sample, vec![10, 20, 30]);
+    }
+
+    /// Inconsistent `saiz` records are rejected: a constant size with a
+    /// non-empty per-sample table, or a variable table whose declared
+    /// `sample_count` disagrees with `per_sample.len()`.
+    #[test]
+    fn build_saiz_box_rejects_inconsistent() {
+        let both = super::SaizBox {
+            default_sample_info_size: 8,
+            per_sample: vec![1],
+            ..Default::default()
+        };
+        assert!(super::build_saiz_box(&both).is_none());
+        let count_mismatch = super::SaizBox {
+            default_sample_info_size: 0,
+            sample_count: 5,
+            per_sample: vec![1, 2],
+            ..Default::default()
+        };
+        assert!(super::build_saiz_box(&count_mismatch).is_none());
+    }
+
+    /// `build_saio_box` is the byte-exact inverse of `parse_saio_box` for
+    /// both v0 (32-bit offsets) and v1 (64-bit offsets, with aux key).
+    #[test]
+    fn build_saio_box_v0_and_v1_round_trip() {
+        let v0 = super::SaioBox {
+            version: 0,
+            aux_info_type: None,
+            aux_info_type_parameter: None,
+            offsets: vec![0x1000, 0x2000],
+        };
+        let boxed = super::build_saio_box(&v0).unwrap();
+        assert_eq!(&boxed[4..8], b"saio");
+        let s = super::parse_saio_box(&boxed[8..]).unwrap();
+        assert_eq!(s.version, 0);
+        assert_eq!(s.offsets, vec![0x1000, 0x2000]);
+
+        let v1 = super::SaioBox {
+            version: 1,
+            aux_info_type: Some(*b"cenc"),
+            aux_info_type_parameter: Some(7),
+            offsets: vec![0x1_0000_0000, 0xffff_ffff_ffff_0000],
+        };
+        let boxed = super::build_saio_box(&v1).unwrap();
+        let s = super::parse_saio_box(&boxed[8..]).unwrap();
+        assert_eq!(s.version, 1);
+        assert_eq!(s.aux_info_type, Some(*b"cenc"));
+        assert_eq!(s.aux_info_type_parameter, Some(7));
+        assert_eq!(s.offsets, vec![0x1_0000_0000, 0xffff_ffff_ffff_0000]);
+    }
+
+    /// A v0 `saio` whose offset exceeds the 32-bit field is rejected (the
+    /// caller must use version 1); an undefined version is rejected.
+    #[test]
+    fn build_saio_box_rejects_inconsistent() {
+        let overflow = super::SaioBox {
+            version: 0,
+            aux_info_type: None,
+            aux_info_type_parameter: None,
+            offsets: vec![0x1_0000_0000],
+        };
+        assert!(super::build_saio_box(&overflow).is_none());
+        let bad_version = super::SaioBox {
+            version: 2,
+            ..Default::default()
+        };
+        assert!(super::build_saio_box(&bad_version).is_none());
     }
 
     /// `parse_stbl` dispatch wires both boxes onto the Track. Build a
