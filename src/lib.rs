@@ -12,6 +12,7 @@ pub mod codec_id;
 pub mod demux;
 pub mod fd;
 pub mod frag;
+pub mod hint;
 pub mod muxer;
 pub mod options;
 mod sample_entries;

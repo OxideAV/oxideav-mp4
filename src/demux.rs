@@ -1386,6 +1386,13 @@ struct Track {
     /// `None` for non-hint tracks (which use `vmhd` / `smhd` / `nmhd` /
     /// `sthd` instead) or when the box is absent.
     hmhd: Option<HmhdBox>,
+    /// §9.1.2 / §9.4.1.2 — the RTP / SRTP / reception hint sample entry
+    /// (`rtp ` / `srtp` / `rrtp`) from the track's active `stsd` entry,
+    /// when present. Carries `maxpacketsize` plus the `tims` timescale and
+    /// optional `tsro`/`snro` offsets (and an `srpp` SRTPProcessBox for
+    /// `srtp`). `None` for non-hint tracks or a hint track whose entry
+    /// format is some other protocol (e.g. an MPEG-2 TS hint).
+    rtp_hint: Option<crate::hint::RtpHintSampleEntry>,
     /// §8.7.2 — `dref` (DataReferenceBox) from the track's
     /// `minf/dinf/dref`. The table of media-data locations that every
     /// sample entry's 1-based `data_reference_index` (§8.5.2.2) selects
@@ -3615,6 +3622,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         clap: None,
         colr: None,
         hmhd: None,
+        rtp_hint: None,
         dref: None,
         stsh: Vec::new(),
         sbgp: Vec::new(),
@@ -4994,6 +5002,14 @@ fn walk_schi(body: &[u8]) -> SchiChildren {
 
 fn parse_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
     if entry.len() < 8 {
+        return Ok(());
+    }
+    // §9.1.2 / §9.4.1.2 — RTP / SRTP / reception hint sample entries.
+    // A hint track's handler maps to MediaType::Data, so dispatch on the
+    // active stsd FourCC before the media-type switch. A malformed entry
+    // leaves `rtp_hint` None rather than aborting the open.
+    if matches!(t.codec_id_fourcc, RTP_HINT | SRTP_HINT | RRTP_HINT) {
+        t.rtp_hint = crate::hint::parse_rtp_hint_sample_entry(t.codec_id_fourcc, entry);
         return Ok(());
     }
     match t.media_type {
@@ -9060,6 +9076,42 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             .insert("hmhd_avg_bitrate", h.avg_bitrate.to_string());
     }
 
+    // ISO/IEC 14496-12 §9.1.2 / §9.4.1.2: when the track's active stsd
+    // entry is an RTP / SRTP / reception hint sample entry (`rtp ` /
+    // `srtp` / `rrtp`), surface its packetisation parameters on
+    // `params.options`: `rtp_hint_format` (the entry FourCC),
+    // `rtp_hint_max_packet_size` (the largest packet this track
+    // generates), `rtp_hint_timescale` (the `tims` RTP clock), and the
+    // optional `rtp_hint_time_offset` / `rtp_hint_sequence_offset` (`tsro`
+    // / `snro`, signed, decimal — omitted when the box is absent). An
+    // `srtp` entry also emits `rtp_hint_srtp = "true"`. A streaming server
+    // reads these to reconstruct the RTP stream without re-walking `stsd`.
+    if let Some(r) = &t.rtp_hint {
+        params.options.insert(
+            "rtp_hint_format",
+            String::from_utf8_lossy(&r.format).to_string(),
+        );
+        params
+            .options
+            .insert("rtp_hint_max_packet_size", r.max_packet_size.to_string());
+        if let Some(ts) = r.timescale {
+            params.options.insert("rtp_hint_timescale", ts.to_string());
+        }
+        if let Some(off) = r.time_offset {
+            params
+                .options
+                .insert("rtp_hint_time_offset", off.to_string());
+        }
+        if let Some(off) = r.sequence_offset {
+            params
+                .options
+                .insert("rtp_hint_sequence_offset", off.to_string());
+        }
+        if r.srpp.is_some() {
+            params.options.insert("rtp_hint_srtp", "true".to_string());
+        }
+    }
+
     // ISO/IEC 14496-12 §8.7.2: surface the DataReferenceBox (`dref`) so a
     // caller can resolve where each sample description's media data lives.
     // The 1-based `data_reference_index` on every sample entry (§8.5.2.2)
@@ -10753,6 +10805,7 @@ mod tests {
             clap: None,
             colr: None,
             hmhd: None,
+            rtp_hint: None,
             dref: None,
             stsh: Vec::new(),
             sbgp: Vec::new(),
@@ -13908,6 +13961,84 @@ mod tests {
         );
         assert_eq!(info.params.options.get("stvi_stereo_scheme"), Some("2"));
         assert_eq!(info.params.options.get("stvi_indication"), None);
+    }
+
+    #[test]
+    fn build_stream_info_surfaces_rtp_hint_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Data;
+        t.codec_id_fourcc = *b"rtp ";
+        t.timescale = 90_000;
+        t.rtp_hint = Some(crate::hint::RtpHintSampleEntry {
+            format: *b"rtp ",
+            data_reference_index: 1,
+            hint_track_version: 1,
+            highest_compatible_version: 1,
+            max_packet_size: 1450,
+            timescale: Some(90_000),
+            time_offset: Some(-100),
+            sequence_offset: Some(42),
+            srpp: None,
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("rtp_hint_format"), Some("rtp "));
+        assert_eq!(
+            info.params.options.get("rtp_hint_max_packet_size"),
+            Some("1450")
+        );
+        assert_eq!(info.params.options.get("rtp_hint_timescale"), Some("90000"));
+        assert_eq!(
+            info.params.options.get("rtp_hint_time_offset"),
+            Some("-100")
+        );
+        assert_eq!(
+            info.params.options.get("rtp_hint_sequence_offset"),
+            Some("42")
+        );
+        assert_eq!(info.params.options.get("rtp_hint_srtp"), None);
+    }
+
+    #[test]
+    fn build_stream_info_srtp_hint_marks_srtp() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Data;
+        t.codec_id_fourcc = *b"srtp";
+        t.timescale = 90_000;
+        t.rtp_hint = Some(crate::hint::RtpHintSampleEntry {
+            format: *b"srtp",
+            data_reference_index: 1,
+            hint_track_version: 1,
+            highest_compatible_version: 1,
+            max_packet_size: 1400,
+            timescale: Some(90_000),
+            time_offset: None,
+            sequence_offset: None,
+            srpp: Some(crate::hint::SrppBox {
+                version: 0,
+                encryption_algorithm_rtp: 0x2020_2020,
+                encryption_algorithm_rtcp: 0x2020_2020,
+                integrity_algorithm_rtp: 0x2020_2020,
+                integrity_algorithm_rtcp: 0x2020_2020,
+                scheme_bytes: vec![],
+            }),
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("rtp_hint_format"), Some("srtp"));
+        assert_eq!(info.params.options.get("rtp_hint_srtp"), Some("true"));
+        // tsro/snro absent → keys omitted.
+        assert_eq!(info.params.options.get("rtp_hint_time_offset"), None);
+        assert_eq!(info.params.options.get("rtp_hint_sequence_offset"), None);
+    }
+
+    #[test]
+    fn build_stream_info_no_rtp_hint_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("rtp_hint_format"), None);
+        assert_eq!(info.params.options.get("rtp_hint_max_packet_size"), None);
     }
 
     /// Absence: a track with no `stvi` emits none of the `stvi_*` keys.

@@ -397,6 +397,33 @@ pub const FIRE: [u8; 4] = fourcc("fire");
 /// Plain Box carrying FEC_encoding_ID, FEC_instance_ID,
 /// source_block_number and encoding_symbol_ID for one FD packet.
 pub const FECI: [u8; 4] = fourcc("feci");
+/// `rtp ` — RTP server hint sample entry (ISO/IEC 14496-12 §9.1.2). The
+/// sample-description entry format for an RTP server hint track (media
+/// handler `hint`).
+pub const RTP_HINT: [u8; 4] = fourcc("rtp ");
+/// `srtp` — SRTP hint sample entry (ISO/IEC 14496-12 §9.1.2). Same body
+/// as `rtp ` plus a mandatory `srpp` SRTPProcessBox.
+pub const SRTP_HINT: [u8; 4] = fourcc("srtp");
+/// `rrtp` — RTP reception hint sample entry (ISO/IEC 14496-12 §9.4.1.2).
+/// Same body as `rtp `; a distinct FourCC so a reception hint track (which
+/// may contain errors) is not mistaken for a valid server hint track.
+pub const RRTP_HINT: [u8; 4] = fourcc("rrtp");
+/// `tims` — timescale entry (ISO/IEC 14496-12 §9.1.2). Required
+/// additional-data box inside an RTP hint sample entry; carries the RTP
+/// clock `timescale`.
+pub const TIMS: [u8; 4] = fourcc("tims");
+/// `tsro` — time offset box (ISO/IEC 14496-12 §9.1.2). Optional
+/// additional-data box inside an RTP hint sample entry; a signed offset
+/// applied to the RTP timestamp (inferred 0 when absent).
+pub const TSRO: [u8; 4] = fourcc("tsro");
+/// `snro` — sequence offset box (ISO/IEC 14496-12 §9.1.2). Optional
+/// additional-data box inside an RTP hint sample entry; a signed offset
+/// applied to the RTP sequence number (inferred 0 when absent).
+pub const SNRO: [u8; 4] = fourcc("snro");
+/// `srpp` — SRTP Process Box (ISO/IEC 14496-12 §9.1.2.1). Mandatory child
+/// of an `srtp` SRTP hint sample entry; FullBox carrying the four SRTP
+/// encryption/integrity algorithm identifiers plus a `schm`/`schi` pair.
+pub const SRPP: [u8; 4] = fourcc("srpp");
 /// `kind` — Track Kind Box (ISO/IEC 14496-12 §8.10.4). Sits inside a
 /// track-level `udta` and labels the track's role with a (schemeURI,
 /// value) pair. Both strings are NULL-terminated C strings; `value`
