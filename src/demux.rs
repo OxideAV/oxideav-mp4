@@ -3897,6 +3897,79 @@ fn parse_tsel(body: &[u8], t: &mut Track) {
     });
 }
 
+/// Serialise a `cprt` (CopyrightBox, ISO/IEC 14496-12 §8.10.2) — the
+/// byte-exact inverse of [`parse_cprt`] (FullBox version 0, flags 0).
+///
+/// Layout: 4-byte FullBox preamble, then the 16-bit packed `language`
+/// word (bit 15 pad, three 5-bit ISO 639-2/T characters each `ASCII -
+/// 0x60`, §8.10.2.3), then the NUL-terminated UTF-8 `notice` string.
+///
+/// `language` must be three lower-case ASCII letters (`'a'..='z'`); a
+/// byte outside that range cannot be encoded into the 5-bit field and is
+/// rejected. A `notice` containing an embedded NUL is rejected (it would
+/// truncate on re-parse). The notice is always written as UTF-8 (the
+/// parser also accepts a UTF-16BE BOM form, but the canonical write form
+/// is UTF-8).
+pub fn build_cprt_box(language: &[u8; 3], notice: &str) -> Option<Vec<u8>> {
+    let mut packed: u16 = 0;
+    for &ch in language {
+        if !ch.is_ascii_lowercase() {
+            return None;
+        }
+        packed = (packed << 5) | u16::from(ch - 0x60);
+    }
+    if notice.as_bytes().contains(&0) {
+        return None;
+    }
+    let mut body = Vec::with_capacity(4 + 2 + notice.len() + 1);
+    body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+    body.extend_from_slice(&packed.to_be_bytes());
+    body.extend_from_slice(notice.as_bytes());
+    body.push(0); // NUL terminator (§8.10.2.3)
+    Some(wrap_box(&crate::boxes::CPRT, &body))
+}
+
+/// Serialise a `kind` (KindBox, ISO/IEC 14496-12 §8.10.4) — the byte-exact
+/// inverse of [`parse_kind`] (FullBox version 0, flags 0).
+///
+/// Layout: 4-byte FullBox preamble, then two NUL-terminated UTF-8 C
+/// strings — the `schemeURI` then the `value` (§8.10.4.2). The `value`
+/// terminator is always written even when empty (`URI\0\0`), which the
+/// parser accepts as an explicitly-empty value.
+///
+/// Rejects an empty `schemeURI` (§8.10.4.3 requires the URI to identify
+/// the kind; the parser drops a URI-less entry) or either string
+/// containing an embedded NUL (it would truncate on re-parse).
+pub fn build_kind_box(scheme_uri: &str, value: &str) -> Option<Vec<u8>> {
+    if scheme_uri.is_empty() || scheme_uri.as_bytes().contains(&0) || value.as_bytes().contains(&0)
+    {
+        return None;
+    }
+    let mut body = Vec::with_capacity(4 + scheme_uri.len() + value.len() + 2);
+    body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+    body.extend_from_slice(scheme_uri.as_bytes());
+    body.push(0);
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
+    Some(wrap_box(&crate::boxes::KIND, &body))
+}
+
+/// Serialise a `tsel` (TrackSelectionBox, ISO/IEC 14496-12 §8.10.3) — the
+/// byte-exact inverse of [`parse_tsel`] (FullBox version 0, flags 0).
+///
+/// Layout: 4-byte FullBox preamble, then the 32-bit signed `switch_group`
+/// (§8.10.3.3), then the `attribute_list` as a sequence of 4-byte FourCCs
+/// to the end of the box.
+pub fn build_tsel_box(switch_group: i32, attribute_list: &[[u8; 4]]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + attribute_list.len() * 4);
+    body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+    body.extend_from_slice(&switch_group.to_be_bytes());
+    for attr in attribute_list {
+        body.extend_from_slice(attr);
+    }
+    wrap_box(&crate::boxes::TSEL, &body)
+}
+
 /// Render a 4-byte FourCC for surfacing on `params.options`: the printable
 /// ASCII string when every byte is non-control valid UTF-8, otherwise an
 /// 8-digit lowercase hex fallback. Mirrors the inline closure used by the
@@ -12482,6 +12555,80 @@ mod tests {
         assert_eq!(t.copyrights.len(), 1);
         assert_eq!(&t.copyrights[0].language, b"fra");
         assert_eq!(t.copyrights[0].notice, "");
+    }
+
+    /// `build_cprt_box` is the byte-exact inverse of `parse_cprt`: a
+    /// language + UTF-8 notice re-parses to the same record.
+    #[test]
+    fn build_cprt_round_trips() {
+        let boxed = super::build_cprt_box(b"eng", "(c) 2026 Example").unwrap();
+        assert_eq!(&boxed[4..8], b"cprt");
+        let mut t = fresh_track();
+        super::parse_cprt(&boxed[8..], &mut t);
+        assert_eq!(t.copyrights.len(), 1);
+        assert_eq!(&t.copyrights[0].language, b"eng");
+        assert_eq!(t.copyrights[0].notice, "(c) 2026 Example");
+    }
+
+    /// An empty notice round-trips while preserving the language.
+    #[test]
+    fn build_cprt_empty_notice() {
+        let boxed = super::build_cprt_box(b"fra", "").unwrap();
+        let mut t = fresh_track();
+        super::parse_cprt(&boxed[8..], &mut t);
+        assert_eq!(&t.copyrights[0].language, b"fra");
+        assert_eq!(t.copyrights[0].notice, "");
+    }
+
+    /// A non-lowercase language byte cannot be encoded into the 5-bit
+    /// field; an embedded NUL in the notice would truncate on re-parse.
+    #[test]
+    fn build_cprt_rejects_bad_inputs() {
+        assert!(super::build_cprt_box(b"EN1", "x").is_none());
+        assert!(super::build_cprt_box(b"eng", "bad\0notice").is_none());
+    }
+
+    /// `build_kind_box` is the byte-exact inverse of `parse_kind`.
+    #[test]
+    fn build_kind_round_trips() {
+        let boxed = super::build_kind_box("urn:mpeg:dash:role:2011", "subtitle").unwrap();
+        assert_eq!(&boxed[4..8], b"kind");
+        let mut t = fresh_track();
+        super::parse_kind(&boxed[8..], &mut t);
+        assert_eq!(t.kinds.len(), 1);
+        assert_eq!(t.kinds[0].0, "urn:mpeg:dash:role:2011");
+        assert_eq!(t.kinds[0].1, "subtitle");
+    }
+
+    /// An empty `value` round-trips (URI-only kind).
+    #[test]
+    fn build_kind_empty_value() {
+        let boxed = super::build_kind_box("urn:scheme", "").unwrap();
+        let mut t = fresh_track();
+        super::parse_kind(&boxed[8..], &mut t);
+        assert_eq!(t.kinds[0].0, "urn:scheme");
+        assert_eq!(t.kinds[0].1, "");
+    }
+
+    /// An empty scheme URI (§8.10.4.3) or an embedded NUL is rejected.
+    #[test]
+    fn build_kind_rejects_bad_inputs() {
+        assert!(super::build_kind_box("", "x").is_none());
+        assert!(super::build_kind_box("urn:a\0b", "x").is_none());
+        assert!(super::build_kind_box("urn:a", "x\0y").is_none());
+    }
+
+    /// `build_tsel_box` is the byte-exact inverse of `parse_tsel`,
+    /// preserving the signed switch_group and the FourCC attribute list.
+    #[test]
+    fn build_tsel_round_trips() {
+        let boxed = super::build_tsel_box(-5, &[*b"bitr", *b"frar"]);
+        assert_eq!(&boxed[4..8], b"tsel");
+        let mut t = fresh_track();
+        super::parse_tsel(&boxed[8..], &mut t);
+        let sel = t.tsel.unwrap();
+        assert_eq!(sel.switch_group, -5);
+        assert_eq!(sel.attribute_list, vec![*b"bitr", *b"frar"]);
     }
 
     /// Multiple `cprt` boxes inside the same track-level `udta` —
