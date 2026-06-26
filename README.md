@@ -371,7 +371,9 @@ Sample-entry FourCCs resolve to these codec ids:
   content description (`cdsc`), font (`font`), hint (`hint`),
   depth / parallax auxiliary video (`vdep` / `vplx`), and hint
   dependency (`hind`) relationships. `track_ID = 0` entries
-  (spec-prohibited) are dropped.
+  (spec-prohibited) are dropped. The write side is
+  `demux::build_tref_box(&[(reference_type, track_IDs)])`, the
+  byte-exact inverse of the parser.
 - Track groups (ISO/IEC 14496-12 §8.3.4, `trgr`): each
   `TrackGroupTypeBox` child inside `trak/trgr` is parsed as a
   `(track_group_type, track_group_id)` pair — the child's FourCC
@@ -392,7 +394,8 @@ Sample-entry FourCCs resolve to these codec ids:
   and silently ignored at this layer; a child whose `version` field
   is non-zero (§8.3.4.2 pins it to 0) is also silently skipped, so
   unknown extensions never mis-parse. Absent `trgr`, none of the
-  keys are emitted.
+  keys are emitted. The write side is
+  `demux::build_trgr_box(&[(track_group_type, track_group_id)])`.
 - Track Kind (ISO/IEC 14496-12 §8.10.4, `kind`): each `KindBox`
   inside a track-level `udta` is parsed as a `(schemeURI, value)`
   pair (both NULL-terminated C strings; an absent value is allowed,
@@ -403,7 +406,8 @@ Sample-entry FourCCs resolve to these codec ids:
   entry is surfaced on `params.options` as `kind_<n>` (0-based
   encounter index); the value is the URI alone when no name
   follows, or `"URI value"` (space-separated, mirroring the
-  `tref_<type>` convention) when both are present.
+  `tref_<type>` convention) when both are present. The write side is
+  `demux::build_kind_box(scheme_uri, value)`.
 - Track copyright (ISO/IEC 14496-12 §8.10.2, `cprt`): each
   `CopyrightBox` inside a track-level `udta` is parsed as a typed
   record carrying a 3-letter ISO 639-2/T language code and a decoded
@@ -423,7 +427,8 @@ Sample-entry FourCCs resolve to these codec ids:
   box is informational and a malformed entry never aborts the open.
   Distinct from the 3GPP TS 26.244 `cprt` shape lumped under the
   generic file-wide metadata channel, where the language code is
-  not surfaced separately.
+  not surfaced separately. The write side is
+  `demux::build_cprt_box(language, notice)`.
 - Track selection (ISO/IEC 14496-12 §8.10.3, `tsel`): the optional
   `TrackSelectionBox` inside a track-level `udta` carries two
   media-selection signals — `switch_group` (signed 32-bit, §8.10.3.4)
@@ -444,7 +449,8 @@ Sample-entry FourCCs resolve to these codec ids:
   informational and a malformed entry never aborts the open.
   Container preserves the raw FourCCs; consumer mapping (e.g. a
   player selecting by language vs. bitrate within an alternate
-  group) is delegated. Absent `tsel`, no keys are emitted.
+  group) is delegated. Absent `tsel`, no keys are emitted. The write
+  side is `demux::build_tsel_box(switch_group, attribute_list)`.
 - Sub tracks (ISO/IEC 14496-12 §8.14, `strk` / `stri` / `strd` /
   `stsg`): a track-level `udta` may carry zero or more `strk` Sub
   Track boxes (§8.14.3), each assigning *part* of the track to the
@@ -474,7 +480,10 @@ Sample-entry FourCCs resolve to these codec ids:
   `stri` / `stsg`, a too-short `stri`, or a `stsg` whose declared
   `item_count` overruns the body are rejected — the boxes are
   informational and a malformed entry never aborts the open. Absent
-  `strk`, no keys are emitted.
+  `strk`, no keys are emitted. The write side is
+  `demux::build_strk_box(switch_group, alternate_group, sub_track_id,
+  attribute_list, sample_groups)` (with `build_stri_box` /
+  `build_stsg_box` exposed for the individual children).
 - Hint media header (ISO/IEC 14496-12 §12.4.2, `hmhd`): a hint
   track's `minf/hmhd` HintMediaHeaderBox carries protocol-independent
   streaming statistics for the packetised stream the hint track
@@ -768,6 +777,9 @@ Sample-entry FourCCs resolve to these codec ids:
   (decimal for everything except `csp`, which is lowercase 8-digit
   hex). The trailing colon and per-sub-sample list are omitted when an
   entry has `subsample_count = 0`. Absent `subs`, no keys are emitted.
+  The typed records (`demux::SubsBox` / `SubsEntry` / `SubSampleEntry`)
+  are public, with a `demux::parse_subs_box` decoder and a byte-exact
+  `demux::build_subs_box` builder.
 - Sample auxiliary information sizes + offsets (ISO/IEC 14496-12
   §8.7.8–9, `saiz` + `saio`): a track's `stbl/saiz` + `stbl/saio` pair
   documents where per-sample auxiliary-information records live in the
@@ -798,7 +810,10 @@ Sample-entry FourCCs resolve to these codec ids:
   preserved as `tfhd.base_data_offset`-relative per §8.8.14) are
   reachable through the public `Mp4Demuxer::sai_records()` accessor on
   the demuxer (downcast). Absent `saiz` / `saio`, no keys are emitted
-  and `sai_records()` is empty.
+  and `sai_records()` is empty. The typed records (`demux::SaizBox` /
+  `SaioBox`) are public, with `demux::parse_saiz_box` / `parse_saio_box`
+  decoders and byte-exact `demux::build_saiz_box` / `build_saio_box`
+  builders.
 - Fragment-local sample groups (ISO/IEC 14496-12 §8.9.2 / §8.9.3 /
   §8.9.5 inside `traf`): a movie fragment may carry its own `sgpd`
   description table plus `sbgp` / `csgp` per-sample maps, so a
@@ -846,7 +861,9 @@ Sample-entry FourCCs resolve to these codec ids:
   `ntp_timestamp`, `media_time`, `version`, `flags`) directly, with
   `is_encoder_input_output()` / `is_finalization_time()` /
   `is_file_write_time()` / `is_arbitrary_association()` /
-  `is_realtime_offset()` accessors for the 2022 flag bits.
+  `is_realtime_offset()` accessors for the 2022 flag bits. A standalone
+  `demux::build_prft_box(&PrftRecord)` builder (byte-exact inverse,
+  v0/v1) complements the fragmented muxer's per-segment `prft` emission.
 - Progressive download information (ISO/IEC 14496-12 §8.1.3, `pdin`): a
   top-level `FullBox(version = 0, flags = 0)` whose body is a sequence
   of `(rate, initial_delay)` u32 pairs (big-endian) — for each effective
@@ -878,7 +895,8 @@ Sample-entry FourCCs resolve to these codec ids:
   preamble likewise fails the open. The version byte is tolerated even
   if the producer wrote a non-zero value (the spec pins it to 0 but
   the payload layout is unambiguous), matching `parse_padb` /
-  `parse_stdp` posture for FullBox version-bit slips.
+  `parse_stdp` posture for FullBox version-bit slips. The write side is
+  `demux::build_pdin_box(&PdinRecord)`, the byte-exact inverse.
 - Level assignment (ISO/IEC 14496-12 §8.8.13, `leva`): a `FullBox(0, 0)`
   inside `mvex` whose body opens with `unsigned int(8) level_count`
   and is followed by `level_count` per-level entries. Each entry maps
