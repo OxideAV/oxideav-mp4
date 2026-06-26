@@ -4179,6 +4179,38 @@ fn parse_tref(body: &[u8], t: &mut Track) -> Result<()> {
     Ok(())
 }
 
+/// Serialise a `tref` (TrackReferenceBox, ISO/IEC 14496-12 §8.3.3) from a
+/// list of `(reference_type, track_IDs)` pairs — the byte-exact inverse of
+/// [`parse_tref`].
+///
+/// The outer `tref` is a plain container box (no FullBox version/flags).
+/// Each pair becomes one `TrackReferenceTypeBox` whose FourCC is the
+/// `reference_type` and whose body is the packed big-endian `track_ID`
+/// array (§8.3.3.2). The pairs are emitted in the supplied order; a given
+/// `reference_type` should appear at most once (the spec permits one
+/// `TrackReferenceTypeBox` per type) but this builder does not enforce
+/// uniqueness — that is the caller's responsibility.
+///
+/// Per §8.3.3.3 a `track_ID` is "never zero"; a pair carrying a zero ID is
+/// rejected (a zero would be silently dropped by [`parse_tref`], breaking
+/// round-trip). An empty `track_IDs` array for a type is permitted (the
+/// box is legal but references nothing). Returns `None` if any pair
+/// carries a zero `track_ID`.
+pub fn build_tref_box(refs: &[([u8; 4], Vec<u32>)]) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    for (ref_type, ids) in refs {
+        let mut child = Vec::with_capacity(ids.len() * 4);
+        for &id in ids {
+            if id == 0 {
+                return None;
+            }
+            child.extend_from_slice(&id.to_be_bytes());
+        }
+        body.extend_from_slice(&wrap_box(ref_type, &child));
+    }
+    Some(wrap_box(&crate::boxes::TREF, &body))
+}
+
 /// §8.3.4 — `trgr` (TrackGroupBox).
 ///
 /// Spec syntax (§8.3.4.2):
@@ -11694,6 +11726,53 @@ mod tests {
         let mut t = fresh_track();
         super::parse_tref(&[], &mut t).unwrap();
         assert!(t.tref.is_empty());
+    }
+
+    /// `build_tref_box` is the byte-exact inverse of `parse_tref`: a
+    /// multi-type reference set re-parses to the same `(type, ids)` pairs.
+    #[test]
+    fn build_tref_round_trips_multiple_types() {
+        let refs = vec![
+            (*b"subt", vec![4u32, 5]),
+            (*b"cdsc", vec![2u32]),
+            (*b"chap", vec![3u32]),
+        ];
+        let boxed = super::build_tref_box(&refs).unwrap();
+        // Outer box is a plain `tref` container (8-byte header).
+        assert_eq!(&boxed[4..8], b"tref");
+        let mut t = fresh_track();
+        super::parse_tref(&boxed[8..], &mut t).unwrap();
+        assert_eq!(t.tref, refs);
+    }
+
+    /// An empty `track_IDs` array for a type is legal (box references
+    /// nothing) and round-trips to an empty list.
+    #[test]
+    fn build_tref_empty_id_array() {
+        let refs = vec![(*b"hint", Vec::<u32>::new())];
+        let boxed = super::build_tref_box(&refs).unwrap();
+        let mut t = fresh_track();
+        super::parse_tref(&boxed[8..], &mut t).unwrap();
+        // An all-empty child contributes a `(type, [])` pair.
+        assert_eq!(t.tref.len(), 1);
+        assert_eq!(&t.tref[0].0, b"hint");
+        assert!(t.tref[0].1.is_empty());
+    }
+
+    /// §8.3.3.3 — a zero `track_ID` is rejected (it would be dropped by
+    /// the parser, breaking round-trip).
+    #[test]
+    fn build_tref_rejects_zero_id() {
+        let refs = vec![(*b"font", vec![0u32])];
+        assert!(super::build_tref_box(&refs).is_none());
+    }
+
+    /// No reference pairs yields a bare empty `tref` container.
+    #[test]
+    fn build_tref_empty_set() {
+        let boxed = super::build_tref_box(&[]).unwrap();
+        assert_eq!(boxed.len(), 8);
+        assert_eq!(&boxed[4..8], b"tref");
     }
 
     /// Track references surface on `StreamInfo.params.options` as
