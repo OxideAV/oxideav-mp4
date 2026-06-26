@@ -2675,6 +2675,11 @@ pub struct MetaItems {
     /// to the start of this buffer (the §8.11.3.3 idat data origin).
     /// Empty when no `idat` box is present.
     pub idat: Vec<u8>,
+    /// `fiin` (FD Item Information Box, §8.13.2), if present. Carries the
+    /// File Delivery partitioning (`paen` → `fpar`/`fecr`/`fire`) plus the
+    /// optional FD session-group (`segr`) and group-name (`gitn`) boxes.
+    /// `None` for a non-FD `meta` (the common HEIF / iTunes case).
+    pub fiin: Option<crate::fd::FiinBox>,
 }
 
 /// A resolved byte range for one item extent, relative to a data origin
@@ -2701,6 +2706,7 @@ impl MetaItems {
             && self.iinf.is_none()
             && self.iref.is_none()
             && self.idat.is_empty()
+            && self.fiin.is_none()
     }
 
     /// Look up an item's `iloc` location record by item ID.
@@ -3106,6 +3112,8 @@ pub fn parse_meta_items(body: &[u8]) -> MetaItems {
             // §8.11.11 ItemDataBox — raw bytes; the data origin for
             // construction_method 1 (idat) items.
             IDAT => out.idat = child.to_vec(),
+            // §8.13.2 FD Item Information Box — File Delivery partitioning.
+            FIIN => out.fiin = crate::fd::parse_fiin_box(child),
             _ => {}
         }
     }
@@ -3155,6 +3163,28 @@ fn surface_meta_items(m: &MetaItems, metadata: &mut Vec<(String, String)>) {
     }
     if !m.idat.is_empty() {
         metadata.push(("meta_idat_len".to_string(), m.idat.len().to_string()));
+    }
+    if let Some(fiin) = m.fiin.as_ref() {
+        // §8.13.2 FD Item Information — surface the partition-entry count
+        // plus whether the optional session-group / group-name boxes are
+        // present, so an FD-aware consumer can spot the box without
+        // reaching into the typed `MetaItems::fiin`.
+        metadata.push((
+            "meta_fiin_partitions".to_string(),
+            fiin.partition_entries.len().to_string(),
+        ));
+        if let Some(segr) = fiin.session_info.as_ref() {
+            metadata.push((
+                "meta_fiin_session_groups".to_string(),
+                segr.session_groups.len().to_string(),
+            ));
+        }
+        if let Some(gitn) = fiin.group_id_to_name.as_ref() {
+            metadata.push((
+                "meta_fiin_group_names".to_string(),
+                gitn.entries.len().to_string(),
+            ));
+        }
     }
 }
 
@@ -17353,6 +17383,59 @@ mod tests {
         assert_eq!(&mi.iinf.as_ref().unwrap().entries[0].item_type, b"hvc1");
         assert_eq!(mi.iref.as_ref().unwrap().references.len(), 1);
         assert!(!mi.is_empty());
+    }
+
+    #[test]
+    fn meta_walk_surfaces_fiin_fd_item_info() {
+        use crate::fd::{FiinBox, FparBox, PartitionEntry};
+
+        // hdlr(`fdel`) + a fiin built via the fd builders.
+        let mut hdlr = vec![0u8, 0, 0, 0];
+        hdlr.extend_from_slice(&[0, 0, 0, 0]);
+        hdlr.extend_from_slice(b"fdel");
+        hdlr.extend_from_slice(&[0u8; 12]);
+        hdlr.push(0);
+        let hdlr = box_bytes(b"hdlr", &hdlr);
+
+        let fiin = FiinBox {
+            partition_entries: vec![PartitionEntry {
+                fpar: Some(FparBox {
+                    version: 0,
+                    item_id: 1,
+                    packet_payload_size: 1400,
+                    fec_encoding_id: 0,
+                    fec_instance_id: 0,
+                    max_source_block_length: 16,
+                    encoding_symbol_length: 1024,
+                    max_number_of_encoding_symbols: 16,
+                    scheme_specific_info: String::new(),
+                    entries: vec![],
+                }),
+                fecr: None,
+                fire: None,
+            }],
+            session_info: None,
+            group_id_to_name: None,
+        };
+        let fiin_bytes = crate::fd::build_fiin_box(&fiin);
+
+        let mut meta = vec![0u8, 0, 0, 0];
+        meta.extend_from_slice(&hdlr);
+        meta.extend_from_slice(&fiin_bytes);
+
+        let mi = super::parse_meta_items(&meta);
+        assert_eq!(&mi.handler_type, b"fdel");
+        let parsed = mi.fiin.as_ref().expect("fiin parsed");
+        assert_eq!(parsed.partition_entries.len(), 1);
+        assert_eq!(parsed, &fiin);
+        assert!(!mi.is_empty());
+
+        // The flat metadata surface carries the partition count.
+        let mut kv = Vec::new();
+        super::surface_meta_items(&mi, &mut kv);
+        assert!(kv
+            .iter()
+            .any(|(k, v)| k == "meta_fiin_partitions" && v == "1"));
     }
 
     #[test]

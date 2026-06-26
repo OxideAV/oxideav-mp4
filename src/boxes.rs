@@ -351,6 +351,52 @@ pub const IREF: [u8; 4] = fourcc("iref");
 /// `meta` box; quantity zero or one. Holds the bytes of items whose
 /// `iloc` construction_method is 1 (idat-relative).
 pub const IDAT: [u8; 4] = fourcc("idat");
+/// `meco` — Additional Metadata Container Box (ISO/IEC 14496-12 §8.11.7).
+/// Sits at File / `moov` / `trak` level; quantity zero or one. Holds one
+/// or more additional `meta` boxes (each with a distinct handler type)
+/// that complement the primary `meta`, plus zero or more `mere` relation
+/// boxes. The box body is just a sequence of child boxes.
+pub const MECO: [u8; 4] = fourcc("meco");
+/// `mere` — Metabox Relation Box (ISO/IEC 14496-12 §8.11.8). Sits inside
+/// a `meco`; quantity zero or more. FullBox(version=0) body is two 32-bit
+/// handler-type codes plus a 1-byte relation enum (1..=5) describing how
+/// the two same-level `meta` boxes relate.
+pub const MERE: [u8; 4] = fourcc("mere");
+/// `fiin` — FD Item Information Box (ISO/IEC 14496-12 §8.13.2). Sits
+/// inside a `meta` box; quantity zero or one. FullBox(version=0) carrying
+/// a 16-bit `entry_count` of `paen` PartitionEntry boxes, optionally
+/// followed by a `segr` session-group box and a `gitn` group-id-to-name
+/// box.
+pub const FIIN: [u8; 4] = fourcc("fiin");
+/// `paen` — Partition Entry Box (ISO/IEC 14496-12 §8.13.2). Sits inside
+/// `fiin`; a plain Box wrapping one mandatory `fpar`, an optional `fecr`,
+/// and an optional `fire`.
+pub const PAEN: [u8; 4] = fourcc("paen");
+/// `fpar` — File Partition Box (ISO/IEC 14496-12 §8.13.3). Sits inside
+/// `paen`; mandatory, exactly one. FullBox(version 0/1) describing the
+/// FEC partitioning of a source file into source blocks and symbols.
+pub const FPAR: [u8; 4] = fourcc("fpar");
+/// `fecr` — FEC Reservoir Box (ISO/IEC 14496-12 §8.13.4). Sits inside
+/// `paen`; zero or one. FullBox(version 0/1) listing (item_ID,
+/// symbol_count) pairs for the FEC reservoirs of each source block.
+pub const FECR: [u8; 4] = fourcc("fecr");
+/// `segr` — FD Session Group Box (ISO/IEC 14496-12 §8.13.5). Sits inside
+/// `fiin`; zero or one. Plain Box listing session groups, each with a set
+/// of file-group IDs and a list of FD hint-track IDs.
+pub const SEGR: [u8; 4] = fourcc("segr");
+/// `gitn` — Group ID to Name Box (ISO/IEC 14496-12 §8.13.6). Sits inside
+/// `fiin`; zero or one. FullBox(version=0) mapping file-group IDs to
+/// NULL-terminated UTF-8 group names.
+pub const GITN: [u8; 4] = fourcc("gitn");
+/// `fire` — File Reservoir Box (ISO/IEC 14496-12 §8.13.7). Sits inside
+/// `paen`; zero or one. FullBox(version 0/1) listing (item_ID,
+/// symbol_count) pairs for the File reservoirs of each source block.
+pub const FIRE: [u8; 4] = fourcc("fire");
+/// `feci` — FEC Information Box (ISO/IEC 14496-12 §9.2.4.7). Sits inside
+/// an `extr` Extra Data Box of an FD hint-track sample; zero or one.
+/// Plain Box carrying FEC_encoding_ID, FEC_instance_ID,
+/// source_block_number and encoding_symbol_ID for one FD packet.
+pub const FECI: [u8; 4] = fourcc("feci");
 /// `kind` — Track Kind Box (ISO/IEC 14496-12 §8.10.4). Sits inside a
 /// track-level `udta` and labels the track's role with a (schemeURI,
 /// value) pair. Both strings are NULL-terminated C strings; `value`
