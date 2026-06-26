@@ -4104,6 +4104,83 @@ fn parse_stsg(body: &[u8]) -> Option<SubTrackSampleGroup> {
     })
 }
 
+/// Serialise an `stsg` (SubTrackSampleGroupBox, ISO/IEC 14496-12 §8.14.6)
+/// — the byte-exact inverse of [`parse_stsg`] (FullBox version 0, flags 0).
+///
+/// Layout: 4-byte FullBox preamble, 4-byte `grouping_type` FourCC, 2-byte
+/// big-endian `item_count` (= `indices.len()`), then `item_count` 4-byte
+/// big-endian `group_description_index` values (§8.14.6.2).
+///
+/// Returns `None` if `indices.len()` exceeds `u16::MAX` (the on-wire
+/// `item_count` is 16-bit).
+pub fn build_stsg_box(grouping_type: &[u8; 4], indices: &[u32]) -> Option<Vec<u8>> {
+    let item_count: u16 = indices.len().try_into().ok()?;
+    let mut body = Vec::with_capacity(6 + indices.len() * 4);
+    body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+    body.extend_from_slice(grouping_type);
+    body.extend_from_slice(&item_count.to_be_bytes());
+    for &idx in indices {
+        body.extend_from_slice(&idx.to_be_bytes());
+    }
+    Some(wrap_box(&STSG, &body))
+}
+
+/// Serialise an `stri` (SubTrackInformationBox, ISO/IEC 14496-12 §8.14.4)
+/// — the byte-exact inverse of [`parse_stri`] (FullBox version 0, flags 0).
+///
+/// Layout: 4-byte FullBox preamble, 2-byte signed `switch_group`, 2-byte
+/// signed `alternate_group`, 4-byte unsigned `sub_track_ID`, then the
+/// `attribute_list` as a sequence of 4-byte FourCCs to the end of the box
+/// (§8.14.4.2).
+pub fn build_stri_box(
+    switch_group: i16,
+    alternate_group: i16,
+    sub_track_id: u32,
+    attribute_list: &[[u8; 4]],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12 + attribute_list.len() * 4);
+    body.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+    body.extend_from_slice(&switch_group.to_be_bytes());
+    body.extend_from_slice(&alternate_group.to_be_bytes());
+    body.extend_from_slice(&sub_track_id.to_be_bytes());
+    for attr in attribute_list {
+        body.extend_from_slice(attr);
+    }
+    wrap_box(&STRI, &body)
+}
+
+/// Serialise a complete `strk` (SubTrackBox, ISO/IEC 14496-12 §8.14.3)
+/// from its mandatory `stri` selection fields plus zero or more
+/// `(grouping_type, group_description_indices)` sample groups.
+///
+/// The `strk` is a plain container box (§8.14.3.2). It holds the mandatory
+/// `stri` (§8.14.4) followed — when `sample_groups` is non-empty — by a
+/// single `strd` (SubTrackDefinitionBox, §8.14.5) wrapping one `stsg`
+/// (§8.14.6) per `(grouping_type, indices)` pair, in supplied order. When
+/// `sample_groups` is empty no `strd` is emitted (the box is optional and
+/// would otherwise be a content-free container). The result re-parses
+/// through [`parse_strk`] to the same sub-track record.
+///
+/// Returns `None` if any sample group's index list exceeds the 16-bit
+/// `item_count` cap (propagated from [`build_stsg_box`]).
+pub fn build_strk_box(
+    switch_group: i16,
+    alternate_group: i16,
+    sub_track_id: u32,
+    attribute_list: &[[u8; 4]],
+    sample_groups: &[([u8; 4], Vec<u32>)],
+) -> Option<Vec<u8>> {
+    let mut body = build_stri_box(switch_group, alternate_group, sub_track_id, attribute_list);
+    if !sample_groups.is_empty() {
+        let mut strd_body = Vec::new();
+        for (grouping_type, indices) in sample_groups {
+            strd_body.extend_from_slice(&build_stsg_box(grouping_type, indices)?);
+        }
+        body.extend_from_slice(&wrap_box(&STRD, &strd_body));
+    }
+    Some(wrap_box(&STRK, &body))
+}
+
 /// §8.3.2 — `tkhd` (TrackHeaderBox). We only need `track_ID` for
 /// fragmented-MP4 traf-to-track matching; the matrix / w/h preview
 /// fields are the visual entry's job.
@@ -12977,6 +13054,74 @@ mod tests {
         let mut t = fresh_track();
         super::parse_strk(&strk, &mut t);
         assert!(t.sub_tracks.is_empty());
+    }
+
+    /// `build_stsg_box` is the byte-exact inverse of `parse_stsg`.
+    #[test]
+    fn build_stsg_round_trips() {
+        let boxed = super::build_stsg_box(b"tele", &[1, 2, 3]).unwrap();
+        assert_eq!(&boxed[4..8], b"stsg");
+        let sg = super::parse_stsg(&boxed[8..]).unwrap();
+        assert_eq!(&sg.grouping_type, b"tele");
+        assert_eq!(sg.group_description_indices, vec![1, 2, 3]);
+    }
+
+    /// An empty index list yields `item_count == 0`.
+    #[test]
+    fn build_stsg_empty_indices() {
+        let boxed = super::build_stsg_box(b"roll", &[]).unwrap();
+        let sg = super::parse_stsg(&boxed[8..]).unwrap();
+        assert_eq!(&sg.grouping_type, b"roll");
+        assert!(sg.group_description_indices.is_empty());
+    }
+
+    /// `build_stri_box` is the byte-exact inverse of `parse_stri`,
+    /// including signed group fields and the FourCC attribute list.
+    #[test]
+    fn build_stri_round_trips() {
+        let boxed = super::build_stri_box(-2, 7, 9, &[*b"tesc", *b"bitr"]);
+        assert_eq!(&boxed[4..8], b"stri");
+        let st = super::parse_stri(&boxed[8..]).unwrap();
+        assert_eq!(st.switch_group, -2);
+        assert_eq!(st.alternate_group, 7);
+        assert_eq!(st.sub_track_id, 9);
+        assert_eq!(st.attribute_list, vec![*b"tesc", *b"bitr"]);
+    }
+
+    /// `build_strk_box` composes a full `strk` (stri + strd/stsg) that
+    /// re-parses through `parse_strk` to the same sub-track record.
+    #[test]
+    fn build_strk_full_round_trips() {
+        let groups = vec![(*b"tele", vec![1u32, 2]), (*b"roll", vec![4u32])];
+        let boxed = super::build_strk_box(2, 2, 5, &[*b"tesc"], &groups).unwrap();
+        assert_eq!(&boxed[4..8], b"strk");
+        let mut t = fresh_track();
+        super::parse_strk(&boxed[8..], &mut t);
+        assert_eq!(t.sub_tracks.len(), 1);
+        let st = &t.sub_tracks[0];
+        assert_eq!(st.switch_group, 2);
+        assert_eq!(st.alternate_group, 2);
+        assert_eq!(st.sub_track_id, 5);
+        assert_eq!(st.attribute_list, vec![*b"tesc"]);
+        assert_eq!(st.sample_groups.len(), 2);
+        assert_eq!(&st.sample_groups[0].grouping_type, b"tele");
+        assert_eq!(st.sample_groups[0].group_description_indices, vec![1, 2]);
+        assert_eq!(&st.sample_groups[1].grouping_type, b"roll");
+        assert_eq!(st.sample_groups[1].group_description_indices, vec![4]);
+    }
+
+    /// With no sample groups, `build_strk_box` emits a `stri`-only `strk`
+    /// (no empty `strd` container).
+    #[test]
+    fn build_strk_stri_only_omits_strd() {
+        let boxed = super::build_strk_box(1, 0, 3, &[], &[]).unwrap();
+        let mut t = fresh_track();
+        super::parse_strk(&boxed[8..], &mut t);
+        assert_eq!(t.sub_tracks.len(), 1);
+        assert_eq!(t.sub_tracks[0].sub_track_id, 3);
+        assert!(t.sub_tracks[0].sample_groups.is_empty());
+        // The only child is the `stri` box: no `strd` container present.
+        assert!(!boxed.windows(4).any(|w| w == b"strd"));
     }
 
     /// Multiple `strk` boxes per track (§8.14.3.1 "Zero or more") are all
