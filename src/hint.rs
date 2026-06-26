@@ -329,6 +329,175 @@ pub fn build_mpeg2ts_hint_sample_entry(e: &Mpeg2TsHintSampleEntry) -> Vec<u8> {
     wrap(&e.format, &body)
 }
 
+/// One `maxr` (max data rate) entry of a `hinf` (ISO/IEC 14496-12
+/// §9.1.5): the maximum bytes sent in any `period`-millisecond window.
+/// `hinf` may carry several `maxr` boxes for different periods.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaxRate {
+    /// Window length in milliseconds.
+    pub period: u32,
+    /// Max bytes sent in any window of that length (including RTP
+    /// headers).
+    pub bytes: u32,
+}
+
+/// A `payt` (payload ID) entry of a `hinf` (§9.1.5): the RTP payload ID
+/// and its `rtpmap` string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayloadId {
+    /// Payload ID used in the RTP packets.
+    pub payload_id: u32,
+    /// The `rtpmap` string (length-prefixed on the wire by an 8-bit
+    /// count; stored decoded).
+    pub rtpmap: String,
+}
+
+/// Decoded `hinf` Hint Statistics Box (ISO/IEC 14496-12 §9.1.5). A
+/// container in a hint track's `udta` holding optional statistic
+/// sub-boxes (total bytes/packets sent, media/immediate/repeated byte
+/// counts, relative-time extremes, largest-packet sizes, and per-payload
+/// rtpmap entries). Every field is `None` / empty when its sub-box was
+/// absent — "not all these sub-boxes may be present" (§9.1.5).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HintStatistics {
+    /// `trpy` — total bytes sent including 12-byte RTP headers (u64).
+    pub bytes_sent_with_rtp_64: Option<u64>,
+    /// `nump` — total packets sent (u64).
+    pub packets_sent_64: Option<u64>,
+    /// `tpyl` — total bytes sent excluding RTP headers (u64).
+    pub bytes_sent_no_rtp_64: Option<u64>,
+    /// `totl` — total bytes sent including RTP headers (u32 variant).
+    pub bytes_sent_with_rtp_32: Option<u32>,
+    /// `npck` — total packets sent (u32 variant).
+    pub packets_sent_32: Option<u32>,
+    /// `tpay` — total bytes sent excluding RTP headers (u32 variant).
+    pub bytes_sent_no_rtp_32: Option<u32>,
+    /// `maxr` — max-rate windows (zero or more).
+    pub max_rates: Vec<MaxRate>,
+    /// `dmed` — total bytes sent from media tracks (u64).
+    pub media_bytes_sent: Option<u64>,
+    /// `dimm` — total bytes sent in immediate mode (u64).
+    pub immediate_bytes_sent: Option<u64>,
+    /// `drep` — total bytes in repeated packets (u64).
+    pub repeated_bytes_sent: Option<u64>,
+    /// `tmin` — smallest relative transmission time, ms (signed).
+    pub min_relative_time: Option<i32>,
+    /// `tmax` — largest relative transmission time, ms (signed).
+    pub max_relative_time: Option<i32>,
+    /// `pmax` — largest packet sent including RTP header (bytes).
+    pub largest_packet: Option<u32>,
+    /// `dmax` — longest packet duration, ms.
+    pub longest_packet: Option<u32>,
+    /// `payt` — payload-ID / rtpmap entries (zero or more).
+    pub payload_ids: Vec<PayloadId>,
+}
+
+impl HintStatistics {
+    /// True when no statistic sub-box was present.
+    pub fn is_empty(&self) -> bool {
+        *self == HintStatistics::default()
+    }
+}
+
+fn rd_u64(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    if *pos + 8 > buf.len() {
+        return None;
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&buf[*pos..*pos + 8]);
+    *pos += 8;
+    Some(u64::from_be_bytes(a))
+}
+
+/// Parse a `hinf` body (the bytes after the `[size][hinf]` header). The
+/// `hinf` itself is a plain container; this walks its statistic
+/// sub-boxes. Unknown / malformed sub-boxes are skipped.
+pub fn parse_hinf_box(body: &[u8]) -> HintStatistics {
+    let mut out = HintStatistics::default();
+    each_child(body, |fourcc, child| {
+        let mut p = 0usize;
+        match &fourcc {
+            b"trpy" => out.bytes_sent_with_rtp_64 = rd_u64(child, &mut p),
+            b"nump" => out.packets_sent_64 = rd_u64(child, &mut p),
+            b"tpyl" => out.bytes_sent_no_rtp_64 = rd_u64(child, &mut p),
+            b"totl" => out.bytes_sent_with_rtp_32 = rd_u32(child, &mut p),
+            b"npck" => out.packets_sent_32 = rd_u32(child, &mut p),
+            b"tpay" => out.bytes_sent_no_rtp_32 = rd_u32(child, &mut p),
+            b"maxr" => {
+                if let (Some(period), Some(bytes)) = (rd_u32(child, &mut p), rd_u32(child, &mut p))
+                {
+                    out.max_rates.push(MaxRate { period, bytes });
+                }
+            }
+            b"dmed" => out.media_bytes_sent = rd_u64(child, &mut p),
+            b"dimm" => out.immediate_bytes_sent = rd_u64(child, &mut p),
+            b"drep" => out.repeated_bytes_sent = rd_u64(child, &mut p),
+            b"tmin" => out.min_relative_time = rd_u32(child, &mut p).map(|v| v as i32),
+            b"tmax" => out.max_relative_time = rd_u32(child, &mut p).map(|v| v as i32),
+            b"pmax" => out.largest_packet = rd_u32(child, &mut p),
+            b"dmax" => out.longest_packet = rd_u32(child, &mut p),
+            b"payt" => {
+                if let Some(payload_id) = rd_u32(child, &mut p) {
+                    // count(8) + rtpmap_string[count].
+                    if p < child.len() {
+                        let count = child[p] as usize;
+                        p += 1;
+                        let end = (p + count).min(child.len());
+                        let rtpmap = String::from_utf8_lossy(&child[p..end]).into_owned();
+                        out.payload_ids.push(PayloadId { payload_id, rtpmap });
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
+    out
+}
+
+/// Serialise a `hinf` Hint Statistics Box. Emits only the sub-boxes whose
+/// corresponding field is present, in the §9.1.5 declaration order. The
+/// byte-exact inverse of [`parse_hinf_box`] for any record it produced.
+pub fn build_hinf_box(s: &HintStatistics) -> Vec<u8> {
+    fn emit_u64(body: &mut Vec<u8>, fourcc: &[u8; 4], v: Option<u64>) {
+        if let Some(v) = v {
+            body.extend_from_slice(&wrap(fourcc, &v.to_be_bytes()));
+        }
+    }
+    fn emit_u32(body: &mut Vec<u8>, fourcc: &[u8; 4], v: Option<u32>) {
+        if let Some(v) = v {
+            body.extend_from_slice(&wrap(fourcc, &v.to_be_bytes()));
+        }
+    }
+    let mut body = Vec::new();
+    emit_u64(&mut body, b"trpy", s.bytes_sent_with_rtp_64);
+    emit_u64(&mut body, b"nump", s.packets_sent_64);
+    emit_u64(&mut body, b"tpyl", s.bytes_sent_no_rtp_64);
+    emit_u32(&mut body, b"totl", s.bytes_sent_with_rtp_32);
+    emit_u32(&mut body, b"npck", s.packets_sent_32);
+    emit_u32(&mut body, b"tpay", s.bytes_sent_no_rtp_32);
+    for m in &s.max_rates {
+        let mut b = Vec::with_capacity(8);
+        b.extend_from_slice(&m.period.to_be_bytes());
+        b.extend_from_slice(&m.bytes.to_be_bytes());
+        body.extend_from_slice(&wrap(b"maxr", &b));
+    }
+    emit_u64(&mut body, b"dmed", s.media_bytes_sent);
+    emit_u64(&mut body, b"dimm", s.immediate_bytes_sent);
+    emit_u64(&mut body, b"drep", s.repeated_bytes_sent);
+    emit_u32(&mut body, b"tmin", s.min_relative_time.map(|v| v as u32));
+    emit_u32(&mut body, b"tmax", s.max_relative_time.map(|v| v as u32));
+    emit_u32(&mut body, b"pmax", s.largest_packet);
+    emit_u32(&mut body, b"dmax", s.longest_packet);
+    for pid in &s.payload_ids {
+        let mut b = Vec::new();
+        b.extend_from_slice(&pid.payload_id.to_be_bytes());
+        b.push(pid.rtpmap.len() as u8);
+        b.extend_from_slice(pid.rtpmap.as_bytes());
+        body.extend_from_slice(&wrap(b"payt", &b));
+    }
+    wrap(&HINF, &body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +677,91 @@ mod tests {
         short.extend_from_slice(&1u16.to_be_bytes()); // version
         short.extend_from_slice(&1u16.to_be_bytes()); // highest
         assert!(parse_mpeg2ts_hint_sample_entry(*b"sm2t", &short).is_none());
+    }
+
+    #[test]
+    fn hinf_full_round_trips() {
+        let s = HintStatistics {
+            bytes_sent_with_rtp_64: Some(1_000_000),
+            packets_sent_64: Some(5000),
+            bytes_sent_no_rtp_64: Some(940_000),
+            bytes_sent_with_rtp_32: Some(123),
+            packets_sent_32: Some(7),
+            bytes_sent_no_rtp_32: Some(99),
+            max_rates: vec![
+                MaxRate {
+                    period: 1000,
+                    bytes: 64_000,
+                },
+                MaxRate {
+                    period: 2000,
+                    bytes: 120_000,
+                },
+            ],
+            media_bytes_sent: Some(800_000),
+            immediate_bytes_sent: Some(50_000),
+            repeated_bytes_sent: Some(10_000),
+            min_relative_time: Some(-50),
+            max_relative_time: Some(50),
+            largest_packet: Some(1452),
+            longest_packet: Some(33),
+            payload_ids: vec![PayloadId {
+                payload_id: 96,
+                rtpmap: "H264/90000".to_string(),
+            }],
+        };
+        let bytes = build_hinf_box(&s);
+        let body = unwrap_box(&bytes, b"hinf");
+        assert_eq!(parse_hinf_box(body), s);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn hinf_partial_round_trips() {
+        // Only a couple of sub-boxes present — the rest stay None/empty.
+        let s = HintStatistics {
+            bytes_sent_with_rtp_64: Some(42),
+            packets_sent_64: Some(1),
+            ..HintStatistics::default()
+        };
+        let bytes = build_hinf_box(&s);
+        let body = unwrap_box(&bytes, b"hinf");
+        let parsed = parse_hinf_box(body);
+        assert_eq!(parsed, s);
+        assert_eq!(parsed.bytes_sent_with_rtp_64, Some(42));
+        assert!(parsed.bytes_sent_no_rtp_64.is_none());
+        assert!(parsed.max_rates.is_empty());
+    }
+
+    #[test]
+    fn hinf_empty_body_is_empty() {
+        assert!(parse_hinf_box(&[]).is_empty());
+    }
+
+    #[test]
+    fn hinf_multiple_maxr_preserved() {
+        let s = HintStatistics {
+            max_rates: vec![
+                MaxRate {
+                    period: 100,
+                    bytes: 10,
+                },
+                MaxRate {
+                    period: 200,
+                    bytes: 20,
+                },
+                MaxRate {
+                    period: 300,
+                    bytes: 30,
+                },
+            ],
+            ..HintStatistics::default()
+        };
+        let bytes = build_hinf_box(&s);
+        let body = unwrap_box(&bytes, b"hinf");
+        let parsed = parse_hinf_box(body);
+        assert_eq!(parsed.max_rates.len(), 3);
+        assert_eq!(parsed.max_rates[2].period, 300);
     }
 
     #[test]

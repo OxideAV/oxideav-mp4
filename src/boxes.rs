@@ -438,6 +438,11 @@ pub const SM2T: [u8; 4] = fourcc("sm2t");
 /// §9.3.3.2). Same MPEG2TSSampleEntry body as `sm2t`; a distinct FourCC
 /// for reception hint tracks.
 pub const RM2T: [u8; 4] = fourcc("rm2t");
+/// `hinf` — Hint Statistics Box (ISO/IEC 14496-12 §9.1.5). A container in
+/// a hint track's `udta` holding optional statistic sub-boxes (`trpy` /
+/// `nump` / `tpyl` / `maxr` / `dmed` / `payt` / …) summarising the
+/// packetised stream a server would generate.
+pub const HINF: [u8; 4] = fourcc("hinf");
 /// `kind` — Track Kind Box (ISO/IEC 14496-12 §8.10.4). Sits inside a
 /// track-level `udta` and labels the track's role with a (schemeURI,
 /// value) pair. Both strings are NULL-terminated C strings; `value`

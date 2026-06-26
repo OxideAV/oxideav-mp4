@@ -1399,6 +1399,12 @@ struct Track {
     /// and the precomputed-only flag. `None` for non-MPEG-2-TS-hint
     /// tracks.
     mpeg2ts_hint: Option<crate::hint::Mpeg2TsHintSampleEntry>,
+    /// §9.1.5 — the `hinf` Hint Statistics Box from the track's `udta`,
+    /// when present. Summarises the packetised stream a server would
+    /// generate (total bytes/packets sent, max-rate windows, payload
+    /// rtpmap entries, …). Empty ([`crate::hint::HintStatistics::is_empty`])
+    /// for non-hint tracks or a hint track that carried no statistics.
+    hint_stats: crate::hint::HintStatistics,
     /// §8.7.2 — `dref` (DataReferenceBox) from the track's
     /// `minf/dinf/dref`. The table of media-data locations that every
     /// sample entry's 1-based `data_reference_index` (§8.5.2.2) selects
@@ -3630,6 +3636,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         hmhd: None,
         rtp_hint: None,
         mpeg2ts_hint: None,
+        hint_stats: crate::hint::HintStatistics::default(),
         dref: None,
         stsh: Vec::new(),
         sbgp: Vec::new(),
@@ -3720,6 +3727,11 @@ fn parse_track_udta(body: &[u8], t: &mut Track) {
             TSEL => parse_tsel(&body[start..start + psz], t),
             STRK => parse_strk(&body[start..start + psz], t),
             CPRT => parse_cprt(&body[start..start + psz], t),
+            // §9.1.5 — `hinf` Hint Statistics Box (in a hint track's
+            // udta). First one wins.
+            HINF if t.hint_stats.is_empty() => {
+                t.hint_stats = crate::hint::parse_hinf_box(&body[start..start + psz]);
+            }
             _ => {
                 // Other track-udta children (e.g. legacy `titl` overrides)
                 // are skipped — file-wide metadata is collected from the
@@ -9156,6 +9168,59 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         }
     }
 
+    // ISO/IEC 14496-12 §9.1.5: when the hint track's `udta` carried a
+    // `hinf` Hint Statistics Box, surface its present statistics on
+    // `params.options` (each key emitted only when the corresponding
+    // sub-box was present): `hinf_bytes_sent` (`trpy`, incl. RTP
+    // headers), `hinf_packets_sent` (`nump`), `hinf_payload_bytes`
+    // (`tpyl`, excl. RTP headers), `hinf_media_bytes` (`dmed`),
+    // `hinf_immediate_bytes` (`dimm`), `hinf_repeated_bytes` (`drep`),
+    // `hinf_largest_packet` (`pmax`), `hinf_maxr_count` (number of `maxr`
+    // windows), and `hinf_payload_count` (number of `payt` entries). A
+    // streaming server / analytics tool reads delivery totals without
+    // walking `udta`. The u32 variants (`totl`/`npck`/`tpay`) prefer the
+    // u64 fields when both forms are present.
+    {
+        let h = &t.hint_stats;
+        if let Some(v) = h
+            .bytes_sent_with_rtp_64
+            .or(h.bytes_sent_with_rtp_32.map(u64::from))
+        {
+            params.options.insert("hinf_bytes_sent", v.to_string());
+        }
+        if let Some(v) = h.packets_sent_64.or(h.packets_sent_32.map(u64::from)) {
+            params.options.insert("hinf_packets_sent", v.to_string());
+        }
+        if let Some(v) = h
+            .bytes_sent_no_rtp_64
+            .or(h.bytes_sent_no_rtp_32.map(u64::from))
+        {
+            params.options.insert("hinf_payload_bytes", v.to_string());
+        }
+        if let Some(v) = h.media_bytes_sent {
+            params.options.insert("hinf_media_bytes", v.to_string());
+        }
+        if let Some(v) = h.immediate_bytes_sent {
+            params.options.insert("hinf_immediate_bytes", v.to_string());
+        }
+        if let Some(v) = h.repeated_bytes_sent {
+            params.options.insert("hinf_repeated_bytes", v.to_string());
+        }
+        if let Some(v) = h.largest_packet {
+            params.options.insert("hinf_largest_packet", v.to_string());
+        }
+        if !h.max_rates.is_empty() {
+            params
+                .options
+                .insert("hinf_maxr_count", h.max_rates.len().to_string());
+        }
+        if !h.payload_ids.is_empty() {
+            params
+                .options
+                .insert("hinf_payload_count", h.payload_ids.len().to_string());
+        }
+    }
+
     // ISO/IEC 14496-12 §8.7.2: surface the DataReferenceBox (`dref`) so a
     // caller can resolve where each sample description's media data lives.
     // The 1-based `data_reference_index` on every sample entry (§8.5.2.2)
@@ -10851,6 +10916,7 @@ mod tests {
             hmhd: None,
             rtp_hint: None,
             mpeg2ts_hint: None,
+            hint_stats: crate::hint::HintStatistics::default(),
             dref: None,
             stsh: Vec::new(),
             sbgp: Vec::new(),
@@ -12045,6 +12111,22 @@ mod tests {
         assert_eq!(t.kinds[0].1, "caption");
         assert_eq!(t.kinds[1].0, "urn:apple:hap:subtitles");
         assert_eq!(t.kinds[1].1, "");
+    }
+
+    #[test]
+    fn parse_track_udta_picks_up_hinf() {
+        let stats = crate::hint::HintStatistics {
+            bytes_sent_with_rtp_64: Some(123_456),
+            packets_sent_64: Some(789),
+            ..crate::hint::HintStatistics::default()
+        };
+        let hinf = crate::hint::build_hinf_box(&stats);
+        let mut udta = Vec::new();
+        udta.extend_from_slice(&hinf);
+        let mut t = fresh_track();
+        super::parse_track_udta(&udta, &mut t);
+        assert_eq!(t.hint_stats, stats);
+        assert_eq!(t.hint_stats.bytes_sent_with_rtp_64, Some(123_456));
     }
 
     /// Non-`kind` children inside a track-level `udta` are skipped
@@ -14116,6 +14198,60 @@ mod tests {
             info.params.options.get("m2t_hint_precomputed"),
             Some("true")
         );
+    }
+
+    #[test]
+    fn build_stream_info_surfaces_hinf_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Data;
+        t.codec_id_fourcc = *b"rtp ";
+        t.timescale = 90_000;
+        t.hint_stats = crate::hint::HintStatistics {
+            bytes_sent_with_rtp_64: Some(1_000_000),
+            packets_sent_64: Some(5000),
+            bytes_sent_no_rtp_64: Some(940_000),
+            media_bytes_sent: Some(800_000),
+            largest_packet: Some(1452),
+            max_rates: vec![
+                crate::hint::MaxRate {
+                    period: 1000,
+                    bytes: 64_000,
+                },
+                crate::hint::MaxRate {
+                    period: 2000,
+                    bytes: 120_000,
+                },
+            ],
+            payload_ids: vec![crate::hint::PayloadId {
+                payload_id: 96,
+                rtpmap: "H264/90000".to_string(),
+            }],
+            ..crate::hint::HintStatistics::default()
+        };
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("hinf_bytes_sent"), Some("1000000"));
+        assert_eq!(info.params.options.get("hinf_packets_sent"), Some("5000"));
+        assert_eq!(
+            info.params.options.get("hinf_payload_bytes"),
+            Some("940000")
+        );
+        assert_eq!(info.params.options.get("hinf_media_bytes"), Some("800000"));
+        assert_eq!(info.params.options.get("hinf_largest_packet"), Some("1452"));
+        assert_eq!(info.params.options.get("hinf_maxr_count"), Some("2"));
+        assert_eq!(info.params.options.get("hinf_payload_count"), Some("1"));
+        // Absent sub-boxes omit their keys.
+        assert_eq!(info.params.options.get("hinf_immediate_bytes"), None);
+    }
+
+    #[test]
+    fn build_stream_info_no_hinf_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("hinf_bytes_sent"), None);
+        assert_eq!(info.params.options.get("hinf_maxr_count"), None);
     }
 
     #[test]
