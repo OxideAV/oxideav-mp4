@@ -4427,6 +4427,27 @@ fn parse_trgr(body: &[u8], t: &mut Track) -> Result<()> {
     Ok(())
 }
 
+/// Serialise a `trgr` (TrackGroupBox, ISO/IEC 14496-12 §8.3.4) from a list
+/// of `(track_group_type, track_group_id)` pairs — the byte-exact inverse
+/// of [`parse_trgr`].
+///
+/// The outer `trgr` is a plain container box (no FullBox preamble). Each
+/// pair becomes one `TrackGroupTypeBox` whose FourCC is the
+/// `track_group_type` and whose body is the 4-byte FullBox preamble
+/// (version 0, flags 0) followed by the 32-bit `track_group_id`
+/// (§8.3.4.2). The per-`track_group_type` extension tail is not emitted
+/// (this layer does not model it); pairs are written in supplied order.
+pub fn build_trgr_box(groups: &[([u8; 4], u32)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (group_type, group_id) in groups {
+        let mut child = Vec::with_capacity(8);
+        child.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
+        child.extend_from_slice(&group_id.to_be_bytes());
+        body.extend_from_slice(&wrap_box(group_type, &child));
+    }
+    wrap_box(&crate::boxes::TRGR, &body)
+}
+
 /// §8.6.5 — `edts` (EditBox) container. We only care about the inner
 /// `elst` (EditListBox) child; everything else in the container is
 /// reserved.
@@ -12066,6 +12087,29 @@ mod tests {
     fn parse_trgr_empty_body_is_ok() {
         let mut t = fresh_track();
         super::parse_trgr(&[], &mut t).unwrap();
+        assert!(t.trgr.is_empty());
+    }
+
+    /// `build_trgr_box` is the byte-exact inverse of `parse_trgr`: a
+    /// multi-type group set re-parses to the same `(type, id)` pairs.
+    #[test]
+    fn build_trgr_round_trips() {
+        let groups = vec![(*b"msrc", 17u32), (*b"ster", 42u32)];
+        let boxed = super::build_trgr_box(&groups);
+        assert_eq!(&boxed[4..8], b"trgr");
+        let mut t = fresh_track();
+        super::parse_trgr(&boxed[8..], &mut t).unwrap();
+        assert_eq!(t.trgr, groups);
+    }
+
+    /// No group pairs yields a bare empty `trgr` container.
+    #[test]
+    fn build_trgr_empty_set() {
+        let boxed = super::build_trgr_box(&[]);
+        assert_eq!(boxed.len(), 8);
+        assert_eq!(&boxed[4..8], b"trgr");
+        let mut t = fresh_track();
+        super::parse_trgr(&boxed[8..], &mut t).unwrap();
         assert!(t.trgr.is_empty());
     }
 
