@@ -10516,6 +10516,40 @@ pub fn parse_prft_box(body: &[u8]) -> Result<Option<PrftRecord>> {
     parse_prft(body)
 }
 
+/// Serialise a `prft` (ProducerReferenceTimeBox, ISO/IEC 14496-12
+/// §8.16.5) from a [`PrftRecord`] — the byte-exact inverse of
+/// [`parse_prft_box`].
+///
+/// Layout (§8.16.5.2): a FullBox preamble carrying the record's `version`
+/// (0 or 1) and its 24-bit `flags` (verbatim — `0` in the 2015 edition,
+/// the named NTP-annotation bits in the 2022 edition), then the 32-bit
+/// `reference_track_ID`, the 64-bit NTP `ntp_timestamp`, and the
+/// `media_time` — written as a 32-bit field for version 0 and a 64-bit
+/// field for version 1.
+///
+/// Returns `None` when `version == 0` but `media_time` exceeds
+/// `u32::MAX` (it would not fit the v0 32-bit field and re-parse
+/// identically — the caller must bump the record to version 1), or for a
+/// `version` other than 0/1 (no other version is defined).
+pub fn build_prft_box(record: &PrftRecord) -> Option<Vec<u8>> {
+    if record.version > 1 {
+        return None;
+    }
+    let mut body = Vec::with_capacity(24);
+    // FullBox preamble: 1-byte version + the 24-bit flags (low 3 bytes).
+    body.push(record.version);
+    body.extend_from_slice(&record.flags.to_be_bytes()[1..4]);
+    body.extend_from_slice(&record.reference_track_id.to_be_bytes());
+    body.extend_from_slice(&record.ntp_timestamp.to_be_bytes());
+    if record.version == 0 {
+        let mt: u32 = record.media_time.try_into().ok()?;
+        body.extend_from_slice(&mt.to_be_bytes());
+    } else {
+        body.extend_from_slice(&record.media_time.to_be_bytes());
+    }
+    Some(wrap_box(&crate::boxes::PRFT, &body))
+}
+
 /// Parse a standalone `pdin` (ProgressiveDownloadInfoBox, ISO/IEC
 /// 14496-12 §8.1.3) body from `body` (the bytes after the 8/16-byte
 /// box header).
@@ -16210,6 +16244,66 @@ mod tests {
         assert_eq!(boxed.len(), 12);
         let r = super::parse_pdin_box(&boxed[8..]).unwrap();
         assert!(r.entries.is_empty());
+    }
+
+    /// `build_prft_box` is the byte-exact inverse of `parse_prft_box` for
+    /// a version-0 (32-bit media_time) record, including the 2022-edition
+    /// `flags` annotation bits.
+    #[test]
+    fn build_prft_box_v0_round_trips() {
+        let record = super::PrftRecord {
+            reference_track_id: 1,
+            ntp_timestamp: 0x1234_5678_9ABC_DEF0,
+            media_time: 90_000,
+            version: 0,
+            flags: 0x00_0001, // encoder_input_output
+        };
+        let boxed = super::build_prft_box(&record).unwrap();
+        assert_eq!(&boxed[4..8], b"prft");
+        let r = super::parse_prft_box(&boxed[8..]).unwrap().unwrap();
+        assert_eq!(r.reference_track_id, 1);
+        assert_eq!(r.ntp_timestamp, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(r.media_time, 90_000);
+        assert_eq!(r.version, 0);
+        assert_eq!(r.flags, 0x00_0001);
+        assert!(r.is_encoder_input_output());
+    }
+
+    /// A version-1 record (64-bit media_time beyond u32 range) round-trips.
+    #[test]
+    fn build_prft_box_v1_round_trips() {
+        let record = super::PrftRecord {
+            reference_track_id: 3,
+            ntp_timestamp: 0xDEAD_BEEF_CAFE_F00D,
+            media_time: 0x1_0000_0001,
+            version: 1,
+            flags: 0,
+        };
+        let boxed = super::build_prft_box(&record).unwrap();
+        let r = super::parse_prft_box(&boxed[8..]).unwrap().unwrap();
+        assert_eq!(r.version, 1);
+        assert_eq!(r.media_time, 0x1_0000_0001);
+        assert_eq!(r.reference_track_id, 3);
+    }
+
+    /// A version-0 record whose media_time overflows the 32-bit field is
+    /// rejected (the caller must bump to version 1); an unknown version
+    /// is rejected.
+    #[test]
+    fn build_prft_box_rejects_inconsistent() {
+        let overflow = super::PrftRecord {
+            reference_track_id: 1,
+            ntp_timestamp: 0,
+            media_time: 0x1_0000_0000,
+            version: 0,
+            flags: 0,
+        };
+        assert!(super::build_prft_box(&overflow).is_none());
+        let bad_version = super::PrftRecord {
+            version: 2,
+            ..overflow
+        };
+        assert!(super::build_prft_box(&bad_version).is_none());
     }
 
     /// A `pdin` body shorter than the 4-byte FullBox preamble is
