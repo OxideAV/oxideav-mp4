@@ -199,6 +199,128 @@ fn heif_meta_surfaces_item_catalogue() {
     assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
 }
 
+/// Build a HEIF-style `meta` box (as `build_heif_meta`) but additionally
+/// carrying an `iprp` ItemPropertiesBox (ISO/IEC 23008-12 §9.3) built from
+/// typed records via the public `build_iprp_box`. Item 1 gets ispe + pixi
+/// + colr + an essential irot; item 2 (the thumbnail) gets ispe + pixi.
+fn build_heif_meta_with_iprp() -> Vec<u8> {
+    use oxideav_mp4::demux::{
+        build_iprp_box, ColrRecord, ItemProperties, ItemProperty, ItemPropertyAssociationEntry,
+        PropertyAssociation,
+    };
+
+    let base = build_heif_meta();
+    // base is `[size][meta][... children]`; splice the iprp before the
+    // closing of the meta body by rebuilding the meta box.
+    // Recover the meta body (after the 8-byte header).
+    let meta_body = &base[8..];
+
+    let iprp = ItemProperties {
+        properties: vec![
+            ItemProperty::Ispe {
+                image_width: 4032,
+                image_height: 3024,
+            },
+            ItemProperty::Pixi {
+                bits_per_channel: vec![8, 8, 8],
+            },
+            ItemProperty::Colr(ColrRecord::Nclx {
+                colour_primaries: 1,
+                transfer_characteristics: 13,
+                matrix_coefficients: 6,
+                full_range: true,
+            }),
+            ItemProperty::Irot { angle: 1 },
+        ],
+        associations: vec![
+            ItemPropertyAssociationEntry {
+                item_id: 1,
+                associations: vec![
+                    PropertyAssociation {
+                        essential: false,
+                        property_index: 1,
+                    },
+                    PropertyAssociation {
+                        essential: false,
+                        property_index: 2,
+                    },
+                    PropertyAssociation {
+                        essential: false,
+                        property_index: 3,
+                    },
+                    PropertyAssociation {
+                        essential: true,
+                        property_index: 4,
+                    },
+                ],
+            },
+            ItemPropertyAssociationEntry {
+                item_id: 2,
+                associations: vec![
+                    PropertyAssociation {
+                        essential: false,
+                        property_index: 1,
+                    },
+                    PropertyAssociation {
+                        essential: false,
+                        property_index: 2,
+                    },
+                ],
+            },
+        ],
+    };
+    let iprp_box = build_iprp_box(&iprp).expect("iprp builds");
+
+    let mut new_body = meta_body.to_vec();
+    new_body.extend_from_slice(&iprp_box);
+    box_bytes(b"meta", &new_body)
+}
+
+#[test]
+fn heif_meta_surfaces_item_properties() {
+    let spliced = splice_after_ftyp(&mux_pcm_to_bytes(), &build_heif_meta_with_iprp());
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(spliced));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let md = dmx.metadata();
+
+    // Catalogue still surfaces (unchanged by the added iprp).
+    assert_eq!(md_get(md, "meta_item_count"), Some(&"2".to_string()));
+
+    // Property list summary.
+    assert_eq!(
+        md_get(md, "meta_iprp_property_count"),
+        Some(&"4".to_string())
+    );
+    assert_eq!(
+        md_get(md, "meta_iprp_property_0"),
+        Some(&"ispe 4032x3024".to_string())
+    );
+    assert_eq!(
+        md_get(md, "meta_iprp_property_1"),
+        Some(&"pixi 8:8:8".to_string())
+    );
+    assert_eq!(
+        md_get(md, "meta_iprp_property_2"),
+        Some(&"colr nclx 1/13/6".to_string())
+    );
+    assert_eq!(
+        md_get(md, "meta_iprp_property_3"),
+        Some(&"irot 90".to_string())
+    );
+
+    // Per-item association lists (item 1's irot is essential → `4*`).
+    assert_eq!(
+        md_get(md, "meta_iprp_item_0"),
+        Some(&"id=1 props=1,2,3,4*".to_string())
+    );
+    assert_eq!(
+        md_get(md, "meta_iprp_item_1"),
+        Some(&"id=2 props=1,2".to_string())
+    );
+
+    assert_eq!(dmx.streams().len(), 1);
+}
+
 /// Build a top-level `meco` AdditionalMetadataContainerBox (§8.11.7)
 /// holding two additional `meta` boxes (distinct handler types) plus one
 /// `mere` relation (§8.11.8) between them.

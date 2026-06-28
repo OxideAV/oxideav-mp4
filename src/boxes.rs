@@ -637,6 +637,56 @@ pub const TENC: [u8; 4] = fourcc("tenc");
 pub const PSSH: [u8; 4] = fourcc("pssh");
 pub const SENC: [u8; 4] = fourcc("senc");
 
+// ---------------------------------------------------------------------------
+// HEIF / MIAF item-properties family (ISO/IEC 23008-12 §9.3, referenced from
+// ISO/IEC 14496-12). The `iprp` ItemPropertiesBox lives inside a `meta` box
+// and associates items (declared by a sibling `iloc` / `iinf`) with an
+// ordered set of small property records held in `ipco`, mapped per item by
+// one or more `ipma` association boxes.
+// ---------------------------------------------------------------------------
+
+/// `iprp` — Item Properties Box (ISO/IEC 23008-12 §9.3.1). Sits inside a
+/// `meta` box; quantity zero or one. Holds exactly one `ipco`
+/// ItemPropertyContainerBox followed by one or more `ipma`
+/// ItemPropertyAssociation boxes.
+pub const IPRP: [u8; 4] = fourcc("iprp");
+/// `ipco` — Item Property Container Box (ISO/IEC 23008-12 §9.3.1). Sits
+/// inside `iprp`; quantity exactly one. An implicitly-indexed (1-based)
+/// list of property boxes, each a `Box` or `FullBox`.
+pub const IPCO: [u8; 4] = fourcc("ipco");
+/// `ipma` — Item Property Association Box (ISO/IEC 23008-12 §9.3.1). Sits
+/// inside `iprp`; quantity one or more. FullBox mapping each item ID to a
+/// list of `(essential, property_index)` pairs.
+pub const IPMA: [u8; 4] = fourcc("ipma");
+/// `ispe` — Image Spatial Extents Property (ISO/IEC 23008-12 §6.5.3).
+/// Descriptive `ipco` child; ItemFullProperty(version=0, flags=0) carrying
+/// the reconstructed image `(image_width, image_height)`.
+pub const ISPE: [u8; 4] = fourcc("ispe");
+/// `pixi` — Pixel Information Property (ISO/IEC 23008-12 §6.5.6).
+/// Descriptive `ipco` child; ItemFullProperty(version=0, flags=0) listing
+/// the per-channel bit depth of the reconstructed image.
+pub const PIXI: [u8; 4] = fourcc("pixi");
+/// `rloc` — Relative Location Property (ISO/IEC 23008-12 §6.5.7).
+/// Descriptive `ipco` child; ItemFullProperty(version=0, flags=0) giving an
+/// item's `(horizontal_offset, vertical_offset)` within its `tbas` base.
+pub const RLOC: [u8; 4] = fourcc("rloc");
+/// `auxC` — Auxiliary Type Property (ISO/IEC 23008-12 §6.5.8). Descriptive
+/// `ipco` child; ItemFullProperty(version=0, flags) carrying a
+/// NULL-terminated URN `aux_type` plus type-specific `aux_subtype` bytes.
+pub const AUXC: [u8; 4] = fourcc("auxC");
+/// `irot` — Image Rotation Property (ISO/IEC 23008-12 §6.5.10).
+/// Transformative `ipco` child; ItemProperty (plain Box) whose low 2 bits
+/// are an anti-clockwise rotation `angle` (`angle * 90` degrees).
+pub const IROT: [u8; 4] = fourcc("irot");
+/// `imir` — Image Mirroring Property (ISO/IEC 23008-12 §6.5.12).
+/// Transformative `ipco` child; ItemProperty (plain Box) whose low bit is a
+/// mirror `axis` (0 = vertical axis, 1 = horizontal axis).
+pub const IMIR: [u8; 4] = fourcc("imir");
+/// `lsel` — Layer Selector Property (ISO/IEC 23008-12 §6.5.11).
+/// Descriptive `ipco` child; ItemProperty (plain Box) carrying a 16-bit
+/// `layer_id` selecting one reconstructed image of a multi-layer item.
+pub const LSEL: [u8; 4] = fourcc("lsel");
+
 #[cfg(test)]
 mod tests {
     use super::*;

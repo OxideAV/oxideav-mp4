@@ -2726,6 +2726,140 @@ pub struct IrefBox {
     pub references: Vec<ItemReference>,
 }
 
+/// One decoded item property held in an `ipco` (ItemPropertyContainerBox,
+/// ISO/IEC 23008-12 §9.3.1). Each property is a `Box` or `FullBox` whose
+/// type code names the property; the variants below model the base HEIF
+/// property set. Boxes whose syntax is shared with ISO/IEC 14496-12
+/// (`pasp` / `clap` / `colr`) reuse this crate's existing typed records.
+/// Any property box this layer does not recognise is preserved verbatim as
+/// [`ItemProperty::Other`] so its index slot and bytes survive a
+/// parse→build round-trip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ItemProperty {
+    /// `ispe` ImageSpatialExtentsProperty (§6.5.3) — the reconstructed
+    /// image `(width, height)` in pixels.
+    Ispe { image_width: u32, image_height: u32 },
+    /// `pixi` PixelInformationProperty (§6.5.6) — the per-channel bit depth
+    /// of the reconstructed image, one entry per colour channel.
+    Pixi { bits_per_channel: Vec<u8> },
+    /// `rloc` RelativeLocationProperty (§6.5.7) — an item's
+    /// `(horizontal_offset, vertical_offset)` within the image it has a
+    /// `tbas` item reference to.
+    Rloc {
+        horizontal_offset: u32,
+        vertical_offset: u32,
+    },
+    /// `auxC` AuxiliaryTypeProperty (§6.5.8) — a NULL-terminated URN
+    /// `aux_type` identifying an auxiliary image (e.g. an alpha plane or
+    /// depth map) plus the type-specific `aux_subtype` tail bytes.
+    AuxC {
+        aux_type: String,
+        aux_subtype: Vec<u8>,
+    },
+    /// `irot` ImageRotation (§6.5.10) — a transformative property: the
+    /// reconstructed image is rotated anti-clockwise by `angle * 90`
+    /// degrees (`angle` ∈ `0..=3`).
+    Irot { angle: u8 },
+    /// `imir` ImageMirror (§6.5.12) — a transformative property: the
+    /// reconstructed image is mirrored about a vertical (`axis == 0`) or
+    /// horizontal (`axis == 1`) axis.
+    Imir { axis: u8 },
+    /// `lsel` LayerSelectorProperty (§6.5.11) — selects one reconstructed
+    /// image (`layer_id`) of a multi-layer coded image item.
+    Lsel { layer_id: u16 },
+    /// `pasp` PixelAspectRatioBox (§6.5.4 → ISO/IEC 14496-12 §12.1.4).
+    Pasp(PaspRecord),
+    /// `clap` CleanApertureBox (§6.5.9 → ISO/IEC 14496-12 §12.1.4), a
+    /// transformative crop property.
+    Clap(ClapRecord),
+    /// `colr` ColourInformationBox (§6.5.5 → ISO/IEC 14496-12 §12.1.5).
+    Colr(ColrRecord),
+    /// Any other property box: its FourCC type plus the raw body bytes
+    /// (after any FullBox preamble is *included* — the body is the box
+    /// payload verbatim). Preserved so the implicit 1-based index slot is
+    /// never silently dropped.
+    Other { box_type: [u8; 4], body: Vec<u8> },
+}
+
+/// One `(essential, property_index)` association from an `ipma`
+/// (ItemPropertyAssociation, ISO/IEC 23008-12 §9.3.1). `property_index` is
+/// the 1-based index into the sibling `ipco` (0 means "no property"); when
+/// `essential` is set a reader that does not understand the referenced
+/// property must not process the item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PropertyAssociation {
+    /// `essential` (§9.3.3) — true → a reader unable to process the
+    /// associated property must reject the item.
+    pub essential: bool,
+    /// `property_index` (§9.3.3) — 1-based index into `ipco`'s implicit
+    /// property list, or 0 for "no property".
+    pub property_index: u16,
+}
+
+/// One item's association list from an `ipma` box (§9.3.1): the item ID and
+/// the ordered set of property indices associated with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemPropertyAssociationEntry {
+    /// `item_ID` — matches an `iloc` / `iinf` item ID.
+    pub item_id: u32,
+    /// The ordered associations (`ipma` preserves writer order, which is
+    /// significant: transformative properties apply in sequence — §6.5.1).
+    pub associations: Vec<PropertyAssociation>,
+}
+
+/// Decoded `iprp` (ItemPropertiesBox, ISO/IEC 23008-12 §9.3.1) — the
+/// `ipco` property list plus every `ipma` association box, merged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ItemProperties {
+    /// The `ipco` property list, in on-wire order. The implicit
+    /// `property_index` an `ipma` association references is the 1-based
+    /// position in this vec (so `properties[index - 1]`).
+    pub properties: Vec<ItemProperty>,
+    /// Every item→property association, accumulated across all `ipma`
+    /// boxes in the `iprp`. The spec permits several `ipma` boxes
+    /// distinguished by `(version, flags)`; their entries are concatenated
+    /// here in encounter order.
+    pub associations: Vec<ItemPropertyAssociationEntry>,
+}
+
+impl ItemProperties {
+    /// True when neither an `ipco` property nor an `ipma` association was
+    /// found (an empty / malformed `iprp`).
+    pub fn is_empty(&self) -> bool {
+        self.properties.is_empty() && self.associations.is_empty()
+    }
+
+    /// Look up the property record referenced by a 1-based `property_index`
+    /// (the value carried in an `ipma` association). Returns `None` for
+    /// index 0 ("no property") or an index past the end of the `ipco` list.
+    pub fn property(&self, property_index: u16) -> Option<&ItemProperty> {
+        if property_index == 0 {
+            return None;
+        }
+        self.properties.get((property_index - 1) as usize)
+    }
+
+    /// The resolved `(essential, &ItemProperty)` pairs associated with an
+    /// item, in `ipma` order. Associations whose `property_index` is 0 or
+    /// out of range are skipped (a malformed reference contributes nothing
+    /// rather than aborting). Returns an empty vec when the item has no
+    /// `ipma` entry.
+    pub fn properties_for(&self, item_id: u32) -> Vec<(bool, &ItemProperty)> {
+        let mut out = Vec::new();
+        for entry in &self.associations {
+            if entry.item_id != item_id {
+                continue;
+            }
+            for a in &entry.associations {
+                if let Some(p) = self.property(a.property_index) {
+                    out.push((a.essential, p));
+                }
+            }
+        }
+        out
+    }
+}
+
 /// A `meta` box's item infrastructure (ISO/IEC 14496-12 §8.11),
 /// collected together. Any of the four child boxes may be absent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2752,6 +2886,13 @@ pub struct MetaItems {
     /// optional FD session-group (`segr`) and group-name (`gitn`) boxes.
     /// `None` for a non-FD `meta` (the common HEIF / iTunes case).
     pub fiin: Option<crate::fd::FiinBox>,
+    /// `iprp` (ItemPropertiesBox, ISO/IEC 23008-12 §9.3.1), if present.
+    /// The HEIF item-properties family: the `ipco` property list plus the
+    /// `ipma` per-item associations. `None` for a `meta` carrying no
+    /// `iprp` (every non-HEIF `meta`, and HEIF files written without
+    /// properties). Resolve an item's properties via
+    /// [`ItemProperties::properties_for`].
+    pub iprp: Option<ItemProperties>,
 }
 
 /// A resolved byte range for one item extent, relative to a data origin
@@ -2779,6 +2920,7 @@ impl MetaItems {
             && self.iref.is_none()
             && self.idat.is_empty()
             && self.fiin.is_none()
+            && self.iprp.is_none()
     }
 
     /// Look up an item's `iloc` location record by item ID.
@@ -3186,7 +3328,266 @@ pub fn parse_meta_items(body: &[u8]) -> MetaItems {
             IDAT => out.idat = child.to_vec(),
             // §8.13.2 FD Item Information Box — File Delivery partitioning.
             FIIN => out.fiin = crate::fd::parse_fiin_box(child),
+            // ISO/IEC 23008-12 §9.3 ItemPropertiesBox — HEIF item
+            // properties (`ipco` list + `ipma` associations).
+            IPRP => {
+                let p = parse_iprp_box(child);
+                if !p.is_empty() {
+                    out.iprp = Some(p);
+                }
+            }
             _ => {}
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// HEIF / MIAF item-properties parsers (ISO/IEC 23008-12 §9.3 / §6.5). The
+// `iprp` ItemPropertiesBox holds one `ipco` (ItemPropertyContainerBox — an
+// implicitly 1-indexed list of property boxes) and one or more `ipma`
+// (ItemPropertyAssociation) boxes mapping each item to its property indices.
+// ---------------------------------------------------------------------------
+
+/// Parse an `iprp` (ItemPropertiesBox, ISO/IEC 23008-12 §9.3.1) body (the
+/// bytes after the box header). Walks the single `ipco` child for the
+/// property list and every `ipma` child for the per-item associations.
+/// A malformed instance yields an empty [`ItemProperties`] (the caller
+/// drops it) rather than aborting the enclosing `meta` walk.
+pub fn parse_iprp_box(body: &[u8]) -> ItemProperties {
+    let mut out = ItemProperties::default();
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur).ok().flatten() {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = match hdr.payload_size() {
+            Some(p) => p as usize,
+            None => break,
+        };
+        let start = cur.position() as usize;
+        if start + psz > body.len() {
+            break;
+        }
+        cur.set_position((start + psz) as u64);
+        let child = &body[start..start + psz];
+        match hdr.fourcc {
+            IPCO => out.properties = parse_ipco_box(child),
+            IPMA => out.associations.extend(parse_ipma_box(child)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parse an `ipco` (ItemPropertyContainerBox, ISO/IEC 23008-12 §9.3.1)
+/// body into the implicitly-indexed property list. Each child box is
+/// decoded into the typed [`ItemProperty`] variant for its FourCC; an
+/// unrecognised box type is preserved verbatim as [`ItemProperty::Other`]
+/// so its 1-based index slot is never dropped (the index an `ipma`
+/// references must stay stable). A `free` / `skip` box (§9.3.1 allows
+/// it inside `ipco`, occupying an index value but carrying no meaning) is
+/// preserved as `Other` too so subsequent indices stay aligned.
+pub fn parse_ipco_box(body: &[u8]) -> Vec<ItemProperty> {
+    let mut out = Vec::new();
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur).ok().flatten() {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = match hdr.payload_size() {
+            Some(p) => p as usize,
+            None => break,
+        };
+        let start = cur.position() as usize;
+        if start + psz > body.len() {
+            break;
+        }
+        cur.set_position((start + psz) as u64);
+        let child = &body[start..start + psz];
+        out.push(parse_item_property(hdr.fourcc, child));
+    }
+    out
+}
+
+/// Decode one `ipco` child box `(box_type, body)` into a typed
+/// [`ItemProperty`]. `body` is the box payload (after the box header). For
+/// the `ItemFullProperty` types (`ispe` / `pixi` / `rloc` / `auxC`) the
+/// body opens with the 4-byte FullBox version/flags word. A child that is
+/// truncated for its declared type falls back to [`ItemProperty::Other`]
+/// so the index slot survives.
+fn parse_item_property(box_type: [u8; 4], body: &[u8]) -> ItemProperty {
+    let other = || ItemProperty::Other {
+        box_type,
+        body: body.to_vec(),
+    };
+    match box_type {
+        // §6.5.3 ispe: FullBox(0,0) + u32 width + u32 height.
+        ISPE => {
+            if body.len() < 12 {
+                return other();
+            }
+            ItemProperty::Ispe {
+                image_width: u32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+                image_height: u32::from_be_bytes([body[8], body[9], body[10], body[11]]),
+            }
+        }
+        // §6.5.6 pixi: FullBox(0,0) + u8 num_channels + num_channels × u8.
+        PIXI => {
+            if body.len() < 5 {
+                return other();
+            }
+            let num = body[4] as usize;
+            if 5 + num > body.len() {
+                return other();
+            }
+            ItemProperty::Pixi {
+                bits_per_channel: body[5..5 + num].to_vec(),
+            }
+        }
+        // §6.5.7 rloc: FullBox(0,0) + u32 horizontal + u32 vertical.
+        RLOC => {
+            if body.len() < 12 {
+                return other();
+            }
+            ItemProperty::Rloc {
+                horizontal_offset: u32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+                vertical_offset: u32::from_be_bytes([body[8], body[9], body[10], body[11]]),
+            }
+        }
+        // §6.5.8 auxC: FullBox(0,flags) + null-terminated UTF-8 URN +
+        // type-specific aux_subtype tail.
+        AUXC => {
+            if body.len() < 4 {
+                return other();
+            }
+            let rest = &body[4..];
+            let nul = rest.iter().position(|&b| b == 0);
+            let (type_bytes, sub) = match nul {
+                Some(i) => (&rest[..i], &rest[i + 1..]),
+                None => (rest, &rest[rest.len()..]),
+            };
+            ItemProperty::AuxC {
+                aux_type: String::from_utf8_lossy(type_bytes).to_string(),
+                aux_subtype: sub.to_vec(),
+            }
+        }
+        // §6.5.10 irot: plain Box; 1 byte = 6 reserved + 2-bit angle.
+        IROT => {
+            if body.is_empty() {
+                return other();
+            }
+            ItemProperty::Irot {
+                angle: body[0] & 0x03,
+            }
+        }
+        // §6.5.12 imir: plain Box; 1 byte = 7 reserved + 1-bit axis.
+        IMIR => {
+            if body.is_empty() {
+                return other();
+            }
+            ItemProperty::Imir {
+                axis: body[0] & 0x01,
+            }
+        }
+        // §6.5.11 lsel: plain Box; u16 layer_id.
+        LSEL => {
+            if body.len() < 2 {
+                return other();
+            }
+            ItemProperty::Lsel {
+                layer_id: u16::from_be_bytes([body[0], body[1]]),
+            }
+        }
+        // §6.5.4 / §6.5.9 / §6.5.5 — same syntax as the 14496-12 boxes.
+        _ if &box_type == b"pasp" => parse_pasp(body)
+            .map(ItemProperty::Pasp)
+            .unwrap_or_else(other),
+        _ if &box_type == b"clap" => parse_clap(body)
+            .map(ItemProperty::Clap)
+            .unwrap_or_else(other),
+        _ if &box_type == b"colr" => parse_colr(body)
+            .map(ItemProperty::Colr)
+            .unwrap_or_else(other),
+        _ => other(),
+    }
+}
+
+/// Parse an `ipma` (ItemPropertyAssociation, ISO/IEC 23008-12 §9.3.1)
+/// body into per-item association lists. `version` selects the item-ID
+/// width (0 → 16-bit, ≥ 1 → 32-bit); `flags & 1` selects the
+/// `property_index` width (0 → 7-bit, 1 → 15-bit), with the top bit of the
+/// field carrying `essential`. A truncated entry ends the walk at what was
+/// read rather than inventing associations.
+pub fn parse_ipma_box(body: &[u8]) -> Vec<ItemPropertyAssociationEntry> {
+    let mut out = Vec::new();
+    if body.len() < 8 {
+        return out;
+    }
+    let version = body[0];
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    let wide_index = flags & 1 == 1;
+    let mut pos = 4usize;
+    let entry_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    pos += 4;
+    for _ in 0..entry_count {
+        let item_id = if version == 0 {
+            if pos + 2 > body.len() {
+                break;
+            }
+            let v = u16::from_be_bytes([body[pos], body[pos + 1]]) as u32;
+            pos += 2;
+            v
+        } else {
+            if pos + 4 > body.len() {
+                break;
+            }
+            let v = u32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+            pos += 4;
+            v
+        };
+        if pos >= body.len() {
+            break;
+        }
+        let assoc_count = body[pos] as usize;
+        pos += 1;
+        let mut associations = Vec::with_capacity(assoc_count);
+        let mut truncated = false;
+        for _ in 0..assoc_count {
+            if wide_index {
+                if pos + 2 > body.len() {
+                    truncated = true;
+                    break;
+                }
+                let w = u16::from_be_bytes([body[pos], body[pos + 1]]);
+                pos += 2;
+                associations.push(PropertyAssociation {
+                    essential: w & 0x8000 != 0,
+                    property_index: w & 0x7FFF,
+                });
+            } else {
+                if pos + 1 > body.len() {
+                    truncated = true;
+                    break;
+                }
+                let b = body[pos];
+                pos += 1;
+                associations.push(PropertyAssociation {
+                    essential: b & 0x80 != 0,
+                    property_index: (b & 0x7F) as u16,
+                });
+            }
+        }
+        out.push(ItemPropertyAssociationEntry {
+            item_id,
+            associations,
+        });
+        if truncated {
+            break;
         }
     }
     out
@@ -3257,6 +3658,82 @@ fn surface_meta_items(m: &MetaItems, metadata: &mut Vec<(String, String)>) {
                 gitn.entries.len().to_string(),
             ));
         }
+    }
+    if let Some(iprp) = m.iprp.as_ref() {
+        // ISO/IEC 23008-12 §9.3 ItemPropertiesBox — surface a compact
+        // summary: the property-list size, a per-property type token, and
+        // each item's resolved association list. A consumer wanting the
+        // typed records reaches `MetaItems::iprp` / `properties_for`.
+        metadata.push((
+            "meta_iprp_property_count".to_string(),
+            iprp.properties.len().to_string(),
+        ));
+        for (n, p) in iprp.properties.iter().enumerate() {
+            metadata.push((format!("meta_iprp_property_{n}"), item_property_token(p)));
+        }
+        for (n, e) in iprp.associations.iter().enumerate() {
+            // Each association rendered as `idx` or `idx*` (the `*` marks
+            // an essential property), space-separated, in `ipma` order.
+            let assoc: Vec<String> = e
+                .associations
+                .iter()
+                .map(|a| {
+                    if a.essential {
+                        format!("{}*", a.property_index)
+                    } else {
+                        a.property_index.to_string()
+                    }
+                })
+                .collect();
+            metadata.push((
+                format!("meta_iprp_item_{n}"),
+                format!("id={} props={}", e.item_id, assoc.join(",")),
+            ));
+        }
+    }
+}
+
+/// Render one [`ItemProperty`] as a compact metadata token: the property
+/// FourCC followed by its salient decoded value(s). Used by the
+/// `meta_iprp_property_<n>` summary surface.
+fn item_property_token(p: &ItemProperty) -> String {
+    match p {
+        ItemProperty::Ispe {
+            image_width,
+            image_height,
+        } => format!("ispe {image_width}x{image_height}"),
+        ItemProperty::Pixi { bits_per_channel } => {
+            let bits: Vec<String> = bits_per_channel.iter().map(|b| b.to_string()).collect();
+            format!("pixi {}", bits.join(":"))
+        }
+        ItemProperty::Rloc {
+            horizontal_offset,
+            vertical_offset,
+        } => format!("rloc {horizontal_offset},{vertical_offset}"),
+        ItemProperty::AuxC { aux_type, .. } => format!("auxC {aux_type}"),
+        ItemProperty::Irot { angle } => format!("irot {}", *angle as u32 * 90),
+        ItemProperty::Imir { axis } => {
+            format!("imir {}", if *axis == 0 { "v" } else { "h" })
+        }
+        ItemProperty::Lsel { layer_id } => format!("lsel {layer_id}"),
+        ItemProperty::Pasp(r) => format!("pasp {}:{}", r.h_spacing, r.v_spacing),
+        ItemProperty::Clap(r) => format!("clap {}/{}", r.width_n, r.width_d),
+        ItemProperty::Colr(c) => match c {
+            ColrRecord::Nclx {
+                colour_primaries,
+                transfer_characteristics,
+                matrix_coefficients,
+                ..
+            } => format!(
+                "colr nclx {colour_primaries}/{transfer_characteristics}/{matrix_coefficients}"
+            ),
+            ColrRecord::RestrictedIcc(d) => format!("colr rICC {}", d.len()),
+            ColrRecord::UnrestrictedIcc(d) => format!("colr prof {}", d.len()),
+            ColrRecord::Other { colour_type, .. } => {
+                format!("colr {}", String::from_utf8_lossy(colour_type))
+            }
+        },
+        ItemProperty::Other { box_type, .. } => String::from_utf8_lossy(box_type).to_string(),
     }
 }
 
@@ -3480,6 +3957,139 @@ pub fn build_iref_box(b: &IrefBox) -> Option<Vec<u8>> {
 /// wrapping the raw item bytes.
 pub fn build_idat_box(data: &[u8]) -> Vec<u8> {
     wrap_box(&IDAT, data)
+}
+
+// ---------------------------------------------------------------------------
+// HEIF / MIAF item-properties builders (ISO/IEC 23008-12 §9.3 / §6.5). The
+// byte-exact inverses of `parse_iprp_box` / `parse_ipco_box` /
+// `parse_ipma_box` / `parse_item_property`, so a caller assembling a HEIF
+// `meta` from typed records re-emits the same bytes the parsers decode.
+// ---------------------------------------------------------------------------
+
+/// Serialise one [`ItemProperty`] into a complete property box (header +
+/// body). The inverse of [`parse_item_property`]; the `ItemFullProperty`
+/// types (`ispe` / `pixi` / `rloc` / `auxC`) emit the 4-byte FullBox
+/// version/flags preamble (version 0, flags 0 — `auxC` likewise writes
+/// flags 0). [`ItemProperty::Other`] re-emits its preserved bytes verbatim.
+pub fn build_item_property(p: &ItemProperty) -> Vec<u8> {
+    match p {
+        ItemProperty::Ispe {
+            image_width,
+            image_height,
+        } => {
+            let mut body = vec![0u8; 4]; // FullBox(0,0)
+            body.extend_from_slice(&image_width.to_be_bytes());
+            body.extend_from_slice(&image_height.to_be_bytes());
+            wrap_box(&ISPE, &body)
+        }
+        ItemProperty::Pixi { bits_per_channel } => {
+            let mut body = vec![0u8; 4]; // FullBox(0,0)
+            body.push(bits_per_channel.len() as u8);
+            body.extend_from_slice(bits_per_channel);
+            wrap_box(&PIXI, &body)
+        }
+        ItemProperty::Rloc {
+            horizontal_offset,
+            vertical_offset,
+        } => {
+            let mut body = vec![0u8; 4]; // FullBox(0,0)
+            body.extend_from_slice(&horizontal_offset.to_be_bytes());
+            body.extend_from_slice(&vertical_offset.to_be_bytes());
+            wrap_box(&RLOC, &body)
+        }
+        ItemProperty::AuxC {
+            aux_type,
+            aux_subtype,
+        } => {
+            let mut body = vec![0u8; 4]; // FullBox(0,0)
+            body.extend_from_slice(aux_type.as_bytes());
+            body.push(0); // NULL terminator
+            body.extend_from_slice(aux_subtype);
+            wrap_box(&AUXC, &body)
+        }
+        ItemProperty::Irot { angle } => wrap_box(&IROT, &[angle & 0x03]),
+        ItemProperty::Imir { axis } => wrap_box(&IMIR, &[axis & 0x01]),
+        ItemProperty::Lsel { layer_id } => wrap_box(&LSEL, &layer_id.to_be_bytes()),
+        ItemProperty::Pasp(r) => build_pasp_box(r),
+        ItemProperty::Clap(r) => build_clap_box(r),
+        ItemProperty::Colr(c) => build_colr_box(c),
+        ItemProperty::Other { box_type, body } => wrap_box(box_type, body),
+    }
+}
+
+/// Build an `ipco` (ItemPropertyContainerBox, ISO/IEC 23008-12 §9.3.1)
+/// from the implicitly-indexed property list — each property box in order.
+/// The inverse of [`parse_ipco_box`].
+pub fn build_ipco_box(properties: &[ItemProperty]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for p in properties {
+        body.extend_from_slice(&build_item_property(p));
+    }
+    wrap_box(&IPCO, &body)
+}
+
+/// Build a single `ipma` (ItemPropertyAssociation, ISO/IEC 23008-12
+/// §9.3.1) box covering all `entries`. The item-ID width and
+/// `property_index` width are chosen as the narrowest that hold every
+/// value: version 1 (32-bit item IDs) when any item ID exceeds 0xFFFF;
+/// `flags & 1` (15-bit index) when any `property_index` exceeds 0x7F. The
+/// inverse of [`parse_ipma_box`]. Per §9.3.1 entries must be ordered by
+/// increasing `item_ID`; the builder sorts a copy so a caller need not.
+/// Returns `None` if any `property_index` exceeds the 15-bit wire ceiling
+/// (0x7FFF) — that would not round-trip.
+pub fn build_ipma_box(entries: &[ItemPropertyAssociationEntry]) -> Option<Vec<u8>> {
+    let mut sorted: Vec<&ItemPropertyAssociationEntry> = entries.iter().collect();
+    sorted.sort_by_key(|e| e.item_id);
+    let need_wide_id = sorted.iter().any(|e| e.item_id > 0xFFFF);
+    let mut need_wide_index = false;
+    for e in &sorted {
+        for a in &e.associations {
+            if a.property_index > 0x7FFF {
+                return None;
+            }
+            if a.property_index > 0x7F {
+                need_wide_index = true;
+            }
+        }
+    }
+    let version: u8 = if need_wide_id { 1 } else { 0 };
+    let flags: u32 = if need_wide_index { 1 } else { 0 };
+    let mut body = Vec::new();
+    body.push(version);
+    body.extend_from_slice(&flags.to_be_bytes()[1..]); // 24-bit flags
+    body.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
+    for e in &sorted {
+        if version == 0 {
+            body.extend_from_slice(&(e.item_id as u16).to_be_bytes());
+        } else {
+            body.extend_from_slice(&e.item_id.to_be_bytes());
+        }
+        body.push(e.associations.len() as u8);
+        for a in &e.associations {
+            if need_wide_index {
+                let w = (if a.essential { 0x8000 } else { 0 }) | (a.property_index & 0x7FFF);
+                body.extend_from_slice(&w.to_be_bytes());
+            } else {
+                let b = (if a.essential { 0x80 } else { 0 }) | (a.property_index as u8 & 0x7F);
+                body.push(b);
+            }
+        }
+    }
+    Some(wrap_box(&IPMA, &body))
+}
+
+/// Build a complete `iprp` (ItemPropertiesBox, ISO/IEC 23008-12 §9.3.1)
+/// box from typed [`ItemProperties`] — the `ipco` property list followed
+/// by one `ipma` association box. The byte-exact inverse of
+/// [`parse_iprp_box`] for the single-`ipma` shape this builder emits.
+/// Returns `None` when the association table cannot round-trip (a
+/// `property_index` past the 15-bit ceiling).
+pub fn build_iprp_box(p: &ItemProperties) -> Option<Vec<u8>> {
+    let mut body = build_ipco_box(&p.properties);
+    if !p.associations.is_empty() {
+        body.extend_from_slice(&build_ipma_box(&p.associations)?);
+    }
+    Some(wrap_box(&IPRP, &body))
 }
 
 // ---------------------------------------------------------------------------
