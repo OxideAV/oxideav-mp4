@@ -3755,12 +3755,46 @@ fn surface_meta_items(m: &MetaItems, metadata: &mut Vec<(String, String)>) {
     }
     if let Some(iloc) = m.iloc.as_ref() {
         metadata.push(("meta_iloc_count".to_string(), iloc.items.len().to_string()));
+        // Surface each item's location summary so a HEIF consumer can spot
+        // where an item lives (construction method + extent layout +
+        // total length) without downcasting to `MetaItems::iloc`. The
+        // exact byte ranges remain on the typed record / `item_byte_ranges`.
+        for (n, it) in iloc.items.iter().enumerate() {
+            let total_len: u64 = it.extents.iter().map(|e| e.extent_length).sum();
+            metadata.push((
+                format!("meta_iloc_{n}"),
+                format!(
+                    "id={} method={} extents={} length={}",
+                    it.item_id,
+                    it.construction_method,
+                    it.extents.len(),
+                    total_len
+                ),
+            ));
+        }
     }
     if let Some(iref) = m.iref.as_ref() {
         metadata.push((
             "meta_iref_count".to_string(),
             iref.references.len().to_string(),
         ));
+        // Surface each typed reference group so the HEIF relationship graph
+        // (thumbnail `thmb`, auxiliary `auxl`, derivation `dimg`,
+        // description `cdsc`, pre-derived `base`, predictive `pred`,
+        // tile-base `tbas`, scalable-base `exbl`, …) is queryable from the
+        // flat channel without downcasting to `MetaItems::iref`.
+        for (n, r) in iref.references.iter().enumerate() {
+            let to: Vec<String> = r.to_item_ids.iter().map(|id| id.to_string()).collect();
+            metadata.push((
+                format!("meta_iref_{n}"),
+                format!(
+                    "type={} from={} to={}",
+                    String::from_utf8_lossy(&r.reference_type),
+                    r.from_item_id,
+                    to.join(",")
+                ),
+            ));
+        }
     }
     if !m.idat.is_empty() {
         metadata.push(("meta_idat_len".to_string(), m.idat.len().to_string()));

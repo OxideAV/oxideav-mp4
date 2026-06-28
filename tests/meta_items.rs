@@ -183,7 +183,22 @@ fn heif_meta_surfaces_item_catalogue() {
     assert_eq!(md_get(md, "meta_primary_item"), Some(&"1".to_string()));
     assert_eq!(md_get(md, "meta_item_count"), Some(&"2".to_string()));
     assert_eq!(md_get(md, "meta_iloc_count"), Some(&"2".to_string()));
+    // Item 1 lives at one file-offset extent of length 0x100 (256).
+    assert_eq!(
+        md_get(md, "meta_iloc_0"),
+        Some(&"id=1 method=0 extents=1 length=256".to_string())
+    );
+    // Item 2 (thumbnail) one extent of length 0x40 (64).
+    assert_eq!(
+        md_get(md, "meta_iloc_1"),
+        Some(&"id=2 method=0 extents=1 length=64".to_string())
+    );
     assert_eq!(md_get(md, "meta_iref_count"), Some(&"1".to_string()));
+    // The thumbnail reference: item 2 (thumb) -> item 1 (primary).
+    assert_eq!(
+        md_get(md, "meta_iref_0"),
+        Some(&"type=thmb from=2 to=1".to_string())
+    );
     assert_eq!(
         md_get(md, "meta_item_0"),
         Some(&"id=1 type=hvc1 name=primary".to_string())
