@@ -710,6 +710,14 @@ pub const ISCL: [u8; 4] = fourcc("iscl");
 /// Descriptive `ipco` child; ItemFullProperty(version=0, flags=0) listing
 /// the `iref` reference types a reader must understand to decode the item.
 pub const RREF: [u8; 4] = fourcc("rref");
+/// `crtt` — Creation Time Property (ISO/IEC 23008-12 §6.5.18). Descriptive
+/// `ipco` child; ItemFullProperty(version=0, flags=0) carrying a 64-bit
+/// `creation_time` (microseconds since 1904-01-01 UTC).
+pub const CRTT: [u8; 4] = fourcc("crtt");
+/// `mdft` — Modification Time Property (ISO/IEC 23008-12 §6.5.19).
+/// Descriptive `ipco` child; ItemFullProperty(version=0, flags=0) carrying
+/// a 64-bit `modification_time` (microseconds since 1904-01-01 UTC).
+pub const MDFT: [u8; 4] = fourcc("mdft");
 
 #[cfg(test)]
 mod tests {

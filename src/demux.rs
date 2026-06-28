@@ -2799,6 +2799,12 @@ pub enum ItemProperty {
     /// reference-type FourCCs a reader must understand to decode the item
     /// (e.g. `pred` for a predictively-coded image item).
     Rref { reference_types: Vec<[u8; 4]> },
+    /// `crtt` CreationTimeProperty (§6.5.18) — the item / group creation
+    /// time, in microseconds since 1904-01-01 UTC.
+    Crtt { creation_time: u64 },
+    /// `mdft` ModificationTimeProperty (§6.5.19) — the most recent
+    /// modification time, in microseconds since 1904-01-01 UTC.
+    Mdft { modification_time: u64 },
     /// Any other property box: its FourCC type plus the raw body bytes
     /// (after any FullBox preamble is *included* — the body is the box
     /// payload verbatim). Preserved so the implicit 1-based index slot is
@@ -3645,6 +3651,28 @@ fn parse_item_property(box_type: [u8; 4], body: &[u8]) -> ItemProperty {
             }
             ItemProperty::Rref { reference_types }
         }
+        // §6.5.18 crtt: FullBox(0,0) + u64 creation_time.
+        CRTT => {
+            if body.len() < 12 {
+                return other();
+            }
+            ItemProperty::Crtt {
+                creation_time: u64::from_be_bytes([
+                    body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
+                ]),
+            }
+        }
+        // §6.5.19 mdft: FullBox(0,0) + u64 modification_time.
+        MDFT => {
+            if body.len() < 12 {
+                return other();
+            }
+            ItemProperty::Mdft {
+                modification_time: u64::from_be_bytes([
+                    body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
+                ]),
+            }
+        }
         // §6.5.4 / §6.5.9 / §6.5.5 — same syntax as the 14496-12 boxes.
         _ if &box_type == b"pasp" => parse_pasp(body)
             .map(ItemProperty::Pasp)
@@ -4019,6 +4047,8 @@ fn item_property_token(p: &ItemProperty) -> String {
                 .collect();
             format!("rref {}", types.join(","))
         }
+        ItemProperty::Crtt { creation_time } => format!("crtt {creation_time}"),
+        ItemProperty::Mdft { modification_time } => format!("mdft {modification_time}"),
         ItemProperty::Other { box_type, .. } => String::from_utf8_lossy(box_type).to_string(),
     }
 }
@@ -4340,6 +4370,16 @@ pub fn build_item_property(p: &ItemProperty) -> Vec<u8> {
                 body.extend_from_slice(rt);
             }
             wrap_box(&RREF, &body)
+        }
+        ItemProperty::Crtt { creation_time } => {
+            let mut body = vec![0u8; 4]; // FullBox(0,0)
+            body.extend_from_slice(&creation_time.to_be_bytes());
+            wrap_box(&CRTT, &body)
+        }
+        ItemProperty::Mdft { modification_time } => {
+            let mut body = vec![0u8; 4]; // FullBox(0,0)
+            body.extend_from_slice(&modification_time.to_be_bytes());
+            wrap_box(&MDFT, &body)
         }
         ItemProperty::Other { box_type, body } => wrap_box(box_type, body),
     }

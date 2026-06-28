@@ -497,3 +497,26 @@ fn rref_overrun_count_falls_back_to_other() {
     let parsed = parse_ipco_box(&boxed);
     assert!(matches!(parsed[0], ItemProperty::Other { box_type, .. } if &box_type == b"rref"));
 }
+
+#[test]
+fn crtt_property_round_trips() {
+    // microseconds since 1904-01-01 UTC.
+    let p = ItemProperty::Crtt {
+        creation_time: 3_800_000_000_000_000,
+    };
+    let boxed = build_item_property(&p);
+    assert_box_header(&boxed, b"crtt");
+    let parsed = parse_ipco_box(&boxed);
+    assert_eq!(parsed, vec![p]);
+}
+
+#[test]
+fn mdft_property_round_trips() {
+    let p = ItemProperty::Mdft {
+        modification_time: 3_900_000_000_000_001,
+    };
+    let boxed = build_item_property(&p);
+    assert_box_header(&boxed, b"mdft");
+    let parsed = parse_ipco_box(&boxed);
+    assert_eq!(parsed, vec![p]);
+}

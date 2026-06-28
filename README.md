@@ -168,7 +168,13 @@ Sample-entry FourCCs resolve to these codec ids:
   structured records are reachable via `Mp4Demuxer::meta_items()`; a
   flat summary appears on `Demuxer::metadata()` as `meta_handler` /
   `meta_primary_item` / `meta_item_count` / `meta_item_<n>` /
-  `meta_iloc_count` / `meta_iref_count`. A plain iTunes `meta` (just
+  `meta_iloc_count` / `meta_iloc_<n>` (`id=<item_id>
+  method=<construction_method> extents=<n> length=<total>` — where each
+  item lives without downcasting) / `meta_iref_count` / `meta_iref_<n>`
+  (`type=<fourcc> from=<item_id> to=<id,…>` — the relationship graph:
+  thumbnail `thmb`, auxiliary `auxl`, derivation `dimg`, description
+  `cdsc`, pre-derived `base`, predictive `pred`, tile-base `tbas`,
+  scalable-base `exbl`, …). A plain iTunes `meta` (just
   `hdlr` + `ilst`) carries no §8.11 items and emits no `meta_*` keys.
   The standalone parsers `demux::parse_iloc_box` / `parse_pitm_box` /
   `parse_iinf_box` / `parse_iref_box` / `parse_meta_items` are public.
@@ -187,6 +193,61 @@ Sample-entry FourCCs resolve to these codec ids:
   a HEIF-style `meta` from `MetaItems` records; `build_iloc_box`
   rejects records that would not round-trip (bad field width, a v0 item
   with a non-zero construction method, etc.).
+- HEIF / MIAF item properties (ISO/IEC 23008-12 §9.3 / §6.5, `iprp` /
+  `ipco` / `ipma`): a file-level `meta`'s `iprp` ItemPropertiesBox is
+  decoded into the public `demux::ItemProperties` (reachable via
+  `MetaItems::iprp`) — the `ipco` ItemPropertyContainerBox property list
+  (an implicitly 1-indexed sequence of property boxes) plus every `ipma`
+  ItemPropertyAssociation box merged into per-item `(essential,
+  property_index)` lists. `ItemProperties::properties_for(item_id)`
+  resolves an item to its ordered `(essential, &ItemProperty)` pairs
+  (transformative properties apply in sequence, §6.5.1; index-0 /
+  out-of-range references are skipped) and `ItemProperties::property(idx)`
+  looks up the 1-based `ipco` slot. The typed `demux::ItemProperty` enum
+  models the base property set: `ispe` ImageSpatialExtents (§6.5.3),
+  `pixi` PixelInformation (§6.5.6), `rloc` RelativeLocation (§6.5.7),
+  `auxC` AuxiliaryType (§6.5.8, NUL-terminated URN + subtype tail), `irot`
+  ImageRotation (§6.5.10), `imir` ImageMirroring (§6.5.12), `lsel`
+  LayerSelector (§6.5.11), `udes` UserDescription (§6.5.20,
+  lang/name/description/tags), `altt` AccessibilityText (§6.5.21), `iscl`
+  ImageScaling (§6.5.13, a transformative H/V scale-ratio property), `rref`
+  RequiredReferenceTypes (§6.5.17), `crtt` / `mdft` Creation / Modification
+  time (§6.5.18–19, µs since 1904-01-01 UTC), plus `pasp` / `clap` / `colr`
+  reusing this crate's existing 14496-12 records (§6.5.4 / §6.5.9 /
+  §6.5.5); any unrecognised property box is preserved verbatim as
+  `ItemProperty::Other` so its 1-based index slot survives a round-trip
+  (the index an `ipma` references must stay stable). Reserved high bits on
+  `irot` / `imir` are masked on read, and a property truncated for its
+  declared type falls back to `Other` rather than reading past the end.
+  The demuxer surfaces a compact summary on `Demuxer::metadata()`:
+  `meta_iprp_property_count`, `meta_iprp_property_<n>` (a `<fourcc>
+  <decoded>` token), and `meta_iprp_item_<n>` (`id=<id>
+  props=<idx[,idx*…]>`, `*` marking an essential association). Public
+  byte-exact builders `demux::build_iprp_box` / `build_ipco_box` /
+  `build_ipma_box` / `build_item_property` are the inverses of the parsers
+  (`parse_iprp_box` / `parse_ipco_box` / `parse_ipma_box`);
+  `build_ipma_box` auto-selects the narrowest item-ID width (v0 16-bit / v1
+  32-bit) and `property_index` width (`flags & 1` 7- / 15-bit), sorts
+  entries by ascending `item_ID` (§9.3.1), and rejects an index past the
+  15-bit ceiling. Absent `iprp`, no keys are emitted. This crate surfaces
+  the property *catalogue*; applying a transform (rotate / mirror / scale /
+  crop) to a decoded item is a renderer concern.
+- HEIF / MIAF entity groups (ISO/IEC 23008-12 §9.4, `grpl` /
+  `EntityToGroupBox`): a file-level `meta`'s `grpl` GroupsListBox is
+  decoded into the public `demux::EntityGroups` (reachable via
+  `MetaItems::grpl`) — every `EntityToGroupBox` (a FullBox whose FourCC is
+  the `grouping_type`: `altr` alternatives where only one entity should be
+  played, `ster` a two-entity stereo pair with entity 0 = left view, …)
+  becomes a typed `demux::EntityToGroup` carrying the `grouping_type`,
+  `group_id`, and the `entity_id` list (item IDs, or track IDs at file
+  level). `EntityGroups::by_type(grouping_type)` filters (e.g. all `altr`
+  alternative sets) and `EntityGroups::by_id(group_id)` locates a group.
+  Surfaced on `Demuxer::metadata()` as `meta_grpl_group_count` plus
+  `meta_grpl_group_<n>` (`type=<fourcc> id=<id> entities=<id,…>`). Public
+  byte-exact builders `demux::build_grpl_box` / `build_entity_to_group_box`
+  are the inverses of `parse_grpl_box`. An `EntityToGroupBox` whose
+  `num_entities_in_group` overruns its body is dropped without aborting the
+  `grpl` walk. Absent `grpl`, no keys are emitted.
 - Extended language tag (ISO/IEC 14496-12 §8.4.6, `elng`): a track's
   `mdia/elng` ExtendedLanguageBox carries a NULL-terminated BCP 47
   (RFC 4646) tag richer than `mdhd`'s packed 3-char ISO 639-2 code
