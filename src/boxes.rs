@@ -692,6 +692,24 @@ pub const LSEL: [u8; 4] = fourcc("lsel");
 /// the `grouping_type` (`altr`, `ster`, …) and whose body lists the item /
 /// track IDs that share the grouping characteristic.
 pub const GRPL: [u8; 4] = fourcc("grpl");
+/// `udes` — User Description Property (ISO/IEC 23008-12 §6.5.20).
+/// Descriptive `ipco` child; ItemFullProperty(version=0, flags=0) carrying
+/// four NUL-terminated UTF-8 strings: `lang` (RFC 5646), `name`,
+/// `description`, and comma-separated `tags`.
+pub const UDES: [u8; 4] = fourcc("udes");
+/// `altt` — Accessibility Text Property (ISO/IEC 23008-12 §6.5.21).
+/// Descriptive `ipco` child; ItemFullProperty(version=0, flags=0) carrying
+/// the NUL-terminated UTF-8 `alt_text` plus an `alt_lang` (RFC 5646).
+pub const ALTT: [u8; 4] = fourcc("altt");
+/// `iscl` — Image Scaling Property (ISO/IEC 23008-12 §6.5.13).
+/// Transformative `ipco` child; ItemFullProperty(version=0, flags=0)
+/// carrying the horizontal / vertical scaling ratios as 16-bit
+/// numerator/denominator pairs.
+pub const ISCL: [u8; 4] = fourcc("iscl");
+/// `rref` — Required Reference Types Property (ISO/IEC 23008-12 §6.5.17).
+/// Descriptive `ipco` child; ItemFullProperty(version=0, flags=0) listing
+/// the `iref` reference types a reader must understand to decode the item.
+pub const RREF: [u8; 4] = fourcc("rref");
 
 #[cfg(test)]
 mod tests {

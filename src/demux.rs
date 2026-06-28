@@ -2774,6 +2774,31 @@ pub enum ItemProperty {
     Clap(ClapRecord),
     /// `colr` ColourInformationBox (§6.5.5 → ISO/IEC 14496-12 §12.1.5).
     Colr(ColrRecord),
+    /// `udes` UserDescriptionProperty (§6.5.20) — four NUL-terminated UTF-8
+    /// strings: `lang` (RFC 5646 tag), `name`, `description`, and
+    /// comma-separated `tags` (any may be empty).
+    Udes {
+        lang: String,
+        name: String,
+        description: String,
+        tags: String,
+    },
+    /// `altt` AccessibilityTextProperty (§6.5.21) — an alternate-text
+    /// string (HTML `alt`-style) plus its RFC 5646 language tag.
+    Altt { alt_text: String, alt_lang: String },
+    /// `iscl` ImageScaling (§6.5.13) — a transformative property: the
+    /// horizontal / vertical scaling ratios as 16-bit numerator/denominator
+    /// pairs (a value of 0 is spec-prohibited but preserved verbatim).
+    Iscl {
+        target_width_numerator: u16,
+        target_width_denominator: u16,
+        target_height_numerator: u16,
+        target_height_denominator: u16,
+    },
+    /// `rref` RequiredReferenceTypesProperty (§6.5.17) — the `iref`
+    /// reference-type FourCCs a reader must understand to decode the item
+    /// (e.g. `pred` for a predictively-coded image item).
+    Rref { reference_types: Vec<[u8; 4]> },
     /// Any other property box: its FourCC type plus the raw body bytes
     /// (after any FullBox preamble is *included* — the body is the box
     /// payload verbatim). Preserved so the implicit 1-based index slot is
@@ -3565,6 +3590,61 @@ fn parse_item_property(box_type: [u8; 4], body: &[u8]) -> ItemProperty {
                 layer_id: u16::from_be_bytes([body[0], body[1]]),
             }
         }
+        // §6.5.20 udes: FullBox(0,0) + four NUL-terminated UTF-8 strings.
+        UDES => {
+            if body.len() < 4 {
+                return other();
+            }
+            let mut p = 4usize;
+            let lang = read_c_string_at(body, &mut p);
+            let name = read_c_string_at(body, &mut p);
+            let description = read_c_string_at(body, &mut p);
+            let tags = read_c_string_at(body, &mut p);
+            ItemProperty::Udes {
+                lang,
+                name,
+                description,
+                tags,
+            }
+        }
+        // §6.5.21 altt: FullBox(0,0) + alt_text + alt_lang (NUL-terminated).
+        ALTT => {
+            if body.len() < 4 {
+                return other();
+            }
+            let mut p = 4usize;
+            let alt_text = read_c_string_at(body, &mut p);
+            let alt_lang = read_c_string_at(body, &mut p);
+            ItemProperty::Altt { alt_text, alt_lang }
+        }
+        // §6.5.13 iscl: FullBox(0,0) + four u16 numerator/denominator.
+        ISCL => {
+            if body.len() < 12 {
+                return other();
+            }
+            ItemProperty::Iscl {
+                target_width_numerator: u16::from_be_bytes([body[4], body[5]]),
+                target_width_denominator: u16::from_be_bytes([body[6], body[7]]),
+                target_height_numerator: u16::from_be_bytes([body[8], body[9]]),
+                target_height_denominator: u16::from_be_bytes([body[10], body[11]]),
+            }
+        }
+        // §6.5.17 rref: FullBox(0,0) + u8 count + count × u32 FourCC.
+        RREF => {
+            if body.len() < 5 {
+                return other();
+            }
+            let count = body[4] as usize;
+            if 5 + count * 4 > body.len() {
+                return other();
+            }
+            let mut reference_types = Vec::with_capacity(count);
+            for i in 0..count {
+                let o = 5 + i * 4;
+                reference_types.push([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+            }
+            ItemProperty::Rref { reference_types }
+        }
         // §6.5.4 / §6.5.9 / §6.5.5 — same syntax as the 14496-12 boxes.
         _ if &box_type == b"pasp" => parse_pasp(body)
             .map(ItemProperty::Pasp)
@@ -3916,6 +3996,29 @@ fn item_property_token(p: &ItemProperty) -> String {
                 format!("colr {}", String::from_utf8_lossy(colour_type))
             }
         },
+        ItemProperty::Udes { name, lang, .. } => {
+            if lang.is_empty() {
+                format!("udes {name}")
+            } else {
+                format!("udes [{lang}] {name}")
+            }
+        }
+        ItemProperty::Altt { alt_text, .. } => format!("altt {alt_text}"),
+        ItemProperty::Iscl {
+            target_width_numerator,
+            target_width_denominator,
+            target_height_numerator,
+            target_height_denominator,
+        } => format!(
+            "iscl {target_width_numerator}/{target_width_denominator}x{target_height_numerator}/{target_height_denominator}"
+        ),
+        ItemProperty::Rref { reference_types } => {
+            let types: Vec<String> = reference_types
+                .iter()
+                .map(|t| String::from_utf8_lossy(t).to_string())
+                .collect();
+            format!("rref {}", types.join(","))
+        }
         ItemProperty::Other { box_type, .. } => String::from_utf8_lossy(box_type).to_string(),
     }
 }
@@ -4196,6 +4299,48 @@ pub fn build_item_property(p: &ItemProperty) -> Vec<u8> {
         ItemProperty::Pasp(r) => build_pasp_box(r),
         ItemProperty::Clap(r) => build_clap_box(r),
         ItemProperty::Colr(c) => build_colr_box(c),
+        ItemProperty::Udes {
+            lang,
+            name,
+            description,
+            tags,
+        } => {
+            let mut body = vec![0u8; 4]; // FullBox(0,0)
+            for s in [lang, name, description, tags] {
+                body.extend_from_slice(s.as_bytes());
+                body.push(0);
+            }
+            wrap_box(&UDES, &body)
+        }
+        ItemProperty::Altt { alt_text, alt_lang } => {
+            let mut body = vec![0u8; 4]; // FullBox(0,0)
+            for s in [alt_text, alt_lang] {
+                body.extend_from_slice(s.as_bytes());
+                body.push(0);
+            }
+            wrap_box(&ALTT, &body)
+        }
+        ItemProperty::Iscl {
+            target_width_numerator,
+            target_width_denominator,
+            target_height_numerator,
+            target_height_denominator,
+        } => {
+            let mut body = vec![0u8; 4]; // FullBox(0,0)
+            body.extend_from_slice(&target_width_numerator.to_be_bytes());
+            body.extend_from_slice(&target_width_denominator.to_be_bytes());
+            body.extend_from_slice(&target_height_numerator.to_be_bytes());
+            body.extend_from_slice(&target_height_denominator.to_be_bytes());
+            wrap_box(&ISCL, &body)
+        }
+        ItemProperty::Rref { reference_types } => {
+            let mut body = vec![0u8; 4]; // FullBox(0,0)
+            body.push(reference_types.len() as u8);
+            for rt in reference_types {
+                body.extend_from_slice(rt);
+            }
+            wrap_box(&RREF, &body)
+        }
         ItemProperty::Other { box_type, body } => wrap_box(box_type, body),
     }
 }

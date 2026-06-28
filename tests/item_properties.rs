@@ -410,3 +410,90 @@ fn truncated_ipma_entry_ends_walk_cleanly() {
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0].item_id, 1);
 }
+
+#[test]
+fn udes_property_round_trips() {
+    let p = ItemProperty::Udes {
+        lang: "en-US".to_string(),
+        name: "Sunset".to_string(),
+        description: "A photo of the sunset over the bay".to_string(),
+        tags: "sunset,bay,golden-hour".to_string(),
+    };
+    let boxed = build_item_property(&p);
+    assert_box_header(&boxed, b"udes");
+    let parsed = parse_ipco_box(&boxed);
+    assert_eq!(parsed, vec![p]);
+}
+
+#[test]
+fn udes_property_empty_strings_round_trip() {
+    // Every string optional / may be empty (§6.5.20.3).
+    let p = ItemProperty::Udes {
+        lang: String::new(),
+        name: String::new(),
+        description: String::new(),
+        tags: String::new(),
+    };
+    let parsed = parse_ipco_box(&build_item_property(&p));
+    assert_eq!(parsed, vec![p]);
+}
+
+#[test]
+fn altt_property_round_trips() {
+    let p = ItemProperty::Altt {
+        alt_text: "A cat sitting on a windowsill".to_string(),
+        alt_lang: "en".to_string(),
+    };
+    let boxed = build_item_property(&p);
+    assert_box_header(&boxed, b"altt");
+    let parsed = parse_ipco_box(&boxed);
+    assert_eq!(parsed, vec![p]);
+}
+
+#[test]
+fn iscl_property_round_trips() {
+    // Scale up 3:2 horizontally, 5:4 vertically.
+    let p = ItemProperty::Iscl {
+        target_width_numerator: 3,
+        target_width_denominator: 2,
+        target_height_numerator: 5,
+        target_height_denominator: 4,
+    };
+    let boxed = build_item_property(&p);
+    assert_box_header(&boxed, b"iscl");
+    let parsed = parse_ipco_box(&boxed);
+    assert_eq!(parsed, vec![p]);
+}
+
+#[test]
+fn rref_property_round_trips() {
+    // A predictively-coded image item requires the `pred` reference type.
+    let p = ItemProperty::Rref {
+        reference_types: vec![*b"pred", *b"dimg"],
+    };
+    let boxed = build_item_property(&p);
+    assert_box_header(&boxed, b"rref");
+    let parsed = parse_ipco_box(&boxed);
+    assert_eq!(parsed, vec![p]);
+
+    // Empty list round-trips too.
+    let empty = ItemProperty::Rref {
+        reference_types: vec![],
+    };
+    let parsed = parse_ipco_box(&build_item_property(&empty));
+    assert_eq!(parsed, vec![empty]);
+}
+
+#[test]
+fn rref_overrun_count_falls_back_to_other() {
+    // A count of 3 with only one FourCC present → preserved as Other so the
+    // index slot survives and no read runs past the end.
+    let mut body = vec![0u8; 4]; // FullBox(0,0)
+    body.push(3); // count
+    body.extend_from_slice(b"pred"); // only one of three
+    let mut boxed = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+    boxed.extend_from_slice(b"rref");
+    boxed.extend_from_slice(&body);
+    let parsed = parse_ipco_box(&boxed);
+    assert!(matches!(parsed[0], ItemProperty::Other { box_type, .. } if &box_type == b"rref"));
+}
