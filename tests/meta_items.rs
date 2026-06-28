@@ -321,6 +321,55 @@ fn heif_meta_surfaces_item_properties() {
     assert_eq!(dmx.streams().len(), 1);
 }
 
+/// Build a HEIF-style `meta` carrying a `grpl` GroupsListBox (ISO/IEC
+/// 23008-12 §9.4) with one `altr` alternative set and one `ster` stereo
+/// pair, built via the public `build_grpl_box`.
+fn build_heif_meta_with_grpl() -> Vec<u8> {
+    use oxideav_mp4::demux::{build_grpl_box, EntityGroups, EntityToGroup};
+
+    let base = build_heif_meta();
+    let meta_body = &base[8..];
+
+    let grpl = EntityGroups {
+        groups: vec![
+            EntityToGroup {
+                grouping_type: *b"altr",
+                group_id: 100,
+                entity_ids: vec![1, 2],
+            },
+            EntityToGroup {
+                grouping_type: *b"ster",
+                group_id: 101,
+                entity_ids: vec![1, 2],
+            },
+        ],
+    };
+    let grpl_box = build_grpl_box(&grpl);
+
+    let mut new_body = meta_body.to_vec();
+    new_body.extend_from_slice(&grpl_box);
+    box_bytes(b"meta", &new_body)
+}
+
+#[test]
+fn heif_meta_surfaces_entity_groups() {
+    let spliced = splice_after_ftyp(&mux_pcm_to_bytes(), &build_heif_meta_with_grpl());
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(spliced));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let md = dmx.metadata();
+
+    assert_eq!(md_get(md, "meta_grpl_group_count"), Some(&"2".to_string()));
+    assert_eq!(
+        md_get(md, "meta_grpl_group_0"),
+        Some(&"type=altr id=100 entities=1,2".to_string())
+    );
+    assert_eq!(
+        md_get(md, "meta_grpl_group_1"),
+        Some(&"type=ster id=101 entities=1,2".to_string())
+    );
+    assert_eq!(dmx.streams().len(), 1);
+}
+
 /// Build a top-level `meco` AdditionalMetadataContainerBox (§8.11.7)
 /// holding two additional `meta` boxes (distinct handler types) plus one
 /// `mere` relation (§8.11.8) between them.

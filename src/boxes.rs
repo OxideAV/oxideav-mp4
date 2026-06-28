@@ -686,6 +686,12 @@ pub const IMIR: [u8; 4] = fourcc("imir");
 /// Descriptive `ipco` child; ItemProperty (plain Box) carrying a 16-bit
 /// `layer_id` selecting one reconstructed image of a multi-layer item.
 pub const LSEL: [u8; 4] = fourcc("lsel");
+/// `grpl` — Groups List Box (ISO/IEC 23008-12 §9.4.2). Sits inside a
+/// `meta` box (not one in an `meco`); quantity zero or one. A plain `Box`
+/// holding a set of `EntityToGroupBox`es, each a FullBox whose FourCC is
+/// the `grouping_type` (`altr`, `ster`, …) and whose body lists the item /
+/// track IDs that share the grouping characteristic.
+pub const GRPL: [u8; 4] = fourcc("grpl");
 
 #[cfg(test)]
 mod tests {

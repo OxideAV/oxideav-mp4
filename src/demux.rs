@@ -2860,6 +2860,55 @@ impl ItemProperties {
     }
 }
 
+/// One entity group decoded from an `EntityToGroupBox` (ISO/IEC 23008-12
+/// §9.4.3) inside a `grpl` GroupsListBox. The box's FourCC names the
+/// `grouping_type` (the semantics — `altr` alternatives, `ster` stereo
+/// pair, etc.); the body lists the item / track IDs that share the
+/// grouping characteristic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntityToGroup {
+    /// The `grouping_type` FourCC (the `EntityToGroupBox`'s box type) —
+    /// e.g. `altr` (alternatives, only one to be played), `ster` (a
+    /// two-entity stereo pair, entity 0 = left / entity 1 = right).
+    pub grouping_type: [u8; 4],
+    /// `group_id` (§9.4.3.3) — the group's unique non-negative ID,
+    /// distinct from any other group ID, item ID, or track ID at its
+    /// hierarchy level.
+    pub group_id: u32,
+    /// `entity_id`s (§9.4.3.3) — the item IDs (or, at file level, track
+    /// IDs) mapped to this group, in list order. For `ster` the first is
+    /// the left view and the second the right.
+    pub entity_ids: Vec<u32>,
+}
+
+/// Decoded `grpl` (GroupsListBox, ISO/IEC 23008-12 §9.4.2) — every
+/// `EntityToGroupBox` it contains, in on-wire order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntityGroups {
+    /// One record per `EntityToGroupBox` child, in file order.
+    pub groups: Vec<EntityToGroup>,
+}
+
+impl EntityGroups {
+    /// True when the `grpl` carried no `EntityToGroupBox` children.
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// The entity groups of a given `grouping_type` (e.g. all `altr`
+    /// alternative sets), in file order.
+    pub fn by_type(&self, grouping_type: [u8; 4]) -> impl Iterator<Item = &EntityToGroup> {
+        self.groups
+            .iter()
+            .filter(move |g| g.grouping_type == grouping_type)
+    }
+
+    /// The group with a given `group_id`, if any.
+    pub fn by_id(&self, group_id: u32) -> Option<&EntityToGroup> {
+        self.groups.iter().find(|g| g.group_id == group_id)
+    }
+}
+
 /// A `meta` box's item infrastructure (ISO/IEC 14496-12 §8.11),
 /// collected together. Any of the four child boxes may be absent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2893,6 +2942,11 @@ pub struct MetaItems {
     /// properties). Resolve an item's properties via
     /// [`ItemProperties::properties_for`].
     pub iprp: Option<ItemProperties>,
+    /// `grpl` (GroupsListBox, ISO/IEC 23008-12 §9.4.2), if present. The
+    /// HEIF entity groups (`altr` alternatives, `ster` stereo pairs, …)
+    /// mapping item / track IDs into named groups. `None` for a `meta`
+    /// carrying no `grpl`.
+    pub grpl: Option<EntityGroups>,
 }
 
 /// A resolved byte range for one item extent, relative to a data origin
@@ -2921,6 +2975,7 @@ impl MetaItems {
             && self.idat.is_empty()
             && self.fiin.is_none()
             && self.iprp.is_none()
+            && self.grpl.is_none()
     }
 
     /// Look up an item's `iloc` location record by item ID.
@@ -3336,6 +3391,13 @@ pub fn parse_meta_items(body: &[u8]) -> MetaItems {
                     out.iprp = Some(p);
                 }
             }
+            // ISO/IEC 23008-12 §9.4 GroupsListBox — HEIF entity groups.
+            GRPL => {
+                let g = parse_grpl_box(child);
+                if !g.is_empty() {
+                    out.grpl = Some(g);
+                }
+            }
             _ => {}
         }
     }
@@ -3593,6 +3655,72 @@ pub fn parse_ipma_box(body: &[u8]) -> Vec<ItemPropertyAssociationEntry> {
     out
 }
 
+/// Parse a `grpl` (GroupsListBox, ISO/IEC 23008-12 §9.4.2) body — a plain
+/// `Box` whose payload is a sequence of `EntityToGroupBox`es (each a
+/// `FullBox(grouping_type, version, flags)`). Each child's FourCC is the
+/// `grouping_type`; its body is `group_id` (u32) + `num_entities_in_group`
+/// (u32) + that many `entity_id`s (u32). A child whose declared
+/// `num_entities_in_group` overruns its body is dropped (it contributes no
+/// group) rather than reading past the end; the walk continues with the
+/// next child. A truncated child header ends the walk cleanly.
+pub fn parse_grpl_box(body: &[u8]) -> EntityGroups {
+    let mut out = EntityGroups::default();
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = match read_box_header(&mut cur).ok().flatten() {
+            Some(h) => h,
+            None => break,
+        };
+        let psz = match hdr.payload_size() {
+            Some(p) => p as usize,
+            None => break,
+        };
+        let start = cur.position() as usize;
+        if start + psz > body.len() {
+            break;
+        }
+        cur.set_position((start + psz) as u64);
+        let child = &body[start..start + psz];
+        if let Some(g) = parse_entity_to_group(hdr.fourcc, child) {
+            out.groups.push(g);
+        }
+    }
+    out
+}
+
+/// Decode one `EntityToGroupBox` (§9.4.3.2) `(grouping_type, body)` where
+/// `body` opens with the 4-byte FullBox version/flags word. Returns `None`
+/// for a body too short for the two fixed u32 fields or whose
+/// `num_entities_in_group` overruns the available bytes.
+fn parse_entity_to_group(grouping_type: [u8; 4], body: &[u8]) -> Option<EntityToGroup> {
+    // FullBox preamble (4) + group_id (4) + num_entities_in_group (4).
+    if body.len() < 12 {
+        return None;
+    }
+    let group_id = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    let num = u32::from_be_bytes([body[8], body[9], body[10], body[11]]) as usize;
+    let mut pos = 12usize;
+    if pos + num * 4 > body.len() {
+        return None;
+    }
+    let mut entity_ids = Vec::with_capacity(num);
+    for _ in 0..num {
+        entity_ids.push(u32::from_be_bytes([
+            body[pos],
+            body[pos + 1],
+            body[pos + 2],
+            body[pos + 3],
+        ]));
+        pos += 4;
+    }
+    Some(EntityToGroup {
+        grouping_type,
+        group_id,
+        entity_ids,
+    })
+}
+
 /// Append the flat `meta_*` metadata keys for a parsed file-level `meta`
 /// box (§8.11). No keys are emitted for an empty / absent `meta`.
 fn surface_meta_items(m: &MetaItems, metadata: &mut Vec<(String, String)>) {
@@ -3688,6 +3816,27 @@ fn surface_meta_items(m: &MetaItems, metadata: &mut Vec<(String, String)>) {
             metadata.push((
                 format!("meta_iprp_item_{n}"),
                 format!("id={} props={}", e.item_id, assoc.join(",")),
+            ));
+        }
+    }
+    if let Some(grpl) = m.grpl.as_ref() {
+        // ISO/IEC 23008-12 §9.4 GroupsListBox — surface a per-group
+        // summary: the group count plus, per group, the grouping type, the
+        // group ID, and the mapped entity IDs.
+        metadata.push((
+            "meta_grpl_group_count".to_string(),
+            grpl.groups.len().to_string(),
+        ));
+        for (n, g) in grpl.groups.iter().enumerate() {
+            let ids: Vec<String> = g.entity_ids.iter().map(|e| e.to_string()).collect();
+            metadata.push((
+                format!("meta_grpl_group_{n}"),
+                format!(
+                    "type={} id={} entities={}",
+                    String::from_utf8_lossy(&g.grouping_type),
+                    g.group_id,
+                    ids.join(",")
+                ),
             ));
         }
     }
@@ -4090,6 +4239,32 @@ pub fn build_iprp_box(p: &ItemProperties) -> Option<Vec<u8>> {
         body.extend_from_slice(&build_ipma_box(&p.associations)?);
     }
     Some(wrap_box(&IPRP, &body))
+}
+
+/// Build a single `EntityToGroupBox` (ISO/IEC 23008-12 §9.4.3.2) from an
+/// [`EntityToGroup`]. The box type is the record's `grouping_type`; the
+/// body is the 4-byte FullBox preamble (version 0, flags 0) + `group_id`
+/// (u32) + `num_entities_in_group` (u32) + the `entity_id` array. The
+/// byte-exact inverse of [`parse_entity_to_group`].
+pub fn build_entity_to_group_box(g: &EntityToGroup) -> Vec<u8> {
+    let mut body = vec![0u8; 4]; // FullBox(0, 0)
+    body.extend_from_slice(&g.group_id.to_be_bytes());
+    body.extend_from_slice(&(g.entity_ids.len() as u32).to_be_bytes());
+    for &e in &g.entity_ids {
+        body.extend_from_slice(&e.to_be_bytes());
+    }
+    wrap_box(&g.grouping_type, &body)
+}
+
+/// Build a complete `grpl` (GroupsListBox, ISO/IEC 23008-12 §9.4.2) box
+/// from typed [`EntityGroups`] — one `EntityToGroupBox` per group, in
+/// slice order. The byte-exact inverse of [`parse_grpl_box`].
+pub fn build_grpl_box(g: &EntityGroups) -> Vec<u8> {
+    let mut body = Vec::new();
+    for grp in &g.groups {
+        body.extend_from_slice(&build_entity_to_group_box(grp));
+    }
+    wrap_box(&GRPL, &body)
 }
 
 // ---------------------------------------------------------------------------
