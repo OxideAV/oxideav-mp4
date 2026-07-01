@@ -461,6 +461,17 @@ pub const RM2T: [u8; 4] = fourcc("rm2t");
 /// 24-hour-max / negative-OK / counter), a 32-bit `timescale`, a 32-bit
 /// `frame_duration`, an 8-bit `number_of_frames`, and a reserved u8.
 pub const TMCD: [u8; 4] = fourcc("tmcd");
+/// `load` — QuickTime Track Load Settings Atom. Sits inside `trak`; a
+/// plain `Box` whose 16-byte body carries `preload_start_time`,
+/// `preload_duration`, `preload_flags` (preload-always `1` /
+/// preload-if-enabled `2`), and `default_hints` (double-buffer `0x0020` /
+/// high-quality `0x0100`) — how a reader should preload / play the track.
+pub const LOAD: [u8; 4] = fourcc("load");
+/// `pnot` — QuickTime Preview Atom. A top-level `Box` whose 12-byte body
+/// locates the movie's preview (poster) image: `modification_date`, a
+/// `version` (0), an `atom_type` (typically `PICT`), and an `atom_index`
+/// (typically 1) identifying which atom of that type is the preview.
+pub const PNOT: [u8; 4] = fourcc("pnot");
 /// `hinf` — Hint Statistics Box (ISO/IEC 14496-12 §9.1.5). A container in
 /// a hint track's `udta` holding optional statistic sub-boxes (`trpy` /
 /// `nump` / `tpyl` / `maxr` / `dmed` / `payt` / …) summarising the

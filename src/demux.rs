@@ -1415,6 +1415,11 @@ struct Track {
     /// when the entry cannot be parsed (the raw post-preamble bytes remain
     /// available as `extradata`).
     text_entry: Option<TextSampleEntry>,
+    /// QuickTime Track Load Settings Atom (`load`) found inside the track's
+    /// `trak`. Carries the preload segment (start/duration), preload flags,
+    /// and default playback hints. `None` when the atom is absent (the
+    /// common case). The first parseable `load` seen wins.
+    load_settings: Option<LoadSettingsBox>,
     /// §9.1.2 / §9.4.1.2 — the RTP / SRTP / reception hint sample entry
     /// (`rtp ` / `srtp` / `rrtp`) from the track's active `stsd` entry,
     /// when present. Carries `maxpacketsize` plus the `tims` timescale and
@@ -2160,6 +2165,50 @@ pub struct TextSampleEntry {
     /// The name of the font to display the text with (the Pascal string,
     /// without its leading length byte). Empty when none is carried.
     pub text_name: String,
+}
+
+/// Decoded QuickTime Track Load Settings Atom (`load`).
+///
+/// A `trak`-level atom indicating how a reader should preload and play the
+/// track. Body layout (a plain `Box`, no FullBox preamble): `int(32)
+/// preload_start_time`, `int(32) preload_duration`, `int(32)
+/// preload_flags`, `int(32) default_hints` — sixteen bytes. Times are in
+/// the movie's time coordinate system. All integers big-endian.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadSettingsBox {
+    /// Start time, in the movie timescale, of a track segment to preload.
+    pub preload_start_time: i32,
+    /// Duration, in the movie timescale, of the preload segment. `-1`
+    /// means the segment extends to the end of the track.
+    pub preload_duration: i32,
+    /// Flags governing preload (mutually exclusive): `1` preload the track
+    /// regardless of enablement; `2` preload only when the track is
+    /// enabled.
+    pub preload_flags: i32,
+    /// Playback hints (may combine): Double-buffer (`0x0020`),
+    /// High-quality (`0x0100`).
+    pub default_hints: i32,
+}
+
+impl LoadSettingsBox {
+    /// Whether the track is preloaded regardless of enablement
+    /// (`preload_flags == 1`).
+    pub fn preload_always(&self) -> bool {
+        self.preload_flags == 1
+    }
+    /// Whether the track is preloaded only when enabled
+    /// (`preload_flags == 2`).
+    pub fn preload_if_enabled(&self) -> bool {
+        self.preload_flags == 2
+    }
+    /// Whether the Double-buffer hint is set (`default_hints & 0x0020`).
+    pub fn double_buffer(&self) -> bool {
+        self.default_hints & 0x0020 != 0
+    }
+    /// Whether the High-quality hint is set (`default_hints & 0x0100`).
+    pub fn high_quality(&self) -> bool {
+        self.default_hints & 0x0100 != 0
+    }
 }
 
 /// One entry of a `dref` (DataReferenceBox, ISO/IEC 14496-12 §8.7.2).
@@ -4817,6 +4866,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         tcmi: None,
         tmcd: None,
         text_entry: None,
+        load_settings: None,
         rtp_hint: None,
         mpeg2ts_hint: None,
         hint_stats: crate::hint::HintStatistics::default(),
@@ -4863,6 +4913,15 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
             TRGR => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
                 parse_trgr(&sub, &mut t)?;
+            }
+            LOAD => {
+                // QuickTime Track Load Settings Atom: keep the first
+                // parseable instance; a malformed one is dropped
+                // (informational) so the trak walk never aborts.
+                let sub = read_bytes_vec(&mut cur, psz)?;
+                if t.load_settings.is_none() {
+                    t.load_settings = parse_load_settings(&sub);
+                }
             }
             UDTA => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
@@ -6472,6 +6531,50 @@ pub fn build_text_sample_entry(r: &TextSampleEntry, data_reference_index: u16) -
     body.push(n as u8);
     body.extend_from_slice(&name[..n]);
     wrap_box(b"text", &body)
+}
+
+/// Parse a QuickTime `load` (Track Load Settings Atom) body from `body`
+/// (the 16 bytes after the plain 8-byte box header — `load` is a plain
+/// `Box`, no FullBox preamble): `int(32) preload_start_time`, `int(32)
+/// preload_duration`, `int(32) preload_flags`, `int(32) default_hints`.
+/// Returns `None` for a body shorter than the fixed 16 bytes; trailing
+/// bytes are ignored.
+fn parse_load_settings(body: &[u8]) -> Option<LoadSettingsBox> {
+    if body.len() < 16 {
+        return None;
+    }
+    let preload_start_time = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    let preload_duration = i32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    let preload_flags = i32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+    let default_hints = i32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+    Some(LoadSettingsBox {
+        preload_start_time,
+        preload_duration,
+        preload_flags,
+        default_hints,
+    })
+}
+
+/// Parse a standalone QuickTime `load` (Track Load Settings Atom) body
+/// from `body` (the 16 bytes after the plain 8-byte box header). Exposed
+/// so tooling holding the atom's payload can recover the preload / hint
+/// fields without re-running `open()`. `Err` for a body shorter than the
+/// fixed 16-byte layout; trailing bytes are ignored.
+pub fn parse_load_settings_box(body: &[u8]) -> Result<LoadSettingsBox> {
+    parse_load_settings(body).ok_or_else(|| Error::invalid("MP4: load too short"))
+}
+
+/// Build a complete QuickTime `load` (Track Load Settings Atom) box from a
+/// [`LoadSettingsBox`]. The byte-exact inverse of
+/// [`parse_load_settings_box`]: the four 32-bit fields with no FullBox
+/// preamble.
+pub fn build_load_settings_box(r: &LoadSettingsBox) -> Vec<u8> {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&r.preload_start_time.to_be_bytes());
+    body.extend_from_slice(&r.preload_duration.to_be_bytes());
+    body.extend_from_slice(&r.preload_flags.to_be_bytes());
+    body.extend_from_slice(&r.default_hints.to_be_bytes());
+    wrap_box(&LOAD, &body)
 }
 
 fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
@@ -10973,6 +11076,41 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         }
     }
 
+    // QuickTime Track Load Settings Atom (`trak/load`): when the track
+    // carries a `load`, surface its preload / hint fields on
+    // `params.options`. `load_preload_start_time` / `load_preload_duration`
+    // / `load_preload_flags` / `load_default_hints` are decimal; the
+    // decoded booleans `load_preload_always` / `load_preload_if_enabled` /
+    // `load_double_buffer` / `load_high_quality` expose the flag / hint
+    // bits. Absent `load`, none of the keys are emitted.
+    if let Some(ls) = &t.load_settings {
+        params
+            .options
+            .insert("load_preload_start_time", ls.preload_start_time.to_string());
+        params
+            .options
+            .insert("load_preload_duration", ls.preload_duration.to_string());
+        params
+            .options
+            .insert("load_preload_flags", ls.preload_flags.to_string());
+        params
+            .options
+            .insert("load_default_hints", ls.default_hints.to_string());
+        params
+            .options
+            .insert("load_preload_always", ls.preload_always().to_string());
+        params.options.insert(
+            "load_preload_if_enabled",
+            ls.preload_if_enabled().to_string(),
+        );
+        params
+            .options
+            .insert("load_double_buffer", ls.double_buffer().to_string());
+        params
+            .options
+            .insert("load_high_quality", ls.high_quality().to_string());
+    }
+
     // ISO/IEC 14496-12 (post-2015): when the track's `VisualSampleEntry`
     // carried an `amve` (AmbientViewingEnvironmentBox), surface its three
     // raw fields on `params.options` as `amve_ambient_illuminance`
@@ -13022,6 +13160,7 @@ mod tests {
             tcmi: None,
             tmcd: None,
             text_entry: None,
+            load_settings: None,
             rtp_hint: None,
             mpeg2ts_hint: None,
             hint_stats: crate::hint::HintStatistics::default(),
@@ -16099,6 +16238,96 @@ mod tests {
         );
         assert_eq!(info.params.options.get("text_font_face"), Some("1"));
         assert_eq!(info.params.options.get("text_font_name"), Some("Courier"));
+    }
+
+    /// `build_load_settings_box` → `parse_load_settings_box` is a
+    /// byte-exact round-trip; the signed `-1` "preload to end of track"
+    /// sentinel and the flag / hint decoders behave as specified.
+    #[test]
+    fn load_settings_round_trips_and_decodes_flags() {
+        let ls = super::LoadSettingsBox {
+            preload_start_time: 0,
+            preload_duration: -1, // to end of track
+            preload_flags: 2,     // preload only if enabled
+            default_hints: 0x0020 | 0x0100,
+        };
+        let boxed = super::build_load_settings_box(&ls);
+        assert_eq!(&boxed[4..8], b"load");
+        assert_eq!(boxed.len(), 24);
+        let back = super::parse_load_settings_box(&boxed[8..]).expect("round-trip");
+        assert_eq!(back, ls);
+        assert!(!back.preload_always());
+        assert!(back.preload_if_enabled());
+        assert!(back.double_buffer());
+        assert!(back.high_quality());
+    }
+
+    /// A `load` body shorter than the fixed 16 bytes is rejected.
+    #[test]
+    fn load_settings_too_short_is_rejected() {
+        assert!(super::parse_load_settings(&[0u8; 15]).is_none());
+        assert!(super::parse_load_settings_box(&[0u8; 15]).is_err());
+    }
+
+    /// A `load` atom nested in a `trak` is picked up by `parse_trak`.
+    #[test]
+    fn parse_trak_picks_up_nested_load() {
+        let ls = super::LoadSettingsBox {
+            preload_start_time: 100,
+            preload_duration: 5000,
+            preload_flags: 1,
+            default_hints: 0,
+        };
+        let mut tkhd = vec![0u8; 92]; // FullBox v0 + 84 bytes
+        tkhd[12..16].copy_from_slice(&1u32.to_be_bytes()); // track_id = 1
+
+        let mut mdhd = vec![0u8; 24];
+        mdhd[12..16].copy_from_slice(&1000u32.to_be_bytes()); // timescale
+
+        let mut hdlr = Vec::new();
+        hdlr.extend_from_slice(&[0u8; 8]);
+        hdlr.extend_from_slice(b"vide");
+        hdlr.extend_from_slice(&[0u8; 12]);
+        hdlr.extend_from_slice(b"\0");
+
+        let mut mdia = Vec::new();
+        mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
+        mdia.extend(wrap_box_full_size(b"hdlr", &hdlr));
+
+        let mut trak = Vec::new();
+        trak.extend(wrap_box_full_size(b"tkhd", &tkhd));
+        trak.extend(wrap_box_full_size(b"mdia", &mdia));
+        // `load` is a plain Box: its body is the 16 numeric bytes.
+        trak.extend_from_slice(&super::build_load_settings_box(&ls));
+
+        let t = super::parse_trak(&trak).unwrap().unwrap();
+        assert_eq!(t.load_settings, Some(ls));
+    }
+
+    /// Surfacing: a parsed `load` exposes its preload / hint fields and the
+    /// decoded flag booleans on `params.options`.
+    #[test]
+    fn build_stream_info_surfaces_load_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        t.load_settings = Some(super::LoadSettingsBox {
+            preload_start_time: 0,
+            preload_duration: -1,
+            preload_flags: 1,
+            default_hints: 0x0100,
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("load_preload_duration"), Some("-1"));
+        assert_eq!(info.params.options.get("load_preload_flags"), Some("1"));
+        assert_eq!(info.params.options.get("load_preload_always"), Some("true"));
+        assert_eq!(
+            info.params.options.get("load_preload_if_enabled"),
+            Some("false")
+        );
+        assert_eq!(info.params.options.get("load_high_quality"), Some("true"));
+        assert_eq!(info.params.options.get("load_double_buffer"), Some("false"));
     }
 
     /// Surfacing: a parsed `gmin` exposes `gmin_graphicsmode` (decimal),

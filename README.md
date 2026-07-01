@@ -632,6 +632,20 @@ Sample-entry FourCCs resolve to these codec ids:
   byte-exact `demux::parse_text_sample_entry_box` /
   `demux::build_text_sample_entry` round-trip the entry. Absent a
   structured `text` entry, none of the keys are emitted.
+- QuickTime track load settings (`trak/load`): a QuickTime `load` atom
+  indicates how a reader should preload and play the track. Its plain-Box
+  16-byte body carries `preload_start_time`, `preload_duration` (`-1` =
+  to end of track), `preload_flags` (preload-always `1` / preload-if-
+  enabled `2`), and `default_hints` (double-buffer `0x0020` / high-quality
+  `0x0100`), all in the movie timescale. The `LoadSettingsBox` record's
+  `preload_always()` / `preload_if_enabled()` / `double_buffer()` /
+  `high_quality()` helpers decode the flag / hint words. Surfaced on
+  `params.options` as `load_preload_start_time` / `load_preload_duration`
+  / `load_preload_flags` / `load_default_hints` (decimal) plus the decoded
+  booleans `load_preload_always` / `load_preload_if_enabled` /
+  `load_double_buffer` / `load_high_quality`. Public byte-exact
+  `demux::parse_load_settings_box` / `demux::build_load_settings_box`
+  round-trip the atom. Absent `load`, none of the keys are emitted.
 - Hint sample entries (ISO/IEC 14496-12 §9.1.2 / §9.3.3.2 / §9.4): a
   hint track's `stsd` entry is decoded when it is an RTP server (`rtp `),
   SRTP (`srtp`), RTP reception (`rrtp`), or RTCP reception (`rtcp`)
