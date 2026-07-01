@@ -613,6 +613,25 @@ Sample-entry FourCCs resolve to these codec ids:
   byte-exact `demux::parse_tmcd_sample_entry_box` /
   `demux::build_tmcd_sample_entry` round-trip the entry. Absent a `tmcd`
   entry, none of the keys are emitted.
+- QuickTime text sample description (`stsd` `text` entry): a QuickTime
+  text track (media type `text`) carries a `text` sample entry defining
+  how its text samples are drawn. After the shared 8-byte preamble: a
+  32-bit `display_flags` word (Don't-auto-scale `0x02` / Use-movie-bg
+  `0x08` / Scroll-in `0x20` / Scroll-out `0x40` / Horizontal-scroll
+  `0x80` / Reverse-scroll `0x100` / Continuous-scroll `0x200` /
+  Drop-shadow `0x1000` / Anti-alias `0x2000` / Key-text `0x4000`), a
+  signed 32-bit `text_justification` (0 left / 1 centered / -1 right), a
+  48-bit `background_color`, a 64-bit `default_text_box` (top/left/bottom/
+  right), a `font_number`, `font_face` style, a 48-bit `foreground_color`,
+  and a Pascal-string `text_name` (the font name). The structured fields
+  are surfaced on `params.options` as `text_display_flags` /
+  `text_justification` / `text_background_color` / `text_foreground_color`
+  / `text_default_text_box` / `text_font_number` / `text_font_face` /
+  `text_font_name` (font name omitted when empty), while the raw
+  post-preamble bytes remain available as `params.extradata`. Public
+  byte-exact `demux::parse_text_sample_entry_box` /
+  `demux::build_text_sample_entry` round-trip the entry. Absent a
+  structured `text` entry, none of the keys are emitted.
 - Hint sample entries (ISO/IEC 14496-12 §9.1.2 / §9.3.3.2 / §9.4): a
   hint track's `stsd` entry is decoded when it is an RTP server (`rtp `),
   SRTP (`srtp`), RTP reception (`rrtp`), or RTCP reception (`rtcp`)

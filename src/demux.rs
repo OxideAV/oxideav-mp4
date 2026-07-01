@@ -1408,6 +1408,13 @@ struct Track {
     /// how the track's timecode samples are interpreted. `None` for
     /// non-timecode tracks or when the entry cannot be parsed.
     tmcd: Option<TmcdSampleEntry>,
+    /// QuickTime Text sample description (`text` `stsd` entry) for a
+    /// QuickTime text track. Carries the display flags, justification,
+    /// colours, default text box, font, and font name that define how the
+    /// track's text samples are drawn. `None` for non-`text` entries or
+    /// when the entry cannot be parsed (the raw post-preamble bytes remain
+    /// available as `extradata`).
+    text_entry: Option<TextSampleEntry>,
     /// §9.1.2 / §9.4.1.2 — the RTP / SRTP / reception hint sample entry
     /// (`rtp ` / `srtp` / `rrtp`) from the track's active `stsd` entry,
     /// when present. Carries `maxpacketsize` plus the `tims` timescale and
@@ -2114,6 +2121,45 @@ impl TmcdSampleEntry {
     pub fn counter(&self) -> bool {
         self.flags & 0x0008 != 0
     }
+}
+
+/// Decoded QuickTime Text sample description (`text` `stsd` entry).
+///
+/// A QuickTime text track (media type `text`) carries a `text` sample
+/// entry that defines how the track's text samples are drawn. Body layout
+/// after the shared 8-byte sample-entry preamble: `unsigned int(32)
+/// display_flags`, `int(32) text_justification`, a 48-bit (`[u16; 3]`)
+/// `background_color`, a 64-bit `default_text_box` (`[i16; 4]` = top,
+/// left, bottom, right), a reserved `int(64)`, `unsigned int(16)
+/// font_number`, `unsigned int(16) font_face`, a reserved `int(8)`, a
+/// reserved `int(16)`, a 48-bit `foreground_color`, and a Pascal-string
+/// `text_name` (the font name). All integers big-endian.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextSampleEntry {
+    /// Flags describing how the text is drawn (Don't-auto-scale `0x0002`,
+    /// Use-movie-background-color `0x0008`, Scroll-in `0x0020`,
+    /// Scroll-out `0x0040`, Horizontal-scroll `0x0080`, Reverse-scroll
+    /// `0x0100`, Continuous-scroll `0x0200`, Drop-shadow `0x1000`,
+    /// Anti-alias `0x2000`, Key-text `0x4000`).
+    pub display_flags: u32,
+    /// Text alignment: `0` left-justified, `1` centered, `-1`
+    /// right-justified.
+    pub text_justification: i32,
+    /// The 48-bit RGB background colour of the text (red, green, blue).
+    pub background_color: [u16; 3],
+    /// The default text box rectangle (top, left, bottom, right).
+    pub default_text_box: [i16; 4],
+    /// The font number to use (must be 0 per the spec).
+    pub font_number: u16,
+    /// The font style (face). `0` is normal; the low bits enable Bold
+    /// (`0x01`), Italic (`0x02`), Underline (`0x04`), Outline (`0x08`),
+    /// Shadow (`0x10`), Condense (`0x20`), and Extend (`0x40`).
+    pub font_face: u16,
+    /// The 48-bit RGB foreground colour of the text (red, green, blue).
+    pub foreground_color: [u16; 3],
+    /// The name of the font to display the text with (the Pascal string,
+    /// without its leading length byte). Empty when none is carried.
+    pub text_name: String,
 }
 
 /// One entry of a `dref` (DataReferenceBox, ISO/IEC 14496-12 §8.7.2).
@@ -4770,6 +4816,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         gmin: None,
         tcmi: None,
         tmcd: None,
+        text_entry: None,
         rtp_hint: None,
         mpeg2ts_hint: None,
         hint_stats: crate::hint::HintStatistics::default(),
@@ -6327,6 +6374,106 @@ pub fn build_tmcd_sample_entry(r: &TmcdSampleEntry, data_reference_index: u16) -
     wrap_box(&TMCD, &body)
 }
 
+/// Parse a QuickTime `text` (Text) sample-description entry from `entry`
+/// (the full sample-entry bytes including the shared 8-byte preamble).
+/// Fixed field offsets (from `entry` start): `display_flags` [8..12],
+/// `text_justification` [12..16], `background_color` [16..22],
+/// `default_text_box` [22..30], reserved [30..38], `font_number`
+/// [38..40], `font_face` [40..42], reserved [42..43], reserved [43..45],
+/// `foreground_color` [45..51], then a Pascal-string `text_name` at
+/// [51..]. Returns `None` for an entry shorter than the 51-byte fixed
+/// prefix; a `text_name` length that overruns the body is clamped to the
+/// bytes present. Non-UTF-8 name bytes are replaced (lossy).
+fn parse_text_sample_entry(entry: &[u8]) -> Option<TextSampleEntry> {
+    if entry.len() < 51 {
+        return None;
+    }
+    let display_flags = u32::from_be_bytes([entry[8], entry[9], entry[10], entry[11]]);
+    let text_justification = i32::from_be_bytes([entry[12], entry[13], entry[14], entry[15]]);
+    let background_color = [
+        u16::from_be_bytes([entry[16], entry[17]]),
+        u16::from_be_bytes([entry[18], entry[19]]),
+        u16::from_be_bytes([entry[20], entry[21]]),
+    ];
+    let default_text_box = [
+        i16::from_be_bytes([entry[22], entry[23]]),
+        i16::from_be_bytes([entry[24], entry[25]]),
+        i16::from_be_bytes([entry[26], entry[27]]),
+        i16::from_be_bytes([entry[28], entry[29]]),
+    ];
+    // reserved int(64) at [30..38]
+    let font_number = u16::from_be_bytes([entry[38], entry[39]]);
+    let font_face = u16::from_be_bytes([entry[40], entry[41]]);
+    // reserved int(8) at [42], reserved int(16) at [43..45]
+    let foreground_color = [
+        u16::from_be_bytes([entry[45], entry[46]]),
+        u16::from_be_bytes([entry[47], entry[48]]),
+        u16::from_be_bytes([entry[49], entry[50]]),
+    ];
+    // Pascal string text_name: a leading length byte then that many
+    // characters. Absent (exactly 51 bytes) → empty name.
+    let text_name = if entry.len() > 51 {
+        let n = entry[51] as usize;
+        let avail = entry.len().saturating_sub(52);
+        let take = n.min(avail);
+        String::from_utf8_lossy(&entry[52..52 + take]).into_owned()
+    } else {
+        String::new()
+    };
+    Some(TextSampleEntry {
+        display_flags,
+        text_justification,
+        background_color,
+        default_text_box,
+        font_number,
+        font_face,
+        foreground_color,
+        text_name,
+    })
+}
+
+/// Parse a standalone QuickTime `text` (Text) sample-description entry
+/// body from `entry` (the full sample-entry bytes including the shared
+/// 8-byte preamble). Exposed so tooling holding the entry's bytes can
+/// recover the display / colour / font fields without re-running
+/// `open()`. `Err` for an entry shorter than the 51-byte fixed prefix.
+pub fn parse_text_sample_entry_box(entry: &[u8]) -> Result<TextSampleEntry> {
+    parse_text_sample_entry(entry).ok_or_else(|| Error::invalid("MP4: text sample entry too short"))
+}
+
+/// Build a complete QuickTime `text` (Text) sample-description entry box
+/// from a [`TextSampleEntry`], with `data_reference_index`. The byte-exact
+/// inverse of [`parse_text_sample_entry_box`]: the shared 8-byte preamble,
+/// the fixed numeric fields (with the spec's reserved zeros), and the
+/// Pascal-string `text_name` (a length byte capped at 255 followed by
+/// that many characters).
+pub fn build_text_sample_entry(r: &TextSampleEntry, data_reference_index: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(52 + r.text_name.len());
+    body.extend_from_slice(&[0u8; 6]); // reserved
+    body.extend_from_slice(&data_reference_index.to_be_bytes());
+    body.extend_from_slice(&r.display_flags.to_be_bytes());
+    body.extend_from_slice(&r.text_justification.to_be_bytes());
+    for c in r.background_color {
+        body.extend_from_slice(&c.to_be_bytes());
+    }
+    for v in r.default_text_box {
+        body.extend_from_slice(&v.to_be_bytes());
+    }
+    body.extend_from_slice(&[0u8; 8]); // reserved int(64)
+    body.extend_from_slice(&r.font_number.to_be_bytes());
+    body.extend_from_slice(&r.font_face.to_be_bytes());
+    body.push(0); // reserved int(8)
+    body.extend_from_slice(&[0u8; 2]); // reserved int(16)
+    for c in r.foreground_color {
+        body.extend_from_slice(&c.to_be_bytes());
+    }
+    let name = r.text_name.as_bytes();
+    let n = name.len().min(255);
+    body.push(n as u8);
+    body.extend_from_slice(&name[..n]);
+    wrap_box(b"text", &body)
+}
+
 fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
@@ -6707,16 +6854,26 @@ fn parse_subtitle_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             // header without re-parsing the BMFF surface.
             t.extradata = entry[8..].to_vec();
         }
-        b"tx3g" | b"text" | b"c608" | b"c708" => {
+        b"text" => {
+            // QuickTime plain-text sample description: a fixed header
+            // (display flags + justification + colours + default text box
+            // + font) followed by a Pascal-string font name. Parse the
+            // fixed numeric fields into a structured record; keep the raw
+            // post-preamble bytes as extradata too (a renderer may want
+            // the trailing font name / any nonstandard tail verbatim).
+            t.text_entry = parse_text_sample_entry(entry);
+            t.extradata = entry[8..].to_vec();
+        }
+        b"tx3g" | b"c608" | b"c708" => {
             // `tx3g` carries an 18-byte fixed header (display flags +
             // colours + default text box + default style record) plus
             // optional `ftab` font table. Treat the entire post-
             // preamble payload as extradata so a downstream renderer
             // can pick the colour / style defaults out of it.
             //
-            // For `text` / `c608` / `c708` no useful per-track header
-            // is defined; the post-preamble bytes are still preserved
-            // as extradata for any nonstandard carriage.
+            // For `c608` / `c708` no useful per-track header is defined;
+            // the post-preamble bytes are still preserved as extradata
+            // for any nonstandard carriage.
             t.extradata = entry[8..].to_vec();
         }
         _ => {}
@@ -10762,6 +10919,60 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             .insert("tmcd_number_of_frames", tm.number_of_frames.to_string());
     }
 
+    // QuickTime Text sample description (`stsd` `text` entry): when a
+    // QuickTime text track carries a structured `text` entry, surface its
+    // draw parameters on `params.options`. `text_display_flags` is the
+    // decimal flag word; `text_justification` is the signed alignment
+    // (0 left / 1 centered / -1 right); `text_background_color` and
+    // `text_foreground_color` are the three space-separated 16-bit RGB
+    // components; `text_default_text_box` is top/left/bottom/right
+    // space-separated; `text_font_number` / `text_font_face` are decimal;
+    // and `text_font_name` is the font name (omitted when empty). Absent a
+    // structured `text` entry, none of the keys are emitted.
+    if let Some(tx) = &t.text_entry {
+        params
+            .options
+            .insert("text_display_flags", tx.display_flags.to_string());
+        params
+            .options
+            .insert("text_justification", tx.text_justification.to_string());
+        params.options.insert(
+            "text_background_color",
+            format!(
+                "{} {} {}",
+                tx.background_color[0], tx.background_color[1], tx.background_color[2]
+            ),
+        );
+        params.options.insert(
+            "text_foreground_color",
+            format!(
+                "{} {} {}",
+                tx.foreground_color[0], tx.foreground_color[1], tx.foreground_color[2]
+            ),
+        );
+        params.options.insert(
+            "text_default_text_box",
+            format!(
+                "{} {} {} {}",
+                tx.default_text_box[0],
+                tx.default_text_box[1],
+                tx.default_text_box[2],
+                tx.default_text_box[3]
+            ),
+        );
+        params
+            .options
+            .insert("text_font_number", tx.font_number.to_string());
+        params
+            .options
+            .insert("text_font_face", tx.font_face.to_string());
+        if !tx.text_name.is_empty() {
+            params
+                .options
+                .insert("text_font_name", tx.text_name.clone());
+        }
+    }
+
     // ISO/IEC 14496-12 (post-2015): when the track's `VisualSampleEntry`
     // carried an `amve` (AmbientViewingEnvironmentBox), surface its three
     // raw fields on `params.options` as `amve_ambient_illuminance`
@@ -12810,6 +13021,7 @@ mod tests {
             gmin: None,
             tcmi: None,
             tmcd: None,
+            text_entry: None,
             rtp_hint: None,
             mpeg2ts_hint: None,
             hint_stats: crate::hint::HintStatistics::default(),
@@ -15788,6 +16000,105 @@ mod tests {
         assert_eq!(info.params.options.get("tmcd_timescale"), Some("30000"));
         assert_eq!(info.params.options.get("tmcd_frame_duration"), Some("1001"));
         assert_eq!(info.params.options.get("tmcd_number_of_frames"), Some("30"));
+    }
+
+    /// `build_text_sample_entry` → `parse_text_sample_entry_box` is a
+    /// byte-exact round-trip, including the signed justification, the
+    /// signed default-text-box rectangle, and the Pascal-string font name.
+    #[test]
+    fn text_sample_entry_round_trips() {
+        let e = super::TextSampleEntry {
+            display_flags: 0x2000 | 0x1000, // anti-alias + drop-shadow
+            text_justification: -1,         // right-justified
+            background_color: [0x1111, 0x2222, 0x3333],
+            default_text_box: [0, 0, 60, 320],
+            font_number: 0,
+            font_face: 0x02, // italic
+            foreground_color: [0xFFFF, 0xFFFF, 0xFFFF],
+            text_name: "Geneva".to_string(),
+        };
+        let boxed = super::build_text_sample_entry(&e, 1);
+        assert_eq!(&boxed[4..8], b"text");
+        assert_eq!(u16::from_be_bytes([boxed[8 + 6], boxed[8 + 7]]), 1);
+        let back = super::parse_text_sample_entry_box(&boxed[8..]).expect("round-trip");
+        assert_eq!(back, e);
+    }
+
+    /// A `text` entry shorter than the 51-byte fixed prefix is rejected.
+    #[test]
+    fn text_sample_entry_too_short_is_rejected() {
+        assert!(super::parse_text_sample_entry(&[0u8; 50]).is_none());
+        assert!(super::parse_text_sample_entry_box(&[0u8; 50]).is_err());
+    }
+
+    /// A `text` entry with a font-name length that overruns the body is
+    /// clamped to the bytes present rather than dropping the whole entry.
+    #[test]
+    fn text_sample_entry_name_overrun_clamped() {
+        let mut e = vec![0u8; 51];
+        e.push(200); // claim 200 chars
+        e.extend_from_slice(b"xy");
+        let tx = super::parse_text_sample_entry(&e).expect("clamped parse");
+        assert_eq!(tx.text_name, "xy");
+    }
+
+    /// A `text` entry parsed through `parse_stsd` populates `t.text_entry`
+    /// and keeps the raw post-preamble bytes as extradata.
+    #[test]
+    fn parse_stsd_captures_text_entry() {
+        let e = super::TextSampleEntry {
+            display_flags: 0,
+            text_justification: 1, // centered
+            background_color: [0, 0, 0],
+            default_text_box: [0, 0, 0, 0],
+            font_number: 0,
+            font_face: 0,
+            foreground_color: [0xFFFF, 0xFFFF, 0xFFFF],
+            text_name: String::new(),
+        };
+        let entry = super::build_text_sample_entry(&e, 1);
+        let mut stsd = vec![0u8, 0, 0, 0];
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        stsd.extend_from_slice(&entry);
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Subtitle;
+        super::parse_stsd(&stsd, &mut t).expect("stsd parse");
+        assert_eq!(t.codec_id_fourcc, *b"text");
+        assert_eq!(t.text_entry, Some(e));
+        assert!(!t.extradata.is_empty());
+    }
+
+    /// Surfacing: a parsed `text` sample entry exposes its draw parameters
+    /// on `params.options`.
+    #[test]
+    fn build_stream_info_surfaces_text_entry_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Subtitle;
+        t.codec_id_fourcc = *b"text";
+        t.timescale = 1000;
+        t.text_entry = Some(super::TextSampleEntry {
+            display_flags: 0x2000,
+            text_justification: -1,
+            background_color: [0, 0, 0],
+            default_text_box: [1, 2, 3, 4],
+            font_number: 0,
+            font_face: 1,
+            foreground_color: [0xFFFF, 0xFFFF, 0xFFFF],
+            text_name: "Courier".to_string(),
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("text_display_flags"), Some("8192"));
+        assert_eq!(info.params.options.get("text_justification"), Some("-1"));
+        assert_eq!(
+            info.params.options.get("text_default_text_box"),
+            Some("1 2 3 4")
+        );
+        assert_eq!(
+            info.params.options.get("text_foreground_color"),
+            Some("65535 65535 65535")
+        );
+        assert_eq!(info.params.options.get("text_font_face"), Some("1"));
+        assert_eq!(info.params.options.get("text_font_name"), Some("Courier"));
     }
 
     /// Surfacing: a parsed `gmin` exposes `gmin_graphicsmode` (decimal),
