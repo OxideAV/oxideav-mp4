@@ -455,6 +455,12 @@ pub const SM2T: [u8; 4] = fourcc("sm2t");
 /// §9.3.3.2). Same MPEG2TSSampleEntry body as `sm2t`; a distinct FourCC
 /// for reception hint tracks.
 pub const RM2T: [u8; 4] = fourcc("rm2t");
+/// `tmcd` — QuickTime Timecode sample entry (and the timecode media
+/// type). Its `stsd` entry, after the shared 8-byte sample-entry
+/// preamble, carries a reserved u32, a 32-bit `flags` field (drop-frame /
+/// 24-hour-max / negative-OK / counter), a 32-bit `timescale`, a 32-bit
+/// `frame_duration`, an 8-bit `number_of_frames`, and a reserved u8.
+pub const TMCD: [u8; 4] = fourcc("tmcd");
 /// `hinf` — Hint Statistics Box (ISO/IEC 14496-12 §9.1.5). A container in
 /// a hint track's `udta` holding optional statistic sub-boxes (`trpy` /
 /// `nump` / `tpyl` / `maxr` / `dmed` / `payt` / …) summarising the

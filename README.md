@@ -597,6 +597,22 @@ Sample-entry FourCCs resolve to these codec ids:
   present rather than dropping the atom. Public byte-exact
   `demux::parse_tcmi_box` / `demux::build_tcmi_box` round-trip the atom.
   Absent `tcmi`, none of the keys are emitted.
+- QuickTime timecode sample description (`stsd` `tmcd` entry): a timecode
+  track (media type `tmcd`) carries a single `tmcd` sample entry defining
+  how its timecode samples are interpreted. After the shared 8-byte
+  sample-entry preamble: a reserved u32, a 32-bit `flags` word (Drop-frame
+  `0x01` / 24-hour-max `0x02` / Negative-OK `0x04` / Counter `0x08`), a
+  32-bit `timescale`, a 32-bit `frame_duration`, and an 8-bit
+  `number_of_frames`. Dispatched by FourCC (the `tmcd` handler maps to the
+  Data media type). Surfaced on `params.options` as `tmcd_flags` (decimal),
+  the decoded booleans `tmcd_drop_frame` / `tmcd_24hour_max` /
+  `tmcd_negative_ok` / `tmcd_counter`, and `tmcd_timescale` /
+  `tmcd_frame_duration` / `tmcd_number_of_frames` (decimal). The
+  `TmcdSampleEntry` record's `drop_frame()` / `twenty_four_hour_max()` /
+  `negative_times_ok()` / `counter()` helpers decode the flag word. Public
+  byte-exact `demux::parse_tmcd_sample_entry_box` /
+  `demux::build_tmcd_sample_entry` round-trip the entry. Absent a `tmcd`
+  entry, none of the keys are emitted.
 - Hint sample entries (ISO/IEC 14496-12 §9.1.2 / §9.3.3.2 / §9.4): a
   hint track's `stsd` entry is decoded when it is an RTP server (`rtp `),
   SRTP (`srtp`), RTP reception (`rrtp`), or RTCP reception (`rtcp`)

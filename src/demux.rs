@@ -1402,6 +1402,12 @@ struct Track {
     /// for non-timecode tracks or when the atom is absent. The first
     /// parseable `tcmi` seen wins.
     tcmi: Option<TcmiBox>,
+    /// QuickTime Timecode sample description (`tmcd` `stsd` entry) for a
+    /// timecode track. Carries the `flags` (drop-frame / 24-hour / …),
+    /// `timescale`, `frame_duration`, and `number_of_frames` that define
+    /// how the track's timecode samples are interpreted. `None` for
+    /// non-timecode tracks or when the entry cannot be parsed.
+    tmcd: Option<TmcdSampleEntry>,
     /// §9.1.2 / §9.4.1.2 — the RTP / SRTP / reception hint sample entry
     /// (`rtp ` / `srtp` / `rrtp`) from the track's active `stsd` entry,
     /// when present. Carries `maxpacketsize` plus the `tims` timescale and
@@ -2063,6 +2069,51 @@ pub struct TcmiBox {
     /// The name of the timecode text's font (the Pascal string, without
     /// its leading length byte). Empty when the atom carries no name.
     pub font_name: String,
+}
+
+/// Decoded QuickTime Timecode sample description (`tmcd` `stsd` entry).
+///
+/// A timecode track (media type `tmcd`) carries a single `tmcd` sample
+/// entry that defines how the track's timecode sample data is
+/// interpreted. Body layout after the shared 8-byte sample-entry preamble
+/// (`reserved[6]` + `data_reference_index`): `unsigned int(32) reserved`,
+/// `unsigned int(32) flags`, `unsigned int(32) timescale`,
+/// `unsigned int(32) frame_duration`, `unsigned int(8) number_of_frames`,
+/// and a reserved `unsigned int(8)` (the qtff shows the trailing reserved
+/// as 24 bits alongside an optional source-reference `udta`; this record
+/// captures the fixed numeric fields). All integers big-endian.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TmcdSampleEntry {
+    /// Timecode characteristics: Drop-frame (`0x0001`), 24-hour-max
+    /// (`0x0002`), Negative-times-OK (`0x0004`), and Counter (`0x0008`).
+    pub flags: u32,
+    /// The time scale for interpreting `frame_duration` (units per
+    /// second).
+    pub timescale: u32,
+    /// How long each timecode frame lasts, in `timescale` units.
+    pub frame_duration: u32,
+    /// The number of frames per second for the timecode format. When the
+    /// Counter flag is set, the number of frames per counter tick.
+    pub number_of_frames: u8,
+}
+
+impl TmcdSampleEntry {
+    /// Whether the timecode is drop-frame (`flags & 0x0001`).
+    pub fn drop_frame(&self) -> bool {
+        self.flags & 0x0001 != 0
+    }
+    /// Whether the timecode wraps after 24 hours (`flags & 0x0002`).
+    pub fn twenty_four_hour_max(&self) -> bool {
+        self.flags & 0x0002 != 0
+    }
+    /// Whether negative time values are allowed (`flags & 0x0004`).
+    pub fn negative_times_ok(&self) -> bool {
+        self.flags & 0x0004 != 0
+    }
+    /// Whether the time value is a tape counter value (`flags & 0x0008`).
+    pub fn counter(&self) -> bool {
+        self.flags & 0x0008 != 0
+    }
 }
 
 /// One entry of a `dref` (DataReferenceBox, ISO/IEC 14496-12 §8.7.2).
@@ -4718,6 +4769,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         hmhd: None,
         gmin: None,
         tcmi: None,
+        tmcd: None,
         rtp_hint: None,
         mpeg2ts_hint: None,
         hint_stats: crate::hint::HintStatistics::default(),
@@ -6219,6 +6271,62 @@ pub fn build_tcmi_box(r: &TcmiBox) -> Vec<u8> {
     wrap_box(&TCMI, &body)
 }
 
+/// Parse a QuickTime `tmcd` (Timecode) sample-description entry from
+/// `entry` (the full sample-entry bytes, including the shared 8-byte
+/// `reserved[6]` + `data_reference_index` preamble). After the preamble:
+/// `unsigned int(32) reserved`, `unsigned int(32) flags`,
+/// `unsigned int(32) timescale`, `unsigned int(32) frame_duration`,
+/// `unsigned int(8) number_of_frames` — 21 payload bytes after the
+/// preamble (29 total up to and including `number_of_frames`). Returns
+/// `None` for an entry too short to hold the fixed numeric fields; any
+/// trailing reserved / source-reference `udta` bytes are ignored.
+fn parse_tmcd_sample_entry(entry: &[u8]) -> Option<TmcdSampleEntry> {
+    // 8 (preamble) + 4 (reserved) + 4 (flags) + 4 (timescale)
+    // + 4 (frame_duration) + 1 (number_of_frames) = 25 bytes minimum.
+    if entry.len() < 25 {
+        return None;
+    }
+    let flags = u32::from_be_bytes([entry[12], entry[13], entry[14], entry[15]]);
+    let timescale = u32::from_be_bytes([entry[16], entry[17], entry[18], entry[19]]);
+    let frame_duration = u32::from_be_bytes([entry[20], entry[21], entry[22], entry[23]]);
+    let number_of_frames = entry[24];
+    Some(TmcdSampleEntry {
+        flags,
+        timescale,
+        frame_duration,
+        number_of_frames,
+    })
+}
+
+/// Parse a standalone QuickTime `tmcd` (Timecode) sample-description entry
+/// body from `entry` (the full sample-entry bytes including the shared
+/// 8-byte preamble). Exposed so tooling holding the entry's bytes can
+/// recover the `(flags, timescale, frame_duration, number_of_frames)`
+/// fields without re-running `open()`. `Err` for an entry too short to
+/// hold the fixed numeric fields.
+pub fn parse_tmcd_sample_entry_box(entry: &[u8]) -> Result<TmcdSampleEntry> {
+    parse_tmcd_sample_entry(entry).ok_or_else(|| Error::invalid("MP4: tmcd sample entry too short"))
+}
+
+/// Build a complete QuickTime `tmcd` (Timecode) sample-description entry
+/// box from a [`TmcdSampleEntry`], with `data_reference_index`. The
+/// byte-exact inverse of [`parse_tmcd_sample_entry_box`]: the shared
+/// 8-byte preamble (`reserved[6]` + `data_reference_index`), a reserved
+/// u32, the `flags`, `timescale`, `frame_duration`, `number_of_frames`,
+/// and a reserved u8. The optional source-reference `udta` is not emitted.
+pub fn build_tmcd_sample_entry(r: &TmcdSampleEntry, data_reference_index: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(26);
+    body.extend_from_slice(&[0u8; 6]); // reserved
+    body.extend_from_slice(&data_reference_index.to_be_bytes());
+    body.extend_from_slice(&[0u8; 4]); // reserved
+    body.extend_from_slice(&r.flags.to_be_bytes());
+    body.extend_from_slice(&r.timescale.to_be_bytes());
+    body.extend_from_slice(&r.frame_duration.to_be_bytes());
+    body.push(r.number_of_frames);
+    body.push(0); // reserved
+    wrap_box(&TMCD, &body)
+}
+
 fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
@@ -6524,6 +6632,13 @@ fn parse_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
     // sample entries.
     if matches!(t.codec_id_fourcc, SM2T | RM2T) {
         t.mpeg2ts_hint = crate::hint::parse_mpeg2ts_hint_sample_entry(t.codec_id_fourcc, entry);
+        return Ok(());
+    }
+    // QuickTime timecode media (`tmcd`): its handler maps to
+    // MediaType::Data, so dispatch on the FourCC before the media-type
+    // switch. A malformed entry leaves `tmcd` None rather than aborting.
+    if t.codec_id_fourcc == TMCD {
+        t.tmcd = parse_tmcd_sample_entry(entry);
         return Ok(());
     }
     match t.media_type {
@@ -10615,6 +10730,38 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         }
     }
 
+    // QuickTime Timecode sample description (`stsd` `tmcd` entry): when the
+    // track is a timecode track, surface the fields that define how its
+    // timecode samples are read. `tmcd_flags` is the decimal flag word;
+    // `tmcd_drop_frame` / `tmcd_24hour_max` / `tmcd_negative_ok` /
+    // `tmcd_counter` are the decoded booleans; `tmcd_timescale`,
+    // `tmcd_frame_duration`, and `tmcd_number_of_frames` are decimal.
+    // Absent a `tmcd` entry, none of the keys are emitted.
+    if let Some(tm) = &t.tmcd {
+        params.options.insert("tmcd_flags", tm.flags.to_string());
+        params
+            .options
+            .insert("tmcd_drop_frame", tm.drop_frame().to_string());
+        params
+            .options
+            .insert("tmcd_24hour_max", tm.twenty_four_hour_max().to_string());
+        params
+            .options
+            .insert("tmcd_negative_ok", tm.negative_times_ok().to_string());
+        params
+            .options
+            .insert("tmcd_counter", tm.counter().to_string());
+        params
+            .options
+            .insert("tmcd_timescale", tm.timescale.to_string());
+        params
+            .options
+            .insert("tmcd_frame_duration", tm.frame_duration.to_string());
+        params
+            .options
+            .insert("tmcd_number_of_frames", tm.number_of_frames.to_string());
+    }
+
     // ISO/IEC 14496-12 (post-2015): when the track's `VisualSampleEntry`
     // carried an `amve` (AmbientViewingEnvironmentBox), surface its three
     // raw fields on `params.options` as `amve_ambient_illuminance`
@@ -12662,6 +12809,7 @@ mod tests {
             hmhd: None,
             gmin: None,
             tcmi: None,
+            tmcd: None,
             rtp_hint: None,
             mpeg2ts_hint: None,
             hint_stats: crate::hint::HintStatistics::default(),
@@ -15561,6 +15709,85 @@ mod tests {
             Some("0 0 0")
         );
         assert_eq!(info.params.options.get("tcmi_font_name"), Some("Helvetica"));
+    }
+
+    /// `build_tmcd_sample_entry` → `parse_tmcd_sample_entry_box` is a
+    /// byte-exact round-trip; the drop-frame example (29.97 fps NTSC:
+    /// timescale 30000, frame_duration 1001, 30 nominal frames, drop-frame
+    /// flag) decodes field-for-field.
+    #[test]
+    fn tmcd_sample_entry_round_trips_ntsc_drop_frame() {
+        let e = super::TmcdSampleEntry {
+            flags: 0x0001 | 0x0002, // drop-frame + 24-hour max
+            timescale: 30_000,
+            frame_duration: 1001,
+            number_of_frames: 30,
+        };
+        let boxed = super::build_tmcd_sample_entry(&e, 1);
+        assert_eq!(&boxed[4..8], b"tmcd");
+        // data_reference_index at preamble offset 6..8 (box header + 6).
+        assert_eq!(u16::from_be_bytes([boxed[8 + 6], boxed[8 + 7]]), 1);
+        let back = super::parse_tmcd_sample_entry_box(&boxed[8..]).expect("round-trip");
+        assert_eq!(back, e);
+        assert!(back.drop_frame());
+        assert!(back.twenty_four_hour_max());
+        assert!(!back.negative_times_ok());
+        assert!(!back.counter());
+    }
+
+    /// A `tmcd` entry too short to hold the fixed numeric fields is
+    /// rejected rather than surfacing truncation noise.
+    #[test]
+    fn tmcd_sample_entry_too_short_is_rejected() {
+        assert!(super::parse_tmcd_sample_entry(&[0u8; 24]).is_none());
+        assert!(super::parse_tmcd_sample_entry_box(&[0u8; 24]).is_err());
+    }
+
+    /// A `tmcd` entry parsed through `parse_stsd` populates `t.tmcd` and
+    /// leaves the FourCC/media-type handling intact.
+    #[test]
+    fn parse_stsd_captures_tmcd_entry() {
+        let e = super::TmcdSampleEntry {
+            flags: 0x0008, // counter
+            timescale: 25,
+            frame_duration: 1,
+            number_of_frames: 25,
+        };
+        let entry = super::build_tmcd_sample_entry(&e, 1);
+        // stsd: FullBox preamble (4) + entry_count(=1) + the entry box.
+        let mut stsd = vec![0u8, 0, 0, 0];
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        stsd.extend_from_slice(&entry);
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Data;
+        super::parse_stsd(&stsd, &mut t).expect("stsd parse");
+        assert_eq!(t.codec_id_fourcc, *b"tmcd");
+        assert_eq!(t.tmcd, Some(e));
+        assert!(t.tmcd.unwrap().counter());
+    }
+
+    /// Surfacing: a parsed `tmcd` sample entry exposes its fields (flags,
+    /// decoded booleans, timescale, frame_duration, number_of_frames) on
+    /// `params.options`.
+    #[test]
+    fn build_stream_info_surfaces_tmcd_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Data;
+        t.codec_id_fourcc = *b"tmcd";
+        t.timescale = 30_000;
+        t.tmcd = Some(super::TmcdSampleEntry {
+            flags: 0x0001,
+            timescale: 30_000,
+            frame_duration: 1001,
+            number_of_frames: 30,
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("tmcd_flags"), Some("1"));
+        assert_eq!(info.params.options.get("tmcd_drop_frame"), Some("true"));
+        assert_eq!(info.params.options.get("tmcd_24hour_max"), Some("false"));
+        assert_eq!(info.params.options.get("tmcd_timescale"), Some("30000"));
+        assert_eq!(info.params.options.get("tmcd_frame_duration"), Some("1001"));
+        assert_eq!(info.params.options.get("tmcd_number_of_frames"), Some("30"));
     }
 
     /// Surfacing: a parsed `gmin` exposes `gmin_graphicsmode` (decimal),
