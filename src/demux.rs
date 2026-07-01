@@ -1386,6 +1386,15 @@ struct Track {
     /// `None` for non-hint tracks (which use `vmhd` / `smhd` / `nmhd` /
     /// `sthd` instead) or when the box is absent.
     hmhd: Option<HmhdBox>,
+    /// QuickTime Base Media Info Atom (`gmin`) found inside the track's
+    /// `minf/gmhd` (base media information header) atom. QuickTime uses
+    /// `gmhd` in place of `vmhd` / `smhd` for media types derived from the
+    /// base media handler (text, timecode, music, generic/`gnrc`); its
+    /// `gmin` child carries a `graphicsmode` composition mode, a
+    /// three-component `opcolor`, and a `balance` (the stereo sound mix).
+    /// `None` for tracks whose `minf` uses a typed media header instead, or
+    /// when the atom is absent. The first parseable `gmin` seen wins.
+    gmin: Option<GminBox>,
     /// §9.1.2 / §9.4.1.2 — the RTP / SRTP / reception hint sample entry
     /// (`rtp ` / `srtp` / `rrtp`) from the track's active `stsd` entry,
     /// when present. Carries `maxpacketsize` plus the `tims` timescale and
@@ -1985,6 +1994,35 @@ struct HmhdBox {
     /// Average rate in bits/second over the entire presentation
     /// (§12.4.2.3).
     avg_bitrate: u32,
+}
+
+/// Decoded QuickTime Base Media Info Atom (`gmin`).
+///
+/// QuickTime carries a **Base Media Information Header Atom** (`gmhd`)
+/// inside `minf` for media types derived from the base media handler
+/// (text, timecode, music, and generic tracks) — the role that `vmhd`
+/// fills for video and `smhd` for sound. The `gmhd`'s required child is
+/// the **Base Media Info Atom** (`gmin`), whose fixed-size body defines
+/// the media's control information: graphics mode, operation colour, and
+/// stereo sound balance.
+///
+/// Body layout after the 4-byte `FullBox(version, flags)` preamble:
+/// `unsigned int(16) graphicsmode`, `unsigned int(16)[3] opcolor`,
+/// `int(16) balance`, and a reserved `unsigned int(16)` — twelve payload
+/// bytes after the preamble, sixteen total. All integers big-endian.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GminBox {
+    /// The transfer (composition) mode for the base media, selecting the
+    /// operation performed when drawing or transferring an image from one
+    /// location to another. `0` is `copy`.
+    pub graphicsmode: u16,
+    /// The three (red, green, blue) 16-bit colour components for the
+    /// transfer-mode operation indicated by `graphicsmode`.
+    pub opcolor: [u16; 3],
+    /// The sound balance: the mix of this media's sound between the two
+    /// speakers. Normally `0` (centered); negative favours the left
+    /// speaker, positive the right (an 8.8 fixed-point value).
+    pub balance: i16,
 }
 
 /// One entry of a `dref` (DataReferenceBox, ISO/IEC 14496-12 §8.7.2).
@@ -4638,6 +4676,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         clap: None,
         colr: None,
         hmhd: None,
+        gmin: None,
         rtp_hint: None,
         mpeg2ts_hint: None,
         hint_stats: crate::hint::HintStatistics::default(),
@@ -5713,6 +5752,20 @@ fn parse_minf(body: &[u8], t: &mut Track) -> Result<()> {
                     }
                 }
             }
+            GMHD => {
+                // QuickTime Base Media Information Header Atom: a container
+                // used in place of a typed media header for base-media
+                // tracks (text / timecode / music / generic). Walk it for
+                // its required `gmin` child. Keep the first parseable
+                // instance; a malformed `gmin` is dropped (informational —
+                // the track still demuxes) so the walk never aborts.
+                let sub = read_bytes_vec(&mut cur, psz)?;
+                if t.gmin.is_none() {
+                    if let Some(g) = parse_gmhd(&sub) {
+                        t.gmin = Some(g);
+                    }
+                }
+            }
             DINF => {
                 // §8.7.1: DataInformationBox is a plain container whose
                 // sole child of interest is the `dref` DataReferenceBox.
@@ -5939,6 +5992,89 @@ fn parse_hmhd(body: &[u8]) -> Result<HmhdBox> {
         max_bitrate,
         avg_bitrate,
     })
+}
+
+/// Walk a QuickTime `gmhd` (Base Media Information Header Atom) body for
+/// its required `gmin` (Base Media Info Atom) child and parse it. Returns
+/// `None` when the `gmhd` carries no parseable `gmin`. A `gmhd` may also
+/// carry media-specific children (e.g. a `text` atom for text media, a
+/// `tmcd` atom for timecode media); those are skipped — only `gmin` is
+/// surfaced here.
+fn parse_gmhd(body: &[u8]) -> Option<GminBox> {
+    let mut cur = std::io::Cursor::new(body);
+    let end = body.len() as u64;
+    while cur.position() < end {
+        let hdr = read_box_header(&mut cur).ok()??;
+        let psz = hdr.payload_size().unwrap_or(0) as usize;
+        let sub = read_bytes_vec(&mut cur, psz).ok()?;
+        if hdr.fourcc == GMIN {
+            return parse_gmin(&sub);
+        }
+    }
+    None
+}
+
+/// Parse a QuickTime `gmin` (Base Media Info Atom) body.
+///
+/// The body is a 4-byte `FullBox(version, flags)` preamble followed by
+/// `unsigned int(16) graphicsmode`, `unsigned int(16)[3] opcolor`,
+/// `int(16) balance`, and a reserved `unsigned int(16)` — twelve payload
+/// bytes after the preamble, sixteen total. The `version` / `flags`
+/// (specified as 0) are read past but not enforced (a non-zero value is
+/// tolerated rather than dropping a usable atom, matching the `parse_vmhd`
+/// posture); the trailing reserved word is read past but not surfaced.
+/// A body shorter than the full 16 bytes is rejected — a partial atom
+/// would surface a `balance` that is really truncation noise.
+fn parse_gmin(body: &[u8]) -> Option<GminBox> {
+    if body.len() < 16 {
+        return None;
+    }
+    let graphicsmode = u16::from_be_bytes([body[4], body[5]]);
+    let opcolor = [
+        u16::from_be_bytes([body[6], body[7]]),
+        u16::from_be_bytes([body[8], body[9]]),
+        u16::from_be_bytes([body[10], body[11]]),
+    ];
+    let balance = i16::from_be_bytes([body[12], body[13]]);
+    Some(GminBox {
+        graphicsmode,
+        opcolor,
+        balance,
+    })
+}
+
+/// Parse a standalone QuickTime `gmin` (Base Media Info Atom) body from
+/// `body` (the 16 bytes after the plain 8-byte box header). Exposed so
+/// tooling holding the atom's payload can recover the
+/// `(graphicsmode, opcolor, balance)` triple without re-running `open()`.
+/// `Err` for a body shorter than the fixed 16-byte layout; trailing bytes
+/// are ignored.
+pub fn parse_gmin_box(body: &[u8]) -> Result<GminBox> {
+    parse_gmin(body).ok_or_else(|| Error::invalid("MP4: gmin too short"))
+}
+
+/// Build a complete QuickTime `gmin` (Base Media Info Atom) box from a
+/// [`GminBox`]. The byte-exact inverse of [`parse_gmin_box`]: a 4-byte
+/// `FullBox(version=0, flags=0)` preamble, the `graphicsmode`, the three
+/// `opcolor` components, the `balance`, and the reserved zero word.
+pub fn build_gmin_box(r: &GminBox) -> Vec<u8> {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+    body.extend_from_slice(&r.graphicsmode.to_be_bytes());
+    for c in r.opcolor {
+        body.extend_from_slice(&c.to_be_bytes());
+    }
+    body.extend_from_slice(&r.balance.to_be_bytes());
+    body.extend_from_slice(&[0, 0]); // reserved
+    wrap_box(&GMIN, &body)
+}
+
+/// Build a complete QuickTime `gmhd` (Base Media Information Header Atom)
+/// box wrapping a single `gmin` (Base Media Info Atom) built from `r`.
+/// This is the minimal `gmhd` — the `gmin` child alone — sufficient for
+/// a base-media (text / timecode / music / generic) track's `minf`.
+pub fn build_gmhd_box(r: &GminBox) -> Vec<u8> {
+    wrap_box(&GMHD, &build_gmin_box(r))
 }
 
 fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
@@ -10280,6 +10416,25 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         );
     }
 
+    // QuickTime Base Media Info Atom (`minf/gmhd/gmin`): when the track
+    // carries a `gmhd` in place of a typed media header (a base-media
+    // track — text / timecode / music / generic), surface its control
+    // information on `params.options`. `gmin_graphicsmode` is the decimal
+    // composition mode (0 = copy); `gmin_opcolor` is the three
+    // (red, green, blue) 16-bit components space-separated, decimal; and
+    // `gmin_balance` is the signed stereo sound balance. Absent `gmhd`,
+    // none of the keys are emitted.
+    if let Some(g) = &t.gmin {
+        params
+            .options
+            .insert("gmin_graphicsmode", g.graphicsmode.to_string());
+        params.options.insert(
+            "gmin_opcolor",
+            format!("{} {} {}", g.opcolor[0], g.opcolor[1], g.opcolor[2]),
+        );
+        params.options.insert("gmin_balance", g.balance.to_string());
+    }
+
     // ISO/IEC 14496-12 (post-2015): when the track's `VisualSampleEntry`
     // carried an `amve` (AmbientViewingEnvironmentBox), surface its three
     // raw fields on `params.options` as `amve_ambient_illuminance`
@@ -12325,6 +12480,7 @@ mod tests {
             clap: None,
             colr: None,
             hmhd: None,
+            gmin: None,
             rtp_hint: None,
             mpeg2ts_hint: None,
             hint_stats: crate::hint::HintStatistics::default(),
@@ -15036,6 +15192,118 @@ mod tests {
         let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
         assert_eq!(info.params.options.get("vmhd_graphicsmode"), None);
         assert_eq!(info.params.options.get("vmhd_opcolor"), None);
+    }
+
+    /// `parse_gmin` decodes the QuickTime Base Media Info Atom body
+    /// (graphicsmode + opcolor + balance) after its FullBox preamble.
+    #[test]
+    fn parse_gmin_fields() {
+        let mut body = vec![0u8, 0, 0, 0]; // version + flags
+        body.extend_from_slice(&0x0040u16.to_be_bytes()); // graphicsmode = dither copy
+        body.extend_from_slice(&0x8000u16.to_be_bytes()); // opcolor R
+        body.extend_from_slice(&0x8001u16.to_be_bytes()); // opcolor G
+        body.extend_from_slice(&0x8002u16.to_be_bytes()); // opcolor B
+        body.extend_from_slice(&(-256i16).to_be_bytes()); // balance = -1.0 (8.8)
+        body.extend_from_slice(&[0u8, 0]); // reserved
+        let g = super::parse_gmin(&body).expect("gmin should parse");
+        assert_eq!(g.graphicsmode, 0x0040);
+        assert_eq!(g.opcolor, [0x8000, 0x8001, 0x8002]);
+        assert_eq!(g.balance, -256);
+    }
+
+    /// A `gmin` body shorter than the fixed 16 bytes is rejected rather
+    /// than surfacing truncation noise.
+    #[test]
+    fn parse_gmin_too_short_is_rejected() {
+        assert!(super::parse_gmin(&[0u8; 15]).is_none());
+        assert!(super::parse_gmin_box(&[0u8; 15]).is_err());
+    }
+
+    /// `build_gmin_box` → `parse_gmin_box` is a byte-exact round-trip, and
+    /// the built box carries the correct 8-byte `gmin` header + 16-byte
+    /// body (24 bytes total).
+    #[test]
+    fn build_gmin_box_round_trips() {
+        let g = super::GminBox {
+            graphicsmode: 0x0100,
+            opcolor: [0x1234, 0x5678, 0x9abc],
+            balance: 128,
+        };
+        let boxed = super::build_gmin_box(&g);
+        assert_eq!(boxed.len(), 24);
+        assert_eq!(&boxed[4..8], b"gmin");
+        assert_eq!(
+            u32::from_be_bytes([boxed[0], boxed[1], boxed[2], boxed[3]]),
+            24
+        );
+        let back = super::parse_gmin_box(&boxed[8..]).expect("round-trip parse");
+        assert_eq!(back, g);
+    }
+
+    /// `build_gmhd_box` wraps a single built `gmin`; `parse_gmhd` walks it
+    /// back to the same record.
+    #[test]
+    fn build_gmhd_box_wraps_gmin() {
+        let g = super::GminBox {
+            graphicsmode: 0,
+            opcolor: [0, 0, 0],
+            balance: 0,
+        };
+        let gmhd = super::build_gmhd_box(&g);
+        assert_eq!(&gmhd[4..8], b"gmhd");
+        // total = 8 (gmhd header) + 24 (gmin box) = 32
+        assert_eq!(gmhd.len(), 32);
+        let back = super::parse_gmhd(&gmhd[8..]).expect("gmhd walk");
+        assert_eq!(back, g);
+    }
+
+    /// A `gmhd` carrying an unrelated child before `gmin` still resolves
+    /// the `gmin` (media-specific children are skipped).
+    #[test]
+    fn parse_gmhd_skips_foreign_children() {
+        let g = super::GminBox {
+            graphicsmode: 0x0040,
+            opcolor: [1, 2, 3],
+            balance: -64,
+        };
+        // A `text` media-info child (arbitrary bytes) before the `gmin`.
+        let mut inner = super::wrap_box(b"text", &[0xAAu8; 20]);
+        inner.extend_from_slice(&super::build_gmin_box(&g));
+        let back = super::parse_gmhd(&inner).expect("gmhd walk past foreign child");
+        assert_eq!(back, g);
+    }
+
+    /// Surfacing: a parsed `gmin` exposes `gmin_graphicsmode` (decimal),
+    /// `gmin_opcolor` (three space-separated decimal components), and
+    /// `gmin_balance` (signed decimal) on `params.options`.
+    #[test]
+    fn build_stream_info_surfaces_gmin_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Subtitle;
+        t.codec_id_fourcc = *b"text";
+        t.timescale = 1000;
+        t.gmin = Some(super::GminBox {
+            graphicsmode: 64,
+            opcolor: [1, 2, 3],
+            balance: -256,
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("gmin_graphicsmode"), Some("64"));
+        assert_eq!(info.params.options.get("gmin_opcolor"), Some("1 2 3"));
+        assert_eq!(info.params.options.get("gmin_balance"), Some("-256"));
+    }
+
+    /// Absent `gmin`, none of the `gmin_*` keys are emitted.
+    #[test]
+    fn build_stream_info_no_gmin_no_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Video;
+        t.codec_id_fourcc = *b"avc1";
+        t.timescale = 1000;
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("gmin_graphicsmode"), None);
+        assert_eq!(info.params.options.get("gmin_opcolor"), None);
+        assert_eq!(info.params.options.get("gmin_balance"), None);
     }
 
     /// Build an 8-byte `amve` body (AmbientViewingEnvironmentBox):

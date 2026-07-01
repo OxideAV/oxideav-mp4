@@ -561,6 +561,25 @@ Sample-entry FourCCs resolve to these codec ids:
   posture; a body shorter than the full 20 bytes is rejected (a
   truncated tail would surface noise as a bitrate). Absent `hmhd`, none
   of the keys are emitted.
+- QuickTime base media information header (`minf/gmhd/gmin`): QuickTime
+  carries a Base Media Information Header Atom (`gmhd`) inside `minf` in
+  place of a typed media header (`vmhd` / `smhd`) for media types derived
+  from the base media handler — text, timecode, music, and generic
+  tracks. Its required child, the Base Media Info Atom (`gmin`), is a
+  FullBox whose fixed 12-byte body carries a 16-bit `graphicsmode`
+  composition (transfer) mode, a three-component 16-bit `opcolor`, a
+  signed 16-bit stereo sound `balance`, and a reserved 16-bit zero. The
+  `gmhd` walk resolves `gmin` past any media-specific sibling atoms
+  (`text` / `tmcd` / …). The three fields are surfaced on `params.options`
+  as `gmin_graphicsmode` (decimal), `gmin_opcolor` (three space-separated
+  decimal components), and `gmin_balance` (signed decimal). The FullBox
+  `version` / `flags` (specified as 0) are tolerated rather than dropping
+  a usable atom, matching the `vmhd` posture; a body shorter than the full
+  16 bytes is rejected. Public byte-exact parse/build helpers
+  `demux::parse_gmin_box` / `demux::build_gmin_box` (the `gmin` atom) and
+  `demux::build_gmhd_box` (a minimal `gmhd` wrapping a single `gmin`) let
+  tooling recover or assemble the atom without re-running `open()`. Absent
+  `gmhd`, none of the keys are emitted.
 - Hint sample entries (ISO/IEC 14496-12 §9.1.2 / §9.3.3.2 / §9.4): a
   hint track's `stsd` entry is decoded when it is an RTP server (`rtp `),
   SRTP (`srtp`), RTP reception (`rrtp`), or RTCP reception (`rtcp`)

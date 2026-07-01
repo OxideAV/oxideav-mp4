@@ -203,6 +203,17 @@ pub const VMHD: [u8; 4] = fourcc("vmhd");
 /// any one-second window / the whole presentation), followed by a
 /// reserved 32-bit zero.
 pub const HMHD: [u8; 4] = fourcc("hmhd");
+/// `gmhd` — QuickTime Base Media Information Header Atom. Sits inside
+/// `minf` in place of a typed media header (`vmhd` / `smhd`) for media
+/// types derived from the base media handler (text, timecode, music,
+/// generic). A pure container whose required child is the `gmin` Base
+/// Media Info Atom.
+pub const GMHD: [u8; 4] = fourcc("gmhd");
+/// `gmin` — QuickTime Base Media Info Atom. Sits inside `gmhd`; a
+/// `FullBox` carrying the base media's control information: a 16-bit
+/// `graphicsmode` composition mode, a three-component 16-bit `opcolor`,
+/// a signed 16-bit stereo sound `balance`, and a reserved 16-bit zero.
+pub const GMIN: [u8; 4] = fourcc("gmin");
 /// `dinf` — DataInformationBox (ISO/IEC 14496-12 §8.7.1). Sits inside
 /// `minf` (mandatory, exactly one) or `meta` (optional). A pure
 /// container whose sole child of interest is the `dref` DataReferenceBox
