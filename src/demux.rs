@@ -1395,6 +1395,13 @@ struct Track {
     /// `None` for tracks whose `minf` uses a typed media header instead, or
     /// when the atom is absent. The first parseable `gmin` seen wins.
     gmin: Option<GminBox>,
+    /// QuickTime Timecode Media Information Atom (`tcmi`) found inside the
+    /// track's `minf/gmhd` for a timecode track (media type `tmcd`). Carries
+    /// the text-rendering parameters (font / face / size / text +
+    /// background colour / font name) for the on-screen timecode. `None`
+    /// for non-timecode tracks or when the atom is absent. The first
+    /// parseable `tcmi` seen wins.
+    tcmi: Option<TcmiBox>,
     /// §9.1.2 / §9.4.1.2 — the RTP / SRTP / reception hint sample entry
     /// (`rtp ` / `srtp` / `rrtp`) from the track's active `stsd` entry,
     /// when present. Carries `maxpacketsize` plus the `tims` timescale and
@@ -2023,6 +2030,39 @@ pub struct GminBox {
     /// speakers. Normally `0` (centered); negative favours the left
     /// speaker, positive the right (an 8.8 fixed-point value).
     pub balance: i16,
+}
+
+/// Decoded QuickTime Timecode Media Information Atom (`tcmi`).
+///
+/// A timecode track (media type `tmcd`) carries a `tcmi` atom inside its
+/// `gmhd` (base media information header). It governs how the timecode
+/// text is rendered on screen: the font, style, size, and the text and
+/// background colours.
+///
+/// Body layout after the 4-byte `FullBox(version, flags)` preamble:
+/// `unsigned int(16) text_font`, `unsigned int(16) text_face`,
+/// `unsigned int(16) text_size`, a 48-bit (`[u16; 3]`) `text_color`, a
+/// 48-bit `background_color`, and a Pascal-string `font_name` (a leading
+/// length byte followed by that many characters). All integers
+/// big-endian.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TcmiBox {
+    /// The font id to use for the timecode text. `0` selects the system
+    /// font; when `font_name` is a valid name this field is ignored.
+    pub text_font: u16,
+    /// The font style (face). `0` is normal; the low bits enable Bold
+    /// (`0x01`), Italic (`0x02`), Underline (`0x04`), Outline (`0x08`),
+    /// Shadow (`0x10`), Condense (`0x20`), and Extend (`0x40`).
+    pub text_face: u16,
+    /// The point size of the timecode text.
+    pub text_size: u16,
+    /// The 48-bit RGB colour of the timecode text (red, green, blue).
+    pub text_color: [u16; 3],
+    /// The 48-bit RGB background colour behind the timecode text.
+    pub background_color: [u16; 3],
+    /// The name of the timecode text's font (the Pascal string, without
+    /// its leading length byte). Empty when the atom carries no name.
+    pub font_name: String,
 }
 
 /// One entry of a `dref` (DataReferenceBox, ISO/IEC 14496-12 §8.7.2).
@@ -4677,6 +4717,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         colr: None,
         hmhd: None,
         gmin: None,
+        tcmi: None,
         rtp_hint: None,
         mpeg2ts_hint: None,
         hint_stats: crate::hint::HintStatistics::default(),
@@ -5756,15 +5797,13 @@ fn parse_minf(body: &[u8], t: &mut Track) -> Result<()> {
                 // QuickTime Base Media Information Header Atom: a container
                 // used in place of a typed media header for base-media
                 // tracks (text / timecode / music / generic). Walk it for
-                // its required `gmin` child. Keep the first parseable
-                // instance; a malformed `gmin` is dropped (informational —
-                // the track still demuxes) so the walk never aborts.
+                // its `gmin` child (base media info) and, for a timecode
+                // track, its `tcmi` child (timecode media info). Keep the
+                // first parseable instance of each; a malformed child is
+                // dropped (informational — the track still demuxes) so the
+                // walk never aborts.
                 let sub = read_bytes_vec(&mut cur, psz)?;
-                if t.gmin.is_none() {
-                    if let Some(g) = parse_gmhd(&sub) {
-                        t.gmin = Some(g);
-                    }
-                }
+                parse_gmhd(&sub, t);
             }
             DINF => {
                 // §8.7.1: DataInformationBox is a plain container whose
@@ -5994,24 +6033,40 @@ fn parse_hmhd(body: &[u8]) -> Result<HmhdBox> {
     })
 }
 
-/// Walk a QuickTime `gmhd` (Base Media Information Header Atom) body for
-/// its required `gmin` (Base Media Info Atom) child and parse it. Returns
-/// `None` when the `gmhd` carries no parseable `gmin`. A `gmhd` may also
-/// carry media-specific children (e.g. a `text` atom for text media, a
-/// `tmcd` atom for timecode media); those are skipped — only `gmin` is
-/// surfaced here.
-fn parse_gmhd(body: &[u8]) -> Option<GminBox> {
+/// Walk a QuickTime `gmhd` (Base Media Information Header Atom) body,
+/// populating `t.gmin` from its `gmin` (Base Media Info Atom) child and,
+/// for a timecode track, `t.tcmi` from its `tcmi` (Timecode Media Info
+/// Atom) child. The first parseable instance of each wins. A `gmhd` may
+/// also carry other media-specific children (e.g. a `text` atom for text
+/// media); those are skipped. A malformed child ends the walk at what was
+/// read without disturbing the surrounding parse.
+fn parse_gmhd(body: &[u8], t: &mut Track) {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
     while cur.position() < end {
-        let hdr = read_box_header(&mut cur).ok()??;
+        let hdr = match read_box_header(&mut cur) {
+            Ok(Some(h)) => h,
+            _ => break,
+        };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
-        let sub = read_bytes_vec(&mut cur, psz).ok()?;
-        if hdr.fourcc == GMIN {
-            return parse_gmin(&sub);
+        let sub = match read_bytes_vec(&mut cur, psz) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        match hdr.fourcc {
+            GMIN if t.gmin.is_none() => {
+                if let Some(g) = parse_gmin(&sub) {
+                    t.gmin = Some(g);
+                }
+            }
+            TCMI if t.tcmi.is_none() => {
+                if let Some(tc) = parse_tcmi(&sub) {
+                    t.tcmi = Some(tc);
+                }
+            }
+            _ => {}
         }
     }
-    None
 }
 
 /// Parse a QuickTime `gmin` (Base Media Info Atom) body.
@@ -6075,6 +6130,93 @@ pub fn build_gmin_box(r: &GminBox) -> Vec<u8> {
 /// a base-media (text / timecode / music / generic) track's `minf`.
 pub fn build_gmhd_box(r: &GminBox) -> Vec<u8> {
     wrap_box(&GMHD, &build_gmin_box(r))
+}
+
+/// Parse a QuickTime `tcmi` (Timecode Media Info Atom) body.
+///
+/// The body is a 4-byte `FullBox(version, flags)` preamble followed by
+/// `unsigned int(16) text_font`, `unsigned int(16) text_face`,
+/// `unsigned int(16) text_size`, a 48-bit (`[u16; 3]`) `text_color`, a
+/// 48-bit `background_color`, and a Pascal-string `font_name` (a length
+/// byte then that many characters) — a fixed 22-byte prefix after the
+/// preamble followed by the variable-length name. The `version` / `flags`
+/// (specified as 0) are read past but not enforced. A body shorter than
+/// the 22-byte fixed prefix is rejected; a `font_name` whose declared
+/// length overruns the remaining bytes is clamped to what is present
+/// (rather than dropping the whole atom). Non-UTF-8 name bytes are
+/// replaced (lossy) so the record always yields a `String`.
+fn parse_tcmi(body: &[u8]) -> Option<TcmiBox> {
+    // 4 (preamble) + 2 (font) + 2 (face) + 2 (size) + 6 (text_color)
+    // + 6 (background_color) = 22 fixed bytes before the Pascal string.
+    if body.len() < 22 {
+        return None;
+    }
+    let text_font = u16::from_be_bytes([body[4], body[5]]);
+    let text_face = u16::from_be_bytes([body[6], body[7]]);
+    let text_size = u16::from_be_bytes([body[8], body[9]]);
+    let text_color = [
+        u16::from_be_bytes([body[10], body[11]]),
+        u16::from_be_bytes([body[12], body[13]]),
+        u16::from_be_bytes([body[14], body[15]]),
+    ];
+    let background_color = [
+        u16::from_be_bytes([body[16], body[17]]),
+        u16::from_be_bytes([body[18], body[19]]),
+        u16::from_be_bytes([body[20], body[21]]),
+    ];
+    // Pascal string: a leading length byte, then that many characters.
+    // A missing length byte (exactly 22 bytes) means an empty name.
+    let font_name = if body.len() > 22 {
+        let n = body[22] as usize;
+        let avail = body.len().saturating_sub(23);
+        let take = n.min(avail);
+        String::from_utf8_lossy(&body[23..23 + take]).into_owned()
+    } else {
+        String::new()
+    };
+    Some(TcmiBox {
+        text_font,
+        text_face,
+        text_size,
+        text_color,
+        background_color,
+        font_name,
+    })
+}
+
+/// Parse a standalone QuickTime `tcmi` (Timecode Media Info Atom) body
+/// from `body` (the bytes after the plain 8-byte box header). Exposed so
+/// tooling holding the atom's payload can recover its rendering
+/// parameters without re-running `open()`. `Err` for a body shorter than
+/// the fixed 22-byte prefix; a `font_name` length that overruns is
+/// clamped to the bytes present.
+pub fn parse_tcmi_box(body: &[u8]) -> Result<TcmiBox> {
+    parse_tcmi(body).ok_or_else(|| Error::invalid("MP4: tcmi too short"))
+}
+
+/// Build a complete QuickTime `tcmi` (Timecode Media Info Atom) box from a
+/// [`TcmiBox`]. The byte-exact inverse of [`parse_tcmi_box`]: a 4-byte
+/// `FullBox(version=0, flags=0)` preamble, the three 16-bit
+/// font/face/size fields, the two 48-bit colours, and the Pascal-string
+/// `font_name` (a length byte capped at 255 followed by that many
+/// characters).
+pub fn build_tcmi_box(r: &TcmiBox) -> Vec<u8> {
+    let mut body = Vec::with_capacity(23 + r.font_name.len());
+    body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+    body.extend_from_slice(&r.text_font.to_be_bytes());
+    body.extend_from_slice(&r.text_face.to_be_bytes());
+    body.extend_from_slice(&r.text_size.to_be_bytes());
+    for c in r.text_color {
+        body.extend_from_slice(&c.to_be_bytes());
+    }
+    for c in r.background_color {
+        body.extend_from_slice(&c.to_be_bytes());
+    }
+    let name = r.font_name.as_bytes();
+    let n = name.len().min(255);
+    body.push(n as u8);
+    body.extend_from_slice(&name[..n]);
+    wrap_box(&TCMI, &body)
 }
 
 fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
@@ -10435,6 +10577,44 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert("gmin_balance", g.balance.to_string());
     }
 
+    // QuickTime Timecode Media Info Atom (`minf/gmhd/tcmi`): when a
+    // timecode track (media type `tmcd`) carries a `tcmi`, surface its
+    // text-rendering parameters on `params.options`. `tcmi_text_font` /
+    // `tcmi_text_face` / `tcmi_text_size` are decimal; `tcmi_text_color`
+    // and `tcmi_background_color` are the three space-separated 16-bit RGB
+    // components; and `tcmi_font_name` is the font name (omitted when
+    // empty). Absent `tcmi`, none of the keys are emitted.
+    if let Some(tc) = &t.tcmi {
+        params
+            .options
+            .insert("tcmi_text_font", tc.text_font.to_string());
+        params
+            .options
+            .insert("tcmi_text_face", tc.text_face.to_string());
+        params
+            .options
+            .insert("tcmi_text_size", tc.text_size.to_string());
+        params.options.insert(
+            "tcmi_text_color",
+            format!(
+                "{} {} {}",
+                tc.text_color[0], tc.text_color[1], tc.text_color[2]
+            ),
+        );
+        params.options.insert(
+            "tcmi_background_color",
+            format!(
+                "{} {} {}",
+                tc.background_color[0], tc.background_color[1], tc.background_color[2]
+            ),
+        );
+        if !tc.font_name.is_empty() {
+            params
+                .options
+                .insert("tcmi_font_name", tc.font_name.clone());
+        }
+    }
+
     // ISO/IEC 14496-12 (post-2015): when the track's `VisualSampleEntry`
     // carried an `amve` (AmbientViewingEnvironmentBox), surface its three
     // raw fields on `params.options` as `amve_ambient_illuminance`
@@ -12481,6 +12661,7 @@ mod tests {
             colr: None,
             hmhd: None,
             gmin: None,
+            tcmi: None,
             rtp_hint: None,
             mpeg2ts_hint: None,
             hint_stats: crate::hint::HintStatistics::default(),
@@ -15253,8 +15434,10 @@ mod tests {
         assert_eq!(&gmhd[4..8], b"gmhd");
         // total = 8 (gmhd header) + 24 (gmin box) = 32
         assert_eq!(gmhd.len(), 32);
-        let back = super::parse_gmhd(&gmhd[8..]).expect("gmhd walk");
-        assert_eq!(back, g);
+        let mut t = fresh_track();
+        super::parse_gmhd(&gmhd[8..], &mut t);
+        assert_eq!(t.gmin, Some(g));
+        assert_eq!(t.tcmi, None);
     }
 
     /// A `gmhd` carrying an unrelated child before `gmin` still resolves
@@ -15269,8 +15452,115 @@ mod tests {
         // A `text` media-info child (arbitrary bytes) before the `gmin`.
         let mut inner = super::wrap_box(b"text", &[0xAAu8; 20]);
         inner.extend_from_slice(&super::build_gmin_box(&g));
-        let back = super::parse_gmhd(&inner).expect("gmhd walk past foreign child");
-        assert_eq!(back, g);
+        let mut t = fresh_track();
+        super::parse_gmhd(&inner, &mut t);
+        assert_eq!(t.gmin, Some(g));
+    }
+
+    /// A timecode-track `gmhd` carrying both a `gmin` and a `tcmi` resolves
+    /// each into its own track field.
+    #[test]
+    fn parse_gmhd_captures_gmin_and_tcmi() {
+        let g = super::GminBox {
+            graphicsmode: 0,
+            opcolor: [0, 0, 0],
+            balance: 0,
+        };
+        let tc = super::TcmiBox {
+            text_font: 0,
+            text_face: 0,
+            text_size: 12,
+            text_color: [0xFFFF, 0xFFFF, 0xFFFF],
+            background_color: [0, 0, 0],
+            font_name: "Chicago".to_string(),
+        };
+        let mut inner = super::build_gmin_box(&g);
+        inner.extend_from_slice(&super::build_tcmi_box(&tc));
+        let mut t = fresh_track();
+        super::parse_gmhd(&inner, &mut t);
+        assert_eq!(t.gmin, Some(g));
+        assert_eq!(t.tcmi, Some(tc));
+    }
+
+    /// `build_tcmi_box` → `parse_tcmi_box` is a byte-exact round-trip,
+    /// including the Pascal-string font name.
+    #[test]
+    fn build_tcmi_box_round_trips() {
+        let tc = super::TcmiBox {
+            text_font: 3,
+            text_face: 0x01, // Bold
+            text_size: 18,
+            text_color: [0x1234, 0x5678, 0x9abc],
+            background_color: [0xdead, 0xbeef, 0xcafe],
+            font_name: "Monaco".to_string(),
+        };
+        let boxed = super::build_tcmi_box(&tc);
+        assert_eq!(&boxed[4..8], b"tcmi");
+        let back = super::parse_tcmi_box(&boxed[8..]).expect("round-trip parse");
+        assert_eq!(back, tc);
+    }
+
+    /// A `tcmi` with an empty font name round-trips to an empty `String`.
+    #[test]
+    fn build_tcmi_box_empty_name_round_trips() {
+        let tc = super::TcmiBox {
+            text_font: 0,
+            text_face: 0,
+            text_size: 10,
+            text_color: [0, 0, 0],
+            background_color: [0xFFFF, 0xFFFF, 0xFFFF],
+            font_name: String::new(),
+        };
+        let boxed = super::build_tcmi_box(&tc);
+        let back = super::parse_tcmi_box(&boxed[8..]).expect("round-trip parse");
+        assert_eq!(back, tc);
+    }
+
+    /// A `tcmi` body shorter than the fixed 22-byte prefix is rejected;
+    /// a font-name length that overruns the body is clamped rather than
+    /// dropping the whole atom.
+    #[test]
+    fn parse_tcmi_short_and_overrun() {
+        assert!(super::parse_tcmi(&[0u8; 21]).is_none());
+        assert!(super::parse_tcmi_box(&[0u8; 21]).is_err());
+        // 22 fixed bytes + a length byte claiming 200 chars but only 3
+        // present → the name is clamped to the 3 available bytes.
+        let mut body = vec![0u8; 22];
+        body.push(200);
+        body.extend_from_slice(b"abc");
+        let tc = super::parse_tcmi(&body).expect("clamped parse");
+        assert_eq!(tc.font_name, "abc");
+    }
+
+    /// Surfacing: a parsed `tcmi` exposes its rendering parameters on
+    /// `params.options` for a timecode track.
+    #[test]
+    fn build_stream_info_surfaces_tcmi_on_options() {
+        let mut t = fresh_track();
+        t.media_type = oxideav_core::MediaType::Data;
+        t.codec_id_fourcc = *b"tmcd";
+        t.timescale = 1000;
+        t.tcmi = Some(super::TcmiBox {
+            text_font: 0,
+            text_face: 1,
+            text_size: 24,
+            text_color: [0xFFFF, 0xFFFF, 0xFFFF],
+            background_color: [0, 0, 0],
+            font_name: "Helvetica".to_string(),
+        });
+        let info = super::build_stream_info(0, &t, &oxideav_core::NullCodecResolver);
+        assert_eq!(info.params.options.get("tcmi_text_font"), Some("0"));
+        assert_eq!(info.params.options.get("tcmi_text_face"), Some("1"));
+        assert_eq!(info.params.options.get("tcmi_text_size"), Some("24"));
+        assert_eq!(
+            info.params.options.get("tcmi_text_color"),
+            Some("65535 65535 65535")
+        );
+        assert_eq!(
+            info.params.options.get("tcmi_background_color"),
+            Some("0 0 0")
+        );
+        assert_eq!(info.params.options.get("tcmi_font_name"), Some("Helvetica"));
     }
 
     /// Surfacing: a parsed `gmin` exposes `gmin_graphicsmode` (decimal),

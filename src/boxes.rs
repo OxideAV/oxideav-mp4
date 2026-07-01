@@ -214,6 +214,12 @@ pub const GMHD: [u8; 4] = fourcc("gmhd");
 /// `graphicsmode` composition mode, a three-component 16-bit `opcolor`,
 /// a signed 16-bit stereo sound `balance`, and a reserved 16-bit zero.
 pub const GMIN: [u8; 4] = fourcc("gmin");
+/// `tcmi` — QuickTime Timecode Media Information Atom. Sits inside a
+/// timecode track's `gmhd`; a `FullBox` carrying the text-rendering
+/// parameters that govern how the timecode text is displayed: a text
+/// font id, face (style), point size, 48-bit RGB text and background
+/// colours, and a Pascal-string font name.
+pub const TCMI: [u8; 4] = fourcc("tcmi");
 /// `dinf` — DataInformationBox (ISO/IEC 14496-12 §8.7.1). Sits inside
 /// `minf` (mandatory, exactly one) or `meta` (optional). A pure
 /// container whose sole child of interest is the `dref` DataReferenceBox

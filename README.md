@@ -580,6 +580,23 @@ Sample-entry FourCCs resolve to these codec ids:
   `demux::build_gmhd_box` (a minimal `gmhd` wrapping a single `gmin`) let
   tooling recover or assemble the atom without re-running `open()`. Absent
   `gmhd`, none of the keys are emitted.
+- QuickTime timecode media info (`minf/gmhd/tcmi`): a timecode track
+  (media type `tmcd`) carries a Timecode Media Information Atom (`tcmi`)
+  inside its `gmhd`, governing how the on-screen timecode text is
+  rendered. Its FullBox body carries a 16-bit `text_font` id, a
+  `text_face` style bitmask (Bold `0x01` / Italic `0x02` / Underline
+  `0x04` / Outline `0x08` / Shadow `0x10` / Condense `0x20` / Extend
+  `0x40`), a 16-bit `text_size` point size, 48-bit (`[u16; 3]`) `text` and
+  `background` RGB colours, and a Pascal-string `font_name`. The `gmhd`
+  walk resolves both `gmin` and `tcmi` (each the first parseable instance
+  wins). Surfaced on `params.options` as `tcmi_text_font` / `tcmi_text_face`
+  / `tcmi_text_size` (decimal), `tcmi_text_color` / `tcmi_background_color`
+  (three space-separated 16-bit components), and `tcmi_font_name` (omitted
+  when empty). A body shorter than the 22-byte fixed prefix is rejected; a
+  `font_name` length that overruns the body is clamped to the bytes
+  present rather than dropping the atom. Public byte-exact
+  `demux::parse_tcmi_box` / `demux::build_tcmi_box` round-trip the atom.
+  Absent `tcmi`, none of the keys are emitted.
 - Hint sample entries (ISO/IEC 14496-12 §9.1.2 / §9.3.3.2 / §9.4): a
   hint track's `stsd` entry is decoded when it is an RTP server (`rtp `),
   SRTP (`srtp`), RTP reception (`rrtp`), or RTCP reception (`rtcp`)
