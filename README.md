@@ -1,5 +1,7 @@
 # oxideav-mp4
 
+[![CI](https://github.com/OxideAV/oxideav-mp4/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mp4/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mp4.svg)](https://crates.io/crates/oxideav-mp4) [![docs.rs](https://docs.rs/oxideav-mp4/badge.svg)](https://docs.rs/oxideav-mp4) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **MP4 / ISO Base Media File Format** container — demuxer
 (probe + sample-table expansion + seek) and muxer (moov-at-end by
 default, optional faststart rewrite). Three brand presets share one
