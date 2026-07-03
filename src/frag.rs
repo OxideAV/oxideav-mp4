@@ -223,6 +223,7 @@ pub fn open_fragmented_typed(
         trailer_written: false,
         styp_override: None,
         pending_prft: None,
+        pending_moof_pssh: Vec::new(),
     })
 }
 
@@ -252,6 +253,14 @@ pub struct FragmentedMuxer {
     /// immediately before the `moof`; consumed (cleared) on the next
     /// `flush_fragment`. Set via [`Self::set_next_segment_prft`].
     pending_prft: Option<PrftRequest>,
+    /// `pssh` (ProtectionSystemSpecificHeaderBox, ISO/IEC 23001-7
+    /// §8.1) boxes to write *inside* the next fragment's `moof`
+    /// (§8.1.1 permits `pssh` in `moov` or `moof`); consumed (cleared)
+    /// on the next `flush_fragment`. Set via
+    /// [`Self::set_next_segment_pssh`]. Used for per-fragment key
+    /// rotation where a new licence blob applies only to the samples
+    /// in the associated fragment.
+    pending_moof_pssh: Vec<crate::cenc::PsshBox>,
 }
 
 impl Muxer for FragmentedMuxer {
@@ -490,6 +499,33 @@ impl FragmentedMuxer {
         });
     }
 
+    /// Queue one or more `pssh` (ProtectionSystemSpecificHeaderBox,
+    /// ISO/IEC 23001-7 §8.1) boxes to be written *inside* the next
+    /// fragment's `moof` (§8.1.1 explicitly permits `pssh` in a `moov`
+    /// **or** a `moof`).
+    ///
+    /// This is the movie-fragment counterpart to the moov-level
+    /// `Mp4MuxerOptions::pssh` init-segment boxes: use it for
+    /// per-fragment key rotation, where a fresh licence blob (or a new
+    /// KID set) applies only to the samples in the associated fragment.
+    /// A §8.1.1-conformant reader examines the `pssh` boxes in the
+    /// `moov` and in the `moof` associated with a sample (but not those
+    /// in other fragments), so a box queued here scopes exactly to the
+    /// next fragment.
+    ///
+    /// The boxes are written as the first children of the `moof` body
+    /// (before `mfhd`? — no: after `mfhd`, before the `traf` boxes, so
+    /// the fragment header still leads), serialised through
+    /// `cenc::build_pssh_box`. The request is consumed (cleared) once
+    /// that fragment is flushed; calling it again before the next flush
+    /// appends to the pending set. A record that would not round-trip
+    /// (a v0 box carrying KIDs, oversize counts) surfaces its error at
+    /// the next `write_packet` / `write_trailer` that triggers the
+    /// flush, not here.
+    pub fn set_next_segment_pssh(&mut self, pssh: impl IntoIterator<Item = crate::cenc::PsshBox>) {
+        self.pending_moof_pssh.extend(pssh);
+    }
+
     /// Return true when the cadence policy says it's time to emit a
     /// fragment after the current packet.
     ///
@@ -581,8 +617,9 @@ impl FragmentedMuxer {
         self.sequence_number += 1;
         let seq = self.sequence_number;
 
-        // Build moof.
-        let moof = build_moof(seq, &self.tracks)?;
+        // Build moof (with any per-fragment moof-level pssh boxes, §8.1.1).
+        let moof_pssh = std::mem::take(&mut self.pending_moof_pssh);
+        let moof = build_moof(seq, &self.tracks, &moof_pssh)?;
         let moof_size = moof.len() as u64;
 
         // Build mdat: concatenate per-track sample bytes in the same
@@ -937,25 +974,40 @@ fn build_trex(track_id: u32, ddur: u32, dsiz: u32, dflg: u32) -> Vec<u8> {
 /// offsets. Since the moof's size doesn't depend on the offset *values*
 /// (they're fixed-width i32), the two passes always produce the same
 /// total length.
-fn build_moof(seq: u32, tracks: &[FragTrackState]) -> Result<Vec<u8>> {
+fn build_moof(
+    seq: u32,
+    tracks: &[FragTrackState],
+    pssh: &[crate::cenc::PsshBox],
+) -> Result<Vec<u8>> {
     // Pass 1: build with data_offset = 0 to learn the moof size.
-    let placeholder = build_moof_inner(seq, tracks, |_track_idx, _byte_in_mdat| 0)?;
+    let placeholder = build_moof_inner(seq, tracks, pssh, |_track_idx, _byte_in_mdat| 0)?;
     let moof_size = placeholder.len() as u64;
     let mdat_header_size: u64 = 8;
     // Pass 2: real offsets relative to start of moof.
-    let final_moof = build_moof_inner(seq, tracks, |_track_idx, byte_in_mdat| {
+    let final_moof = build_moof_inner(seq, tracks, pssh, |_track_idx, byte_in_mdat| {
         (moof_size + mdat_header_size + byte_in_mdat) as i32
     })?;
     debug_assert_eq!(final_moof.len() as u64, moof_size, "moof size shifted");
     Ok(final_moof)
 }
 
-fn build_moof_inner<F>(seq: u32, tracks: &[FragTrackState], offset_fn: F) -> Result<Vec<u8>>
+fn build_moof_inner<F>(
+    seq: u32,
+    tracks: &[FragTrackState],
+    pssh: &[crate::cenc::PsshBox],
+    offset_fn: F,
+) -> Result<Vec<u8>>
 where
     F: Fn(usize, u64) -> i32,
 {
     let mut moof_body = Vec::new();
     moof_body.extend_from_slice(&build_mfhd(seq));
+    // ISO/IEC 23001-7 §8.1.1: moof-level pssh boxes sit after the
+    // fragment header and before the traf boxes, scoping their DRM
+    // header to this fragment's samples only.
+    for record in pssh {
+        moof_body.extend_from_slice(&crate::cenc::build_pssh_box(record)?);
+    }
 
     // Walk tracks, accumulating per-track byte offsets within mdat.
     let mut byte_in_mdat: u64 = 0;

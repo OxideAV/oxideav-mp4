@@ -1440,6 +1440,17 @@ also exposed via the public `oxideav_mp4::styp` module —
 mirroring the read-side `parse_styp` in oxideav-mov so a producer
 round-tripping a parsed `Styp` can emit the same byte sequence.
 
+One or more `pssh` (ProtectionSystemSpecificHeaderBox, ISO/IEC 23001-7
+§8.1) boxes can be attached to the *next* fragment's `moof` via
+`FragmentedMuxer::set_next_segment_pssh(iter)`. Per §8.1.1 a `pssh` may
+live in the `moov` **or** a `moof`; a box queued here is written after
+that fragment's `mfhd` and before its `traf` boxes, scoping its DRM
+header to the fragment's samples only (per-fragment key rotation). The
+request is consumed per fragment; the demuxer surfaces the box on
+`Demuxer::metadata()` as `moof_pssh_<n>` keyed by the fragment's
+`mfhd.sequence_number`. This complements the init-segment-level
+`Mp4MuxerOptions::pssh` boxes.
+
 A `prft` (ProducerReferenceTimeBox, ISO/IEC 14496-12 §8.16.5) can be
 attached to the *next* fragment via
 `FragmentedMuxer::set_next_segment_prft(reference_track_id,

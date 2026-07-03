@@ -360,3 +360,69 @@ fn incoherent_protection_fails_at_open() {
         oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), options).is_err()
     );
 }
+
+/// The fragmented muxer's `set_next_segment_pssh` writes a `pssh` box
+/// inside the targeted fragment's `moof` (ISO/IEC 23001-7 §8.1.1), which
+/// the demuxer surfaces on `moof_pssh_<n>` keyed by the fragment's
+/// `mfhd.sequence_number`.
+#[test]
+fn moof_level_pssh_scopes_to_its_fragment() {
+    use oxideav_core::Muxer;
+    let stream = pcm_stream();
+    let frag_opts = oxideav_mp4::FragmentedOptions {
+        cadence: oxideav_mp4::FragmentCadence::EveryNPackets(2),
+        emit_random_access_indexes: false,
+        ..oxideav_mp4::FragmentedOptions::default()
+    };
+    let options = Mp4MuxerOptions {
+        fragmented: Some(frag_opts.clone()),
+        ..Mp4MuxerOptions::default()
+    };
+    let tmp = std::env::temp_dir().join("oxideav-mp4-moof-pssh.mp4");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut typed = oxideav_mp4::frag::open_fragmented_typed(
+            ws,
+            std::slice::from_ref(&stream),
+            options,
+            frag_opts,
+        )
+        .unwrap();
+        typed.write_header().unwrap();
+        // Attach a per-fragment pssh, then push two packets (cadence 2 →
+        // one fragment). The box scopes to that fragment's moof.
+        typed.set_next_segment_pssh([PsshBox {
+            version: 1,
+            system_id: [0x9A; 16],
+            kids: vec![[0x01; 16], [0x02; 16]],
+            data: vec![0xFE, 0xED],
+        }]);
+        for i in 0..4i64 {
+            let mut pkt = Packet::new(0, stream.time_base, vec![i as u8; 32]);
+            pkt.pts = Some(i * 1024);
+            pkt.duration = Some(1024);
+            pkt.flags.keyframe = true;
+            typed.write_packet(&pkt).unwrap();
+        }
+        typed.write_trailer().unwrap();
+    }
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let md: std::collections::HashMap<&str, &str> = dmx
+        .metadata()
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    // Exactly one moof_pssh, on fragment sequence 1 (the first fragment).
+    let moof_pssh0 = md.get("moof_pssh_0").copied().expect("moof_pssh_0");
+    assert_eq!(
+        moof_pssh0,
+        &format!("systemid={} seq=1 kids=2 data=2", "9a".repeat(16))[..]
+    );
+    assert!(
+        !md.contains_key("moof_pssh_1"),
+        "only the first fragment carries a pssh"
+    );
+}
