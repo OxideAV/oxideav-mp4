@@ -60,7 +60,7 @@
 //! defined by ISO/IEC 23001-7.
 
 use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecryptMut, KeyIvInit, StreamCipher};
+use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, StreamCipher};
 use oxideav_core::{Error, Result};
 
 use crate::cenc::{
@@ -69,6 +69,7 @@ use crate::cenc::{
 
 type Aes128Ctr64 = ctr::Ctr64BE<aes::Aes128>;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
 /// Expand an 8- or 16-byte CENC IV into the 16-byte AES block the
 /// cipher consumes (§9.1).
@@ -133,6 +134,47 @@ pub fn decrypt_steps_in_place(
     steps: &[CipherStep],
     data: &mut [u8],
 ) -> Result<()> {
+    run_steps_in_place(mode, key, iv, steps, data, CipherDirection::Decrypt)
+}
+
+/// Encrypt the [`CipherStepKind::Encrypted`] runs of one sample in
+/// place, leaving [`CipherStepKind::Clear`] runs untouched — the
+/// write-side dual of [`decrypt_steps_in_place`], for a packager
+/// producing CENC-protected samples from plaintext.
+///
+/// The two directions share every structural rule: under CTR the two
+/// operations are the *same* XOR keystream (§9.3 — encrypt and decrypt
+/// are identical), so this entry point differs from the decrypt one
+/// only under CBC, where the block operation runs the AES cipher
+/// forward and the chain feeds each block's *output* ciphertext
+/// onward (§9.4.3). `iv_restart` reseeds the chain per `cbcs`
+/// subsample exactly as on the read side, and a non-16-byte-aligned
+/// encrypted CBC run is rejected (partial blocks are never
+/// CBC-encrypted).
+pub fn encrypt_steps_in_place(
+    mode: CipherMode,
+    key: &[u8; 16],
+    iv: &[u8],
+    steps: &[CipherStep],
+    data: &mut [u8],
+) -> Result<()> {
+    run_steps_in_place(mode, key, iv, steps, data, CipherDirection::Encrypt)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CipherDirection {
+    Encrypt,
+    Decrypt,
+}
+
+fn run_steps_in_place(
+    mode: CipherMode,
+    key: &[u8; 16],
+    iv: &[u8],
+    steps: &[CipherStep],
+    data: &mut [u8],
+    direction: CipherDirection,
+) -> Result<()> {
     let iv_block = expand_iv(iv)?;
     let key_ga = GenericArray::from_slice(key);
     let iv_ga = GenericArray::from_slice(&iv_block);
@@ -152,6 +194,8 @@ pub fn decrypt_steps_in_place(
 
     match mode {
         CipherMode::Ctr => {
+            // §9.3: CTR encryption and decryption are the same
+            // keystream XOR — direction does not change the operation.
             let mut cipher = Aes128Ctr64::new(key_ga, iv_ga);
             for (i, step) in steps.iter().enumerate() {
                 if step.kind != CipherStepKind::Encrypted {
@@ -169,6 +213,7 @@ pub fn decrypt_steps_in_place(
         }
         CipherMode::Cbc => {
             let mut dec = Aes128CbcDec::new(key_ga, iv_ga);
+            let mut enc = Aes128CbcEnc::new(key_ga, iv_ga);
             for step in steps.iter() {
                 if step.kind != CipherStepKind::Encrypted {
                     continue;
@@ -176,7 +221,10 @@ pub fn decrypt_steps_in_place(
                 if step.iv_restart {
                     // §9.5.1: cbcs treats each subsample as a separate
                     // chain starting with the sample's IV.
-                    dec = Aes128CbcDec::new(key_ga, iv_ga);
+                    match direction {
+                        CipherDirection::Decrypt => dec = Aes128CbcDec::new(key_ga, iv_ga),
+                        CipherDirection::Encrypt => enc = Aes128CbcEnc::new(key_ga, iv_ga),
+                    }
                 }
                 if step.len % 16 != 0 {
                     return Err(Error::invalid(format!(
@@ -187,7 +235,14 @@ pub fn decrypt_steps_in_place(
                 }
                 let range = step.offset as usize..(step.offset + step.len) as usize;
                 for block in data[range].chunks_exact_mut(16) {
-                    dec.decrypt_block_mut(GenericArray::from_mut_slice(block));
+                    match direction {
+                        CipherDirection::Decrypt => {
+                            dec.decrypt_block_mut(GenericArray::from_mut_slice(block))
+                        }
+                        CipherDirection::Encrypt => {
+                            enc.encrypt_block_mut(GenericArray::from_mut_slice(block))
+                        }
+                    }
                 }
             }
         }
@@ -229,6 +284,56 @@ pub fn decrypt_sample_in_place(
     subsamples: Option<&[SubsampleEntry]>,
     data: &mut [u8],
 ) -> Result<()> {
+    run_sample_in_place(
+        decision,
+        key,
+        per_sample_iv,
+        subsamples,
+        data,
+        CipherDirection::Decrypt,
+    )
+}
+
+/// Encrypt one plaintext sample in place using the track-level routing
+/// decision — the write-side dual of [`decrypt_sample_in_place`], for a
+/// packager producing CENC-protected content.
+///
+/// Inputs mirror the decrypt entry point exactly: the same
+/// [`CencSchemeDecision`] (built from the `tenc` the packager is about
+/// to write), the same §9.2 IV-supply discipline (a per-sample IV of
+/// `tenc.default_Per_Sample_IV_Size` bytes — destined for the sample's
+/// `senc` entry — or the `tenc` constant IV with none supplied), and
+/// the same subsample map (destined for the same `senc` entry when the
+/// `UseSubSampleEncryption` flag is set). The clear/encrypted
+/// partition is the identical `plan_sample_cipher` walk, so bytes a
+/// conforming reader leaves clear are exactly the bytes this call
+/// leaves clear — `encrypt_sample_in_place` followed by
+/// `decrypt_sample_in_place` with the same arguments is the identity.
+pub fn encrypt_sample_in_place(
+    decision: &CencSchemeDecision,
+    key: &[u8; 16],
+    per_sample_iv: Option<&[u8]>,
+    subsamples: Option<&[SubsampleEntry]>,
+    data: &mut [u8],
+) -> Result<()> {
+    run_sample_in_place(
+        decision,
+        key,
+        per_sample_iv,
+        subsamples,
+        data,
+        CipherDirection::Encrypt,
+    )
+}
+
+fn run_sample_in_place(
+    decision: &CencSchemeDecision,
+    key: &[u8; 16],
+    per_sample_iv: Option<&[u8]>,
+    subsamples: Option<&[SubsampleEntry]>,
+    data: &mut [u8],
+    direction: CipherDirection,
+) -> Result<()> {
     let mode = decision.cipher_mode().ok_or_else(|| {
         Error::invalid("CENC cipher: unknown scheme — no §10-registered cipher mode")
     })?;
@@ -236,7 +341,7 @@ pub fn decrypt_sample_in_place(
     let iv: &[u8] =
         match decision.iv_supply() {
             IvSupply::None => return Err(Error::invalid(
-                "CENC cipher: track default is unprotected (isProtected == 0) — nothing to decrypt",
+                "CENC cipher: track default is unprotected (isProtected == 0) — nothing to cipher",
             )),
             IvSupply::PerSample { size } => {
                 let iv = supplied.ok_or_else(|| {
@@ -271,16 +376,14 @@ pub fn decrypt_sample_in_place(
             }
         };
     let plan = crate::cenc::plan_sample_cipher(decision, subsamples, data.len() as u64)?;
-    decrypt_steps_in_place(mode, key, iv, &plan, data)
+    run_steps_in_place(mode, key, iv, &plan, data, direction)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cenc::{CencScheme, TencBox};
-    use aes::cipher::{BlockEncrypt, BlockEncryptMut, KeyInit};
-
-    type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+    use aes::cipher::{BlockEncrypt, KeyInit};
 
     // ---- fixture helpers --------------------------------------------
 
@@ -779,6 +882,158 @@ mod tests {
             .unwrap();
         let mut data = vec![0u8; 16];
         assert!(decrypt_sample_in_place(&d, &KEY, Some(&[0u8; 8]), None, &mut data).is_err());
+    }
+
+    // ---- write side: encrypt_sample_in_place ---------------------------
+
+    #[test]
+    fn encrypt_then_decrypt_is_identity_for_all_schemes() {
+        // Every §10 scheme × a representative subsample/pattern shape:
+        // encrypt_sample_in_place followed by decrypt_sample_in_place
+        // with identical arguments must return the plaintext.
+        let subs = [
+            SubsampleEntry {
+                bytes_of_clear_data: 5,
+                bytes_of_protected_data: 48,
+            },
+            SubsampleEntry {
+                bytes_of_clear_data: 3,
+                bytes_of_protected_data: 32,
+            },
+        ];
+        let plaintext = deterministic_payload(5 + 48 + 3 + 32);
+        let iv8 = [0x51, 0x62, 0x73, 0x84, 0x95, 0xA6, 0xB7, 0xC8];
+        let iv16 = [0x1D; 16];
+
+        let cases: Vec<(CencSchemeDecision, Option<&[u8]>)> = vec![
+            (cenc_decision(8), Some(&iv8)),
+            (cbc1_decision(), Some(&iv16)),
+            (cens_decision(2, 1), Some(&iv8)),
+            (cbcs_decision(1, 9, iv16), None),
+        ];
+        for (decision, iv) in cases {
+            let mut data = plaintext.clone();
+            encrypt_sample_in_place(&decision, &KEY, iv, Some(&subs), &mut data).expect("encrypt");
+            assert_ne!(
+                data, plaintext,
+                "{:?}: ciphertext must differ from plaintext",
+                decision.scheme
+            );
+            // Clear prefix bytes stay clear.
+            assert_eq!(
+                &data[..5],
+                &plaintext[..5],
+                "{:?}: BytesOfClearData untouched",
+                decision.scheme
+            );
+            decrypt_sample_in_place(&decision, &KEY, iv, Some(&subs), &mut data).expect("decrypt");
+            assert_eq!(
+                data, plaintext,
+                "{:?}: round-trip identity",
+                decision.scheme
+            );
+        }
+    }
+
+    #[test]
+    fn encrypt_ctr_matches_first_principles_keystream() {
+        // §9.3: encryption is the same XOR keystream as decryption —
+        // the ciphertext must equal plaintext ⊕ ECB(IV‖n).
+        let iv8 = [0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78];
+        let plaintext = deterministic_payload(37);
+        let mut ct = plaintext.clone();
+        let d = cenc_decision(8);
+        encrypt_sample_in_place(&d, &KEY, Some(&iv8), None, &mut ct).expect("encrypt");
+        for (i, byte) in ct.iter().enumerate() {
+            let ks = ecb_block(&KEY, ctr_block_iv8(iv8, (i / 16) as u64));
+            assert_eq!(*byte, plaintext[i] ^ ks[i % 16], "byte {i}");
+        }
+    }
+
+    #[test]
+    fn encrypt_cbc1_matches_reference_cbc_chain() {
+        // The full-sample cbc1 path must produce the standard CBC
+        // ciphertext over the whole blocks and leave the partial tail
+        // clear (§9.4.3).
+        let iv16 = [0x9C; 16];
+        let plaintext = deterministic_payload(44);
+        let mut ct = plaintext.clone();
+        let d = cbc1_decision();
+        encrypt_sample_in_place(&d, &KEY, Some(&iv16), None, &mut ct).expect("encrypt");
+
+        let mut expected = plaintext.clone();
+        let mut enc = Aes128CbcEnc::new(
+            GenericArray::from_slice(&KEY),
+            GenericArray::from_slice(&iv16),
+        );
+        for block in expected[..32].chunks_exact_mut(16) {
+            enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+        }
+        assert_eq!(ct, expected, "whole blocks CBC-encrypted, tail clear");
+        assert_eq!(&ct[32..], &plaintext[32..], "partial tail left clear");
+    }
+
+    #[test]
+    fn encrypt_cbcs_restarts_constant_iv_per_subsample() {
+        // Two identical fully-protected subsamples under cbcs encrypt
+        // to identical ciphertext (per-subsample IV restart).
+        let iv16 = [0x33; 16];
+        let subs = [
+            SubsampleEntry {
+                bytes_of_clear_data: 0,
+                bytes_of_protected_data: 32,
+            },
+            SubsampleEntry {
+                bytes_of_clear_data: 0,
+                bytes_of_protected_data: 32,
+            },
+        ];
+        let half = deterministic_payload(32);
+        let plaintext: Vec<u8> = [half.clone(), half].concat();
+        let mut ct = plaintext.clone();
+        let d = cbcs_decision(2, 8, iv16);
+        encrypt_sample_in_place(&d, &KEY, None, Some(&subs), &mut ct).expect("encrypt");
+        assert_eq!(
+            ct[..32].to_vec(),
+            ct[32..].to_vec(),
+            "restarted constant IV ⇒ identical ciphertext halves"
+        );
+        assert_ne!(ct[..32], plaintext[..32]);
+    }
+
+    #[test]
+    fn encrypt_steps_rejects_the_same_malformed_plans_as_decrypt() {
+        // Geometry and mode guards are shared with the decrypt path.
+        let past_end = [CipherStep {
+            offset: 8,
+            len: 16,
+            kind: CipherStepKind::Encrypted,
+            iv_restart: false,
+        }];
+        let mut data = vec![0u8; 16];
+        assert!(
+            encrypt_steps_in_place(CipherMode::Ctr, &KEY, &[0u8; 8], &past_end, &mut data).is_err()
+        );
+        let ctr_restart = [CipherStep {
+            offset: 0,
+            len: 16,
+            kind: CipherStepKind::Encrypted,
+            iv_restart: true,
+        }];
+        assert!(
+            encrypt_steps_in_place(CipherMode::Ctr, &KEY, &[0u8; 8], &ctr_restart, &mut data)
+                .is_err()
+        );
+        let misaligned = [CipherStep {
+            offset: 0,
+            len: 12,
+            kind: CipherStepKind::Encrypted,
+            iv_restart: false,
+        }];
+        assert!(
+            encrypt_steps_in_place(CipherMode::Cbc, &KEY, &[0u8; 16], &misaligned, &mut data)
+                .is_err()
+        );
     }
 
     // ---- step-level engine guards --------------------------------------

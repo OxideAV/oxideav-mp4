@@ -813,6 +813,184 @@ pub fn parse_senc(body: &[u8], per_sample_iv_size: u8) -> Result<SencBox> {
     Ok(SencBox { flags, samples })
 }
 
+// ---- Write side (§7.2 / §8.1 / §8.2 emission) --------------------------
+
+/// Append a complete `[size][fourcc]` box around `body` bytes.
+fn wrap_full_box(fourcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let total = 8 + body.len() as u32;
+    let mut out = Vec::with_capacity(total as usize);
+    out.extend_from_slice(&total.to_be_bytes());
+    out.extend_from_slice(fourcc);
+    out.extend_from_slice(body);
+    out
+}
+
+/// Serialise a [`TencBox`] into a complete `[size]['tenc']` box — the
+/// byte-exact inverse of [`parse_tenc`] (§8.2.2). Rejects records that
+/// would not round-trip:
+///
+/// * a version other than 0 / 1,
+/// * a v0 record carrying a non-zero pattern pair (the packed
+///   `crypt:4|skip:4` byte only exists at v1),
+/// * a pattern component above the 4-bit field ceiling,
+/// * `default_per_sample_iv_size` outside {0, 8, 16},
+/// * a constant IV whose presence disagrees with the §9.1 rule
+///   (`Some` iff `isProtected == 1 && IV_size == 0`) or whose length
+///   is not 8 / 16.
+pub fn build_tenc_box(tenc: &TencBox) -> Result<Vec<u8>> {
+    if tenc.version > 1 {
+        return Err(Error::invalid(format!(
+            "MP4 tenc build: undefined version {}",
+            tenc.version
+        )));
+    }
+    if tenc.version == 0
+        && (tenc.default_crypt_byte_block != 0 || tenc.default_skip_byte_block != 0)
+    {
+        return Err(Error::invalid(
+            "MP4 tenc build: pattern pair requires version 1",
+        ));
+    }
+    if tenc.default_crypt_byte_block > 0x0F || tenc.default_skip_byte_block > 0x0F {
+        return Err(Error::invalid(
+            "MP4 tenc build: pattern component exceeds its 4-bit field",
+        ));
+    }
+    if !matches!(tenc.default_per_sample_iv_size, 0 | 8 | 16) {
+        return Err(Error::invalid(format!(
+            "MP4 tenc build: default_Per_Sample_IV_Size {} not in {{0, 8, 16}}",
+            tenc.default_per_sample_iv_size
+        )));
+    }
+    let needs_constant_iv = tenc.default_is_protected == 1 && tenc.default_per_sample_iv_size == 0;
+    match (&tenc.default_constant_iv, needs_constant_iv) {
+        (Some(iv), true) => {
+            if iv.len() != 8 && iv.len() != 16 {
+                return Err(Error::invalid(format!(
+                    "MP4 tenc build: default_constant_IV length {} not in {{8, 16}}",
+                    iv.len()
+                )));
+            }
+        }
+        (None, true) => {
+            return Err(Error::invalid(
+                "MP4 tenc build: isProtected==1 && IV_size==0 requires a constant IV",
+            ));
+        }
+        (Some(_), false) => {
+            return Err(Error::invalid(
+                "MP4 tenc build: constant IV present but not required (would not round-trip)",
+            ));
+        }
+        (None, false) => {}
+    }
+    let mut body = Vec::with_capacity(24 + 17);
+    body.extend_from_slice(&[tenc.version, 0, 0, 0]); // FullBox version + flags
+    body.push(0); // reserved
+    if tenc.version == 0 {
+        body.push(0); // reserved
+    } else {
+        body.push((tenc.default_crypt_byte_block << 4) | tenc.default_skip_byte_block);
+    }
+    body.push(tenc.default_is_protected);
+    body.push(tenc.default_per_sample_iv_size);
+    body.extend_from_slice(&tenc.default_kid);
+    if let Some(iv) = &tenc.default_constant_iv {
+        body.push(iv.len() as u8);
+        body.extend_from_slice(iv);
+    }
+    Ok(wrap_full_box(b"tenc", &body))
+}
+
+/// Serialise a [`PsshBox`] into a complete `[size]['pssh']` box — the
+/// byte-exact inverse of [`parse_pssh`] (§8.1.2). Rejects a v0 record
+/// carrying KIDs (the KID array only exists at v1) and count / size
+/// values that overflow their 32-bit on-wire fields.
+pub fn build_pssh_box(pssh: &PsshBox) -> Result<Vec<u8>> {
+    if pssh.version == 0 && !pssh.kids.is_empty() {
+        return Err(Error::invalid(
+            "MP4 pssh build: KID list requires version >= 1",
+        ));
+    }
+    let kid_count = u32::try_from(pssh.kids.len())
+        .map_err(|_| Error::invalid("MP4 pssh build: KID_count exceeds u32"))?;
+    let data_size = u32::try_from(pssh.data.len())
+        .map_err(|_| Error::invalid("MP4 pssh build: DataSize exceeds u32"))?;
+    let mut body = Vec::with_capacity(4 + 16 + 4 + pssh.kids.len() * 16 + 4 + pssh.data.len());
+    body.extend_from_slice(&[pssh.version, 0, 0, 0]);
+    body.extend_from_slice(&pssh.system_id);
+    if pssh.version > 0 {
+        body.extend_from_slice(&kid_count.to_be_bytes());
+        for kid in &pssh.kids {
+            body.extend_from_slice(kid);
+        }
+    }
+    body.extend_from_slice(&data_size.to_be_bytes());
+    body.extend_from_slice(&pssh.data);
+    Ok(wrap_full_box(b"pssh", &body))
+}
+
+/// Serialise a [`SencBox`] into a complete `[size]['senc']` box — the
+/// byte-exact inverse of [`parse_senc`] (§7.2.2), emitted at FullBox
+/// version 0 with the record's 24-bit `flags` verbatim.
+///
+/// The on-wire box does not record the IV width (§7.2.3), so the same
+/// consistency the parser demands is enforced here: every sample's
+/// `initialization_vector` must have one shared length ∈ {0, 8, 16}.
+/// When the `UseSubSampleEncryption` bit (`0x000002`) is clear, no
+/// sample may carry a subsample map (it would be dropped on re-parse);
+/// when set, every subsample count must fit its 16-bit field.
+pub fn build_senc_box(senc: &SencBox) -> Result<Vec<u8>> {
+    if senc.flags > 0x00FF_FFFF {
+        return Err(Error::invalid(
+            "MP4 senc build: flags exceed the 24-bit field",
+        ));
+    }
+    let sample_count = u32::try_from(senc.samples.len())
+        .map_err(|_| Error::invalid("MP4 senc build: sample_count exceeds u32"))?;
+    let iv_size = senc
+        .samples
+        .first()
+        .map(|s| s.initialization_vector.len())
+        .unwrap_or(0);
+    if !matches!(iv_size, 0 | 8 | 16) {
+        return Err(Error::invalid(format!(
+            "MP4 senc build: per-sample IV length {iv_size} not in {{0, 8, 16}}"
+        )));
+    }
+    let use_subsamples = senc.uses_subsample_encryption();
+    let mut body = Vec::with_capacity(8 + senc.samples.len() * (iv_size + 8));
+    body.push(0); // version 0
+    body.extend_from_slice(&senc.flags.to_be_bytes()[1..4]);
+    body.extend_from_slice(&sample_count.to_be_bytes());
+    for (i, sample) in senc.samples.iter().enumerate() {
+        if sample.initialization_vector.len() != iv_size {
+            return Err(Error::invalid(format!(
+                "MP4 senc build: sample {i} IV length {} differs from the shared width {iv_size}",
+                sample.initialization_vector.len()
+            )));
+        }
+        body.extend_from_slice(&sample.initialization_vector);
+        if use_subsamples {
+            let sub_count = u16::try_from(sample.subsamples.len()).map_err(|_| {
+                Error::invalid(format!(
+                    "MP4 senc build: sample {i} subsample_count exceeds u16"
+                ))
+            })?;
+            body.extend_from_slice(&sub_count.to_be_bytes());
+            for sub in &sample.subsamples {
+                body.extend_from_slice(&sub.bytes_of_clear_data.to_be_bytes());
+                body.extend_from_slice(&sub.bytes_of_protected_data.to_be_bytes());
+            }
+        } else if !sample.subsamples.is_empty() {
+            return Err(Error::invalid(format!(
+                "MP4 senc build: sample {i} carries subsamples but UseSubSampleEncryption is clear"
+            )));
+        }
+    }
+    Ok(wrap_full_box(b"senc", &body))
+}
+
 // ---- Per-sample cipher walker (§9.4–9.6) ------------------------------
 
 /// The kind of byte run a [`CipherStep`] names.
@@ -1185,6 +1363,223 @@ fn plan_pattern_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- build_tenc_box / build_pssh_box / build_senc_box ------------
+
+    fn box_body(bytes: &[u8], fourcc: &[u8; 4]) -> Vec<u8> {
+        assert_eq!(
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize,
+            bytes.len(),
+            "box size field must match total length"
+        );
+        assert_eq!(&bytes[4..8], fourcc);
+        bytes[8..].to_vec()
+    }
+
+    #[test]
+    fn build_tenc_v0_round_trips() {
+        let rec = TencBox {
+            version: 0,
+            default_is_protected: 1,
+            default_per_sample_iv_size: 16,
+            default_kid: [0x42; 16],
+            default_crypt_byte_block: 0,
+            default_skip_byte_block: 0,
+            default_constant_iv: None,
+        };
+        let bytes = build_tenc_box(&rec).unwrap();
+        assert_eq!(parse_tenc(&box_body(&bytes, b"tenc")).unwrap(), rec);
+    }
+
+    #[test]
+    fn build_tenc_v1_pattern_constant_iv_round_trips() {
+        let rec = TencBox {
+            version: 1,
+            default_is_protected: 1,
+            default_per_sample_iv_size: 0,
+            default_kid: [0x0F; 16],
+            default_crypt_byte_block: 1,
+            default_skip_byte_block: 9,
+            default_constant_iv: Some(vec![0xCC; 16]),
+        };
+        let bytes = build_tenc_box(&rec).unwrap();
+        assert_eq!(parse_tenc(&box_body(&bytes, b"tenc")).unwrap(), rec);
+    }
+
+    #[test]
+    fn build_tenc_rejects_non_round_trippable_records() {
+        let base = TencBox {
+            version: 0,
+            default_is_protected: 1,
+            default_per_sample_iv_size: 8,
+            default_kid: [0; 16],
+            default_crypt_byte_block: 0,
+            default_skip_byte_block: 0,
+            default_constant_iv: None,
+        };
+        // v0 with a pattern pair.
+        let mut r = base.clone();
+        r.default_crypt_byte_block = 1;
+        assert!(build_tenc_box(&r).is_err());
+        // Undefined version.
+        let mut r = base.clone();
+        r.version = 2;
+        assert!(build_tenc_box(&r).is_err());
+        // IV size outside {0, 8, 16}.
+        let mut r = base.clone();
+        r.default_per_sample_iv_size = 4;
+        assert!(build_tenc_box(&r).is_err());
+        // Constant IV required but absent.
+        let mut r = base.clone();
+        r.default_per_sample_iv_size = 0;
+        assert!(build_tenc_box(&r).is_err());
+        // Constant IV present but not required.
+        let mut r = base.clone();
+        r.default_constant_iv = Some(vec![0xAA; 8]);
+        assert!(build_tenc_box(&r).is_err());
+        // Constant IV with a bad length.
+        let mut r = base;
+        r.default_per_sample_iv_size = 0;
+        r.default_constant_iv = Some(vec![0xAA; 12]);
+        assert!(build_tenc_box(&r).is_err());
+    }
+
+    #[test]
+    fn build_pssh_v0_and_v1_round_trip() {
+        let v0 = PsshBox {
+            version: 0,
+            system_id: [0x11; 16],
+            kids: Vec::new(),
+            data: vec![1, 2, 3, 4, 5],
+        };
+        let bytes = build_pssh_box(&v0).unwrap();
+        assert_eq!(parse_pssh(&box_body(&bytes, b"pssh")).unwrap(), v0);
+
+        let v1 = PsshBox {
+            version: 1,
+            system_id: [0x22; 16],
+            kids: vec![[0xA0; 16], [0xB1; 16]],
+            data: Vec::new(),
+        };
+        let bytes = build_pssh_box(&v1).unwrap();
+        assert_eq!(parse_pssh(&box_body(&bytes, b"pssh")).unwrap(), v1);
+    }
+
+    #[test]
+    fn build_pssh_rejects_v0_with_kids() {
+        let rec = PsshBox {
+            version: 0,
+            system_id: [0; 16],
+            kids: vec![[1; 16]],
+            data: Vec::new(),
+        };
+        assert!(build_pssh_box(&rec).is_err());
+    }
+
+    #[test]
+    fn build_senc_plain_iv_round_trips() {
+        let rec = SencBox {
+            flags: 0,
+            samples: vec![
+                SencSample {
+                    initialization_vector: vec![1; 8],
+                    subsamples: Vec::new(),
+                },
+                SencSample {
+                    initialization_vector: vec![2; 8],
+                    subsamples: Vec::new(),
+                },
+            ],
+        };
+        let bytes = build_senc_box(&rec).unwrap();
+        assert_eq!(parse_senc(&box_body(&bytes, b"senc"), 8).unwrap(), rec);
+    }
+
+    #[test]
+    fn build_senc_subsample_round_trips() {
+        let rec = SencBox {
+            flags: 0x0000_0002,
+            samples: vec![SencSample {
+                initialization_vector: vec![7; 16],
+                subsamples: vec![
+                    SubsampleEntry {
+                        bytes_of_clear_data: 13,
+                        bytes_of_protected_data: 96,
+                    },
+                    SubsampleEntry {
+                        bytes_of_clear_data: 4,
+                        bytes_of_protected_data: 32,
+                    },
+                ],
+            }],
+        };
+        let bytes = build_senc_box(&rec).unwrap();
+        assert_eq!(parse_senc(&box_body(&bytes, b"senc"), 16).unwrap(), rec);
+    }
+
+    #[test]
+    fn build_senc_constant_iv_scheme_round_trips() {
+        // Zero-length IVs (constant-IV scheme) with subsample maps —
+        // the cbcs shape.
+        let rec = SencBox {
+            flags: 0x0000_0002,
+            samples: vec![SencSample {
+                initialization_vector: Vec::new(),
+                subsamples: vec![SubsampleEntry {
+                    bytes_of_clear_data: 5,
+                    bytes_of_protected_data: 160,
+                }],
+            }],
+        };
+        let bytes = build_senc_box(&rec).unwrap();
+        assert_eq!(parse_senc(&box_body(&bytes, b"senc"), 0).unwrap(), rec);
+    }
+
+    #[test]
+    fn build_senc_rejects_inconsistent_records() {
+        // Mixed IV widths.
+        let rec = SencBox {
+            flags: 0,
+            samples: vec![
+                SencSample {
+                    initialization_vector: vec![1; 8],
+                    subsamples: Vec::new(),
+                },
+                SencSample {
+                    initialization_vector: vec![2; 16],
+                    subsamples: Vec::new(),
+                },
+            ],
+        };
+        assert!(build_senc_box(&rec).is_err());
+        // Subsamples present with the flag clear.
+        let rec = SencBox {
+            flags: 0,
+            samples: vec![SencSample {
+                initialization_vector: vec![1; 8],
+                subsamples: vec![SubsampleEntry {
+                    bytes_of_clear_data: 1,
+                    bytes_of_protected_data: 2,
+                }],
+            }],
+        };
+        assert!(build_senc_box(&rec).is_err());
+        // Flags exceeding the 24-bit field.
+        let rec = SencBox {
+            flags: 0x0100_0000,
+            samples: Vec::new(),
+        };
+        assert!(build_senc_box(&rec).is_err());
+        // Bad shared IV width.
+        let rec = SencBox {
+            flags: 0,
+            samples: vec![SencSample {
+                initialization_vector: vec![1; 4],
+                subsamples: Vec::new(),
+            }],
+        };
+        assert!(build_senc_box(&rec).is_err());
+    }
 
     // ---- tenc -------------------------------------------------------
 

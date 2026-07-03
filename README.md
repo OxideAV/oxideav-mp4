@@ -322,7 +322,14 @@ Sample-entry FourCCs resolve to these codec ids:
   The standalone parsers (`cenc::parse_tenc` / `cenc::parse_pssh`
   / `cenc::parse_senc`) are public for callers that already have
   the box body in hand from another path (e.g. a non-MP4 carrier
-  of CENC framing).
+  of CENC framing). The write side is `cenc::build_tenc_box` /
+  `build_pssh_box` / `build_senc_box` — each emits a complete
+  `[size][fourcc]` box whose body is the byte-exact inverse of the
+  matching parser, rejecting records that would not round-trip (a
+  v0 `tenc` carrying a pattern pair, a constant IV whose presence
+  disagrees with the §9.1 `isProtected`/`IV_size` rule, a v0 `pssh`
+  with KIDs, a `senc` with mixed per-sample IV widths or subsample
+  maps under a cleared `UseSubSampleEncryption` flag, …).
   - Typed scheme decision router (§4.2 + §10). The four `scheme_type`
     FourCCs defined in ISO/IEC 23001-7:2016 §10 — `cenc` (AES-CTR
     full / NAL-subsample), `cbc1` (AES-CBC full / NAL-subsample),
@@ -415,7 +422,15 @@ Sample-entry FourCCs resolve to these codec ids:
     CBC-encrypted). The step-level engine is public as
     `cenc_cipher::decrypt_steps_in_place(mode, key, iv, steps,
     data)` for `seig`-overridden sample groups where the caller
-    assembles its own plan/IV pairing. Tested against a FIPS-197
+    assembles its own plan/IV pairing. The write-side duals —
+    `cenc_cipher::encrypt_sample_in_place` /
+    `encrypt_steps_in_place` — encrypt plaintext samples under the
+    identical §9.4–§9.7 partition (CTR is the same keystream XOR;
+    CBC runs the cipher forward with the same per-`cbcs`-subsample
+    IV restart and whole-block discipline), so encrypt followed by
+    decrypt with the same arguments is the identity — a packager
+    producing protected content uses the same routing decision the
+    reader consumes. Tested against a FIPS-197
     known-answer AES block anchor, first-principles ECB-built §9.3
     keystreams (including the 64-bit counter wrap), and synthetic
     known-key round-trips for every scheme × subsample × pattern
