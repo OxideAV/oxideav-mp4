@@ -1298,9 +1298,28 @@ Supported encode codec ids (produced sample entry FourCC in
 parentheses):
 
 - `pcm_s16le` → `sowt`
+- `pcm_mulaw` / `pcm_alaw` → `ulaw` / `alaw` (plain 8-bit AudioSampleEntry)
 - `flac` → `fLaC` with `dfLa` config (requires STREAMINFO extradata)
 - `aac` → `mp4a` with `esds` (requires AudioSpecificConfig extradata)
+- `mp3` → `mp4a` with `esds` `objectTypeIndication = 0x6B` (MPEG-1 audio;
+  no DecoderSpecificInfo — the demuxer's OTI refinement resolves it back
+  to `mp3`)
+- `opus` → `Opus` with `dOps` (extradata is the demuxer's surfaced form —
+  the dOps body behind an `OpusHead` magic; the magic is stripped on
+  write and re-prepended on read, byte-exact both ways)
+- `alac` → `alac` with `alac` magic-cookie config child (extradata is the
+  cookie; the FullBox version/flags word is added on write / stripped on
+  read)
+- `ac3` → `ac-3` with `dac3` (extradata verbatim as the config-box body)
+- `eac3` → `ec-3` with `dec3` (extradata verbatim)
 - `h264` → `avc1` with `avcC` (requires AVCConfigurationRecord extradata)
+- `h265` → `hvc1` with `hvcC` (requires HEVCDecoderConfigurationRecord)
+- `av1` → `av01` with `av1C` (requires AV1CodecConfigurationRecord)
+- `vp9` / `vp8` → `vp09` / `vp08` with `vpcC` (requires
+  VPCodecConfigurationRecord, including its FullBox version/flags word —
+  the demuxer's surfaced form)
+- `h263` → `s263`, with a `d263` config child when extradata is present
+  (opaque symmetric carriage; the demuxer surfaces the `d263` body)
 - `mjpeg` → `jpeg`
 - `mov_text` → `tx3g` (3GPP TS 26.245 timed text) — `text` handler + `nmhd`
 - `webvtt` → `wvtt` (BMFF §12.6.3.2 XMLSubtitleSampleEntry sibling) — `subt` handler + `sthd`

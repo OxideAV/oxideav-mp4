@@ -43,6 +43,10 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     // copies (a malformed file with two pdin boxes is no reason to
     // abort the open — the first is the one the spec endorses).
     let mut pdin: Option<PdinRecord> = None;
+    // QuickTime Preview Atom (`pnot`) — a top-level atom locating the
+    // movie's preview (poster) image. Quantity zero or one; the first
+    // instance seen wins.
+    let mut pnot: Option<PnotRecord> = None;
     // §8.11 — file-level `meta` box item infrastructure (HEIF / MIAF).
     // Quantity zero or one at the top level; the first instance wins. A
     // `meta` may also appear inside `moov` / `trak` (handled in
@@ -69,6 +73,16 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                 let body = read_box_body(&mut *input, &hdr)?;
                 if pdin.is_none() {
                     pdin = Some(parse_pdin(&body)?);
+                }
+            }
+            // QuickTime Preview Atom (`pnot`) — a top-level plain `Box`
+            // locating the movie's preview (poster) image. The first
+            // parseable instance wins; a malformed one is dropped
+            // (informational) rather than aborting the open.
+            PNOT => {
+                let body = read_box_body(&mut *input, &hdr)?;
+                if pnot.is_none() {
+                    pnot = parse_pnot(&body);
                 }
             }
             MOOV => {
@@ -263,6 +277,25 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                 format!("{} {}", e.rate, e.initial_delay),
             ));
         }
+    }
+
+    // Surface a QuickTime Preview Atom (`pnot`) on the flat metadata
+    // channel as `pnot` with value "<atom_type> <atom_index>
+    // mod=<modification_date>" — the FourCC of the atom that holds the
+    // preview data (e.g. `PICT`), which instance of that type to use, and
+    // the Macintosh-format modification date. The structured record is
+    // reachable via `Mp4Demuxer::pnot()` (or the public `parse_pnot_box`).
+    // Absent `pnot`, no key is emitted.
+    if let Some(p) = pnot.as_ref() {
+        metadata.push((
+            "pnot".to_string(),
+            format!(
+                "{} {} mod={}",
+                String::from_utf8_lossy(&p.atom_type),
+                p.atom_index,
+                p.modification_date
+            ),
+        ));
     }
 
     // Surface the file-level `meta` box item infrastructure (§8.11) on
@@ -561,6 +594,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         tfras,
         prfts,
         pdin,
+        pnot,
         leva: parsed.leva,
         treps: parsed.treps,
         psshes: parsed.psshes,
@@ -975,6 +1009,31 @@ pub struct PdinRecord {
     /// producer is suspected — the spec wording recommends interpolation
     /// but doesn't *mandate* monotonic ordering.
     pub entries: Vec<PdinEntry>,
+}
+
+/// Decoded QuickTime Preview Atom (`pnot`).
+///
+/// A top-level atom locating the movie's preview (poster) image — a
+/// representative frame suitable for display in an Open dialog. Body
+/// layout (a plain `Box`, no FullBox preamble): `unsigned int(32)
+/// modification_date` (a Macintosh-format date), `unsigned int(16)
+/// version` (0), `unsigned int(32) atom_type` (the FourCC of the atom
+/// holding the preview data, typically `PICT`), and `unsigned int(16)
+/// atom_index` (which atom of that type to use, typically 1) — twelve
+/// bytes. All integers big-endian.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PnotRecord {
+    /// The date the preview was last updated, in Macintosh format
+    /// (seconds since 1904-01-01).
+    pub modification_date: u32,
+    /// The version number (must be 0).
+    pub version: u16,
+    /// The FourCC of the atom type that holds the preview data (typically
+    /// `PICT` for a QuickDraw picture).
+    pub atom_type: [u8; 4],
+    /// Which atom of the specified type to use as the preview (typically
+    /// 1 = the first).
+    pub atom_index: u16,
 }
 
 /// Per-level descriptor carried by `leva` (LevelAssignmentBox, ISO/IEC
@@ -7041,6 +7100,13 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
                     t.esds_oti = parsed.oti;
                 }
             }
+            // ALAC magic cookie (`alac` config child inside an `alac`
+            // entry): a FullBox — 4 bytes version/flags then the cookie.
+            // Surface the cookie bytes (mirroring the dfLa convention);
+            // the muxer's `alac_entry` re-wraps them byte-exact.
+            b"alac" if body.len() > 4 => {
+                t.extradata = body[4..].to_vec();
+            }
             // AC-3 specific config (`dac3`, ETSI TS 102 366 Annex F.4)
             // and E-AC-3 specific config (`dec3`, Annex G.4). Keep the
             // raw box payload as extradata so downstream decoders that
@@ -7234,6 +7300,10 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             b"av1C" => t.extradata = body,
             // VPCodecConfigurationRecord — vpcC box for VP8 / VP9.
             b"vpcC" => t.extradata = body,
+            // H.263 decoder configuration (`d263`, the 3GPP MP4 packaging's
+            // config child inside an `s263` entry). Kept verbatim as opaque
+            // extradata — the muxer's `h263_entry` re-emits it byte-exact.
+            b"d263" => t.extradata = body,
             // esds for `mp4v` sample entries. Same shape as the audio variant.
             // We keep the DSI (MPEG-4 VOL header for Part 2, etc.) as
             // extradata and remember the OTI so `from_sample_entry_with_oti`
@@ -11901,6 +11971,12 @@ struct Mp4Demuxer {
     /// Informational only — the demuxer does not consult it.
     #[allow(dead_code)]
     pdin: Option<PdinRecord>,
+    /// Parsed QuickTime Preview Atom (`pnot`), if the file carries one at
+    /// the top level. Reachable via the public `Mp4Demuxer::pnot`
+    /// accessor and surfaced on the flat metadata channel as `pnot`.
+    /// Informational only — the demuxer does not consult it.
+    #[allow(dead_code)]
+    pnot: Option<PnotRecord>,
     /// Parsed `leva` LevelAssignmentBox (§8.8.13), if the file carries
     /// one. Quantity is zero or one per file (§8.8.13.1); the
     /// structured record is reachable via the public
@@ -12043,6 +12119,17 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn pdin_entries(&self) -> Option<&[PdinEntry]> {
         self.pdin.as_ref().map(|p| p.entries.as_slice())
+    }
+
+    /// The parsed QuickTime Preview Atom (`pnot`), if the file carried one
+    /// at the top level. Locates the movie's preview (poster) image: the
+    /// FourCC of the atom holding the preview data, which instance of that
+    /// type to use, and the Macintosh-format modification date. `None`
+    /// when no `pnot` was present. Also surfaced on the flat metadata
+    /// channel as `pnot`.
+    #[allow(dead_code)]
+    pub fn pnot(&self) -> Option<&PnotRecord> {
+        self.pnot.as_ref()
     }
 
     /// ISO/IEC 14496-12 §8.8.13 — `leva` LevelAssignmentBox entries,
@@ -12569,6 +12656,49 @@ pub fn build_pdin_box(record: &PdinRecord) -> Vec<u8> {
         body.extend_from_slice(&e.initial_delay.to_be_bytes());
     }
     wrap_box(&crate::boxes::PDIN, &body)
+}
+
+/// Parse a QuickTime `pnot` (Preview Atom) body from `body` (the 12 bytes
+/// after the plain 8-byte box header — `pnot` is a plain `Box`, no FullBox
+/// preamble): `unsigned int(32) modification_date`, `unsigned int(16)
+/// version`, `unsigned int(32) atom_type`, `unsigned int(16) atom_index`.
+/// Returns `None` for a body shorter than the fixed 12 bytes; trailing
+/// bytes are ignored.
+fn parse_pnot(body: &[u8]) -> Option<PnotRecord> {
+    if body.len() < 12 {
+        return None;
+    }
+    let modification_date = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    let version = u16::from_be_bytes([body[4], body[5]]);
+    let atom_type = [body[6], body[7], body[8], body[9]];
+    let atom_index = u16::from_be_bytes([body[10], body[11]]);
+    Some(PnotRecord {
+        modification_date,
+        version,
+        atom_type,
+        atom_index,
+    })
+}
+
+/// Parse a standalone QuickTime `pnot` (Preview Atom) body from `body`
+/// (the 12 bytes after the plain 8-byte box header). Exposed so tooling
+/// holding the atom's payload can recover the preview locator without
+/// re-running `open()`. `Err` for a body shorter than the fixed 12-byte
+/// layout; trailing bytes are ignored.
+pub fn parse_pnot_box(body: &[u8]) -> Result<PnotRecord> {
+    parse_pnot(body).ok_or_else(|| Error::invalid("MP4: pnot too short"))
+}
+
+/// Build a complete QuickTime `pnot` (Preview Atom) box from a
+/// [`PnotRecord`]. The byte-exact inverse of [`parse_pnot_box`]: the four
+/// fields with no FullBox preamble.
+pub fn build_pnot_box(r: &PnotRecord) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&r.modification_date.to_be_bytes());
+    body.extend_from_slice(&r.version.to_be_bytes());
+    body.extend_from_slice(&r.atom_type);
+    body.extend_from_slice(&r.atom_index.to_be_bytes());
+    wrap_box(&crate::boxes::PNOT, &body)
 }
 
 /// Parse a standalone `leva` (LevelAssignmentBox, ISO/IEC 14496-12
@@ -18721,6 +18851,30 @@ mod tests {
         assert_eq!(boxed.len(), 12);
         let r = super::parse_pdin_box(&boxed[8..]).unwrap();
         assert!(r.entries.is_empty());
+    }
+
+    /// `build_pnot_box` → `parse_pnot_box` is a byte-exact round-trip; the
+    /// typical `PICT` / index-1 poster locator decodes field-for-field.
+    #[test]
+    fn pnot_box_round_trips() {
+        let r = super::PnotRecord {
+            modification_date: 0xC0FF_EE00,
+            version: 0,
+            atom_type: *b"PICT",
+            atom_index: 1,
+        };
+        let boxed = super::build_pnot_box(&r);
+        assert_eq!(&boxed[4..8], b"pnot");
+        assert_eq!(boxed.len(), 20); // 8 header + 12 body
+        let back = super::parse_pnot_box(&boxed[8..]).expect("round-trip");
+        assert_eq!(back, r);
+    }
+
+    /// A `pnot` body shorter than the fixed 12 bytes is rejected.
+    #[test]
+    fn pnot_box_too_short_is_rejected() {
+        assert!(super::parse_pnot(&[0u8; 11]).is_none());
+        assert!(super::parse_pnot_box(&[0u8; 11]).is_err());
     }
 
     /// `build_prft_box` is the byte-exact inverse of `parse_prft_box` for

@@ -34,6 +34,26 @@ pub(crate) fn sample_entry_for(params: &CodecParameters) -> Result<SampleEntry> 
         "aac" => aac_entry(params),
         "h264" => h264_entry(params),
         "mjpeg" => mjpeg_entry(params),
+        // Video codecs whose sample entry is the shared VisualSampleEntry
+        // preamble plus one mandatory configuration-record child box.
+        // The extradata is the config-record bytes exactly as this
+        // crate's demuxer surfaces them (the box *body*), so a
+        // demux → mux round-trip re-emits the byte-identical box.
+        "h265" => video_config_entry(params, *b"hvc1", *b"hvcC", "HEVCDecoderConfigurationRecord"),
+        "av1" => video_config_entry(params, *b"av01", *b"av1C", "AV1CodecConfigurationRecord"),
+        "vp9" => video_config_entry(params, *b"vp09", *b"vpcC", "VPCodecConfigurationRecord"),
+        "vp8" => video_config_entry(params, *b"vp08", *b"vpcC", "VPCodecConfigurationRecord"),
+        "h263" => h263_entry(params),
+        // Audio codecs carried as an AudioSampleEntry preamble plus a
+        // codec-specific config child (or none). Extradata conventions
+        // mirror the demuxer's surfaced form (see each builder).
+        "opus" => opus_entry(params),
+        "alac" => alac_entry(params),
+        "ac3" => dolby_entry(params, *b"ac-3", *b"dac3"),
+        "eac3" => dolby_entry(params, *b"ec-3", *b"dec3"),
+        "mp3" => mp3_entry(params),
+        "pcm_mulaw" => g711_entry(params, *b"ulaw"),
+        "pcm_alaw" => g711_entry(params, *b"alaw"),
         // Subtitle / timed-text packagings (ISO/IEC 14496-12 §12.5–6
         // + 3GPP TS 26.245 for tx3g/mov_text). All five accept the
         // demuxer's `extradata` (the post-preamble body) verbatim,
@@ -226,52 +246,13 @@ fn aac_entry(params: &CodecParameters) -> Result<SampleEntry> {
     }
     let mut body = audio_preamble(channels, 16, sample_rate).to_vec();
 
-    // esds box (full box): ES_Descriptor wrapping DecoderConfigDescriptor wrapping
-    // DecoderSpecificInfo (the AudioSpecificConfig). ObjectTypeIndication = 0x40
-    // (AAC). StreamType = 0x05 (audio). See ISO/IEC 14496-1 §7.2.6.
-    let asc = &params.extradata;
-    // DecoderSpecificInfo (tag 0x05): length = asc.len()
-    let mut dsi = Vec::new();
-    dsi.push(0x05);
-    append_ber_length(&mut dsi, asc.len() as u32);
-    dsi.extend_from_slice(asc);
-
-    // DecoderConfigDescriptor (tag 0x04): 13 bytes header + DSI
-    let mut dcd = Vec::new();
-    dcd.push(0x04);
-    let dcd_payload_len = 13 + dsi.len() as u32;
-    append_ber_length(&mut dcd, dcd_payload_len);
-    dcd.push(0x40); // object type: AAC
-    dcd.push((0x05 << 2) | 0x01); // stream type (audio=5) | upstream=0 | reserved=1
-                                  // buffer_size_db (24-bit) = 0
-    dcd.extend_from_slice(&[0, 0, 0]);
-    // max_bitrate (32-bit) = 0
-    dcd.extend_from_slice(&[0, 0, 0, 0]);
-    // avg_bitrate (32-bit) = 0
-    dcd.extend_from_slice(&[0, 0, 0, 0]);
-    dcd.extend_from_slice(&dsi);
-
-    // SLConfigDescriptor (tag 0x06): 1 byte predefined=2
-    let mut slc = Vec::new();
-    slc.push(0x06);
-    append_ber_length(&mut slc, 1);
-    slc.push(0x02);
-
-    // ES_Descriptor (tag 0x03): 3-byte header + DCD + SLC
-    let mut esd = Vec::new();
-    esd.push(0x03);
-    let esd_payload_len = 3 + dcd.len() as u32 + slc.len() as u32;
-    append_ber_length(&mut esd, esd_payload_len);
-    // ES_ID = 0, flags = 0
-    esd.extend_from_slice(&[0, 0, 0]);
-    esd.extend_from_slice(&dcd);
-    esd.extend_from_slice(&slc);
-
-    // esds FullBox: 4 bytes version/flags + ES_Descriptor
-    let mut esds_body = Vec::with_capacity(4 + esd.len());
-    esds_body.extend_from_slice(&[0, 0, 0, 0]);
-    esds_body.extend_from_slice(&esd);
-    body.extend_from_slice(&write_simple_box(b"esds", &esds_body));
+    // esds box (full box): ES_Descriptor wrapping DecoderConfigDescriptor
+    // wrapping DecoderSpecificInfo (the AudioSpecificConfig).
+    // ObjectTypeIndication = 0x40 (AAC). See ISO/IEC 14496-1 §7.2.6.
+    body.extend_from_slice(&write_simple_box(
+        b"esds",
+        &build_esds_body(0x40, &params.extradata),
+    ));
 
     Ok(SampleEntry {
         fourcc: *b"mp4a",
@@ -301,6 +282,267 @@ fn h264_entry(params: &CodecParameters) -> Result<SampleEntry> {
         fourcc: *b"avc1",
         body,
     })
+}
+
+/// Generic video sample entry: 78-byte VisualSampleEntry preamble plus one
+/// mandatory configuration-record child box whose body is the stream's
+/// extradata verbatim (the same bytes this crate's demuxer surfaces when it
+/// meets the box — `hvcC` / `av1C` / `vpcC`). ISO/IEC 14496-12 §12.1.3
+/// (VisualSampleEntry) + ISO/IEC 14496-15 §8.4 (hvc1/hvcC); the AV1 and VP
+/// ISOBMFF bindings follow the same shape with their own record.
+fn video_config_entry(
+    params: &CodecParameters,
+    fourcc: [u8; 4],
+    config_fourcc: [u8; 4],
+    record_name: &str,
+) -> Result<SampleEntry> {
+    if params.media_type != MediaType::Video {
+        return Err(Error::invalid(format!(
+            "mp4 muxer: {} must be video",
+            params.codec_id.as_str()
+        )));
+    }
+    let width = params.width.ok_or_else(|| {
+        Error::invalid(format!(
+            "mp4 muxer: {} requires width",
+            params.codec_id.as_str()
+        ))
+    })?;
+    let height = params.height.ok_or_else(|| {
+        Error::invalid(format!(
+            "mp4 muxer: {} requires height",
+            params.codec_id.as_str()
+        ))
+    })?;
+    if params.extradata.is_empty() {
+        return Err(Error::invalid(format!(
+            "mp4 muxer: {} stream missing extradata ({record_name})",
+            params.codec_id.as_str()
+        )));
+    }
+    let mut body = visual_preamble(width, height).to_vec();
+    body.extend_from_slice(&write_simple_box(&config_fourcc, &params.extradata));
+    Ok(SampleEntry { fourcc, body })
+}
+
+/// H.263 sample entry (`s263`, the 3GPP MP4 packaging this crate's demuxer
+/// already recognises). When the stream carries extradata it is emitted
+/// verbatim as the `d263` configuration child's body — the opaque symmetric
+/// carriage of whatever the demux side surfaced; when absent, a plain
+/// VisualSampleEntry is emitted (matching the mjpeg posture).
+fn h263_entry(params: &CodecParameters) -> Result<SampleEntry> {
+    if params.media_type != MediaType::Video {
+        return Err(Error::invalid("mp4 muxer: h263 must be video"));
+    }
+    let width = params
+        .width
+        .ok_or_else(|| Error::invalid("mp4 muxer: h263 requires width"))?;
+    let height = params
+        .height
+        .ok_or_else(|| Error::invalid("mp4 muxer: h263 requires height"))?;
+    let mut body = visual_preamble(width, height).to_vec();
+    if !params.extradata.is_empty() {
+        body.extend_from_slice(&write_simple_box(b"d263", &params.extradata));
+    }
+    Ok(SampleEntry {
+        fourcc: *b"s263",
+        body,
+    })
+}
+
+/// Opus sample entry (`Opus` + `dOps`). This crate's demuxer surfaces the
+/// dOps body with an 8-byte `OpusHead` magic prepended so downstream code
+/// treats Ogg- and MP4-sourced Opus uniformly; the write side strips that
+/// magic back off when present and emits the remaining bytes verbatim as
+/// the `dOps` body — the byte-exact inverse. Extradata without the magic is
+/// taken to already be the dOps body.
+fn opus_entry(params: &CodecParameters) -> Result<SampleEntry> {
+    if params.media_type != MediaType::Audio {
+        return Err(Error::invalid("mp4 muxer: opus must be audio"));
+    }
+    let channels = params
+        .channels
+        .ok_or_else(|| Error::invalid("mp4 muxer: opus requires channels"))?;
+    let sample_rate = params
+        .sample_rate
+        .ok_or_else(|| Error::invalid("mp4 muxer: opus requires sample_rate"))?;
+    if params.extradata.is_empty() {
+        return Err(Error::invalid(
+            "mp4 muxer: opus stream missing extradata (OpusHead / dOps config)",
+        ));
+    }
+    let dops_body = match params.extradata.strip_prefix(b"OpusHead") {
+        Some(rest) => rest,
+        None => &params.extradata[..],
+    };
+    if dops_body.len() < 11 {
+        return Err(Error::invalid(
+            "mp4 muxer: opus extradata too short for a dOps config",
+        ));
+    }
+    let mut body = audio_preamble(channels, 16, sample_rate).to_vec();
+    body.extend_from_slice(&write_simple_box(b"dOps", dops_body));
+    Ok(SampleEntry {
+        fourcc: *b"Opus",
+        body,
+    })
+}
+
+/// ALAC sample entry (`alac` entry + `alac` config child). The child is a
+/// FullBox — 4 bytes version/flags then the ALAC magic-cookie bytes — and
+/// the demux side surfaces the post-version/flags cookie as extradata
+/// (mirroring the dfLa convention), so the write side re-wraps the cookie
+/// under a zero version/flags word: the byte-exact inverse.
+fn alac_entry(params: &CodecParameters) -> Result<SampleEntry> {
+    if params.media_type != MediaType::Audio {
+        return Err(Error::invalid("mp4 muxer: alac must be audio"));
+    }
+    let channels = params
+        .channels
+        .ok_or_else(|| Error::invalid("mp4 muxer: alac requires channels"))?;
+    let sample_rate = params
+        .sample_rate
+        .ok_or_else(|| Error::invalid("mp4 muxer: alac requires sample_rate"))?;
+    if params.extradata.is_empty() {
+        return Err(Error::invalid(
+            "mp4 muxer: alac stream missing extradata (ALAC magic cookie)",
+        ));
+    }
+    let bps = params
+        .sample_format
+        .map(|f| (f.bytes_per_sample() * 8) as u16)
+        .unwrap_or(16);
+    let mut body = audio_preamble(channels, bps, sample_rate).to_vec();
+    let mut cfg = Vec::with_capacity(4 + params.extradata.len());
+    cfg.extend_from_slice(&[0, 0, 0, 0]); // FullBox version 0 + flags 0
+    cfg.extend_from_slice(&params.extradata);
+    body.extend_from_slice(&write_simple_box(b"alac", &cfg));
+    Ok(SampleEntry {
+        fourcc: *b"alac",
+        body,
+    })
+}
+
+/// AC-3 / E-AC-3 sample entry (`ac-3` + `dac3`, `ec-3` + `dec3` — ETSI
+/// TS 102 366 Annex F / G carriage as this crate's demuxer reads it). The
+/// demux side keeps the raw config-box body as extradata, so the write side
+/// emits it verbatim: the byte-exact inverse.
+fn dolby_entry(
+    params: &CodecParameters,
+    fourcc: [u8; 4],
+    config_fourcc: [u8; 4],
+) -> Result<SampleEntry> {
+    if params.media_type != MediaType::Audio {
+        return Err(Error::invalid(format!(
+            "mp4 muxer: {} must be audio",
+            params.codec_id.as_str()
+        )));
+    }
+    let channels = params.channels.ok_or_else(|| {
+        Error::invalid(format!(
+            "mp4 muxer: {} requires channels",
+            params.codec_id.as_str()
+        ))
+    })?;
+    let sample_rate = params.sample_rate.ok_or_else(|| {
+        Error::invalid(format!(
+            "mp4 muxer: {} requires sample_rate",
+            params.codec_id.as_str()
+        ))
+    })?;
+    if params.extradata.is_empty() {
+        return Err(Error::invalid(format!(
+            "mp4 muxer: {} stream missing extradata ({} config)",
+            params.codec_id.as_str(),
+            String::from_utf8_lossy(&config_fourcc)
+        )));
+    }
+    let mut body = audio_preamble(channels, 16, sample_rate).to_vec();
+    body.extend_from_slice(&write_simple_box(&config_fourcc, &params.extradata));
+    Ok(SampleEntry { fourcc, body })
+}
+
+/// MP3-in-MP4 sample entry (`mp4a` + `esds` with `objectTypeIndication =
+/// 0x6B`, MPEG-1 audio — the OTI this crate's demuxer refines back to the
+/// `mp3` codec id). MP3 needs no DecoderSpecificInfo: the frame headers are
+/// self-describing, so the DecoderConfigDescriptor carries no DSI child.
+fn mp3_entry(params: &CodecParameters) -> Result<SampleEntry> {
+    if params.media_type != MediaType::Audio {
+        return Err(Error::invalid("mp4 muxer: mp3 must be audio"));
+    }
+    let channels = params
+        .channels
+        .ok_or_else(|| Error::invalid("mp4 muxer: mp3 requires channels"))?;
+    let sample_rate = params
+        .sample_rate
+        .ok_or_else(|| Error::invalid("mp4 muxer: mp3 requires sample_rate"))?;
+    let mut body = audio_preamble(channels, 16, sample_rate).to_vec();
+    body.extend_from_slice(&write_simple_box(b"esds", &build_esds_body(0x6B, &[])));
+    Ok(SampleEntry {
+        fourcc: *b"mp4a",
+        body,
+    })
+}
+
+/// G.711 µ-law / A-law sample entry (`ulaw` / `alaw`): a plain 28-byte
+/// AudioSampleEntry, 8-bit samples, no config child.
+fn g711_entry(params: &CodecParameters, fourcc: [u8; 4]) -> Result<SampleEntry> {
+    if params.media_type != MediaType::Audio {
+        return Err(Error::invalid("mp4 muxer: G.711 must be audio"));
+    }
+    let channels = params
+        .channels
+        .ok_or_else(|| Error::invalid("mp4 muxer: G.711 requires channels"))?;
+    let sample_rate = params
+        .sample_rate
+        .ok_or_else(|| Error::invalid("mp4 muxer: G.711 requires sample_rate"))?;
+    let body = audio_preamble(channels, 8, sample_rate).to_vec();
+    Ok(SampleEntry { fourcc, body })
+}
+
+/// Build an `esds` FullBox body: 4 bytes version/flags then the
+/// ES_Descriptor wrapping a DecoderConfigDescriptor (with the given
+/// `objectTypeIndication` and optional DecoderSpecificInfo bytes) and an
+/// SLConfigDescriptor (predefined = 2). ISO/IEC 14496-1 §7.2.6; streamType
+/// is always audio (0x05) here.
+fn build_esds_body(oti: u8, dsi_bytes: &[u8]) -> Vec<u8> {
+    // DecoderSpecificInfo (tag 0x05) — omitted entirely when empty.
+    let mut dsi = Vec::new();
+    if !dsi_bytes.is_empty() {
+        dsi.push(0x05);
+        append_ber_length(&mut dsi, dsi_bytes.len() as u32);
+        dsi.extend_from_slice(dsi_bytes);
+    }
+
+    // DecoderConfigDescriptor (tag 0x04): 13 fixed bytes + DSI.
+    let mut dcd = Vec::new();
+    dcd.push(0x04);
+    append_ber_length(&mut dcd, 13 + dsi.len() as u32);
+    dcd.push(oti);
+    dcd.push((0x05 << 2) | 0x01); // streamType audio | upstream=0 | reserved=1
+    dcd.extend_from_slice(&[0, 0, 0]); // bufferSizeDB (u24) = 0
+    dcd.extend_from_slice(&[0, 0, 0, 0]); // maxBitrate = 0
+    dcd.extend_from_slice(&[0, 0, 0, 0]); // avgBitrate = 0
+    dcd.extend_from_slice(&dsi);
+
+    // SLConfigDescriptor (tag 0x06): predefined = 2.
+    let mut slc = Vec::new();
+    slc.push(0x06);
+    append_ber_length(&mut slc, 1);
+    slc.push(0x02);
+
+    // ES_Descriptor (tag 0x03).
+    let mut esd = Vec::new();
+    esd.push(0x03);
+    append_ber_length(&mut esd, 3 + dcd.len() as u32 + slc.len() as u32);
+    esd.extend_from_slice(&[0, 0, 0]); // ES_ID = 0, flags = 0
+    esd.extend_from_slice(&dcd);
+    esd.extend_from_slice(&slc);
+
+    let mut esds_body = Vec::with_capacity(4 + esd.len());
+    esds_body.extend_from_slice(&[0, 0, 0, 0]);
+    esds_body.extend_from_slice(&esd);
+    esds_body
 }
 
 /// Write a simple (non-FullBox) box: 4-byte size + 4-byte fourcc + body.
@@ -370,6 +612,157 @@ mod tests {
     #[test]
     fn unsupported_codec_errors() {
         let p = CodecParameters::audio(CodecId::new("vorbis"));
+        assert!(sample_entry_for(&p).is_err());
+    }
+
+    fn video_params(codec: &str, extradata: &[u8]) -> CodecParameters {
+        let mut p = CodecParameters::video(CodecId::new(codec));
+        p.width = Some(640);
+        p.height = Some(360);
+        p.extradata = extradata.to_vec();
+        p
+    }
+
+    fn audio_params(codec: &str, extradata: &[u8]) -> CodecParameters {
+        let mut p = CodecParameters::audio(CodecId::new(codec));
+        p.channels = Some(2);
+        p.sample_rate = Some(48_000);
+        p.extradata = extradata.to_vec();
+        p
+    }
+
+    #[test]
+    fn video_config_entries_wrap_extradata() {
+        // (codec id, expected entry fourcc, expected config-box fourcc)
+        for (codec, fourcc, cfg) in [
+            ("h265", b"hvc1", b"hvcC"),
+            ("av1", b"av01", b"av1C"),
+            ("vp9", b"vp09", b"vpcC"),
+            ("vp8", b"vp08", b"vpcC"),
+        ] {
+            let record = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
+            let e = sample_entry_for(&video_params(codec, &record)).unwrap();
+            assert_eq!(&e.fourcc, fourcc, "{codec} entry fourcc");
+            // 78-byte preamble + 8-byte box header + record.
+            assert_eq!(e.body.len(), 78 + 8 + record.len(), "{codec} body size");
+            assert_eq!(&e.body[82..86], cfg, "{codec} config fourcc");
+            assert_eq!(&e.body[86..], &record, "{codec} config body verbatim");
+            // Width/height in the preamble.
+            assert_eq!(u16::from_be_bytes([e.body[24], e.body[25]]), 640);
+            assert_eq!(u16::from_be_bytes([e.body[26], e.body[27]]), 360);
+        }
+    }
+
+    #[test]
+    fn video_config_entries_require_extradata() {
+        for codec in ["h265", "av1", "vp9", "vp8"] {
+            assert!(
+                sample_entry_for(&video_params(codec, &[])).is_err(),
+                "{codec} must require a config record"
+            );
+        }
+    }
+
+    #[test]
+    fn h263_entry_with_and_without_d263() {
+        // With extradata: a d263 child carrying the bytes verbatim.
+        let d263 = [b'O', b'X', b'A', b'V', 0, 10, 0];
+        let e = sample_entry_for(&video_params("h263", &d263)).unwrap();
+        assert_eq!(&e.fourcc, b"s263");
+        assert_eq!(e.body.len(), 78 + 8 + d263.len());
+        assert_eq!(&e.body[82..86], b"d263");
+        assert_eq!(&e.body[86..], &d263);
+        // Without extradata: a plain VisualSampleEntry.
+        let e = sample_entry_for(&video_params("h263", &[])).unwrap();
+        assert_eq!(e.body.len(), 78);
+    }
+
+    #[test]
+    fn opus_entry_strips_opushead_magic() {
+        // 11-byte dOps-shaped payload behind the OpusHead magic.
+        let dops = [1u8, 2, 0x01, 0x38, 0, 0, 0xBB, 0x80, 0, 0, 0];
+        let mut extradata = b"OpusHead".to_vec();
+        extradata.extend_from_slice(&dops);
+        let e = sample_entry_for(&audio_params("opus", &extradata)).unwrap();
+        assert_eq!(&e.fourcc, b"Opus");
+        assert_eq!(e.body.len(), 28 + 8 + dops.len());
+        assert_eq!(&e.body[32..36], b"dOps");
+        assert_eq!(&e.body[36..], &dops, "dOps body must lose the magic");
+
+        // Extradata already without the magic is taken verbatim.
+        let e2 = sample_entry_for(&audio_params("opus", &dops)).unwrap();
+        assert_eq!(&e2.body[36..], &dops);
+
+        // Too-short config is rejected.
+        assert!(sample_entry_for(&audio_params("opus", b"OpusHead\x01")).is_err());
+    }
+
+    #[test]
+    fn alac_entry_wraps_cookie_in_fullbox() {
+        let cookie = [0u8, 0, 16, 0, 40, 10, 14, 2];
+        let e = sample_entry_for(&audio_params("alac", &cookie)).unwrap();
+        assert_eq!(&e.fourcc, b"alac");
+        // 28 preamble + 8 header + 4 version/flags + cookie.
+        assert_eq!(e.body.len(), 28 + 8 + 4 + cookie.len());
+        assert_eq!(&e.body[32..36], b"alac");
+        assert_eq!(&e.body[36..40], &[0, 0, 0, 0], "FullBox version/flags");
+        assert_eq!(&e.body[40..], &cookie);
+        assert!(sample_entry_for(&audio_params("alac", &[])).is_err());
+    }
+
+    #[test]
+    fn dolby_entries_carry_config_verbatim() {
+        let dac3 = [0x10u8, 0x4C, 0x40];
+        let e = sample_entry_for(&audio_params("ac3", &dac3)).unwrap();
+        assert_eq!(&e.fourcc, b"ac-3");
+        assert_eq!(&e.body[32..36], b"dac3");
+        assert_eq!(&e.body[36..], &dac3);
+
+        let dec3 = [0x07u8, 0xC0, 0x20, 0x00, 0x00];
+        let e = sample_entry_for(&audio_params("eac3", &dec3)).unwrap();
+        assert_eq!(&e.fourcc, b"ec-3");
+        assert_eq!(&e.body[32..36], b"dec3");
+        assert_eq!(&e.body[36..], &dec3);
+
+        assert!(sample_entry_for(&audio_params("ac3", &[])).is_err());
+        assert!(sample_entry_for(&audio_params("eac3", &[])).is_err());
+    }
+
+    #[test]
+    fn mp3_entry_emits_esds_with_mpeg1_oti() {
+        let e = sample_entry_for(&audio_params("mp3", &[])).unwrap();
+        assert_eq!(&e.fourcc, b"mp4a");
+        assert_eq!(&e.body[32..36], b"esds");
+        // Deterministic layout: 28 preamble + 8 box header + 4 version/flags
+        // + ES tag(1) + BER len(4) + ES_ID/flags(3) + DCD tag(1) + BER
+        // len(4) → the objectTypeIndication byte.
+        assert_eq!(e.body[28 + 8 + 4 + 13], 0x6B, "OTI must be MPEG-1 audio");
+        // No DecoderSpecificInfo: the DCD payload is exactly 13 bytes (the
+        // final BER length byte sits just before the OTI).
+        assert_eq!(e.body[28 + 8 + 4 + 12], 13, "DCD BER length");
+    }
+
+    #[test]
+    fn g711_entries_are_plain_8bit_audio() {
+        for (codec, fourcc) in [("pcm_mulaw", b"ulaw"), ("pcm_alaw", b"alaw")] {
+            let e = sample_entry_for(&audio_params(codec, &[])).unwrap();
+            assert_eq!(&e.fourcc, fourcc);
+            assert_eq!(e.body.len(), 28, "{codec} has no config child");
+            assert_eq!(
+                u16::from_be_bytes([e.body[18], e.body[19]]),
+                8,
+                "{codec} sample size"
+            );
+        }
+    }
+
+    #[test]
+    fn new_entries_reject_wrong_media_type() {
+        // Video codec ids presented as audio params must error, and
+        // vice-versa for audio codec ids.
+        let p = CodecParameters::audio(CodecId::new("h265"));
+        assert!(sample_entry_for(&p).is_err());
+        let p = CodecParameters::video(CodecId::new("opus"));
         assert!(sample_entry_for(&p).is_err());
     }
 

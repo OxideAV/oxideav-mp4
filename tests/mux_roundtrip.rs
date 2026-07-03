@@ -95,7 +95,9 @@ fn pcm_roundtrip_byte_exact() {
 
 #[test]
 fn unsupported_codec_fails_at_open() {
-    let mut params = CodecParameters::audio(CodecId::new("opus"));
+    // vorbis has no MP4 sample-entry packaging in our table (opus does,
+    // since the Opus/dOps write side landed).
+    let mut params = CodecParameters::audio(CodecId::new("vorbis"));
     params.channels = Some(2);
     params.sample_rate = Some(48_000);
     let stream = StreamInfo {
@@ -109,7 +111,7 @@ fn unsupported_codec_fails_at_open() {
     match oxideav_mp4::muxer::open(cursor, &[stream]) {
         Err(oxideav_core::Error::Unsupported(_)) => {}
         Err(other) => panic!("expected Unsupported, got {other:?}"),
-        Ok(_) => panic!("expected Unsupported error for opus"),
+        Ok(_) => panic!("expected Unsupported error for vorbis"),
     }
 }
 
@@ -1516,4 +1518,152 @@ fn edit_list_roundtrips_through_demuxer() {
         }
     }
     assert_eq!(count, 3, "all three samples demuxed");
+}
+
+// ---------------------------------------------------------------------------
+// Write-side codec coverage: mux → demux round-trips for every sample-entry
+// packaging that has a config-record child, asserting the codec id resolves
+// back and the extradata survives byte-exact (the demuxer surfaces the same
+// bytes the muxer was given).
+// ---------------------------------------------------------------------------
+
+use oxideav_core::MediaType;
+
+fn video_stream(codec: &str, extradata: &[u8]) -> StreamInfo {
+    let mut params = CodecParameters::video(CodecId::new(codec));
+    params.width = Some(320);
+    params.height = Some(240);
+    params.extradata = extradata.to_vec();
+    StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 1000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    }
+}
+
+fn audio_stream(codec: &str, extradata: &[u8]) -> StreamInfo {
+    let mut params = CodecParameters::audio(CodecId::new(codec));
+    params.channels = Some(2);
+    params.sample_rate = Some(48_000);
+    params.extradata = extradata.to_vec();
+    StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 48_000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    }
+}
+
+/// Mux three keyframe packets of `stream` and demux the result back,
+/// returning the demuxed stream parameters and packet payloads.
+fn remux(stream: &StreamInfo) -> (CodecParameters, Vec<Vec<u8>>) {
+    let sent: Vec<Vec<u8>> = (0..3u8)
+        .map(|i| vec![i.wrapping_mul(37); 64 + i as usize])
+        .collect();
+    let tmp = std::env::temp_dir().join(format!(
+        "oxideav-mp4-remux-{}.mp4",
+        stream.params.codec_id.as_str()
+    ));
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = oxideav_mp4::muxer::open(ws, std::slice::from_ref(stream)).unwrap();
+        mux.write_header().unwrap();
+        for (i, payload) in sent.iter().enumerate() {
+            let mut pkt = Packet::new(0, stream.time_base, payload.clone());
+            pkt.pts = Some(i as i64 * 100);
+            pkt.duration = Some(100);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    assert_eq!(dmx.streams().len(), 1);
+    let params = dmx.streams()[0].params.clone();
+    let mut got = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => got.push(p.data),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    assert_eq!(got, sent, "packet bytes must survive the remux");
+    (params, got)
+}
+
+#[test]
+fn video_codecs_roundtrip_extradata() {
+    // (codec id, synthetic config-record bytes)
+    let cases: [(&str, &[u8]); 5] = [
+        ("h265", &[0x01, 0x22, 0x33, 0x44, 0x55, 0x66]),
+        ("av1", &[0x81, 0x0D, 0x0C, 0x00]),
+        (
+            "vp9",
+            &[
+                0x01, 0x00, 0x00, 0x00, 0x00, 0xA4, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+            ],
+        ),
+        (
+            "vp8",
+            &[
+                0x01, 0x00, 0x00, 0x00, 0x00, 0x14, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+            ],
+        ),
+        ("h263", &[b'o', b'x', b'a', b'v', 0, 10, 0]),
+    ];
+    for (codec, record) in cases {
+        let (params, _) = remux(&video_stream(codec, record));
+        assert_eq!(params.codec_id, CodecId::new(codec), "{codec} codec id");
+        assert_eq!(params.media_type, MediaType::Video);
+        assert_eq!(params.width, Some(320), "{codec} width");
+        assert_eq!(params.height, Some(240), "{codec} height");
+        assert_eq!(params.extradata, record, "{codec} extradata round-trip");
+    }
+}
+
+#[test]
+fn audio_codecs_roundtrip_extradata() {
+    // Opus: extradata carries the OpusHead magic on both sides of the trip
+    // (the demuxer re-prepends what the muxer strips).
+    let mut opus_head = b"OpusHead".to_vec();
+    opus_head.extend_from_slice(&[1, 2, 0x01, 0x38, 0, 0, 0xBB, 0x80, 0, 0, 0]);
+    let (params, _) = remux(&audio_stream("opus", &opus_head));
+    assert_eq!(params.codec_id, CodecId::new("opus"));
+    assert_eq!(params.extradata, opus_head, "OpusHead magic re-prepended");
+
+    // ALAC: the magic cookie survives (demux strips the FullBox word the
+    // muxer adds).
+    let cookie = [0u8, 0, 16, 0, 40, 10, 14, 2, 0xFF];
+    let (params, _) = remux(&audio_stream("alac", &cookie));
+    assert_eq!(params.codec_id, CodecId::new("alac"));
+    assert_eq!(params.extradata, cookie, "ALAC cookie round-trip");
+
+    // AC-3 / E-AC-3: raw config-box body verbatim.
+    let dac3 = [0x10u8, 0x4C, 0x40];
+    let (params, _) = remux(&audio_stream("ac3", &dac3));
+    assert_eq!(params.codec_id, CodecId::new("ac3"));
+    assert_eq!(params.extradata, dac3);
+
+    let dec3 = [0x07u8, 0xC0, 0x20, 0x00, 0x00];
+    let (params, _) = remux(&audio_stream("eac3", &dec3));
+    assert_eq!(params.codec_id, CodecId::new("eac3"));
+    assert_eq!(params.extradata, dec3);
+
+    // MP3-in-mp4a: the esds OTI (0x6B) refines mp4a back to "mp3".
+    let (params, _) = remux(&audio_stream("mp3", &[]));
+    assert_eq!(params.codec_id, CodecId::new("mp3"), "OTI 0x6B refinement");
+
+    // G.711 µ-law / A-law.
+    for codec in ["pcm_mulaw", "pcm_alaw"] {
+        let (params, _) = remux(&audio_stream(codec, &[]));
+        assert_eq!(params.codec_id, CodecId::new(codec), "{codec} codec id");
+        assert_eq!(params.channels, Some(2));
+        assert_eq!(params.sample_rate, Some(48_000));
+    }
 }
