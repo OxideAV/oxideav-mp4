@@ -37,7 +37,7 @@ use oxideav_core::{Muxer, WriteSeek};
 
 use crate::options::{BrandPreset, FragmentedOptions, Mp4MuxerOptions, TrackSampleGroups};
 use crate::sample_entries::{
-    sample_entry_for, subtitle_handler_for, subtitle_uses_sthd, SampleEntry,
+    apply_protection, sample_entry_for, subtitle_handler_for, subtitle_uses_sthd, SampleEntry,
 };
 use crate::sample_groups::{
     build_csgp, build_sbgp, build_sgpd, CompactSampleToGroup, SampleGroupDescription, SampleToGroup,
@@ -194,8 +194,17 @@ pub fn open_with_options(
         return crate::frag::open_fragmented(output, streams, options, frag_opts);
     }
     let mut tracks = Vec::with_capacity(streams.len());
-    for s in streams {
-        let entry = sample_entry_for(&s.params)?;
+    for (i, s) in streams.iter().enumerate() {
+        let mut entry = sample_entry_for(&s.params)?;
+        // ISO/IEC 14496-12 §8.12: wrap the entry into its protected
+        // enc* form when a protection directive targets this stream.
+        if let Some(prot) = options
+            .track_protection
+            .iter()
+            .find(|p| p.stream_index == i)
+        {
+            entry = apply_protection(entry, s.params.media_type, prot)?;
+        }
         tracks.push(TrackState::new(s.clone(), entry));
     }
     Ok(Box::new(Mp4Muxer {
@@ -446,6 +455,7 @@ impl Mp4Muxer {
             &self.tracks,
             self.options.write_edit_list,
             &self.options.track_sample_groups,
+            &self.options.pssh,
         )?;
         self.output.write_all(&moov)?;
         Ok(())
@@ -501,6 +511,7 @@ impl Mp4Muxer {
                 &self.tracks,
                 self.options.write_edit_list,
                 &self.options.track_sample_groups,
+                &self.options.pssh,
             )?;
             let candidate_size = candidate.len() as u64;
             let converged = candidate_size == moov_size;
@@ -542,6 +553,7 @@ fn build_moov(
     tracks: &[TrackState],
     write_edit_list: bool,
     track_sample_groups: &[TrackSampleGroups],
+    pssh: &[crate::cenc::PsshBox],
 ) -> Result<Vec<u8>> {
     // mvhd: use the largest media-time-scale duration as a rough movie
     // duration at timescale 1000.
@@ -582,6 +594,11 @@ fn build_moov(
             &track_sgpd,
             &track_csgp,
         )?);
+    }
+    // ISO/IEC 23001-7 §8.1: moov-level pssh boxes, one per DRM
+    // system, after the trak boxes.
+    for record in pssh {
+        moov_body.extend_from_slice(&crate::cenc::build_pssh_box(record)?);
     }
     Ok(wrap_box(b"moov", &moov_body))
 }

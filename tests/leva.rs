@@ -182,6 +182,7 @@ fn fragmented_options() -> Mp4MuxerOptions {
         write_edit_list: false,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     }
 }
 

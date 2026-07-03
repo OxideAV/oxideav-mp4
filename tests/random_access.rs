@@ -312,6 +312,7 @@ fn tfra_drives_seek_to_correct_keyframe() {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     };
     let path = std::env::temp_dir().join("oxideav-mp4-tfra-seek.mp4");
 
@@ -418,6 +419,7 @@ fn mfra_in_fragmented_file_does_not_break_demux() {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     };
     let path = std::env::temp_dir().join("oxideav-mp4-mfra-smoke.mp4");
     {
@@ -627,6 +629,7 @@ fn prft_in_file_is_surfaced_as_metadata() {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     };
     let path = std::env::temp_dir().join("oxideav-mp4-prft-meta.mp4");
     {
@@ -771,6 +774,7 @@ fn sidx_drives_seek_to_correct_keyframe_when_no_mfra() {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     };
     let path = std::env::temp_dir().join("oxideav-mp4-sidx-seek.mp4");
     {
@@ -883,6 +887,7 @@ fn seek_to_still_works_without_sidx_or_mfra() {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     };
     let path = std::env::temp_dir().join("oxideav-mp4-noindex-seek.mp4");
     {
@@ -950,6 +955,7 @@ fn sidx_with_wrong_reference_id_is_ignored() {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     };
     let path = std::env::temp_dir().join("oxideav-mp4-sidx-wrong-id.mp4");
     {

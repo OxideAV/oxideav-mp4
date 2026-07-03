@@ -144,3 +144,219 @@ fn senc_rejects_invalid_iv_size_per_spec_9_1() {
     assert!(parse_senc(&body, 12).is_err());
     assert!(parse_senc(&body, 32).is_err());
 }
+
+// --- Write side: protected-entry envelope + pssh mux → demux -------------
+
+use oxideav_core::{
+    CodecId, CodecParameters, Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase, WriteSeek,
+};
+use oxideav_mp4::cenc::{CencScheme, CencSchemeDecision, PsshBox, TencBox};
+use oxideav_mp4::cenc_cipher::{decrypt_sample_in_place, encrypt_sample_in_place};
+use oxideav_mp4::{Mp4MuxerOptions, TrackProtection};
+
+const CONTENT_KEY: [u8; 16] = [
+    0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
+];
+
+fn pcm_stream() -> StreamInfo {
+    let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+    params.channels = Some(2);
+    params.sample_rate = Some(48_000);
+    params.sample_format = Some(SampleFormat::S16);
+    StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 48_000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    }
+}
+
+fn cenc_tenc(kid: [u8; 16]) -> TencBox {
+    TencBox {
+        version: 0,
+        default_is_protected: 1,
+        default_per_sample_iv_size: 8,
+        default_kid: kid,
+        default_crypt_byte_block: 0,
+        default_skip_byte_block: 0,
+        default_constant_iv: None,
+    }
+}
+
+/// Full black-box loop: encrypt plaintext samples with the write-side
+/// cipher, mux them into a protected (`enca` + `sinf`) track with a
+/// moov-level `pssh`, demux the file back, verify the protection
+/// surface, then decrypt the demuxed ciphertext packets and compare
+/// them to the original plaintext.
+#[test]
+fn protected_mux_demux_decrypt_round_trip() {
+    let kid: [u8; 16] = [0x5A; 16];
+    let tenc = cenc_tenc(kid);
+    let decision = CencSchemeDecision::new(CencScheme::Cenc, tenc.clone()).unwrap();
+
+    // Three plaintext packets; per-sample 8-byte IVs (the senc channel
+    // a real packager would write is exercised by the frag muxer —
+    // here the IVs travel out-of-band, as §7.2.3 allows).
+    let plaintexts: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i.wrapping_mul(29); 100]).collect();
+    let ivs: Vec<[u8; 8]> = (0..3u8).map(|i| [i + 1; 8]).collect();
+    let mut ciphertexts = plaintexts.clone();
+    for ((ct, iv), plain) in ciphertexts.iter_mut().zip(&ivs).zip(&plaintexts) {
+        encrypt_sample_in_place(&decision, &CONTENT_KEY, Some(iv), None, ct).unwrap();
+        assert_ne!(ct, plain, "ciphertext must differ from plaintext");
+    }
+
+    let stream = pcm_stream();
+    let options = Mp4MuxerOptions {
+        track_protection: vec![TrackProtection {
+            stream_index: 0,
+            scheme_type: *b"cenc",
+            scheme_version: 0x0001_0000,
+            tenc: tenc.clone(),
+        }],
+        pssh: vec![PsshBox {
+            version: 1,
+            system_id: [0xEE; 16],
+            kids: vec![kid],
+            data: vec![0xD0, 0xD1, 0xD2],
+        }],
+        ..Mp4MuxerOptions::default()
+    };
+    let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-mux-roundtrip.mp4");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux =
+            oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), options)
+                .unwrap();
+        mux.write_header().unwrap();
+        for (i, ct) in ciphertexts.iter().enumerate() {
+            let mut pkt = Packet::new(0, stream.time_base, ct.clone());
+            pkt.pts = Some(i as i64 * 25);
+            pkt.duration = Some(25);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+
+    // The protected entry unwraps back to the original codec id, with
+    // the protection surface on params.options.
+    let params = dmx.streams()[0].params.clone();
+    assert_eq!(params.codec_id, CodecId::new("pcm_s16le"));
+    assert_eq!(params.options.get("protection_scheme"), Some("cenc"));
+    assert_eq!(
+        params.options.get("cenc_default_kid"),
+        Some("5a".repeat(16).as_str())
+    );
+    assert_eq!(params.options.get("cenc_default_is_protected"), Some("1"));
+    assert_eq!(params.options.get("cenc_default_iv_size"), Some("8"));
+
+    // The moov-level pssh surfaces on metadata().
+    let md: std::collections::HashMap<&str, &str> = dmx
+        .metadata()
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let pssh0 = md.get("pssh_0").copied().expect("pssh_0 metadata key");
+    assert_eq!(pssh0, format!("{} 1 3", "ee".repeat(16)));
+
+    // Packets come out as ciphertext; decrypt with the same decision +
+    // IVs and recover the plaintext byte-exact.
+    let mut got = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => got.push(p.data),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    assert_eq!(got, ciphertexts, "demux must yield the ciphertext verbatim");
+    for ((data, iv), plain) in got.iter_mut().zip(&ivs).zip(&plaintexts) {
+        decrypt_sample_in_place(&decision, &CONTENT_KEY, Some(iv), None, data).unwrap();
+        assert_eq!(data, plain, "decrypted payload must match the plaintext");
+    }
+}
+
+/// The fragmented muxer applies the same §8.12 envelope + init-segment
+/// pssh emission.
+#[test]
+fn protected_fragmented_init_segment_surfaces_protection() {
+    let kid: [u8; 16] = [0x33; 16];
+    let stream = pcm_stream();
+    let options = Mp4MuxerOptions {
+        fragmented: Some(oxideav_mp4::FragmentedOptions::default()),
+        track_protection: vec![TrackProtection {
+            stream_index: 0,
+            scheme_type: *b"cenc",
+            scheme_version: 0x0001_0000,
+            tenc: cenc_tenc(kid),
+        }],
+        pssh: vec![PsshBox {
+            version: 0,
+            system_id: [0xAB; 16],
+            kids: Vec::new(),
+            data: vec![1, 2, 3, 4],
+        }],
+        ..Mp4MuxerOptions::default()
+    };
+    let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-init.mp4");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux =
+            oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), options)
+                .unwrap();
+        mux.write_header().unwrap();
+        for i in 0..4i64 {
+            let mut pkt = Packet::new(0, stream.time_base, vec![i as u8; 64]);
+            pkt.pts = Some(i * 1024);
+            pkt.duration = Some(1024);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let params = dmx.streams()[0].params.clone();
+    assert_eq!(params.codec_id, CodecId::new("pcm_s16le"));
+    assert_eq!(params.options.get("protection_scheme"), Some("cenc"));
+    assert_eq!(
+        params.options.get("cenc_default_kid"),
+        Some("33".repeat(16).as_str())
+    );
+    let md: std::collections::HashMap<&str, &str> = dmx
+        .metadata()
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let pssh0 = md.get("pssh_0").copied().expect("pssh_0 metadata key");
+    assert_eq!(pssh0, format!("{} 0 4", "ab".repeat(16)));
+}
+
+/// A protection directive whose (scheme, tenc) pair is incoherent must
+/// fail at open, never at write time.
+#[test]
+fn incoherent_protection_fails_at_open() {
+    let stream = pcm_stream();
+    // cbcs pins tenc v1 + pattern + constant IV; a v0 per-sample tenc
+    // must be rejected.
+    let options = Mp4MuxerOptions {
+        track_protection: vec![TrackProtection {
+            stream_index: 0,
+            scheme_type: *b"cbcs",
+            scheme_version: 0x0001_0000,
+            tenc: cenc_tenc([0; 16]),
+        }],
+        ..Mp4MuxerOptions::default()
+    };
+    let ws: Box<dyn WriteSeek> = Box::new(std::io::Cursor::new(Vec::new()));
+    assert!(
+        oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), options).is_err()
+    );
+}

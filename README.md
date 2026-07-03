@@ -1350,6 +1350,31 @@ strings), so a demux → mux round-trip preserves the inner config.
 Other codec ids fail with `Error::Unsupported` at `open`, never at
 `write_packet` time.
 
+#### CENC protected-track muxing
+
+`Mp4MuxerOptions::track_protection` (a list of `TrackProtection`
+records, each keyed by `stream_index`) wraps the target track's sample
+entry into its ISO/IEC 14496-12 §8.12 protected form: the FourCC
+becomes `encv` / `enca` / `enct` / `encs` per the stream's media type
+and a `sinf` box — `frma` (original format) + `schm` (`scheme_type`,
+`scheme_version`) + `schi`/`tenc` (ISO/IEC 23001-7 §8.2 track
+defaults) — is appended to the entry body, serialised through the
+public `cenc::build_sinf_box`. The `(scheme_type, tenc)` pair is
+validated at `open` through `CencSchemeDecision::new` (a §10 scheme
+pins the `tenc` version; pattern schemes need a non-zero pattern pair)
+plus `build_tenc_box`'s round-trip rules, so an envelope this crate's
+own demuxer would reject cannot be emitted. `Mp4MuxerOptions::pssh`
+emits moov-level `pssh` boxes (one per DRM system) after the `trak`
+boxes — in fragmented mode, inside the init-segment `moov` after
+`mvex`. The muxer signals protection only: packet payloads are written
+as handed in, so the caller encrypts each sample first
+(`cenc_cipher::encrypt_sample_in_place` with a decision built from the
+same `(scheme_type, tenc)` pair) and carries per-sample IVs /
+subsample maps through its own channel. A demux of the produced file
+recovers the original codec id via `frma` and surfaces
+`protection_scheme` / `cenc_default_*` exactly as for foreign
+CENC files.
+
 Edit lists (`edts`/`elst`, ISO/IEC 14496-12 §8.6.5–6) are emitted
 per-track when the first packet has a positive presentation timestamp:
 a leading empty edit (`media_time = -1`) of the start delay (in the

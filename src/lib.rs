@@ -20,7 +20,10 @@ pub mod sample_group_entries;
 pub mod sample_groups;
 pub mod styp;
 
-pub use options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
+pub use options::{
+    BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions, TrackProtection,
+    TrackSampleGroups,
+};
 
 use oxideav_core::ContainerRegistry;
 

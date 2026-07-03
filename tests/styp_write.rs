@@ -155,6 +155,7 @@ fn write_fragmented_segment_with_styp_overrides_one_segment() {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     };
     let frag_opts = FragmentedOptions {
         cadence: FragmentCadence::EveryNPackets(1),
@@ -243,6 +244,7 @@ fn write_fragmented_segment_with_styp_emits_styp_when_preset_is_none() {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     };
     let frag_opts = FragmentedOptions {
         cadence: FragmentCadence::EveryNPackets(1),
@@ -298,6 +300,7 @@ fn write_fragmented_segment_with_styp_precedes_moof() {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     };
     let frag_opts = FragmentedOptions {
         cadence: FragmentCadence::EveryNPackets(1),
@@ -359,6 +362,7 @@ fn write_fragmented_segment_with_styp_empty_compat_emits_sixteen_bytes() {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: false,
+        ..Mp4MuxerOptions::default()
     };
     let frag_opts = FragmentedOptions {
         cadence: FragmentCadence::EveryNPackets(1),

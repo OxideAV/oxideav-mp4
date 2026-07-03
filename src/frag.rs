@@ -196,7 +196,16 @@ pub fn open_fragmented_typed(
     }
     let mut tracks = Vec::with_capacity(streams.len());
     for (i, s) in streams.iter().enumerate() {
-        let entry = sample_entry_for(&s.params)?;
+        let mut entry = sample_entry_for(&s.params)?;
+        // ISO/IEC 14496-12 §8.12: wrap the entry into its protected
+        // enc* form when a protection directive targets this stream.
+        if let Some(prot) = options
+            .track_protection
+            .iter()
+            .find(|p| p.stream_index == i)
+        {
+            entry = crate::sample_entries::apply_protection(entry, s.params.media_type, prot)?;
+        }
         let mut base = TrackState::new(s.clone(), entry);
         // For fragmented mode every fragment is its own chunk, so the
         // chunking-target field is irrelevant — we only carry it to keep
@@ -270,6 +279,7 @@ impl Muxer for FragmentedMuxer {
             &self.tracks,
             &self.frag_options.levels,
             &self.frag_options.treps,
+            &self.options.pssh,
         )?;
         self.output.write_all(&moov)?;
 
@@ -826,6 +836,7 @@ fn build_init_moov(
     tracks: &[FragTrackState],
     levels: &[crate::demux::LevaEntry],
     treps: &[crate::demux::TrepRecord],
+    pssh: &[crate::cenc::PsshBox],
 ) -> Result<Vec<u8>> {
     // Movie timescale: pick 1000 (matches the non-fragmented path).
     let movie_timescale: u32 = 1000;
@@ -836,6 +847,11 @@ fn build_init_moov(
         moov_body.extend_from_slice(&build_trak_init(t.track_id, &t.base, movie_timescale)?);
     }
     moov_body.extend_from_slice(&build_mvex(tracks, levels, treps)?);
+    // ISO/IEC 23001-7 §8.1: moov-level pssh boxes, one per DRM system,
+    // after the trak boxes + mvex.
+    for record in pssh {
+        moov_body.extend_from_slice(&crate::cenc::build_pssh_box(record)?);
+    }
     Ok(wrap_box(b"moov", &moov_body))
 }
 

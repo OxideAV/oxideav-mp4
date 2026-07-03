@@ -237,6 +237,43 @@ pub struct TrackSampleGroups {
     pub csgp: Vec<crate::sample_groups::CompactSampleToGroup>,
 }
 
+/// Per-track CENC protection signalling for the muxer (ISO/IEC
+/// 14496-12 §8.12 envelope + ISO/IEC 23001-7 §4.1 carriage).
+///
+/// When a [`Mp4MuxerOptions::track_protection`] entry targets a
+/// stream, the muxer wraps that track's sample entry into its
+/// protected form: the FourCC becomes `encv` / `enca` / `enct` /
+/// `encs` (per the stream's media type) and a `sinf` box —
+/// `frma(original_format)` + `schm(scheme_type, scheme_version)` +
+/// `schi(tenc)` — is appended to the entry body, exactly the shape
+/// this crate's demuxer unwraps back to the original codec id plus
+/// `protection_scheme` / `cenc_default_*` options.
+///
+/// The muxer signals protection only — packet payloads are written
+/// as handed in. The caller encrypts each sample first (e.g. via
+/// `cenc_cipher::encrypt_sample_in_place` with a
+/// `CencSchemeDecision` built from this same `(scheme_type, tenc)`
+/// pair) and carries the per-sample IVs / subsample maps through its
+/// own `senc` / `saiz` / `saio` channel.
+#[derive(Clone, Debug)]
+pub struct TrackProtection {
+    /// Index into the muxer's `streams` slice (the stream to protect).
+    pub stream_index: usize,
+    /// §8.12.5 `scheme_type` FourCC — one of the ISO/IEC 23001-7 §10
+    /// schemes (`cenc` / `cbc1` / `cens` / `cbcs`) or a private
+    /// dialect FourCC (validated structurally only in that case).
+    pub scheme_type: [u8; 4],
+    /// §8.12.5 32-bit `scheme_version` word. Every ISO/IEC 23001-7
+    /// edition to date uses `0x0001_0000` (the [`Default`] here).
+    pub scheme_version: u32,
+    /// Track-default encryption parameters written into `schi/tenc`
+    /// (ISO/IEC 23001-7 §8.2). Must satisfy the same round-trip rules
+    /// as `cenc::build_tenc_box` plus scheme coherence (a §10 scheme
+    /// pins the `tenc` version; pattern schemes need a non-zero
+    /// pattern pair) — violations fail at `open`.
+    pub tenc: crate::cenc::TencBox,
+}
+
 /// Runtime options controlling how the MP4 muxer shapes its output.
 ///
 /// Call [`Mp4MuxerOptions::default`] for the historical behavior of the
@@ -293,6 +330,22 @@ pub struct Mp4MuxerOptions {
     /// automatically when any chunk offset itself exceeds `u32::MAX`,
     /// independent of this flag.
     pub large_mdat: bool,
+    /// Per-track CENC protection signalling (ISO/IEC 14496-12 §8.12 +
+    /// ISO/IEC 23001-7). Empty by default. Each [`TrackProtection`]
+    /// entry wraps the target stream's sample entry into its `enc*`
+    /// protected form with a `sinf`(`frma`+`schm`+`schi`/`tenc`)
+    /// envelope. See [`TrackProtection`] for the caller's encryption
+    /// responsibilities.
+    pub track_protection: Vec<TrackProtection>,
+    /// `pssh` (ProtectionSystemSpecificHeaderBox, ISO/IEC 23001-7
+    /// §8.1) boxes emitted at `moov` level, after the `trak` boxes —
+    /// one per DRM system the content keys are provisioned for.
+    /// Empty by default (no box). Serialised through
+    /// `cenc::build_pssh_box`, so a record that would not round-trip
+    /// (a v0 record carrying KIDs, oversize counts) fails at
+    /// `write_trailer` (non-fragmented) / `write_header` (fragmented
+    /// init segment) rather than emitting a malformed box.
+    pub pssh: Vec<crate::cenc::PsshBox>,
 }
 
 impl Default for Mp4MuxerOptions {
@@ -304,6 +357,8 @@ impl Default for Mp4MuxerOptions {
             write_edit_list: true,
             track_sample_groups: Vec::new(),
             large_mdat: false,
+            track_protection: Vec::new(),
+            pssh: Vec::new(),
         }
     }
 }

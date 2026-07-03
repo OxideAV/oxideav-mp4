@@ -545,6 +545,41 @@ fn build_esds_body(oti: u8, dsi_bytes: &[u8]) -> Vec<u8> {
     esds_body
 }
 
+/// Wrap an already-built sample entry into its §8.12 protected form
+/// (ISO/IEC 14496-12 §8.12 ProtectionSchemeInfoBox envelope, as
+/// profiled by ISO/IEC 23001-7 §4.1): the entry FourCC becomes the
+/// media type's `enc*` transform (`encv` video / `enca` audio /
+/// `enct` subtitle-text / `encs` everything else, matching the
+/// demuxer's unwrap table) and a `sinf` box carrying
+/// `frma(original_format)` + `schm(scheme_type, scheme_version)` +
+/// `schi(tenc)` is appended to the entry body. The demuxer recovers
+/// the original codec id from `frma` and surfaces
+/// `protection_scheme` / `cenc_default_*` on `params.options`.
+pub(crate) fn apply_protection(
+    entry: SampleEntry,
+    media_type: MediaType,
+    protection: &crate::options::TrackProtection,
+) -> Result<SampleEntry> {
+    let enc_fourcc: [u8; 4] = match media_type {
+        MediaType::Video => *b"encv",
+        MediaType::Audio => *b"enca",
+        MediaType::Subtitle => *b"enct",
+        _ => *b"encs",
+    };
+    let sinf = crate::cenc::build_sinf_box(
+        entry.fourcc,
+        protection.scheme_type,
+        protection.scheme_version,
+        &protection.tenc,
+    )?;
+    let mut body = entry.body;
+    body.extend_from_slice(&sinf);
+    Ok(SampleEntry {
+        fourcc: enc_fourcc,
+        body,
+    })
+}
+
 /// Write a simple (non-FullBox) box: 4-byte size + 4-byte fourcc + body.
 fn write_simple_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let total = 8 + body.len() as u32;

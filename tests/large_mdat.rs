@@ -58,6 +58,7 @@ fn base_opts() -> Mp4MuxerOptions {
         write_edit_list: true,
         track_sample_groups: Vec::new(),
         large_mdat: true,
+        ..Mp4MuxerOptions::default()
     }
 }
 

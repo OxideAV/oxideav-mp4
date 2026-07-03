@@ -991,6 +991,51 @@ pub fn build_senc_box(senc: &SencBox) -> Result<Vec<u8>> {
     Ok(wrap_full_box(b"senc", &body))
 }
 
+/// Serialise a complete `sinf` ProtectionSchemeInfoBox (ISO/IEC
+/// 14496-12 §8.12 as profiled by ISO/IEC 23001-7 §4.1) for a muxer
+/// wrapping a sample entry into its protected (`encv` / `enca` /
+/// `enct` / `encs`) form:
+///
+/// ```text
+///   sinf
+///     frma  original_format          (§8.12.2 — the unprotected FourCC)
+///     schm  scheme_type + version    (§8.12.5, FullBox v0 flags 0)
+///     schi                            (§8.12.6)
+///       tenc  track defaults          (23001-7 §8.2)
+/// ```
+///
+/// The `(scheme_type, tenc)` pair is validated through
+/// [`CencSchemeDecision::new`] — a §10 scheme must match the `tenc`
+/// version it pins and pattern schemes must carry a non-zero pattern
+/// pair — and the `tenc` itself through [`build_tenc_box`]'s round-trip
+/// rules, so a `sinf` that this crate's own demuxer (or any conforming
+/// reader) would reject cannot be emitted. `scheme_version` is the
+/// §8.12.5 32-bit version word (0x0001_0000 for every ISO/IEC 23001-7
+/// scheme edition to date).
+pub fn build_sinf_box(
+    original_format: [u8; 4],
+    scheme_type: [u8; 4],
+    scheme_version: u32,
+    tenc: &TencBox,
+) -> Result<Vec<u8>> {
+    CencSchemeDecision::new(CencScheme::from_fourcc(&scheme_type), tenc.clone())?;
+    let tenc_bytes = build_tenc_box(tenc)?;
+
+    let frma = wrap_full_box(b"frma", &original_format);
+    let mut schm_body = Vec::with_capacity(12);
+    schm_body.extend_from_slice(&[0, 0, 0, 0]); // FullBox version 0 + flags 0
+    schm_body.extend_from_slice(&scheme_type);
+    schm_body.extend_from_slice(&scheme_version.to_be_bytes());
+    let schm = wrap_full_box(b"schm", &schm_body);
+    let schi = wrap_full_box(b"schi", &tenc_bytes);
+
+    let mut sinf_body = Vec::with_capacity(frma.len() + schm.len() + schi.len());
+    sinf_body.extend_from_slice(&frma);
+    sinf_body.extend_from_slice(&schm);
+    sinf_body.extend_from_slice(&schi);
+    Ok(wrap_full_box(b"sinf", &sinf_body))
+}
+
 // ---- Per-sample cipher walker (§9.4–9.6) ------------------------------
 
 /// The kind of byte run a [`CipherStep`] names.
