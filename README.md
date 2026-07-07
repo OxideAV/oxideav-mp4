@@ -1368,14 +1368,57 @@ plus `build_tenc_box`'s round-trip rules, so an envelope this crate's
 own demuxer would reject cannot be emitted. `Mp4MuxerOptions::pssh`
 emits moov-level `pssh` boxes (one per DRM system) after the `trak`
 boxes — in fragmented mode, inside the init-segment `moov` after
-`mvex`. The muxer signals protection only: packet payloads are written
-as handed in, so the caller encrypts each sample first
-(`cenc_cipher::encrypt_sample_in_place` with a decision built from the
-same `(scheme_type, tenc)` pair) and carries per-sample IVs /
-subsample maps through its own channel. A demux of the produced file
-recovers the original codec id via `frma` and surfaces
-`protection_scheme` / `cenc_default_*` exactly as for foreign
-CENC files.
+`mvex`. On the plain (non-fragmented) muxer, protection is signalled only:
+packet payloads are written as handed in, so the caller encrypts each
+sample first (`cenc_cipher::encrypt_sample_in_place` with a decision
+built from the same `(scheme_type, tenc)` pair) and carries per-sample
+IVs / subsample maps through its own channel. On the fragmented muxer
+the auxiliary information travels **in the file** — see the CENC
+packaging subsection below. A demux of the produced file recovers the
+original codec id via `frma` and surfaces `protection_scheme` /
+`cenc_default_*` exactly as for foreign CENC files.
+
+#### Self-describing CENC fragment packaging
+
+`FragmentedMuxer::write_protected_packet(packet, SencSample)` queues
+each protected sample's ISO/IEC 23001-7 §7.1 auxiliary information
+(per-sample IV + optional subsample map) alongside the payload,
+validated at queue time (§9.2 IV-supply discipline against the track
+`tenc`, §9.5.1 subsample totals, §7.2.3 all-samples-or-none per
+fragment). Each flush emits, per `traf`: a §7.2 `senc`
+(`UseSubSampleEncryption` iff any sample maps subsamples), a §8.7.8
+`saiz` (constant-size shortcut when sizes agree, `aux_info_type`
+omitted per the §7.1 SHOULD), and a §8.7.9 `saio` whose single offset
+is patched to the moof-relative position of the first `senc` entry
+(§8.8.14 `default-base-is-moof`) — so every fragment is independently
+decryptable (the §7.2.1 DASH Media Segment posture). Constant-IV
+tracks without subsample maps omit all three boxes (§7.1 empty-aux
+rule).
+
+`write_protected_packet_grouped(packet, senc, Option<SeigEntry>)` adds
+**key rotation**: per-sample §6 `seig` overrides are deduplicated (in
+first-use order) into a fragment-local `sgpd('seig')` plus an
+`sbgp('seig')` run-length map using the §8.9.4 fragment-local index
+numbering (`0x10001`-based; 0 = `tenc` defaults). The write side is
+`cenc::build_seig_entry`, the byte-exact inverse of `parse_seig`.
+
+`cenc_packager::CencFragmentPackager` is the plaintext-in driver on
+top: it owns the KID-keyed AES-128 content-key store, generates unique
+per-sample IVs (a per-track 64-bit counter in IV bytes 0..8, so §9.3
+CTR counter blocks never collide across samples under one key),
+encrypts via `encrypt_sample_in_place` (`write_packet` for §9.4/§9.7
+full-sample shapes, `write_packet_with_subsamples` for §9.5 NAL-video
+shapes), and `rotate_key(kid, key, constant_iv?)` switches the active
+key mid-stream through the `seig` channel (constant-IV schemes take a
+fresh constant IV per key). `set_next_segment_pssh` scopes a licence
+blob to the rotated fragment's `moof` (§8.1.1). The whole loop is
+gated end-to-end: plaintext → packager → own demux
+(`demux::open_typed` exposes the typed `Mp4Demuxer` with the
+structured `senc_records` / `sai_records` / `traf_sample_groups`
+accessors) → decrypt driven only by what the file says → byte-exact
+plaintext, for every §10 scheme (`cenc` / `cbc1` / `cens` / `cbcs`,
+full-sample + subsample + pattern + constant-IV shapes) and across
+key-rotation boundaries.
 
 Edit lists (`edts`/`elst`, ISO/IEC 14496-12 §8.6.5–6) are emitted
 per-track when the first packet has a positive presentation timestamp:
