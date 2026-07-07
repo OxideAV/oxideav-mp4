@@ -455,3 +455,198 @@ fn plain_writes_on_protected_track_emit_no_aux_boxes() {
         Some("cenc")
     );
 }
+
+// --- seig key rotation (fragment-local sgpd + sbgp, §8.9.4 + 23001-7 §6) --
+
+/// Mid-fragment key rotation: samples 0–1 on the `tenc` default KID,
+/// samples 2–3 mapped (via a per-sample `seig` override) to a rotated
+/// KID. The flush must emit a fragment-local `sgpd('seig')` with one
+/// deduplicated entry plus an `sbgp('seig')` whose run-length map uses
+/// the §8.9.4 fragment-local index 0x10001 — and the demuxer's
+/// `traf_sample_groups()` must hand all of it back.
+#[test]
+fn seig_key_rotation_emits_fragment_local_groups() {
+    use oxideav_mp4::cenc::{parse_seig, SeigEntry};
+    let default_kid = [0x5A; 16];
+    let rotated_kid = [0xB7; 16];
+    let stream = pcm_stream(0);
+    let options = protected_options(*b"cenc", tenc_iv8(default_kid), frag_opts(4));
+    let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-seig.mp4");
+    let rotated = SeigEntry {
+        crypt_byte_block: 0,
+        skip_byte_block: 0,
+        is_protected: 1,
+        per_sample_iv_size: 8,
+        kid: rotated_kid,
+        constant_iv: None,
+    };
+    {
+        let mut mux = open_typed(&tmp, std::slice::from_ref(&stream), options);
+        mux.write_header().unwrap();
+        for i in 0..4i64 {
+            let pkt = audio_packet(&stream, i, vec![i as u8; 48]);
+            let senc = SencSample {
+                initialization_vector: vec![0xC0 + i as u8; 8],
+                subsamples: Vec::new(),
+            };
+            let seig = if i >= 2 { Some(rotated.clone()) } else { None };
+            mux.write_protected_packet_grouped(&pkt, senc, seig)
+                .unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let dmx = demux_file(&tmp);
+    let groups = dmx.traf_sample_groups();
+    assert_eq!(groups.len(), 1, "one traf carried sample groups");
+    let rec = &groups[0];
+    assert_eq!(rec.track_idx, 0);
+    assert_eq!(rec.moof_sequence, 1);
+
+    // Fragment-local sgpd: one deduplicated seig entry.
+    assert_eq!(rec.sgpd.len(), 1);
+    let sgpd = &rec.sgpd[0];
+    assert_eq!(&sgpd.grouping_type, b"seig");
+    assert_eq!(sgpd.entries.len(), 1, "two rotated samples share one entry");
+    let parsed = parse_seig(&sgpd.entries[0]).expect("seig entry parses");
+    assert_eq!(parsed, rotated);
+
+    // sbgp: run-length map (2 default, 2 fragment-local index 0x10001),
+    // totalling the fragment's sample count per §8.9.4.
+    assert_eq!(rec.sbgp.len(), 1);
+    let sbgp = &rec.sbgp[0];
+    assert_eq!(&sbgp.grouping_type, b"seig");
+    assert_eq!(sbgp.entries, vec![(2, 0), (2, 0x10001)]);
+
+    // The senc still carries all four IVs (rotation doesn't change the
+    // aux-info channel).
+    assert_eq!(dmx.senc_records().len(), 1);
+    assert_eq!(dmx.senc_records()[0].senc.samples.len(), 4);
+}
+
+/// Two distinct rotated keys inside one fragment dedupe into two sgpd
+/// entries with consecutive fragment-local indices, in first-use order.
+#[test]
+fn seig_two_keys_dedupe_in_first_use_order() {
+    use oxideav_mp4::cenc::SeigEntry;
+    let stream = pcm_stream(0);
+    let options = protected_options(*b"cenc", tenc_iv8([0x00; 16]), frag_opts(4));
+    let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-seig2.mp4");
+    let key_a = SeigEntry {
+        crypt_byte_block: 0,
+        skip_byte_block: 0,
+        is_protected: 1,
+        per_sample_iv_size: 8,
+        kid: [0xA1; 16],
+        constant_iv: None,
+    };
+    let key_b = SeigEntry {
+        kid: [0xB2; 16],
+        ..key_a.clone()
+    };
+    {
+        let mut mux = open_typed(&tmp, std::slice::from_ref(&stream), options);
+        mux.write_header().unwrap();
+        // Pattern A, B, A, B — dedupes to two entries, four sbgp runs.
+        for i in 0..4i64 {
+            let pkt = audio_packet(&stream, i, vec![i as u8; 32]);
+            let senc = SencSample {
+                initialization_vector: vec![i as u8 + 1; 8],
+                subsamples: Vec::new(),
+            };
+            let seig = if i % 2 == 0 {
+                key_a.clone()
+            } else {
+                key_b.clone()
+            };
+            mux.write_protected_packet_grouped(&pkt, senc, Some(seig))
+                .unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let dmx = demux_file(&tmp);
+    let rec = &dmx.traf_sample_groups()[0];
+    assert_eq!(rec.sgpd[0].entries.len(), 2, "two distinct keys");
+    assert_eq!(
+        rec.sbgp[0].entries,
+        vec![(1, 0x10001), (1, 0x10002), (1, 0x10001), (1, 0x10002)]
+    );
+}
+
+/// A protected seig override that changes the per-sample IV width is
+/// rejected — the fragment's senc stores one IV width for all samples
+/// (§7.2.3).
+#[test]
+fn seig_iv_width_change_is_rejected() {
+    use oxideav_mp4::cenc::SeigEntry;
+    let stream = pcm_stream(0);
+    let options = protected_options(*b"cenc", tenc_iv8([0x00; 16]), frag_opts(4));
+    let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-seig-ivw.mp4");
+    let mut mux = open_typed(&tmp, std::slice::from_ref(&stream), options);
+    mux.write_header().unwrap();
+    let senc = SencSample {
+        initialization_vector: vec![0x01; 8],
+        subsamples: Vec::new(),
+    };
+    let wide = SeigEntry {
+        crypt_byte_block: 0,
+        skip_byte_block: 0,
+        is_protected: 1,
+        per_sample_iv_size: 16, // tenc says 8
+        kid: [0xEE; 16],
+        constant_iv: None,
+    };
+    let err = mux
+        .write_protected_packet_grouped(&audio_packet(&stream, 0, vec![0; 16]), senc, Some(wide))
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("Per_Sample_IV_Size"),
+        "err = {err}"
+    );
+}
+
+/// An unprotected seig override (isProtected = 0 — a clear-samples
+/// group, §6) rides along without disturbing the senc channel.
+#[test]
+fn seig_clear_group_round_trips() {
+    use oxideav_mp4::cenc::{parse_seig, SeigEntry};
+    let stream = pcm_stream(0);
+    let options = protected_options(*b"cenc", tenc_iv8([0x0C; 16]), frag_opts(2));
+    let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-seig-clear.mp4");
+    let clear = SeigEntry {
+        crypt_byte_block: 0,
+        skip_byte_block: 0,
+        is_protected: 0,
+        per_sample_iv_size: 0,
+        kid: [0u8; 16],
+        constant_iv: None,
+    };
+    {
+        let mut mux = open_typed(&tmp, std::slice::from_ref(&stream), options);
+        mux.write_header().unwrap();
+        // Sample 0 protected (defaults); sample 1 clear via seig.
+        let senc0 = SencSample {
+            initialization_vector: vec![0x11; 8],
+            subsamples: Vec::new(),
+        };
+        mux.write_protected_packet(&audio_packet(&stream, 0, vec![0xAA; 32]), senc0)
+            .unwrap();
+        let senc1 = SencSample {
+            initialization_vector: vec![0x22; 8],
+            subsamples: Vec::new(),
+        };
+        mux.write_protected_packet_grouped(
+            &audio_packet(&stream, 1, vec![0xBB; 32]),
+            senc1,
+            Some(clear.clone()),
+        )
+        .unwrap();
+        mux.write_trailer().unwrap();
+    }
+    let dmx = demux_file(&tmp);
+    let rec = &dmx.traf_sample_groups()[0];
+    assert_eq!(rec.sbgp[0].entries, vec![(1, 0), (1, 0x10001)]);
+    let parsed = parse_seig(&rec.sgpd[0].entries[0]).unwrap();
+    assert_eq!(parsed, clear);
+}

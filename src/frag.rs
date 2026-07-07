@@ -100,6 +100,15 @@ struct FragTrackState {
     /// [`FragmentedMuxer::write_protected_packet`]). Mixing the two
     /// write paths within one fragment is rejected at queue time.
     pending_senc: Vec<crate::cenc::SencSample>,
+    /// Per-sample CENC `seig` overrides (ISO/IEC 23001-7 §6) queued for
+    /// the next fragment, parallel to `pending_senc`: `Some(entry)` for
+    /// a sample whose encryption parameters (typically the KID — key
+    /// rotation) override the `tenc` defaults, `None` for a sample on
+    /// the defaults. At flush, the distinct entries become one
+    /// fragment-local `sgpd` (`grouping_type = 'seig'`, §8.9.3) and the
+    /// per-sample mapping one `sbgp` whose fragment-local
+    /// group-description indices start at 0x10001 (§8.9.4).
+    pending_seig: Vec<Option<crate::cenc::SeigEntry>>,
     /// trex defaults: derived from the first packet's metadata.
     trex_default_sample_duration: u32,
     trex_default_sample_size: u32,
@@ -143,6 +152,7 @@ impl FragTrackState {
             track_id,
             protection,
             pending_senc: Vec::new(),
+            pending_seig: Vec::new(),
             trex_default_sample_duration: 0,
             trex_default_sample_size: 0,
             trex_default_sample_flags: 0,
@@ -397,16 +407,97 @@ impl FragmentedMuxer {
         packet: &Packet,
         senc: crate::cenc::SencSample,
     ) -> Result<()> {
-        self.queue_packet(packet, Some(senc))
+        self.queue_packet_protected(packet, senc, None)
+    }
+
+    /// Like [`Self::write_protected_packet`] but additionally maps the
+    /// sample to a CENC sample group override (ISO/IEC 23001-7 §6 —
+    /// `CencSampleEncryptionInformationGroupEntry`, `seig`), the
+    /// key-rotation channel: samples whose `seig` names a different
+    /// `KID` than `tenc.default_KID` are decrypted with a different
+    /// key.
+    ///
+    /// Pass `Some(entry)` for a sample whose encryption parameters
+    /// override the track defaults, `None` for a sample on the
+    /// defaults (equivalent to [`Self::write_protected_packet`] —
+    /// `sbgp.group_description_index = 0`, "member of no group").
+    ///
+    /// At each fragment flush, the distinct entries used by the
+    /// fragment's samples are deduplicated (in first-use order) into
+    /// one **fragment-local** `sgpd` with `grouping_type = 'seig'`
+    /// (§8.9.3 — `sgpd` in `traf`) and the per-sample mapping becomes
+    /// one `sbgp` whose group-description indices use the §8.9.4
+    /// fragment-local numbering (`0x10001` = first local description).
+    /// Both boxes are written into the track's `traf`, so each
+    /// fragment remains independently decryptable — the same posture
+    /// as the per-fragment `senc` (ISO/IEC 23001-7 §6: "For fragmented
+    /// files, it may be necessary to store both the Sample To Group
+    /// Box and Sample Group Description Box in each track fragment").
+    ///
+    /// Restrictions, enforced at queue time:
+    ///
+    /// * the entry itself must satisfy the §6 round-trip rules (see
+    ///   [`crate::cenc::build_seig_entry`]);
+    /// * a **protected** override (`isProtected == 1`) must keep
+    ///   `Per_Sample_IV_Size` equal to the track default — the `senc`
+    ///   box stores every sample's IV at one width (§7.2.3), so an
+    ///   override changing the width would make the fragment's `senc`
+    ///   unparseable.
+    pub fn write_protected_packet_grouped(
+        &mut self,
+        packet: &Packet,
+        senc: crate::cenc::SencSample,
+        seig: Option<crate::cenc::SeigEntry>,
+    ) -> Result<()> {
+        self.queue_packet_protected(packet, senc, seig)
+    }
+
+    /// Protected-path front half: validates the optional `seig`
+    /// override, then joins the shared queue path.
+    fn queue_packet_protected(
+        &mut self,
+        packet: &Packet,
+        senc: crate::cenc::SencSample,
+        seig: Option<crate::cenc::SeigEntry>,
+    ) -> Result<()> {
+        if let Some(entry) = &seig {
+            let idx = packet.stream_index as usize;
+            // §6 round-trip validation (pattern nibbles, IV-size set,
+            // constant-IV coherence) — fail here, not at flush.
+            crate::cenc::build_seig_entry(entry)?;
+            if let Some(track) = self.tracks.get(idx) {
+                if let Some(decision) = &track.protection {
+                    if entry.is_protected == 1
+                        && entry.per_sample_iv_size != decision.tenc.default_per_sample_iv_size
+                    {
+                        return Err(Error::invalid(format!(
+                            "mp4 muxer: stream {idx} seig override changes \
+                             Per_Sample_IV_Size from {} to {} — the fragment's senc stores \
+                             one IV width for all samples (§7.2.3)",
+                            decision.tenc.default_per_sample_iv_size, entry.per_sample_iv_size
+                        )));
+                    }
+                }
+            }
+        }
+        self.queue_packet_impl(packet, Some(senc), seig)
     }
 
     /// Shared queue path behind [`Muxer::write_packet`] (no CENC
-    /// auxiliary info) and [`Self::write_protected_packet`] (per-sample
-    /// `senc` entry).
+    /// auxiliary info) and the protected-write entry points.
     fn queue_packet(
         &mut self,
         packet: &Packet,
         senc: Option<crate::cenc::SencSample>,
+    ) -> Result<()> {
+        self.queue_packet_impl(packet, senc, None)
+    }
+
+    fn queue_packet_impl(
+        &mut self,
+        packet: &Packet,
+        senc: Option<crate::cenc::SencSample>,
+        seig: Option<crate::cenc::SeigEntry>,
     ) -> Result<()> {
         if !self.header_written {
             return Err(Error::other("mp4 muxer: write_header not called"));
@@ -538,6 +629,10 @@ impl FragmentedMuxer {
         });
         if let Some(entry) = senc {
             track.pending_senc.push(entry);
+            // pending_seig stays parallel to pending_senc: every
+            // protected sample records its (possibly absent) group
+            // override so the flush can run-length-encode the sbgp.
+            track.pending_seig.push(seig);
         }
 
         // Update bookkeeping for delta computation on subsequent packets.
@@ -749,17 +844,25 @@ impl FragmentedMuxer {
         // For EveryKeyframe semantics: the just-pushed keyframe needs to
         // be the *first* sample of the *next* fragment, not the last of
         // the current one. Detach and replay after. A CENC senc entry
-        // queued alongside the sample travels with it.
-        let mut detached: Vec<(usize, PendingSample, Option<crate::cenc::SencSample>)> = Vec::new();
+        // (and its seig override) queued alongside the sample travels
+        // with it.
+        type Detached = (
+            usize,
+            PendingSample,
+            Option<(crate::cenc::SencSample, Option<crate::cenc::SeigEntry>)>,
+        );
+        let mut detached: Vec<Detached> = Vec::new();
         if matches!(self.frag_options.cadence, FragmentCadence::EveryKeyframe) {
             let anchor = 0usize;
             if let Some(last) = self.tracks[anchor].pending.last() {
                 if last.flags & SAMPLE_IS_NON_SYNC == 0 {
                     let s = self.tracks[anchor].pending.pop().unwrap();
-                    let senc = if self.tracks[anchor].pending_senc.len()
+                    let cenc = if self.tracks[anchor].pending_senc.len()
                         > self.tracks[anchor].pending.len()
                     {
-                        self.tracks[anchor].pending_senc.pop()
+                        let senc = self.tracks[anchor].pending_senc.pop().unwrap();
+                        let seig = self.tracks[anchor].pending_seig.pop().flatten();
+                        Some((senc, seig))
                     } else {
                         None
                     };
@@ -769,7 +872,7 @@ impl FragmentedMuxer {
                         .base
                         .cumulative_duration
                         .saturating_sub(s.duration as u64);
-                    detached.push((anchor, s, senc));
+                    detached.push((anchor, s, cenc));
                 }
             }
         }
@@ -777,11 +880,12 @@ impl FragmentedMuxer {
         // If after detaching everything is empty, nothing to flush.
         if self.tracks.iter().all(|t| t.pending.is_empty()) {
             // Replay any detached samples into the next fragment.
-            for (idx, s, senc) in detached {
+            for (idx, s, cenc) in detached {
                 self.tracks[idx].base.cumulative_duration += s.duration as u64;
                 self.tracks[idx].pending.push(s);
-                if let Some(e) = senc {
-                    self.tracks[idx].pending_senc.push(e);
+                if let Some((senc, seig)) = cenc {
+                    self.tracks[idx].pending_senc.push(senc);
+                    self.tracks[idx].pending_seig.push(seig);
                 }
             }
             return Ok(());
@@ -972,12 +1076,14 @@ impl FragmentedMuxer {
             t.next_bmdt += frag_dur;
             t.pending.clear();
             t.pending_senc.clear();
+            t.pending_seig.clear();
         }
-        for (idx, s, senc) in detached {
+        for (idx, s, cenc) in detached {
             self.tracks[idx].base.cumulative_duration += s.duration as u64;
             self.tracks[idx].pending.push(s);
-            if let Some(e) = senc {
-                self.tracks[idx].pending_senc.push(e);
+            if let Some((senc, seig)) = cenc {
+                self.tracks[idx].pending_senc.push(senc);
+                self.tracks[idx].pending_seig.push(seig);
             }
         }
 
@@ -1261,6 +1367,7 @@ fn build_traf(t: &FragTrackState, trun_data_offset: i32) -> Result<TrafBuild> {
     body.extend_from_slice(&build_tfhd(t, defaults));
     body.extend_from_slice(&build_tfdt(t.next_bmdt));
     let saio_patch = append_traf_cenc_boxes(t, &mut body)?;
+    append_traf_seig_groups(t, &mut body)?;
     body.extend_from_slice(&build_trun(t, trun_data_offset, defaults));
     Ok(TrafBuild {
         bytes: wrap_box(b"traf", &body),
@@ -1385,6 +1492,78 @@ fn append_traf_cenc_boxes(t: &FragTrackState, body: &mut Vec<u8>) -> Result<Opti
         field_pos,
         aux_data_pos,
     }))
+}
+
+/// Append the fragment-local CENC `seig` sample-group boxes — one
+/// `sgpd` (`grouping_type = 'seig'`, ISO/IEC 14496-12 §8.9.3 in its
+/// `traf` container) plus one `sbgp` (§8.9.2) — to a traf body under
+/// construction, when any of the fragment's samples carries a
+/// [`crate::cenc::SeigEntry`] override (ISO/IEC 23001-7 §6).
+///
+/// The distinct entries are deduplicated in first-use order into the
+/// `sgpd`; the `sbgp` run-length-encodes the per-sample mapping with
+/// the §8.9.4 fragment-local index numbering — "the group description
+/// indexes for groups defined within the same fragment start at
+/// 0x10001, i.e. the index value 1, with the value 1 in the top 16
+/// bits" — and index 0 ("member of no group") for samples on the
+/// `tenc` defaults. The §8.9.4 constraint that the sbgp's sample total
+/// equal the fragment's sample count holds by construction.
+fn append_traf_seig_groups(t: &FragTrackState, body: &mut Vec<u8>) -> Result<()> {
+    if t.pending_seig.iter().all(|s| s.is_none()) {
+        return Ok(());
+    }
+    if t.pending_seig.len() != t.pending.len() {
+        return Err(Error::invalid(
+            "MP4: pending seig overrides out of step with pending samples",
+        ));
+    }
+
+    // Dedupe entries in first-use order; map each sample to its sbgp
+    // group_description_index.
+    let mut uniques: Vec<&crate::cenc::SeigEntry> = Vec::new();
+    let mut indices: Vec<u32> = Vec::with_capacity(t.pending_seig.len());
+    for seig in &t.pending_seig {
+        match seig {
+            None => indices.push(0),
+            Some(entry) => {
+                let k = match uniques.iter().position(|u| *u == entry) {
+                    Some(k) => k,
+                    None => {
+                        uniques.push(entry);
+                        uniques.len() - 1
+                    }
+                };
+                indices.push(0x10001 + k as u32);
+            }
+        }
+    }
+
+    let mut sgpd_entries: Vec<Vec<u8>> = Vec::with_capacity(uniques.len());
+    for entry in &uniques {
+        sgpd_entries.push(crate::cenc::build_seig_entry(entry)?);
+    }
+    let sgpd = crate::sample_groups::SampleGroupDescription {
+        grouping_type: *b"seig",
+        default_sample_description_index: None,
+        entries: sgpd_entries,
+    };
+    body.extend_from_slice(&crate::sample_groups::build_sgpd(&sgpd));
+
+    // Run-length encode the per-sample indices.
+    let mut entries: Vec<(u32, u32)> = Vec::new();
+    for &idx in &indices {
+        match entries.last_mut() {
+            Some((count, last)) if *last == idx => *count += 1,
+            _ => entries.push((1, idx)),
+        }
+    }
+    let sbgp = crate::sample_groups::SampleToGroup {
+        grouping_type: *b"seig",
+        grouping_type_parameter: None,
+        entries,
+    };
+    body.extend_from_slice(&crate::sample_groups::build_sbgp(&sbgp));
+    Ok(())
 }
 
 /// `tfhd` flag bits (ISO/IEC 14496-12 §8.8.7.1).
