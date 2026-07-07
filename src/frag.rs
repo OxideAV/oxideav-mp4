@@ -346,7 +346,13 @@ impl Muxer for FragmentedMuxer {
             return Err(Error::other("mp4 muxer: write_trailer before write_header"));
         }
         if self.tracks.iter().any(|t| !t.pending.is_empty()) {
-            self.flush_fragment()?;
+            // Final flush: keep the trailing keyframe in THIS fragment.
+            // The EveryKeyframe detach exists to make a keyframe open
+            // the *next* fragment — at end of stream there is no next
+            // fragment, and detaching here would silently drop the
+            // sample (it would be replayed into a pending queue nobody
+            // flushes again).
+            self.flush_fragment_inner(false)?;
         }
         // Random-access trailer (§8.8.10 mfra + §8.8.11 tfra + §8.8.13 mfro).
         // Only emit when at least one fragment carried a sync sample on at
@@ -841,6 +847,15 @@ impl FragmentedMuxer {
     /// just-pushed keyframe is detached from `pending` and re-pushed after
     /// the flush — see `should_flush` doc.
     fn flush_fragment(&mut self) -> Result<()> {
+        self.flush_fragment_inner(true)
+    }
+
+    /// `flush_fragment` body. `detach_trailing_keyframe` is `true` on
+    /// cadence-driven flushes (the just-pushed keyframe opens the next
+    /// fragment) and `false` on the final `write_trailer` flush, where
+    /// detaching would drop the sample — there is no next fragment to
+    /// replay it into.
+    fn flush_fragment_inner(&mut self, detach_trailing_keyframe: bool) -> Result<()> {
         // For EveryKeyframe semantics: the just-pushed keyframe needs to
         // be the *first* sample of the *next* fragment, not the last of
         // the current one. Detach and replay after. A CENC senc entry
@@ -852,7 +867,9 @@ impl FragmentedMuxer {
             Option<(crate::cenc::SencSample, Option<crate::cenc::SeigEntry>)>,
         );
         let mut detached: Vec<Detached> = Vec::new();
-        if matches!(self.frag_options.cadence, FragmentCadence::EveryKeyframe) {
+        if detach_trailing_keyframe
+            && matches!(self.frag_options.cadence, FragmentCadence::EveryKeyframe)
+        {
             let anchor = 0usize;
             if let Some(last) = self.tracks[anchor].pending.last() {
                 if last.flags & SAMPLE_IS_NON_SYNC == 0 {

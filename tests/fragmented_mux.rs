@@ -648,3 +648,34 @@ fn find_fourcc(bytes: &[u8], fourcc: &[u8; 4]) -> Option<usize> {
 fn count_fourcc(bytes: &[u8], fourcc: &[u8; 4]) -> usize {
     bytes.windows(4).filter(|w| *w == fourcc.as_slice()).count()
 }
+
+/// Regression: with `EveryKeyframe` cadence, the final sample used to
+/// be silently dropped at `write_trailer` — the trailer's flush ran
+/// the cadence detach (pop the trailing keyframe for "the next
+/// fragment"), but no next fragment ever flushed it back out. Every
+/// written packet must come back out of the demuxer.
+#[test]
+fn every_keyframe_cadence_keeps_the_final_sample() {
+    let stream = pcm_stream();
+    let packets = make_pcm_packets(4, 1024);
+    let path = mux_to_tempfile(
+        "oxideav-mp4-frag-ekf-final.mp4",
+        &stream,
+        FragmentCadence::EveryKeyframe,
+        &packets,
+    );
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&path).unwrap());
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let mut got = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => got.push(p.data),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    assert_eq!(got.len(), packets.len(), "no sample may be dropped");
+    for (i, (g, p)) in got.iter().zip(&packets).enumerate() {
+        assert_eq!(g, &p.data, "packet {i} byte-exact");
+    }
+}

@@ -650,3 +650,180 @@ fn seig_clear_group_round_trips() {
     let parsed = parse_seig(&rec.sgpd[0].entries[0]).unwrap();
     assert_eq!(parsed, clear);
 }
+
+// --- indexed / multi-track / cadence interplay -----------------------------
+
+/// Protected fragments with the full DASH index chrome enabled (sidx +
+/// styp + mfra): the senc/saiz/saio triple still lands per traf and
+/// the saio byte gate still holds — the offset is moof-relative
+/// (§8.8.14), so the preceding sidx/styp don't disturb it.
+#[test]
+fn protected_fragments_with_sidx_styp_and_mfra() {
+    let stream = pcm_stream(0);
+    let frag = FragmentedOptions {
+        cadence: FragmentCadence::EveryNPackets(2),
+        emit_random_access_indexes: true,
+        ..FragmentedOptions::default() // default styp(msdh) preset
+    };
+    let options = protected_options(*b"cenc", tenc_iv8([0x31; 16]), frag);
+    let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-indexed.mp4");
+    {
+        let mut mux = open_typed(&tmp, std::slice::from_ref(&stream), options);
+        mux.write_header().unwrap();
+        for i in 0..4i64 {
+            let senc = SencSample {
+                initialization_vector: vec![0xD0 + i as u8; 8],
+                subsamples: Vec::new(),
+            };
+            mux.write_protected_packet(&audio_packet(&stream, i, vec![i as u8; 40]), senc)
+                .unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let bytes = std::fs::read(&tmp).unwrap();
+    assert_eq!(
+        top_level_boxes(&bytes, b"sidx").len(),
+        2,
+        "one sidx per fragment"
+    );
+    assert_eq!(
+        top_level_boxes(&bytes, b"styp").len(),
+        2,
+        "one styp per fragment"
+    );
+    assert_eq!(
+        top_level_boxes(&bytes, b"mfra").len(),
+        1,
+        "random-access trailer"
+    );
+
+    let dmx = demux_file(&tmp);
+    assert_eq!(dmx.senc_records().len(), 2);
+    let sai = dmx.sai_records();
+    assert_eq!(sai.len(), 2);
+    let moofs = top_level_boxes(&bytes, b"moof");
+    for (frag_idx, ((moof_pos, _), rec)) in moofs.iter().zip(sai).enumerate() {
+        let off = rec.saio[0].offsets[0] as usize;
+        let first_iv = 0xD0 + (frag_idx * 2) as u8;
+        assert_eq!(
+            &bytes[moof_pos + off..moof_pos + off + 8],
+            &[first_iv; 8],
+            "fragment {frag_idx}: saio offset unaffected by sidx/styp"
+        );
+    }
+}
+
+/// Two protected tracks in one moof: each traf carries its own senc +
+/// saiz + saio, and each saio offset resolves to that track's first IV
+/// (both patched against the shared moof origin).
+#[test]
+fn two_protected_tracks_patch_independent_saio_offsets() {
+    let streams = [pcm_stream(0), pcm_stream(1)];
+    let frag = frag_opts(2);
+    let options = Mp4MuxerOptions {
+        fragmented: Some(frag),
+        track_protection: vec![
+            TrackProtection {
+                stream_index: 0,
+                scheme_type: *b"cenc",
+                scheme_version: 0x0001_0000,
+                tenc: tenc_iv8([0x0A; 16]),
+            },
+            TrackProtection {
+                stream_index: 1,
+                scheme_type: *b"cenc",
+                scheme_version: 0x0001_0000,
+                tenc: tenc_iv8([0x0B; 16]),
+            },
+        ],
+        ..Mp4MuxerOptions::default()
+    };
+    let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-2track.mp4");
+    {
+        let mut mux = open_typed(&tmp, &streams, options);
+        mux.write_header().unwrap();
+        // Interleave: t0, t1, t0 (flush fires on t0's 2nd packet), t1.
+        for i in 0..2i64 {
+            for s in &streams {
+                let tag = if s.index == 0 { 0xA0 } else { 0xB0 };
+                let senc = SencSample {
+                    initialization_vector: vec![tag + i as u8; 8],
+                    subsamples: Vec::new(),
+                };
+                mux.write_protected_packet(&audio_packet(s, i, vec![tag; 32]), senc)
+                    .unwrap();
+            }
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let bytes = std::fs::read(&tmp).unwrap();
+    let moofs = top_level_boxes(&bytes, b"moof");
+    let dmx = demux_file(&tmp);
+    // First moof: both tracks contributed (track 0 twice, track 1 once).
+    let first_moof_sais: Vec<_> = dmx
+        .sai_records()
+        .iter()
+        .filter(|r| r.moof_sequence == 1)
+        .collect();
+    assert_eq!(first_moof_sais.len(), 2, "one sai record per traf");
+    let (moof_pos, _) = moofs[0];
+    for rec in first_moof_sais {
+        let off = rec.saio[0].offsets[0] as usize;
+        let expect = if rec.track_idx == 0 { 0xA0 } else { 0xB0 };
+        assert_eq!(
+            &bytes[moof_pos + off..moof_pos + off + 8],
+            &[expect; 8],
+            "track {}: saio points at its own traf's first IV",
+            rec.track_idx
+        );
+    }
+}
+
+/// EveryKeyframe cadence detaches the just-pushed keyframe into the
+/// next fragment — its senc entry must travel with it, keeping IVs
+/// aligned to samples across the boundary.
+#[test]
+fn every_keyframe_cadence_keeps_senc_aligned() {
+    let stream = pcm_stream(0);
+    let frag = FragmentedOptions {
+        cadence: FragmentCadence::EveryKeyframe,
+        emit_random_access_indexes: false,
+        styp: None,
+        ..FragmentedOptions::default()
+    };
+    let options = protected_options(*b"cenc", tenc_iv8([0x44; 16]), frag);
+    let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-ekf.mp4");
+    {
+        let mut mux = open_typed(&tmp, std::slice::from_ref(&stream), options);
+        mux.write_header().unwrap();
+        for i in 0..4i64 {
+            let senc = SencSample {
+                initialization_vector: vec![0xE0 + i as u8; 8],
+                subsamples: Vec::new(),
+            };
+            // All keyframes → one sample per fragment after the first
+            // detach cycle.
+            mux.write_protected_packet(&audio_packet(&stream, i, vec![i as u8; 24]), senc)
+                .unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let dmx = demux_file(&tmp);
+    // Collect (moof_sequence, IVs) and flatten; the IV stream must be
+    // 0xE0, 0xE1, 0xE2, 0xE3 in sample order regardless of how the
+    // detach re-binned the fragments.
+    let ivs: Vec<u8> = dmx
+        .senc_records()
+        .iter()
+        .flat_map(|r| r.senc.samples.iter().map(|s| s.initialization_vector[0]))
+        .collect();
+    assert_eq!(ivs, vec![0xE0, 0xE1, 0xE2, 0xE3], "IVs track their samples");
+    let total: usize = dmx
+        .senc_records()
+        .iter()
+        .map(|r| r.senc.samples.len())
+        .sum();
+    assert_eq!(total, 4, "every sample carries aux info");
+}

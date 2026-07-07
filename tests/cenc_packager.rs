@@ -510,3 +510,72 @@ fn subsamples_on_unprotected_stream_are_rejected() {
         .unwrap_err();
     assert!(format!("{err}").contains("unprotected"), "err = {err}");
 }
+
+/// The usual rotation workflow pairs the key switch with a
+/// fragment-scoped licence blob: `set_next_segment_pssh` +
+/// `rotate_key` before the rotated samples. The pssh must land inside
+/// the moof of the fragment carrying the rotated samples (ISO/IEC
+/// 23001-7 §8.1.1 scoping) and everything still decrypts.
+#[test]
+fn rotation_with_moof_scoped_pssh() {
+    let stream = pcm_stream(0);
+    let tenc = tenc_cenc_iv8();
+    let options = options_for(*b"cenc", tenc.clone(), frag_opts(2));
+    let plaintexts: Vec<Vec<u8>> = (0..4).map(|i| plaintext(i, 64)).collect();
+    let tmp = std::env::temp_dir().join("oxideav-mp4-pkg-rot-pssh.mp4");
+    {
+        let mut pkg = new_packager(
+            &tmp,
+            std::slice::from_ref(&stream),
+            options,
+            vec![TrackKey {
+                stream_index: 0,
+                key: KEY_A,
+            }],
+        );
+        pkg.write_header().unwrap();
+        for (i, plain) in plaintexts.iter().enumerate() {
+            if i == 2 {
+                // New licence blob scoped to the rotated fragment.
+                pkg.set_next_segment_pssh([oxideav_mp4::cenc::PsshBox {
+                    version: 1,
+                    system_id: [0xEE; 16],
+                    kids: vec![KID_B],
+                    data: vec![0xFA, 0xCE],
+                }]);
+                pkg.rotate_key(0, KID_B, KEY_B, None).unwrap();
+            }
+            pkg.write_packet(&audio_packet(&stream, i as i64, plain.clone()))
+                .unwrap();
+        }
+        pkg.write_trailer().unwrap();
+    }
+
+    let mut dmx = demux_file(&tmp);
+    // The pssh scopes to fragment 2 (the rotated one).
+    let moof_psshes = dmx.moof_psshes();
+    assert_eq!(moof_psshes.len(), 1);
+    assert_eq!(moof_psshes[0].moof_sequence, 2, "§8.1.1 fragment scoping");
+    assert_eq!(moof_psshes[0].pssh.kids, vec![KID_B]);
+
+    // And the rotated fragment still decrypts under KEY_B.
+    let entries: Vec<_> = dmx
+        .senc_records()
+        .iter()
+        .flat_map(|r| r.senc.samples.clone())
+        .collect();
+    let decision = CencSchemeDecision::new(CencScheme::Cenc, tenc).unwrap();
+    let mut got = drain(&mut dmx);
+    for (i, data) in got.iter_mut().enumerate() {
+        let key = if i < 2 { KEY_A } else { KEY_B };
+        decrypt_sample_in_place(
+            &decision,
+            &key,
+            Some(&entries[i].initialization_vector),
+            None,
+            data,
+        )
+        .unwrap();
+        assert_eq!(data, &plaintexts[i], "sample {i} decrypts byte-exact");
+    }
+}
