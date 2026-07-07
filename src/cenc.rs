@@ -991,6 +991,66 @@ pub fn build_senc_box(senc: &SencBox) -> Result<Vec<u8>> {
     Ok(wrap_full_box(b"senc", &body))
 }
 
+/// Serialise a [`SeigEntry`] into a raw
+/// `CencSampleEncryptionInformationGroupEntry` payload (§6) — the
+/// byte-exact inverse of [`parse_seig`]. The returned bytes are the
+/// *entry* blob a `grouping_type = *b"seig"` `sgpd` description
+/// carries (no box header — sample-group entries are not boxes).
+///
+/// Rejects records that would not round-trip:
+///
+/// * a pattern component above its 4-bit field ceiling,
+/// * `per_sample_iv_size` outside {0, 8, 16} (§9.1),
+/// * a constant IV whose presence disagrees with the §6 rule
+///   (`Some` iff `isProtected == 1 && Per_Sample_IV_Size == 0`) or
+///   whose length is not 8 / 16 (§9.1).
+pub fn build_seig_entry(entry: &SeigEntry) -> Result<Vec<u8>> {
+    if entry.crypt_byte_block > 0x0F || entry.skip_byte_block > 0x0F {
+        return Err(Error::invalid(
+            "CENC seig build: pattern component exceeds its 4-bit field",
+        ));
+    }
+    if !matches!(entry.per_sample_iv_size, 0 | 8 | 16) {
+        return Err(Error::invalid(format!(
+            "CENC seig build: Per_Sample_IV_Size {} not in {{0, 8, 16}}",
+            entry.per_sample_iv_size
+        )));
+    }
+    let needs_constant_iv = entry.is_protected == 1 && entry.per_sample_iv_size == 0;
+    match (&entry.constant_iv, needs_constant_iv) {
+        (Some(iv), true) => {
+            if iv.len() != 8 && iv.len() != 16 {
+                return Err(Error::invalid(format!(
+                    "CENC seig build: constant_IV length {} not in {{8, 16}}",
+                    iv.len()
+                )));
+            }
+        }
+        (None, true) => {
+            return Err(Error::invalid(
+                "CENC seig build: isProtected==1 && IV_size==0 requires a constant IV",
+            ));
+        }
+        (Some(_), false) => {
+            return Err(Error::invalid(
+                "CENC seig build: constant IV present but not required (would not round-trip)",
+            ));
+        }
+        (None, false) => {}
+    }
+    let mut out = Vec::with_capacity(20 + 17);
+    out.push(0); // reserved
+    out.push((entry.crypt_byte_block << 4) | entry.skip_byte_block);
+    out.push(entry.is_protected);
+    out.push(entry.per_sample_iv_size);
+    out.extend_from_slice(&entry.kid);
+    if let Some(iv) = &entry.constant_iv {
+        out.push(iv.len() as u8);
+        out.extend_from_slice(iv);
+    }
+    Ok(out)
+}
+
 /// Serialise a complete `sinf` ProtectionSchemeInfoBox (ISO/IEC
 /// 14496-12 §8.12 as profiled by ISO/IEC 23001-7 §4.1) for a muxer
 /// wrapping a sample entry into its protected (`encv` / `enca` /
@@ -1487,6 +1547,85 @@ mod tests {
         r.default_per_sample_iv_size = 0;
         r.default_constant_iv = Some(vec![0xAA; 12]);
         assert!(build_tenc_box(&r).is_err());
+    }
+
+    #[test]
+    fn build_seig_per_sample_iv_round_trips() {
+        let rec = SeigEntry {
+            crypt_byte_block: 0,
+            skip_byte_block: 0,
+            is_protected: 1,
+            per_sample_iv_size: 8,
+            kid: [0x7E; 16],
+            constant_iv: None,
+        };
+        let bytes = build_seig_entry(&rec).unwrap();
+        assert_eq!(bytes.len(), 20, "fixed-prefix-only entry is 20 bytes");
+        assert_eq!(parse_seig(&bytes).unwrap(), rec);
+    }
+
+    #[test]
+    fn build_seig_pattern_constant_iv_round_trips() {
+        let rec = SeigEntry {
+            crypt_byte_block: 1,
+            skip_byte_block: 9,
+            is_protected: 1,
+            per_sample_iv_size: 0,
+            kid: [0xC4; 16],
+            constant_iv: Some(vec![0x5D; 16]),
+        };
+        let bytes = build_seig_entry(&rec).unwrap();
+        assert_eq!(bytes[1], 0x19, "crypt:4|skip:4 packing");
+        assert_eq!(parse_seig(&bytes).unwrap(), rec);
+    }
+
+    #[test]
+    fn build_seig_unprotected_group_round_trips() {
+        // §6: isProtected = 0 overrides the track default to "clear for
+        // this group" — no constant IV even at IV size 0.
+        let rec = SeigEntry {
+            crypt_byte_block: 0,
+            skip_byte_block: 0,
+            is_protected: 0,
+            per_sample_iv_size: 0,
+            kid: [0u8; 16],
+            constant_iv: None,
+        };
+        let bytes = build_seig_entry(&rec).unwrap();
+        assert_eq!(parse_seig(&bytes).unwrap(), rec);
+    }
+
+    #[test]
+    fn build_seig_rejects_non_round_trippable_records() {
+        let base = SeigEntry {
+            crypt_byte_block: 0,
+            skip_byte_block: 0,
+            is_protected: 1,
+            per_sample_iv_size: 8,
+            kid: [0x11; 16],
+            constant_iv: None,
+        };
+        // Pattern nibble overflow.
+        let mut r = base.clone();
+        r.crypt_byte_block = 16;
+        assert!(build_seig_entry(&r).is_err());
+        // IV size outside {0, 8, 16}.
+        let mut r = base.clone();
+        r.per_sample_iv_size = 4;
+        assert!(build_seig_entry(&r).is_err());
+        // Constant IV required but absent.
+        let mut r = base.clone();
+        r.per_sample_iv_size = 0;
+        assert!(build_seig_entry(&r).is_err());
+        // Constant IV present but not required.
+        let mut r = base.clone();
+        r.constant_iv = Some(vec![0xAA; 8]);
+        assert!(build_seig_entry(&r).is_err());
+        // Constant IV with a bad length.
+        let mut r = base;
+        r.per_sample_iv_size = 0;
+        r.constant_iv = Some(vec![0xAA; 12]);
+        assert!(build_seig_entry(&r).is_err());
     }
 
     #[test]
