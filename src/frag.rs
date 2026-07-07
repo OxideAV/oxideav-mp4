@@ -86,6 +86,20 @@ struct FragTrackState {
     base: TrackState,
     /// Track-ID (1-based) used in `tfhd.track_ID`.
     track_id: u32,
+    /// CENC routing decision built from the matching
+    /// `Mp4MuxerOptions::track_protection` entry at open (ISO/IEC
+    /// 23001-7 §4.1). `None` for unprotected tracks. Used to validate
+    /// the per-sample `senc` entries handed to
+    /// [`FragmentedMuxer::write_protected_packet`] (§9.2 IV-supply
+    /// discipline) and to size the per-fragment `saiz` table.
+    protection: Option<crate::cenc::CencSchemeDecision>,
+    /// Per-sample CENC auxiliary information (§7.1) queued for the next
+    /// fragment, parallel to `pending`: either empty (no protected
+    /// writes this fragment) or exactly `pending.len()` entries (every
+    /// sample of the fragment came through
+    /// [`FragmentedMuxer::write_protected_packet`]). Mixing the two
+    /// write paths within one fragment is rejected at queue time.
+    pending_senc: Vec<crate::cenc::SencSample>,
     /// trex defaults: derived from the first packet's metadata.
     trex_default_sample_duration: u32,
     trex_default_sample_size: u32,
@@ -119,10 +133,16 @@ struct TfraEmitEntry {
 }
 
 impl FragTrackState {
-    fn new(base: TrackState, track_id: u32) -> Self {
+    fn new(
+        base: TrackState,
+        track_id: u32,
+        protection: Option<crate::cenc::CencSchemeDecision>,
+    ) -> Self {
         Self {
             base,
             track_id,
+            protection,
+            pending_senc: Vec::new(),
             trex_default_sample_duration: 0,
             trex_default_sample_size: 0,
             trex_default_sample_flags: 0,
@@ -199,19 +219,27 @@ pub fn open_fragmented_typed(
         let mut entry = sample_entry_for(&s.params)?;
         // ISO/IEC 14496-12 §8.12: wrap the entry into its protected
         // enc* form when a protection directive targets this stream.
+        // Keep the typed scheme decision around: write_protected_packet
+        // validates each sample's senc entry against it (§9.2) and the
+        // flush path sizes the per-fragment saiz from it.
+        let mut protection = None;
         if let Some(prot) = options
             .track_protection
             .iter()
             .find(|p| p.stream_index == i)
         {
             entry = crate::sample_entries::apply_protection(entry, s.params.media_type, prot)?;
+            protection = Some(crate::cenc::CencSchemeDecision::new(
+                crate::cenc::CencScheme::from_fourcc(&prot.scheme_type),
+                prot.tenc.clone(),
+            )?);
         }
         let mut base = TrackState::new(s.clone(), entry);
         // For fragmented mode every fragment is its own chunk, so the
         // chunking-target field is irrelevant — we only carry it to keep
         // TrackState happy.
         base.samples_per_chunk_target = default_samples_per_chunk(&base.stream);
-        tracks.push(FragTrackState::new(base, (i as u32) + 1));
+        tracks.push(FragTrackState::new(base, (i as u32) + 1, protection));
     }
     Ok(FragmentedMuxer {
         output,
@@ -297,6 +325,89 @@ impl Muxer for FragmentedMuxer {
     }
 
     fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        self.queue_packet(packet, None)
+    }
+
+    fn write_trailer(&mut self) -> Result<()> {
+        if self.trailer_written {
+            return Ok(());
+        }
+        if !self.header_written {
+            return Err(Error::other("mp4 muxer: write_trailer before write_header"));
+        }
+        if self.tracks.iter().any(|t| !t.pending.is_empty()) {
+            self.flush_fragment()?;
+        }
+        // Random-access trailer (§8.8.10 mfra + §8.8.11 tfra + §8.8.13 mfro).
+        // Only emit when at least one fragment carried a sync sample on at
+        // least one track; an mfra with all-empty tfras would be useless
+        // and wastes ~24 bytes for nothing.
+        if self.frag_options.emit_random_access_indexes
+            && self.tracks.iter().any(|t| !t.tfra_entries.is_empty())
+        {
+            self.write_mfra()?;
+        }
+        self.output.flush()?;
+        self.trailer_written = true;
+        Ok(())
+    }
+}
+
+impl FragmentedMuxer {
+    /// Write one **protected** sample: the packet's (already-encrypted)
+    /// payload plus its ISO/IEC 23001-7 §7.1 sample auxiliary
+    /// information — the per-sample `InitializationVector` and optional
+    /// subsample map destined for this fragment's `senc`
+    /// SampleEncryptionBox (§7.2).
+    ///
+    /// The stream targeted by `packet.stream_index` must carry a
+    /// [`crate::TrackProtection`] directive (the `sinf`-wrapped sample
+    /// entry written at `open`); the `senc` entry is validated against
+    /// that directive's `tenc`:
+    ///
+    /// * `initialization_vector.len()` must equal
+    ///   `tenc.default_Per_Sample_IV_Size` (§9.2) — or be empty when
+    ///   the track uses a constant IV (`Per_Sample_IV_Size == 0`,
+    ///   §9.1);
+    /// * when a subsample map is supplied, its
+    ///   `BytesOfClearData + BytesOfProtectedData` total must equal the
+    ///   packet payload length (§9.5.1);
+    /// * every sample of a fragment must come through this method, or
+    ///   none — mixing with plain [`Muxer::write_packet`] on the same
+    ///   track within one fragment would leave `senc.sample_count`
+    ///   disagreeing with the §7.2.3 rule ("either zero or the total
+    ///   number of samples in the track fragment") and is rejected.
+    ///
+    /// At each fragment flush the queued entries become one `senc` box
+    /// in the track's `traf` plus the matching `saiz` /
+    /// `saio` pair (§8.7.8–9; inside a `traf` the single `saio` offset
+    /// is relative to the moof start since the muxer always sets
+    /// `default-base-is-moof`, per §8.8.14), making every fragment
+    /// independently decryptable (the §7.2.1 DASH Media Segment
+    /// posture). When the track uses a constant IV **and** no sample
+    /// carries a subsample map, the auxiliary information is empty and
+    /// all three boxes are omitted per §7.1 ("the sample auxiliary
+    /// information would then be empty and should be omitted").
+    ///
+    /// Encryption itself is the caller's job (e.g. via
+    /// [`crate::cenc_cipher::encrypt_sample_in_place`] with the same
+    /// IV / subsample map handed here).
+    pub fn write_protected_packet(
+        &mut self,
+        packet: &Packet,
+        senc: crate::cenc::SencSample,
+    ) -> Result<()> {
+        self.queue_packet(packet, Some(senc))
+    }
+
+    /// Shared queue path behind [`Muxer::write_packet`] (no CENC
+    /// auxiliary info) and [`Self::write_protected_packet`] (per-sample
+    /// `senc` entry).
+    fn queue_packet(
+        &mut self,
+        packet: &Packet,
+        senc: Option<crate::cenc::SencSample>,
+    ) -> Result<()> {
         if !self.header_written {
             return Err(Error::other("mp4 muxer: write_header not called"));
         }
@@ -305,6 +416,80 @@ impl Muxer for FragmentedMuxer {
             return Err(Error::invalid(format!(
                 "mp4 muxer: unknown stream index {idx}"
             )));
+        }
+
+        // CENC queue discipline (ISO/IEC 23001-7 §7.2.3 + §9.2).
+        match &senc {
+            Some(entry) => {
+                let track = &self.tracks[idx];
+                let decision = track.protection.as_ref().ok_or_else(|| {
+                    Error::invalid(format!(
+                        "mp4 muxer: write_protected_packet on stream {idx} without a \
+                         track_protection directive"
+                    ))
+                })?;
+                // §7.2.3: senc covers all samples of the fragment or
+                // none — every previously queued sample of this
+                // fragment must have carried an entry too.
+                if track.pending_senc.len() != track.pending.len() {
+                    return Err(Error::invalid(format!(
+                        "mp4 muxer: stream {idx} mixes write_protected_packet with plain \
+                         write_packet within one fragment (senc covers all samples or none, \
+                         ISO/IEC 23001-7 §7.2.3)"
+                    )));
+                }
+                // §9.2 IV-supply discipline against the track tenc.
+                match decision.iv_supply() {
+                    crate::cenc::IvSupply::PerSample { size } => {
+                        if entry.initialization_vector.len() != size as usize {
+                            return Err(Error::invalid(format!(
+                                "mp4 muxer: stream {idx} per-sample IV is {} bytes but \
+                                 tenc.default_Per_Sample_IV_Size is {size} (§9.2)",
+                                entry.initialization_vector.len()
+                            )));
+                        }
+                    }
+                    crate::cenc::IvSupply::Constant => {
+                        if !entry.initialization_vector.is_empty() {
+                            return Err(Error::invalid(format!(
+                                "mp4 muxer: stream {idx} uses a constant IV — senc entries \
+                                 must not carry per-sample IV bytes (§9.2)"
+                            )));
+                        }
+                    }
+                    crate::cenc::IvSupply::None => {
+                        return Err(Error::invalid(format!(
+                            "mp4 muxer: stream {idx} tenc default is unprotected \
+                             (isProtected == 0) — write_protected_packet has no IV context"
+                        )));
+                    }
+                }
+                // §9.5.1: subsample totals must cover the sample exactly.
+                if !entry.subsamples.is_empty() {
+                    let mut total: u64 = 0;
+                    for s in &entry.subsamples {
+                        total += s.bytes_of_clear_data as u64 + s.bytes_of_protected_data as u64;
+                    }
+                    if total != packet.data.len() as u64 {
+                        return Err(Error::invalid(format!(
+                            "mp4 muxer: stream {idx} subsample map covers {total} bytes but \
+                             the sample is {} bytes (§9.5.1)",
+                            packet.data.len()
+                        )));
+                    }
+                }
+            }
+            None => {
+                // A protected track that already queued senc entries in
+                // this fragment cannot fall back to the plain path.
+                if !self.tracks[idx].pending_senc.is_empty() {
+                    return Err(Error::invalid(format!(
+                        "mp4 muxer: stream {idx} mixes plain write_packet with \
+                         write_protected_packet within one fragment (senc covers all samples \
+                         or none, ISO/IEC 23001-7 §7.2.3)"
+                    )));
+                }
+            }
         }
 
         // Convert pts/duration to the media timescale.
@@ -351,6 +536,9 @@ impl Muxer for FragmentedMuxer {
             flags,
             composition_time_offset: cts_off,
         });
+        if let Some(entry) = senc {
+            track.pending_senc.push(entry);
+        }
 
         // Update bookkeeping for delta computation on subsequent packets.
         let pts_in_ts = packet
@@ -378,32 +566,6 @@ impl Muxer for FragmentedMuxer {
         Ok(())
     }
 
-    fn write_trailer(&mut self) -> Result<()> {
-        if self.trailer_written {
-            return Ok(());
-        }
-        if !self.header_written {
-            return Err(Error::other("mp4 muxer: write_trailer before write_header"));
-        }
-        if self.tracks.iter().any(|t| !t.pending.is_empty()) {
-            self.flush_fragment()?;
-        }
-        // Random-access trailer (§8.8.10 mfra + §8.8.11 tfra + §8.8.13 mfro).
-        // Only emit when at least one fragment carried a sync sample on at
-        // least one track; an mfra with all-empty tfras would be useless
-        // and wastes ~24 bytes for nothing.
-        if self.frag_options.emit_random_access_indexes
-            && self.tracks.iter().any(|t| !t.tfra_entries.is_empty())
-        {
-            self.write_mfra()?;
-        }
-        self.output.flush()?;
-        self.trailer_written = true;
-        Ok(())
-    }
-}
-
-impl FragmentedMuxer {
     /// Mark the next emitted fragment's `styp` (ISO/IEC 14496-12 §8.16.2
     /// Segment Type Box) to use the given `(major_brand, compat_brands)`,
     /// overriding the `Mp4MuxerOptions::fragmented::styp` preset for one
@@ -586,20 +748,28 @@ impl FragmentedMuxer {
     fn flush_fragment(&mut self) -> Result<()> {
         // For EveryKeyframe semantics: the just-pushed keyframe needs to
         // be the *first* sample of the *next* fragment, not the last of
-        // the current one. Detach and replay after.
-        let mut detached: Vec<(usize, PendingSample)> = Vec::new();
+        // the current one. Detach and replay after. A CENC senc entry
+        // queued alongside the sample travels with it.
+        let mut detached: Vec<(usize, PendingSample, Option<crate::cenc::SencSample>)> = Vec::new();
         if matches!(self.frag_options.cadence, FragmentCadence::EveryKeyframe) {
             let anchor = 0usize;
             if let Some(last) = self.tracks[anchor].pending.last() {
                 if last.flags & SAMPLE_IS_NON_SYNC == 0 {
                     let s = self.tracks[anchor].pending.pop().unwrap();
+                    let senc = if self.tracks[anchor].pending_senc.len()
+                        > self.tracks[anchor].pending.len()
+                    {
+                        self.tracks[anchor].pending_senc.pop()
+                    } else {
+                        None
+                    };
                     // Roll back cumulative_duration so the next fragment
                     // re-accounts for this keyframe.
                     self.tracks[anchor].base.cumulative_duration = self.tracks[anchor]
                         .base
                         .cumulative_duration
                         .saturating_sub(s.duration as u64);
-                    detached.push((anchor, s));
+                    detached.push((anchor, s, senc));
                 }
             }
         }
@@ -607,9 +777,12 @@ impl FragmentedMuxer {
         // If after detaching everything is empty, nothing to flush.
         if self.tracks.iter().all(|t| t.pending.is_empty()) {
             // Replay any detached samples into the next fragment.
-            for (idx, s) in detached {
+            for (idx, s, senc) in detached {
                 self.tracks[idx].base.cumulative_duration += s.duration as u64;
                 self.tracks[idx].pending.push(s);
+                if let Some(e) = senc {
+                    self.tracks[idx].pending_senc.push(e);
+                }
             }
             return Ok(());
         }
@@ -798,10 +971,14 @@ impl FragmentedMuxer {
             let frag_dur: u64 = t.pending.iter().map(|s| s.duration as u64).sum();
             t.next_bmdt += frag_dur;
             t.pending.clear();
+            t.pending_senc.clear();
         }
-        for (idx, s) in detached {
+        for (idx, s, senc) in detached {
             self.tracks[idx].base.cumulative_duration += s.duration as u64;
             self.tracks[idx].pending.push(s);
+            if let Some(e) = senc {
+                self.tracks[idx].pending_senc.push(e);
+            }
         }
 
         let _ = moof_size;
@@ -1018,13 +1195,48 @@ where
         let track_first_byte = byte_in_mdat;
         let trun_data_offset = offset_fn(i, track_first_byte);
         let traf = build_traf(t, trun_data_offset)?;
-        moof_body.extend_from_slice(&traf);
+        let traf_pos_in_body = moof_body.len();
+        moof_body.extend_from_slice(&traf.bytes);
+        // Patch this traf's single `saio` offset now that the traf's
+        // position within the moof is known. With
+        // `default-base-is-moof` set, the offset is relative to the
+        // first byte of the enclosing moof box (§8.8.14), i.e. the
+        // 8-byte moof header plus the traf's position in the body plus
+        // the aux-data position inside the traf. Identical in both
+        // build passes (the moof layout doesn't depend on the trun
+        // data-offset values), so patching per pass is safe.
+        if let Some(patch) = traf.saio_patch {
+            let absolute = 8u64 + traf_pos_in_body as u64 + patch.aux_data_pos as u64;
+            let value = u32::try_from(absolute).map_err(|_| {
+                Error::invalid("MP4: saio offset exceeds u32 (moof too large for v0 saio)")
+            })?;
+            let field = traf_pos_in_body + patch.field_pos;
+            moof_body[field..field + 4].copy_from_slice(&value.to_be_bytes());
+        }
         // Advance byte pointer past this track's samples.
         for s in &t.pending {
             byte_in_mdat += s.data.len() as u64;
         }
     }
     Ok(wrap_box(b"moof", &moof_body))
+}
+
+/// Byte positions (relative to the start of the traf box, i.e.
+/// including its 8-byte header) that [`build_moof_inner`] needs to
+/// finalise a traf's `saio` once the traf's position within the moof
+/// is known.
+struct SaioPatch {
+    /// Position of the 4-byte v0 `saio` offset field.
+    field_pos: usize,
+    /// Position of the first CENC auxiliary-information byte — the
+    /// first `senc` entry, right after the senc box's `sample_count`.
+    aux_data_pos: usize,
+}
+
+/// A built `traf` plus the optional `saio` patch request.
+struct TrafBuild {
+    bytes: Vec<u8>,
+    saio_patch: Option<SaioPatch>,
 }
 
 /// §8.8.5 `mfhd` — MovieFragmentHeaderBox.
@@ -1036,14 +1248,143 @@ fn build_mfhd(seq: u32) -> Vec<u8> {
     wrap_box(b"mfhd", &body)
 }
 
-/// `traf` for one track: tfhd + tfdt + trun.
-fn build_traf(t: &FragTrackState, trun_data_offset: i32) -> Result<Vec<u8>> {
+/// `traf` for one track: tfhd + tfdt + [senc + saiz + saio] + trun.
+///
+/// The CENC triple is present only when the fragment's samples were
+/// queued through [`FragmentedMuxer::write_protected_packet`] and the
+/// per-sample auxiliary information is non-empty (ISO/IEC 23001-7
+/// §7.1 — a constant-IV track with no subsample maps has empty aux
+/// info, and all three boxes are omitted).
+fn build_traf(t: &FragTrackState, trun_data_offset: i32) -> Result<TrafBuild> {
     let defaults = FragmentDefaults::for_track(t);
     let mut body = Vec::new();
     body.extend_from_slice(&build_tfhd(t, defaults));
     body.extend_from_slice(&build_tfdt(t.next_bmdt));
+    let saio_patch = append_traf_cenc_boxes(t, &mut body)?;
     body.extend_from_slice(&build_trun(t, trun_data_offset, defaults));
-    Ok(wrap_box(b"traf", &body))
+    Ok(TrafBuild {
+        bytes: wrap_box(b"traf", &body),
+        // `body` positions shift by the 8-byte traf box header once
+        // wrapped.
+        saio_patch: saio_patch.map(|p| SaioPatch {
+            field_pos: p.field_pos + 8,
+            aux_data_pos: p.aux_data_pos + 8,
+        }),
+    })
+}
+
+/// Append the per-fragment CENC boxes — `senc` (ISO/IEC 23001-7 §7.2)
+/// plus the matching `saiz` / `saio` pair (ISO/IEC 14496-12 §8.7.8–9)
+/// — to a traf body under construction. Returns the [`SaioPatch`]
+/// positions (relative to the traf *body*) when the boxes were
+/// emitted.
+///
+/// Layout decisions, per spec:
+///
+/// * `senc.flags` gets the `UseSubSampleEncryption` bit (0x2) iff any
+///   sample carries a subsample map (§7.2.3);
+/// * `saiz` / `saio` omit the optional `aux_info_type` /
+///   `aux_info_type_parameter` pair — §7.1: for CENC-protected tracks
+///   the defaults are the scheme FourCC and 0, "so content SHOULD be
+///   created omitting these optional fields";
+/// * `saiz.default_sample_info_size` is used when every sample's aux
+///   info has one size (the §7.1 NOTE), else the per-sample table;
+/// * `saio` carries a single offset (the aux info for all the track's
+///   runs is contiguous inside `senc`, §8.8.14) pointing at the first
+///   senc entry; the field is patched to its moof-relative value by
+///   [`build_moof_inner`];
+/// * empty aux info (constant IV + no subsamples) emits nothing (§7.1).
+fn append_traf_cenc_boxes(t: &FragTrackState, body: &mut Vec<u8>) -> Result<Option<SaioPatch>> {
+    if t.pending_senc.is_empty() {
+        return Ok(None);
+    }
+    if t.pending_senc.len() != t.pending.len() {
+        // queue_packet enforces this; re-checked so a future internal
+        // caller can't desynchronise the two queues silently.
+        return Err(Error::invalid(
+            "MP4: pending senc entries out of step with pending samples",
+        ));
+    }
+    let any_subsamples = t.pending_senc.iter().any(|s| !s.subsamples.is_empty());
+    let iv_size = t
+        .pending_senc
+        .first()
+        .map(|s| s.initialization_vector.len())
+        .unwrap_or(0);
+    if iv_size == 0 && !any_subsamples {
+        // §7.1: constant-IV track without subsample maps — the sample
+        // auxiliary information is empty "and should be omitted".
+        return Ok(None);
+    }
+
+    // Per-sample auxiliary-information sizes (§7.1
+    // CencSampleAuxiliaryDataFormat): IV bytes, plus — only under
+    // subsample encryption — the u16 subsample_count and 6 bytes per
+    // (clear, protected) pair.
+    let mut sizes: Vec<u64> = Vec::with_capacity(t.pending_senc.len());
+    for s in &t.pending_senc {
+        let mut sz = s.initialization_vector.len() as u64;
+        if any_subsamples {
+            sz += 2 + 6 * s.subsamples.len() as u64;
+        }
+        sizes.push(sz);
+    }
+    for (i, &sz) in sizes.iter().enumerate() {
+        if sz > u8::MAX as u64 {
+            return Err(Error::invalid(format!(
+                "MP4: sample {i} CENC auxiliary info is {sz} bytes — exceeds the 8-bit \
+                 saiz sample_info_size field (§8.7.8.3)"
+            )));
+        }
+    }
+
+    let senc = crate::cenc::SencBox {
+        flags: if any_subsamples { 0x0000_0002 } else { 0 },
+        samples: t.pending_senc.clone(),
+    };
+    let senc_bytes = crate::cenc::build_senc_box(&senc)?;
+    let senc_pos = body.len();
+    body.extend_from_slice(&senc_bytes);
+    // First aux-info byte: senc box header (8) + FullBox (4) +
+    // sample_count (4).
+    let aux_data_pos = senc_pos + 16;
+
+    // saiz — constant-size shortcut when all samples agree.
+    let all_same = sizes.windows(2).all(|w| w[0] == w[1]);
+    let saiz_record = crate::demux::SaizBox {
+        aux_info_type: None,
+        aux_info_type_parameter: None,
+        default_sample_info_size: if all_same { sizes[0] as u8 } else { 0 },
+        sample_count: sizes.len() as u32,
+        per_sample: if all_same {
+            Vec::new()
+        } else {
+            sizes.iter().map(|&s| s as u8).collect()
+        },
+    };
+    let saiz_bytes = crate::demux::build_saiz_box(&saiz_record)
+        .ok_or_else(|| Error::invalid("MP4: saiz record failed to serialise"))?;
+    body.extend_from_slice(&saiz_bytes);
+
+    // saio — v0, one placeholder offset patched by build_moof_inner.
+    let saio_record = crate::demux::SaioBox {
+        version: 0,
+        aux_info_type: None,
+        aux_info_type_parameter: None,
+        offsets: vec![0],
+    };
+    let saio_bytes = crate::demux::build_saio_box(&saio_record)
+        .ok_or_else(|| Error::invalid("MP4: saio record failed to serialise"))?;
+    let saio_pos = body.len();
+    body.extend_from_slice(&saio_bytes);
+    // v0 saio layout: box header (8) + FullBox (4) + entry_count (4),
+    // then the 4-byte offset field.
+    let field_pos = saio_pos + 16;
+
+    Ok(Some(SaioPatch {
+        field_pos,
+        aux_data_pos,
+    }))
 }
 
 /// `tfhd` flag bits (ISO/IEC 14496-12 §8.8.7.1).

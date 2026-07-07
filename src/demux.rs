@@ -21,7 +21,18 @@ use crate::boxes::*;
 use crate::cenc::{parse_pssh, parse_senc, parse_tenc, PsshBox, SencBox, TencBox};
 use crate::codec_id::{from_sample_entry, from_sample_entry_with_oti};
 
-pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(open_typed(input, codecs)?))
+}
+
+/// Open an MP4 / ISOBMFF input and return the concrete [`Mp4Demuxer`] —
+/// same parse as [`open`], but the typed form reaches the inherent
+/// accessors that aren't part of the [`Demuxer`] trait (the structured
+/// `sidx` / `ssix` / `tfra` / `pssh` / CENC `senc` / `saiz`+`saio` /
+/// fragment-local sample-group records a decrypting or indexing layer
+/// consumes). The `Box<dyn Demuxer>` form returned by [`open`] is what
+/// the registry uses.
+pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Mp4Demuxer> {
     // Walk top-level boxes looking for ftyp + moov. Continue past moov
     // to pick up any movie fragments (`moof`+`mdat` pairs) that a
     // fragmented / DASH / HLS / Smooth Streaming MP4 emits after the
@@ -582,7 +593,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         ));
     }
 
-    Ok(Box::new(Mp4Demuxer {
+    Ok(Mp4Demuxer {
         input,
         streams,
         samples,
@@ -607,7 +618,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         movie_timescale: parsed.movie_timescale,
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
-    }))
+    })
 }
 
 /// One `moof` box captured from the top-level walk. We hold onto the
@@ -11925,7 +11936,16 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
 
 // --- Demuxer state --------------------------------------------------------
 
-struct Mp4Demuxer {
+/// The concrete MP4 / ISOBMFF demuxer behind [`open`].
+///
+/// Constructed via [`open_typed`] when a caller needs the structured
+/// inherent accessors (`sidxes` / `ssixes` / `psshes` / `senc_records` /
+/// `sai_records` / `traf_sample_groups` / …) that don't fit the
+/// [`Demuxer`] trait — most notably a CENC decrypting layer replaying
+/// per-sample IVs and subsample maps from the per-fragment `senc`
+/// records. All fields are private; the trait implementation is
+/// identical through either construction path.
+pub struct Mp4Demuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     samples: Vec<SampleRef>,
