@@ -332,6 +332,50 @@ Sample-entry FourCCs resolve to these codec ids:
   disagrees with the §9.1 `isProtected`/`IV_size` rule, a v0 `pssh`
   with KIDs, a `senc` with mixed per-sample IV widths or subsample
   maps under a cleared `UseSubSampleEncryption` flag, …).
+  - PIFF legacy `uuid` encryption boxes (Protected Interoperable File
+    Format 1.1/1.3 — the pre-CENC predecessors of `senc` / `tenc` /
+    `pssh` emitted by Smooth Streaming / PlayReady-era packagers,
+    carried as §4.2 extended-type boxes keyed by vendor UUIDs). All
+    three usertypes are parsed and re-emitted: the `schi`-level
+    TrackEncryptionBox (`cenc::PiffTencBox` — u24 `AlgorithmID`
+    0 none / 1 AES-CTR / 2 AES-CBC, `IV_size`, `KID`; surfaced on
+    `params.options` as `piff_algorithm_id` / `piff_iv_size` /
+    `piff_kid` and per track via `Mp4Demuxer::piff_tencs`), the
+    moov- and moof-level ProtectionSystemSpecificHeaderBox
+    (byte-identical to a v0 `pssh` payload; `Mp4Demuxer::piff_psshes`
+    / `piff_moof_psshes`, metadata `piff_pssh_<n>` /
+    `piff_moof_pssh_<n>`), and the traf-level SampleEncryptionBox
+    (`cenc::PiffSencBox` — inline per-sample IVs + subsample map,
+    plus the PIFF-only `flags & 1` inline
+    `AlgorithmID / IV_size / KID` override triple that CENC later
+    replaced with `seig`; `Mp4Demuxer::piff_senc_records`, metadata
+    `piff_senc_<n>`). A traf whose only sample-encryption carrier is
+    the PIFF form is bridged into the standard `senc_records`
+    surface (the tables are byte-compatible), and
+    `PiffTencBox::to_tenc` / `scheme_decision` route legacy tracks
+    into the same `CencSchemeDecision` decryption path as modern
+    `cenc` / `cbc1` files; dual-branded files (both forms present)
+    keep the 4CC boxes authoritative with no double-reporting. Write
+    side: `cenc::build_piff_tenc_box` / `build_piff_senc_box` /
+    `build_piff_pssh_box` emit complete `uuid`-wrapped boxes,
+    byte-exact inverses of the parsers with the same round-trip
+    rejection discipline.
+- `emsg` DASH Event Message Box (ISO/IEC 23009-1 §5.10.3.3) — in-band
+  timed events (SCTE-35 splice, ad markers, application events)
+  carried at the top level of a media segment before the first `moof`
+  they apply to. Both versions are parsed and written — v0 (strings
+  first, 32-bit segment-relative `presentation_time_delta`) and v1
+  (integers first, 64-bit absolute `presentation_time`) — into the
+  typed `emsg::EmsgBox` (`scheme_id_uri`, `value`, `timescale`,
+  `EmsgTime` presentation, `event_duration` with the `0xFFFFFFFF`
+  unknown sentinel, `id`, `message_data`). The demuxer collects
+  instances in file order keyed by the index of the following `moof`
+  (`Mp4Demuxer::emsgs`, metadata `emsg_<n>`); the fragmented muxer
+  queues them per segment via
+  `FragmentedMuxer::set_next_segment_emsg`, writing them between the
+  `styp` and the `moof` and counting their bytes into the `sidx`
+  `referenced_size` / `ssix` metadata range. Standalone byte layer:
+  `emsg::parse_emsg_box` / `build_emsg_box`.
   - Typed scheme decision router (§4.2 + §10). The four `scheme_type`
     FourCCs defined in ISO/IEC 23001-7:2016 §10 — `cenc` (AES-CTR
     full / NAL-subsample), `cbc1` (AES-CBC full / NAL-subsample),

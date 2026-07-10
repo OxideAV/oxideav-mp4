@@ -18,8 +18,13 @@ use oxideav_core::{
 use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::boxes::*;
-use crate::cenc::{parse_pssh, parse_senc, parse_tenc, PsshBox, SencBox, TencBox};
+use crate::cenc::{
+    parse_piff_pssh, parse_piff_senc, parse_piff_tenc, parse_pssh, parse_senc, parse_tenc,
+    PiffSencBox, PiffTencBox, PsshBox, SencBox, TencBox, PIFF_PSSH_USERTYPE, PIFF_SENC_USERTYPE,
+    PIFF_TENC_USERTYPE,
+};
 use crate::codec_id::{from_sample_entry, from_sample_entry_with_oti};
+use crate::emsg::{parse_emsg_box, EmsgBox};
 
 pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     Ok(Box::new(open_typed(input, codecs)?))
@@ -68,6 +73,14 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // additional `meta` boxes (distinct handler types) plus `mere`
     // relations. Default-empty when no `meco` is present.
     let mut meco: MecoBox = MecoBox::default();
+    // ISO/IEC 23009-1 §5.10.3.3 — `emsg` DASH Event Message Boxes.
+    // Zero or more per media segment, each placed before the first
+    // `moof` of the segment it applies to. Collected in file order,
+    // keyed by the index of the following `moof` (== the number of
+    // moofs seen so far when the emsg is encountered) so a consumer
+    // can anchor a v0 `presentation_time_delta` to the right
+    // fragment's earliest presentation time.
+    let mut emsgs: Vec<EmsgRecord> = Vec::new();
     while let Some(hdr) = read_box_header(&mut *input)? {
         match hdr.fourcc {
             FTYP => {
@@ -154,6 +167,21 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
                 let body = read_box_body(&mut *input, &hdr)?;
                 parse_mfra(&body, &mut tfras)?;
             }
+            // ISO/IEC 23009-1 §5.10.3.3 — `emsg` DASH Event Message
+            // Box. Top-level, zero or more before the first `moof` of
+            // the segment each applies to. Purely informational for
+            // this demuxer (the events belong to an application
+            // layer), so — mirroring `ssix` / `leva` — a malformed
+            // instance is dropped rather than aborting the open.
+            EMSG => {
+                let body = read_box_body(&mut *input, &hdr)?;
+                if let Ok(e) = parse_emsg_box(&body) {
+                    emsgs.push(EmsgRecord {
+                        next_moof_index: moofs.len(),
+                        emsg: e,
+                    });
+                }
+            }
             // §8.16.5 — `prft` ProducerReferenceTimeBox. Top-level
             // FullBox correlating wall-clock NTP time with a media
             // time on one reference track. Multiple instances are
@@ -221,6 +249,8 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let mut sai_records: Vec<SaiRecord> = Vec::new();
     let mut moof_psshes: Vec<MoofPsshRecord> = Vec::new();
     let mut traf_sample_groups: Vec<TrafSampleGroupRecord> = Vec::new();
+    let mut piff_senc_records: Vec<PiffSencRecord> = Vec::new();
+    let mut piff_moof_psshes: Vec<MoofPsshRecord> = Vec::new();
     for moof in &moofs {
         parse_moof(
             moof,
@@ -231,6 +261,8 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             &mut sai_records,
             &mut moof_psshes,
             &mut traf_sample_groups,
+            &mut piff_senc_records,
+            &mut piff_moof_psshes,
         )?;
     }
 
@@ -573,6 +605,83 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         ));
     }
 
+    // PIFF legacy `uuid` boxes — flat-metadata summaries mirroring
+    // their CENC 4CC counterparts, with a `piff_` prefix so a consumer
+    // can tell the legacy carriage from the modern one:
+    //   - `piff_pssh_<n>`      moov-level uuid pssh (SystemID + sizes)
+    //   - `piff_moof_pssh_<n>` moof-level uuid pssh keyed by sequence
+    //   - `piff_senc_<n>`      per-traf uuid SampleEncryptionBox
+    //     summary; `override=1` marks a box whose `flags & 1` triple
+    //     replaces the track defaults for this fragment.
+    // Structured records via `Mp4Demuxer::piff_psshes` /
+    // `piff_moof_psshes` / `piff_senc_records`.
+    for (n, p) in parsed.piff_psshes.iter().enumerate() {
+        let sysid_hex: String = p.system_id.iter().map(|b| format!("{b:02x}")).collect();
+        metadata.push((
+            format!("piff_pssh_{n}"),
+            format!("{} {} {}", sysid_hex, p.kids.len(), p.data.len()),
+        ));
+    }
+    for (n, r) in piff_moof_psshes.iter().enumerate() {
+        let sysid_hex: String = r
+            .pssh
+            .system_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        metadata.push((
+            format!("piff_moof_pssh_{n}"),
+            format!(
+                "systemid={} seq={} kids={} data={}",
+                sysid_hex,
+                r.moof_sequence,
+                r.pssh.kids.len(),
+                r.pssh.data.len(),
+            ),
+        ));
+    }
+    for (n, r) in piff_senc_records.iter().enumerate() {
+        metadata.push((
+            format!("piff_senc_{n}"),
+            format!(
+                "track={} seq={} samples={} flags=0x{:08x} override={}",
+                r.track_idx,
+                r.moof_sequence,
+                r.senc.samples.len(),
+                r.senc.flags,
+                u8::from(r.senc.has_override()),
+            ),
+        ));
+    }
+
+    // ISO/IEC 23009-1 §5.10.3.3 — `emsg` DASH Event Message summaries,
+    // one `emsg_<n>` key per box in file order. Value:
+    // "scheme=<uri> value=<v> timescale=<ts> {delta|time}=<t>
+    // duration=<d> id=<i> bytes=<len> before_moof=<k>" — `delta` for a
+    // v0 (segment-relative) event, `time` for a v1 (absolute) one, and
+    // `before_moof` the index of the moof the box preceded. Structured
+    // records via `Mp4Demuxer::emsgs`.
+    for (n, r) in emsgs.iter().enumerate() {
+        let time_token = match r.emsg.presentation {
+            crate::emsg::EmsgTime::Delta(d) => format!("delta={d}"),
+            crate::emsg::EmsgTime::Absolute(t) => format!("time={t}"),
+        };
+        metadata.push((
+            format!("emsg_{n}"),
+            format!(
+                "scheme={} value={} timescale={} {} duration={} id={} bytes={} before_moof={}",
+                r.emsg.scheme_id_uri,
+                r.emsg.value,
+                r.emsg.timescale,
+                time_token,
+                r.emsg.event_duration,
+                r.emsg.id,
+                r.emsg.message_data.len(),
+                r.next_moof_index,
+            ),
+        ));
+    }
+
     // §8.9 — per-fragment sample-group summary, one `frag_sample_group_<n>`
     // key per `traf` that carried at least one `sgpd` / `sbgp` / `csgp`.
     // Format: "track=<t> seq=<s> sgpd=<n> sbgp=<m> csgp=<k>" so a caller
@@ -613,12 +722,37 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         senc_records,
         sai_records,
         traf_sample_groups,
+        piff_psshes: parsed.piff_psshes,
+        piff_moof_psshes,
+        piff_senc_records,
+        piff_tencs: parsed.tracks.iter().map(|t| t.piff_tenc.clone()).collect(),
+        emsgs,
         meta_items,
         meco,
         movie_timescale: parsed.movie_timescale,
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
     })
+}
+
+/// One ISO/IEC 23009-1 §5.10.3.3 `emsg` DASH Event Message Box
+/// captured during the top-level walk, in file order. The box carries
+/// one timed in-band event (SCTE-35 splice, ad marker, application
+/// event); it is placed before the first `moof` of the media segment
+/// it applies to, so the record keys it by the index of the moof that
+/// followed it.
+#[derive(Clone, Debug)]
+pub struct EmsgRecord {
+    /// Index (into the file's moof sequence, 0-based file order) of
+    /// the `moof` this box preceded — the segment the event applies
+    /// to. A v0 event's `presentation_time_delta` is relative to that
+    /// fragment's earliest presentation time. Equal to the total moof
+    /// count when a (non-conforming) producer placed the box after the
+    /// last `moof`; the record is still surfaced so a validator can
+    /// flag it.
+    pub next_moof_index: usize,
+    /// The parsed event message.
+    pub emsg: EmsgBox,
 }
 
 /// One `moof` box captured from the top-level walk. We hold onto the
@@ -1233,6 +1367,15 @@ struct ParsedMoov {
     /// fragment-level pssh can be added without changing the demuxer
     /// API.
     psshes: Vec<PsshBox>,
+    /// PIFF legacy `uuid` ProtectionSystemSpecificHeaderBox entries
+    /// collected at moov level — the pre-CENC predecessor of `pssh`,
+    /// carried as a `uuid` box with
+    /// [`crate::cenc::PIFF_PSSH_USERTYPE`]. Kept separate from
+    /// `psshes` so a dual-branded file (one that carries both the
+    /// `uuid` and the 4CC form for the same SystemID) doesn't
+    /// double-report; the record shape is the shared [`PsshBox`]
+    /// (the PIFF body is byte-identical to a v0 `pssh` payload).
+    piff_psshes: Vec<PsshBox>,
     /// §8.8.13 — `leva` LevelAssignmentBox. Optional FullBox inside
     /// `mvex` (quantity zero or one); maps tracks / sample groups /
     /// sub-tracks to "levels" inside subsequent movie fragments. `None`
@@ -1332,6 +1475,16 @@ struct Track {
     /// (Yes, for protected tracks)", so a missing tenc on an `enc*`
     /// entry is still parseable but the file is non-conforming).
     tenc: Option<TencBox>,
+    /// PIFF legacy `uuid` TrackEncryptionBox payload, when present —
+    /// the pre-CENC predecessor of `tenc`, carried inside `sinf/schi`
+    /// as a `uuid` box with [`crate::cenc::PIFF_TENC_USERTYPE`].
+    /// Kept alongside (not merged into) `tenc` so a dual-branded file
+    /// keeps both surfaces distinct; when only the PIFF form is
+    /// present, the fragment walker recovers the per-sample IV width
+    /// from `piff_tenc.iv_size` and [`PiffTencBox::to_tenc`] /
+    /// [`PiffTencBox::scheme_decision`] bridge into the CENC
+    /// decryption router.
+    piff_tenc: Option<PiffTencBox>,
     /// §8.3.3 — `tref` (TrackReferenceBox) entries. Each pair is
     /// `(reference_type, track_IDs)` where `reference_type` is the FourCC
     /// of an inner `TrackReferenceTypeBox` (e.g. `chap`, `subt`, `cdsc`,
@@ -2535,6 +2688,20 @@ fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
                 let body = read_bytes_vec(&mut cur, psz)?;
                 if let Ok(p) = parse_pssh(&body) {
                     out.psshes.push(p);
+                }
+            }
+            // PIFF legacy `uuid` boxes at moov level. The only
+            // encryption usertype placed here is the
+            // ProtectionSystemSpecificHeaderBox (the pre-CENC `pssh`);
+            // its body is byte-identical to a v0 `pssh` payload. Same
+            // recovery policy as the 4CC form: a malformed instance is
+            // dropped, not fatal. Unknown usertypes are skipped.
+            UUID => {
+                let body = read_bytes_vec(&mut cur, psz)?;
+                if body.len() >= 16 && body[..16] == PIFF_PSSH_USERTYPE {
+                    if let Ok(p) = parse_piff_pssh(&body[16..]) {
+                        out.piff_psshes.push(p);
+                    }
                 }
             }
             _ => {
@@ -4916,6 +5083,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         trex: TrexDefaults::default(),
         protection_scheme: None,
         tenc: None,
+        piff_tenc: None,
         tref: Vec::new(),
         trgr: Vec::new(),
         elng: None,
@@ -6764,6 +6932,7 @@ fn parse_stsd(body: &[u8], t: &mut Track) -> Result<()> {
         }
         t.protection_scheme = unwrap.scheme_type;
         t.tenc = unwrap.tenc;
+        t.piff_tenc = unwrap.piff_tenc;
         if t.stvi.is_none() {
             t.stvi = unwrap.stvi;
         }
@@ -6788,6 +6957,10 @@ struct SinfUnwrap {
     original_format: Option<[u8; 4]>,
     scheme_type: Option<[u8; 4]>,
     tenc: Option<TencBox>,
+    /// PIFF legacy `uuid` TrackEncryptionBox recovered from
+    /// `sinf/schi` (the pre-CENC `tenc` predecessor). Absent for
+    /// modern CENC files and for non-encryption schemes.
+    piff_tenc: Option<PiffTencBox>,
     /// `stvi` (StereoVideoBox, §8.15.4.2) recovered from `sinf/schi`
     /// when the SchemeType is `stvi` (stereoscopic video, §8.15.4.1).
     /// `None` for non-stereo schemes (the common case) or a malformed
@@ -6801,6 +6974,7 @@ impl SinfUnwrap {
             original_format: None,
             scheme_type: None,
             tenc: None,
+            piff_tenc: None,
             stvi: None,
         }
     }
@@ -6882,6 +7056,7 @@ fn parse_sinf_body(body: &[u8]) -> Result<SinfUnwrap> {
                 // swallowed independently and left `None` on error.
                 let children = walk_schi(&inner);
                 out.tenc = children.tenc;
+                out.piff_tenc = children.piff_tenc;
                 out.stvi = children.stvi;
             }
             _ => {}
@@ -6898,6 +7073,10 @@ fn parse_sinf_body(body: &[u8]) -> Result<SinfUnwrap> {
 struct SchiChildren {
     /// `tenc` (TrackEncryptionBox, ISO/IEC 23001-7 §8.2) — CENC scheme.
     tenc: Option<TencBox>,
+    /// PIFF legacy `uuid` TrackEncryptionBox — the pre-CENC `tenc`
+    /// predecessor, dispatched on
+    /// [`crate::cenc::PIFF_TENC_USERTYPE`].
+    piff_tenc: Option<PiffTencBox>,
     /// `stvi` (StereoVideoBox, §8.15.4.2) — `stvi` stereoscopic scheme.
     stvi: Option<StviRecord>,
 }
@@ -6925,6 +7104,16 @@ fn walk_schi(body: &[u8]) -> SchiChildren {
         };
         match hdr.fourcc {
             TENC if out.tenc.is_none() => out.tenc = parse_tenc(&inner).ok(),
+            // PIFF legacy `uuid` TrackEncryptionBox — the 16-byte
+            // usertype leads the body; only the PIFF tenc usertype is
+            // meaningful inside a `schi`. Same drop-on-malformed
+            // policy as the 4CC `tenc`.
+            UUID if out.piff_tenc.is_none()
+                && inner.len() >= 16
+                && inner[..16] == PIFF_TENC_USERTYPE =>
+            {
+                out.piff_tenc = parse_piff_tenc(&inner[16..]).ok();
+            }
             STVI if out.stvi.is_none() => out.stvi = parse_stvi(&inner),
             _ => {}
         }
@@ -8794,6 +8983,33 @@ pub struct SencRecord {
     pub senc: SencBox,
 }
 
+/// One per-fragment PIFF legacy `uuid` SampleEncryptionBox record —
+/// the pre-CENC predecessor of `senc`, carried in `traf` as a `uuid`
+/// box with [`crate::cenc::PIFF_SENC_USERTYPE`]. Keyed like
+/// [`SencRecord`] by `(track_idx, moof_sequence)`.
+///
+/// When a `traf` carries **only** the PIFF form, the demuxer also
+/// bridges it into the standard [`Mp4Demuxer::senc_records`] surface
+/// (via [`PiffSencBox::to_senc`] — the per-sample table is
+/// byte-compatible) so an existing CENC decryption layer consumes
+/// legacy PIFF fragments unchanged; the typed record here additionally
+/// preserves the PIFF-only `flags & 1` override triple
+/// ([`PiffSencBox::override_params`]) that replaces the track defaults
+/// for this fragment. A `traf` carrying both forms (a dual-branded
+/// packager) surfaces the 4CC box in `senc_records` and the `uuid` box
+/// here only — no duplicate.
+#[derive(Clone, Debug)]
+pub struct PiffSencRecord {
+    /// `track_idx` of the matching stream in the demuxer's
+    /// `streams()` list (0-based).
+    pub track_idx: u32,
+    /// `mfhd.sequence_number` of the containing `moof`.
+    pub moof_sequence: u32,
+    /// Parsed PIFF SampleEncryptionBox (per-sample IVs, optional
+    /// subsample map, optional override triple).
+    pub senc: PiffSencBox,
+}
+
 /// One per-fragment ISO/IEC 14496-12 §8.7.8 / §8.7.9 record. Each
 /// `traf` may carry zero or more `(saiz, saio)` pairs (keyed by
 /// `(aux_info_type, aux_info_type_parameter)`); the demuxer collects
@@ -8957,6 +9173,8 @@ fn parse_moof(
     sai_records: &mut Vec<SaiRecord>,
     moof_psshes: &mut Vec<MoofPsshRecord>,
     traf_sample_groups: &mut Vec<TrafSampleGroupRecord>,
+    piff_senc_records: &mut Vec<PiffSencRecord>,
+    piff_moof_psshes: &mut Vec<MoofPsshRecord>,
 ) -> Result<()> {
     let mut cur = std::io::Cursor::new(&moof.body);
     let end = moof.body.len() as u64;
@@ -8965,8 +9183,10 @@ fn parse_moof(
     // we walk so a pssh that precedes `mfhd` (rare but spec-legal —
     // §8.8 doesn't fix the relative order between `mfhd` and `pssh`)
     // still binds to the correct sequence_number once we've seen
-    // mfhd. Finalised below.
+    // mfhd. Finalised below. The PIFF `uuid` form of the same box gets
+    // the identical deferred treatment.
     let mut pending_pssh_bodies: Vec<Vec<u8>> = Vec::new();
+    let mut pending_piff_pssh_bodies: Vec<Vec<u8>> = Vec::new();
     while cur.position() < end {
         let hdr = match read_box_header(&mut cur)? {
             Some(h) => h,
@@ -8996,6 +9216,7 @@ fn parse_moof(
                     senc_records,
                     sai_records,
                     traf_sample_groups,
+                    piff_senc_records,
                 )?;
             }
             PSSH => {
@@ -9009,12 +9230,31 @@ fn parse_moof(
                 let body = read_bytes_vec(&mut cur, psz)?;
                 pending_pssh_bodies.push(body);
             }
+            // PIFF legacy `uuid` boxes at moof level: the pre-CENC
+            // ProtectionSystemSpecificHeaderBox (PIFF places it in
+            // `moov` and/or `moof`). Deferred like the 4CC `pssh` so
+            // a box preceding `mfhd` still binds to the right
+            // sequence number. Unknown usertypes are skipped.
+            UUID => {
+                let body = read_bytes_vec(&mut cur, psz)?;
+                if body.len() >= 16 && body[..16] == PIFF_PSSH_USERTYPE {
+                    pending_piff_pssh_bodies.push(body);
+                }
+            }
             _ => skip_cursor_bytes(&mut cur, psz),
         }
     }
     for body in pending_pssh_bodies {
         if let Ok(pssh) = parse_pssh(&body) {
             moof_psshes.push(MoofPsshRecord {
+                moof_sequence,
+                pssh,
+            });
+        }
+    }
+    for body in pending_piff_pssh_bodies {
+        if let Ok(pssh) = parse_piff_pssh(&body[16..]) {
+            piff_moof_psshes.push(MoofPsshRecord {
                 moof_sequence,
                 pssh,
             });
@@ -9211,6 +9451,7 @@ fn parse_traf(
     senc_records: &mut Vec<SencRecord>,
     sai_records: &mut Vec<SaiRecord>,
     traf_sample_groups: &mut Vec<TrafSampleGroupRecord>,
+    piff_senc_records: &mut Vec<PiffSencRecord>,
 ) -> Result<()> {
     // First pass: read tfhd + tfdt before the trun(s) so each trun
     // has the full default context. Also pick up senc (ISO/IEC 23001-7
@@ -9220,6 +9461,12 @@ fn parse_traf(
     let mut state = TrafState::default();
     let mut tfhd_seen = false;
     let mut senc_body: Option<Vec<u8>> = None;
+    // PIFF legacy `uuid` SampleEncryptionBox body (usertype already
+    // stripped) — deferred for the same reason as `senc`: when the
+    // box has no `flags & 1` override triple, its IV width comes from
+    // the track's (PIFF or CENC) tenc default, and the track is only
+    // known after `tfhd`.
+    let mut piff_senc_body: Option<Vec<u8>> = None;
     let mut frag_saiz: Vec<TrafSaiz> = Vec::new();
     let mut frag_saio: Vec<TrafSaio> = Vec::new();
     // §8.9 — fragment-local sample-group boxes. A `traf` may carry its
@@ -9253,6 +9500,17 @@ fn parse_traf(
             // can interpret the per-sample IV width.
             SENC => {
                 senc_body = Some(read_bytes_vec(&mut cur, psz)?);
+            }
+            // PIFF legacy `uuid` boxes inside `traf`: the pre-CENC
+            // SampleEncryptionBox is the only encryption usertype
+            // placed here. Keep the body (sans usertype) for the
+            // post-tfhd parse; unknown usertypes (e.g. the Smooth
+            // Streaming tfxd/tfrf fragment-timing boxes) are skipped.
+            UUID => {
+                let b = read_bytes_vec(&mut cur, psz)?;
+                if b.len() >= 16 && b[..16] == PIFF_SENC_USERTYPE {
+                    piff_senc_body = Some(b[16..].to_vec());
+                }
             }
             // §8.7.8 / §8.7.9 — `saiz` / `saio` inside `traf`.
             // Promote the parsed `SaizBox` / `SaioBox` to the public
@@ -9322,6 +9580,7 @@ fn parse_traf(
     // all) drop the senc on the floor — a malformed file may carry
     // it without the matching scheme box, but there's nothing the
     // demuxer can do with it without an IV-size key.
+    let mut standard_senc_recorded = false;
     if let Some(body) = senc_body {
         if let Some(tenc) = &track.tenc {
             if let Ok(senc) = parse_senc(&body, tenc.default_per_sample_iv_size) {
@@ -9330,7 +9589,44 @@ fn parse_traf(
                     moof_sequence,
                     senc,
                 });
+                standard_senc_recorded = true;
             }
+        }
+    }
+
+    // PIFF legacy `uuid` SampleEncryptionBox. The IV width resolves
+    // from the box's own `flags & 1` override triple when present;
+    // otherwise from the track's PIFF tenc default (or the CENC tenc
+    // of a dual-branded file). A box with neither source is
+    // unparseable (same drop policy as an IV-size-less `senc`) —
+    // `parse_piff_senc` is handed width 0 and the entry table then
+    // either fails or the box legitimately carries subsample-only
+    // entries. On success the typed record is always surfaced; it is
+    // additionally bridged into the standard `senc_records` surface
+    // (per-sample tables are byte-compatible) when this `traf` carried
+    // no parseable 4CC `senc`, so a CENC decryption layer consumes
+    // PIFF-only fragments unchanged without double-reporting
+    // dual-branded ones.
+    if let Some(body) = piff_senc_body {
+        let default_iv_size = track
+            .piff_tenc
+            .as_ref()
+            .map(|p| p.iv_size)
+            .or_else(|| track.tenc.as_ref().map(|t| t.default_per_sample_iv_size))
+            .unwrap_or(0);
+        if let Ok(piff) = parse_piff_senc(&body, default_iv_size) {
+            if !standard_senc_recorded {
+                senc_records.push(SencRecord {
+                    track_idx: state.track_idx as u32,
+                    moof_sequence,
+                    senc: piff.to_senc(),
+                });
+            }
+            piff_senc_records.push(PiffSencRecord {
+                track_idx: state.track_idx as u32,
+                moof_sequence,
+                senc: piff,
+            });
         }
     }
 
@@ -10761,6 +11057,29 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         }
     }
 
+    // PIFF legacy `uuid` TrackEncryptionBox (the pre-CENC `tenc`
+    // predecessor, carried in `sinf/schi`): surface its track defaults
+    // under dedicated `piff_*` keys so a consumer can tell the legacy
+    // carriage from a real CENC `tenc` (whose `cenc_*` keys above stay
+    // reserved for the 4CC box). Keys:
+    //
+    //   piff_algorithm_id   decimal (0 = none, 1 = AES-CTR, 2 = AES-CBC)
+    //   piff_iv_size        0 / 8 / 16
+    //   piff_kid            16-byte KID, lowercase hex
+    //
+    // The typed record (and its CENC bridges) is reachable via
+    // `Mp4Demuxer::piff_tencs`.
+    if let Some(piff) = &t.piff_tenc {
+        let kid_hex: String = piff.kid.iter().map(|b| format!("{b:02x}")).collect();
+        params
+            .options
+            .insert("piff_algorithm_id", piff.algorithm_id.to_string());
+        params
+            .options
+            .insert("piff_iv_size", piff.iv_size.to_string());
+        params.options.insert("piff_kid", kid_hex);
+    }
+
     // ISO/IEC 14496-12 §8.4.6: when the track carries an `elng`
     // ExtendedLanguageBox, surface its BCP 47 (RFC 4646) tag on
     // `params.options["language"]` (e.g. `en-US`, `zh-Hant`). This is
@@ -12053,6 +12372,37 @@ pub struct Mp4Demuxer {
     /// `trak`/`stbl` level (the common case).
     #[allow(dead_code)]
     traf_sample_groups: Vec<TrafSampleGroupRecord>,
+    /// PIFF legacy `uuid` ProtectionSystemSpecificHeaderBox entries
+    /// collected at moov level — the pre-CENC `pssh` predecessor.
+    /// Kept separate from `psshes` so dual-branded files don't
+    /// double-report; empty for modern (or unprotected) files.
+    #[allow(dead_code)]
+    piff_psshes: Vec<PsshBox>,
+    /// PIFF legacy `uuid` ProtectionSystemSpecificHeaderBox entries
+    /// collected from inside individual `moof` boxes, keyed by the
+    /// enclosing `mfhd.sequence_number` like `moof_psshes`.
+    #[allow(dead_code)]
+    piff_moof_psshes: Vec<MoofPsshRecord>,
+    /// PIFF legacy `uuid` SampleEncryptionBox records, one per `traf`
+    /// that carried the pre-CENC `senc` predecessor. PIFF-only trafs
+    /// are additionally bridged into `senc_records` (see
+    /// [`PiffSencRecord`]); this vector preserves the PIFF-specific
+    /// `flags & 1` override triples.
+    #[allow(dead_code)]
+    piff_senc_records: Vec<PiffSencRecord>,
+    /// Per-track PIFF legacy `uuid` TrackEncryptionBox defaults
+    /// (parallel to `streams()`, `None` per unprotected / modern-CENC
+    /// track). The typed record bridges into the CENC decryption
+    /// router via [`PiffTencBox::scheme_decision`].
+    #[allow(dead_code)]
+    piff_tencs: Vec<Option<PiffTencBox>>,
+    /// ISO/IEC 23009-1 §5.10.3.3 — `emsg` DASH Event Message Boxes
+    /// captured during the top-level walk, in file order, each keyed
+    /// by the index of the `moof` it preceded. Informational — the
+    /// demuxer does not consume the events; also surfaced as
+    /// `emsg_<n>` flat-metadata summaries.
+    #[allow(dead_code)]
+    emsgs: Vec<EmsgRecord>,
     /// ISO/IEC 14496-12 §8.11 — the file-level `meta` box item
     /// infrastructure (HEIF / MIAF item catalogue), if the file carries
     /// one. Holds the primary item, item-location directory, item-info
@@ -12231,6 +12581,73 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn traf_sample_groups(&self) -> &[TrafSampleGroupRecord] {
         &self.traf_sample_groups
+    }
+
+    /// PIFF legacy `uuid` ProtectionSystemSpecificHeaderBox entries
+    /// discovered at moov level, in file order — the pre-CENC
+    /// predecessor of `pssh`, carried as a `uuid` box with
+    /// [`crate::cenc::PIFF_PSSH_USERTYPE`] by Smooth Streaming /
+    /// PlayReady-era packagers. The body is byte-identical to a v0
+    /// `pssh` payload, so the record shape is the shared [`PsshBox`];
+    /// the pool is kept separate from [`Mp4Demuxer::psshes`] so a
+    /// dual-branded file (carrying both forms for the same SystemID)
+    /// doesn't double-report. Empty for modern or unprotected files.
+    #[allow(dead_code)]
+    pub fn piff_psshes(&self) -> &[PsshBox] {
+        &self.piff_psshes
+    }
+
+    /// PIFF legacy `uuid` ProtectionSystemSpecificHeaderBox entries
+    /// collected from inside individual `moof` boxes (PIFF permits the
+    /// box in `moov` and/or `moof`), keyed by the enclosing
+    /// `mfhd.sequence_number` — the legacy counterpart of
+    /// [`Mp4Demuxer::moof_psshes`].
+    #[allow(dead_code)]
+    pub fn piff_moof_psshes(&self) -> &[MoofPsshRecord] {
+        &self.piff_moof_psshes
+    }
+
+    /// PIFF legacy `uuid` SampleEncryptionBox records, one per `traf`
+    /// that carried the pre-CENC `senc` predecessor
+    /// ([`crate::cenc::PIFF_SENC_USERTYPE`]), in moof-encounter order.
+    /// Each preserves the PIFF-only `flags & 1` override triple
+    /// alongside the per-sample IV / subsample table. A `traf` whose
+    /// only sample-encryption carrier was the PIFF form is *also*
+    /// bridged into [`Mp4Demuxer::senc_records`] (the tables are
+    /// byte-compatible) so an existing CENC decryption layer consumes
+    /// legacy fragments unchanged — see [`PiffSencRecord`] for the
+    /// dual-branding rules.
+    #[allow(dead_code)]
+    pub fn piff_senc_records(&self) -> &[PiffSencRecord] {
+        &self.piff_senc_records
+    }
+
+    /// Per-track PIFF legacy `uuid` TrackEncryptionBox defaults,
+    /// parallel to [`Demuxer::streams`] (`None` for tracks without the
+    /// box). The pre-CENC predecessor of `tenc`, carried in
+    /// `sinf/schi` with [`crate::cenc::PIFF_TENC_USERTYPE`]; a
+    /// decrypting layer bridges it into the CENC router via
+    /// [`PiffTencBox::scheme_decision`] / [`PiffTencBox::to_tenc`].
+    /// The same defaults are surfaced as `piff_algorithm_id` /
+    /// `piff_iv_size` / `piff_kid` stream options.
+    #[allow(dead_code)]
+    pub fn piff_tencs(&self) -> &[Option<PiffTencBox>] {
+        &self.piff_tencs
+    }
+
+    /// ISO/IEC 23009-1 §5.10.3.3 — `emsg` DASH Event Message Boxes
+    /// captured during the top-level walk, in file order. Each record
+    /// carries the parsed event (scheme URI + value, timing triple,
+    /// id, opaque `message_data`) plus the index of the `moof` the box
+    /// preceded — the segment the event applies to (a v0
+    /// `presentation_time_delta` is relative to that fragment's
+    /// earliest presentation time). Empty for files without in-band
+    /// events (which is most of the corpus). The flat metadata channel
+    /// carries `emsg_<n>` summaries; this accessor returns the
+    /// structured records.
+    #[allow(dead_code)]
+    pub fn emsgs(&self) -> &[EmsgRecord] {
+        &self.emsgs
     }
 
     /// ISO/IEC 14496-12 §8.11 — the file-level `meta` box item
@@ -13290,6 +13707,7 @@ mod tests {
             trex: super::TrexDefaults::default(),
             protection_scheme: None,
             tenc: None,
+            piff_tenc: None,
             tref: Vec::new(),
             trgr: Vec::new(),
             elng: None,
@@ -20686,6 +21104,8 @@ mod tests {
             &mut sai,
             &mut moof_psshes,
             &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
         )
         .expect("moof walk succeeds");
 
@@ -20736,6 +21156,8 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut moof_psshes,
+            &mut Vec::new(),
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .expect("moof walk succeeds");
@@ -20795,6 +21217,8 @@ mod tests {
             &mut sai,
             &mut moof_psshes,
             &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
         )
         .expect("moof walk succeeds");
 
@@ -20830,6 +21254,8 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut moof_psshes,
+            &mut Vec::new(),
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .expect("walk succeeds despite bad pssh");
@@ -20896,6 +21322,7 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut groups,
+            &mut Vec::new(),
         )
         .expect("traf walk succeeds");
 
@@ -20950,6 +21377,7 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut groups,
+            &mut Vec::new(),
         )
         .expect("traf walk succeeds");
 

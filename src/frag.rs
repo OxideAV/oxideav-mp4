@@ -262,6 +262,7 @@ pub fn open_fragmented_typed(
         styp_override: None,
         pending_prft: None,
         pending_moof_pssh: Vec::new(),
+        pending_emsg: Vec::new(),
     })
 }
 
@@ -299,6 +300,13 @@ pub struct FragmentedMuxer {
     /// rotation where a new licence blob applies only to the samples
     /// in the associated fragment.
     pending_moof_pssh: Vec<crate::cenc::PsshBox>,
+    /// `emsg` (DASH Event Message Boxes, ISO/IEC 23009-1 §5.10.3.3) to
+    /// write ahead of the next fragment's `moof` — the spec places
+    /// in-band events at the top level of a media segment, before the
+    /// first `moof` of the segment they apply to. Consumed (cleared)
+    /// on the next `flush_fragment`. Set via
+    /// [`Self::set_next_segment_emsg`].
+    pending_emsg: Vec<crate::emsg::EmsgBox>,
 }
 
 impl Muxer for FragmentedMuxer {
@@ -789,6 +797,39 @@ impl FragmentedMuxer {
         self.pending_moof_pssh.extend(pssh);
     }
 
+    /// Queue one or more `emsg` (DASH Event Message Boxes, ISO/IEC
+    /// 23009-1 §5.10.3.3) to be written ahead of the *next* fragment's
+    /// `moof`.
+    ///
+    /// The spec carries in-band events (SCTE-35 splice sections, ad
+    /// markers, application events) at the top level of a media
+    /// segment, before the first `moof` of the segment they apply to;
+    /// this method records the request and the next `flush_fragment`
+    /// emits the boxes in queue order between the segment's `styp`
+    /// (when one is configured) and the `moof` (before any queued
+    /// `prft`, which §8.16.5 wants immediately ahead of its moof).
+    /// When the writer is emitting `sidx` indexes, the emsg bytes are
+    /// counted into the subsegment's `referenced_size` (and the `ssix`
+    /// metadata range) so byte-range fetches driven by the index cover
+    /// them.
+    ///
+    /// The queue is consumed (cleared) once that fragment is flushed;
+    /// calling again before the next flush appends. Note the version
+    /// choice is the caller's, made through the [`crate::emsg::EmsgTime`]
+    /// variant on each box: a v0 `Delta` is relative to the earliest
+    /// presentation time of the fragment this queue targets, so it
+    /// must be computed against the samples that will land in that
+    /// fragment; a v1 `Absolute` time is cadence-independent (prefer
+    /// it when the flush boundary isn't under the caller's control). A
+    /// record that would not round-trip (an interior NUL in a string)
+    /// surfaces its error at the flush that writes it, not here.
+    pub fn set_next_segment_emsg(
+        &mut self,
+        events: impl IntoIterator<Item = crate::emsg::EmsgBox>,
+    ) {
+        self.pending_emsg.extend(events);
+    }
+
     /// Return true when the cadence policy says it's time to emit a
     /// fragment after the current packet.
     ///
@@ -916,6 +957,18 @@ impl FragmentedMuxer {
         let moof = build_moof(seq, &self.tracks, &moof_pssh)?;
         let moof_size = moof.len() as u64;
 
+        // Serialise any queued `emsg` boxes (ISO/IEC 23009-1
+        // §5.10.3.3) up front — their bytes land inside this segment
+        // (between styp and moof), so the sidx / ssix sizing below
+        // must account for them. A record that fails the round-trip
+        // rules surfaces its error here, before anything is written.
+        let pending_emsg = std::mem::take(&mut self.pending_emsg);
+        let emsg_boxes: Vec<Vec<u8>> = pending_emsg
+            .iter()
+            .map(crate::emsg::build_emsg_box)
+            .collect::<Result<_>>()?;
+        let emsg_size: u64 = emsg_boxes.iter().map(|b| b.len() as u64).sum();
+
         // Build mdat: concatenate per-track sample bytes in the same
         // order trun walks them (track-by-track).
         let mut mdat_payload: Vec<u8> = Vec::new();
@@ -943,16 +996,17 @@ impl FragmentedMuxer {
                     .map(|b| build_styp(b).len() as u64)
                     .unwrap_or(0)
             };
-            // A queued `prft` is written inside this subsegment (between
-            // styp and moof), so its size counts toward the sidx
-            // referenced_size — otherwise a byte-range fetch driven by the
-            // sidx would fall short of the moof.
+            // A queued `prft` (and any queued `emsg` boxes) is written
+            // inside this subsegment (between styp and moof), so its
+            // size counts toward the sidx referenced_size — otherwise
+            // a byte-range fetch driven by the sidx would fall short
+            // of the moof.
             let prft_size: u64 = self
                 .pending_prft
                 .as_ref()
                 .map(|p| build_prft(p).len() as u64)
                 .unwrap_or(0);
-            let subsegment_size = styp_size + prft_size + moof_size + mdat_size;
+            let subsegment_size = styp_size + emsg_size + prft_size + moof_size + mdat_size;
             // EPT for this fragment on the anchor (first contributing) track
             // is the bmdt the track entered the fragment with.
             let anchor_idx = self
@@ -992,14 +1046,14 @@ impl FragmentedMuxer {
             // (§8.16.4.1) and carry `subsegment_count == reference_count`
             // (1 here). The single subsegment is partitioned into two
             // contiguous level ranges that together cover every byte:
-            //   range 1 = styp? + prft? + moof  (metadata level),
-            //   range 2 = mdat                  (media level).
+            //   range 1 = styp? + emsg* + prft? + moof  (metadata level),
+            //   range 2 = mdat                          (media level).
             // `range_size` is a 24-bit field; an mdat (or metadata run)
             // larger than 16 MiB is rejected by `build_ssix_box` rather
             // than silently truncated.
             if self.frag_options.emit_ssix {
                 let (meta_level, media_level) = self.frag_options.ssix_levels;
-                let meta_size = styp_size + prft_size + moof_size;
+                let meta_size = styp_size + emsg_size + prft_size + moof_size;
                 // Guard the u64 → u32 narrowing before build_ssix_box's
                 // 24-bit check, so a >4 GiB range surfaces an error rather
                 // than wrapping. (Fragment subsegments are far smaller in
@@ -1035,6 +1089,15 @@ impl FragmentedMuxer {
         } else if let Some(brand) = &self.frag_options.styp {
             let styp = build_styp(brand);
             self.output.write_all(&styp)?;
+        }
+
+        // Queued `emsg` boxes (ISO/IEC 23009-1 §5.10.3.3): in-band
+        // events belong at the top level of the media segment, before
+        // the first `moof` of the segment they apply to — written here
+        // after the segment marker (`styp`) and ahead of the `prft`
+        // (which §8.16.5 wants immediately before its moof).
+        for b in &emsg_boxes {
+            self.output.write_all(b)?;
         }
 
         // Optional `prft` (ProducerReferenceTimeBox §8.16.5). Per spec it
