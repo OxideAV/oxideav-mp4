@@ -763,10 +763,33 @@ pub fn parse_senc(body: &[u8], per_sample_iv_size: u8) -> Result<SencBox> {
     }
     let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
     let use_subsamples = (flags & 0x0000_0002) != 0;
-    let sample_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let samples = parse_senc_sample_table(body, 4, use_subsamples, per_sample_iv_size as usize)?;
+    Ok(SencBox { flags, samples })
+}
 
-    let iv_size = per_sample_iv_size as usize;
-    let mut cursor = 8usize;
+/// Parse the `sample_count` + per-sample entry table shared by the
+/// §7.2 `senc` body and the byte-compatible PIFF `uuid`
+/// SampleEncryptionBox body (see [`parse_piff_senc`]). `cursor` points
+/// at the 32-bit `sample_count`; each entry is an
+/// `InitializationVector` of `iv_size` bytes followed (when
+/// `use_subsamples`) by a `u16` count of `(u16 clear, u32 protected)`
+/// runs.
+fn parse_senc_sample_table(
+    body: &[u8],
+    cursor: usize,
+    use_subsamples: bool,
+    iv_size: usize,
+) -> Result<Vec<SencSample>> {
+    if body.len() < cursor + 4 {
+        return Err(Error::invalid("MP4 senc: short payload"));
+    }
+    let sample_count = u32::from_be_bytes([
+        body[cursor],
+        body[cursor + 1],
+        body[cursor + 2],
+        body[cursor + 3],
+    ]) as usize;
+    let mut cursor = cursor + 4;
     let mut samples: Vec<SencSample> = Vec::with_capacity(sample_count.min(body.len() / 8));
     for _ in 0..sample_count {
         if body.len() < cursor + iv_size {
@@ -810,7 +833,7 @@ pub fn parse_senc(body: &[u8], per_sample_iv_size: u8) -> Result<SencBox> {
         });
     }
 
-    Ok(SencBox { flags, samples })
+    Ok(samples)
 }
 
 // ---- Write side (§7.2 / §8.1 / §8.2 emission) --------------------------
@@ -946,8 +969,6 @@ pub fn build_senc_box(senc: &SencBox) -> Result<Vec<u8>> {
             "MP4 senc build: flags exceed the 24-bit field",
         ));
     }
-    let sample_count = u32::try_from(senc.samples.len())
-        .map_err(|_| Error::invalid("MP4 senc build: sample_count exceeds u32"))?;
     let iv_size = senc
         .samples
         .first()
@@ -962,8 +983,26 @@ pub fn build_senc_box(senc: &SencBox) -> Result<Vec<u8>> {
     let mut body = Vec::with_capacity(8 + senc.samples.len() * (iv_size + 8));
     body.push(0); // version 0
     body.extend_from_slice(&senc.flags.to_be_bytes()[1..4]);
+    build_senc_sample_table(&mut body, &senc.samples, iv_size, use_subsamples)?;
+    Ok(wrap_full_box(b"senc", &body))
+}
+
+/// Serialise the `sample_count` + per-sample entry table shared by the
+/// §7.2 `senc` body and the byte-compatible PIFF `uuid`
+/// SampleEncryptionBox body (see [`build_piff_senc_box`]), appending
+/// onto `body`. Enforces the round-trip rules common to both carriers:
+/// one shared IV width, subsample maps present iff `use_subsamples`,
+/// and 16-bit subsample counts.
+fn build_senc_sample_table(
+    body: &mut Vec<u8>,
+    samples: &[SencSample],
+    iv_size: usize,
+    use_subsamples: bool,
+) -> Result<()> {
+    let sample_count = u32::try_from(samples.len())
+        .map_err(|_| Error::invalid("MP4 senc build: sample_count exceeds u32"))?;
     body.extend_from_slice(&sample_count.to_be_bytes());
-    for (i, sample) in senc.samples.iter().enumerate() {
+    for (i, sample) in samples.iter().enumerate() {
         if sample.initialization_vector.len() != iv_size {
             return Err(Error::invalid(format!(
                 "MP4 senc build: sample {i} IV length {} differs from the shared width {iv_size}",
@@ -988,7 +1027,7 @@ pub fn build_senc_box(senc: &SencBox) -> Result<Vec<u8>> {
             )));
         }
     }
-    Ok(wrap_full_box(b"senc", &body))
+    Ok(())
 }
 
 /// Serialise a [`SeigEntry`] into a raw
@@ -1094,6 +1133,448 @@ pub fn build_sinf_box(
     sinf_body.extend_from_slice(&schm);
     sinf_body.extend_from_slice(&schi);
     Ok(wrap_full_box(b"sinf", &sinf_body))
+}
+
+// ---- PIFF legacy `uuid` encryption boxes -------------------------------
+//
+// Before ISO/IEC 23001-7 standardised `senc` / `tenc` / `pssh`, the
+// Microsoft PIFF (Protected Interoperable File Format) 1.1 / 1.3
+// extension carried the same three structures as `uuid` extended-type
+// boxes (ISO/IEC 14496-12 §4.2) keyed by vendor UUIDs. The bodies are
+// byte-compatible with the early CENC layout — the PIFF
+// SampleEncryptionBox additionally allows an inline
+// `AlgorithmID / IV_size / KID` override triple (gated by `flags & 1`)
+// that CENC later moved into the `seig` sample-group mechanism — so
+// this crate parses them into the same record shapes and provides
+// typed bridges ([`PiffTencBox::to_tenc`], [`PiffSencBox::to_senc`],
+// [`PiffTencBox::scheme_decision`]) into the CENC decryption surface.
+// Modern files use the 4CC boxes; the `uuid` forms are legacy interop
+// (Smooth Streaming / PlayReady packagers).
+
+/// PIFF SampleEncryptionBox `usertype` UUID
+/// (`A2394F52-5A9B-4F14-A244-6C427C648DF4`, raw RFC 4122 big-endian
+/// bytes). The `uuid`-boxed predecessor of the CENC `senc` box;
+/// carried in `traf`.
+pub const PIFF_SENC_USERTYPE: [u8; 16] = [
+    0xA2, 0x39, 0x4F, 0x52, 0x5A, 0x9B, 0x4F, 0x14, 0xA2, 0x44, 0x6C, 0x42, 0x7C, 0x64, 0x8D, 0xF4,
+];
+
+/// PIFF TrackEncryptionBox `usertype` UUID
+/// (`8974DBCE-7BE7-4C51-84F9-7148F9882554`). The `uuid`-boxed
+/// predecessor of the CENC `tenc` box; carried in `sinf/schi`.
+pub const PIFF_TENC_USERTYPE: [u8; 16] = [
+    0x89, 0x74, 0xDB, 0xCE, 0x7B, 0xE7, 0x4C, 0x51, 0x84, 0xF9, 0x71, 0x48, 0xF9, 0x88, 0x25, 0x54,
+];
+
+/// PIFF ProtectionSystemSpecificHeaderBox `usertype` UUID
+/// (`D08A4F18-10F3-4A82-B6C8-32D8ABA183D3`). The `uuid`-boxed
+/// predecessor of the CENC `pssh` box; carried in `moov` and/or
+/// `moof`. Its body is byte-identical to a `pssh` **version 0**
+/// payload.
+pub const PIFF_PSSH_USERTYPE: [u8; 16] = [
+    0xD0, 0x8A, 0x4F, 0x18, 0x10, 0xF3, 0x4A, 0x82, 0xB6, 0xC8, 0x32, 0xD8, 0xAB, 0xA1, 0x83, 0xD3,
+];
+
+/// PIFF `AlgorithmID` value: not encrypted (`IV_size` should be 0).
+pub const PIFF_ALGORITHM_NONE: u32 = 0x0;
+/// PIFF `AlgorithmID` value: AES-128 CTR — the mode CENC standardised
+/// as the `cenc` scheme.
+pub const PIFF_ALGORITHM_AES_CTR: u32 = 0x1;
+/// PIFF `AlgorithmID` value: AES-128 CBC — the mode CENC standardised
+/// as the `cbc1` scheme.
+pub const PIFF_ALGORITHM_AES_CBC: u32 = 0x2;
+
+/// PIFF `uuid` TrackEncryptionBox payload — the track-wide default
+/// encryption parameters, carried in `sinf/schi` as a
+/// `FullBox('uuid', version=0, flags=0)` with
+/// [`PIFF_TENC_USERTYPE`]. Fixed 20-byte body:
+/// `u24 default_AlgorithmID`, `u8 default_IV_size`,
+/// `u8[16] default_KID`. Per-fragment PIFF SampleEncryptionBoxes with
+/// `flags & 1` set override all three for the samples they describe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PiffTencBox {
+    /// `default_AlgorithmID` — 24 bits on the wire, widened to `u32`.
+    /// Known values: [`PIFF_ALGORITHM_NONE`] / [`PIFF_ALGORITHM_AES_CTR`]
+    /// / [`PIFF_ALGORITHM_AES_CBC`]; other values are preserved
+    /// verbatim (the typed accessors return `None` for them).
+    pub algorithm_id: u32,
+    /// `default_IV_size` — per-sample IV byte length: 8 or 16
+    /// (0 = track unencrypted by default).
+    pub iv_size: u8,
+    /// `default_KID` — the 16-byte key identifier for the track.
+    pub kid: [u8; 16],
+}
+
+impl PiffTencBox {
+    /// Map the PIFF `AlgorithmID` to the CENC scheme that standardised
+    /// the same cipher configuration: AES-CTR → [`CencScheme::Cenc`],
+    /// AES-CBC → [`CencScheme::Cbc1`]. `None` for
+    /// [`PIFF_ALGORITHM_NONE`] (unencrypted) and for unknown values.
+    pub fn scheme(&self) -> Option<CencScheme> {
+        match self.algorithm_id {
+            PIFF_ALGORITHM_AES_CTR => Some(CencScheme::Cenc),
+            PIFF_ALGORITHM_AES_CBC => Some(CencScheme::Cbc1),
+            _ => None,
+        }
+    }
+
+    /// The AES cipher mode the PIFF `AlgorithmID` selects. `None` for
+    /// [`PIFF_ALGORITHM_NONE`] and for unknown values.
+    pub fn cipher_mode(&self) -> Option<CipherMode> {
+        self.scheme().and_then(|s| s.cipher_mode())
+    }
+
+    /// Bridge into the CENC record shape: a version-0 [`TencBox`] with
+    /// `default_isProtected` derived from the `AlgorithmID`
+    /// (non-zero ⇒ protected), the same IV size and KID, and no
+    /// pattern / constant-IV (PIFF predates both).
+    pub fn to_tenc(&self) -> TencBox {
+        TencBox {
+            version: 0,
+            default_is_protected: u8::from(self.algorithm_id != PIFF_ALGORITHM_NONE),
+            default_per_sample_iv_size: self.iv_size,
+            default_kid: self.kid,
+            default_crypt_byte_block: 0,
+            default_skip_byte_block: 0,
+            default_constant_iv: None,
+        }
+    }
+
+    /// Bridge into the CENC decryption router: package this PIFF
+    /// track default as a [`CencSchemeDecision`] so
+    /// [`crate::cenc_cipher::decrypt_sample_in_place`] can consume
+    /// legacy PIFF fragments through the same code path as modern
+    /// `cenc` / `cbc1` files. Errors when the `AlgorithmID` is
+    /// [`PIFF_ALGORITHM_NONE`] or unknown (no cipher to route to), or
+    /// when the derived `tenc` fails the §9 coherence checks.
+    pub fn scheme_decision(&self) -> Result<CencSchemeDecision> {
+        let scheme = self.scheme().ok_or_else(|| {
+            Error::invalid(format!(
+                "PIFF tenc: AlgorithmID {:#x} names no cipher",
+                self.algorithm_id
+            ))
+        })?;
+        CencSchemeDecision::new(scheme, self.to_tenc())
+    }
+}
+
+/// Parse a PIFF `uuid` TrackEncryptionBox body — everything after the
+/// 16-byte `usertype`, i.e. starting at the FullBox version byte.
+/// Layout: 4-byte FullBox header (version must be 0) then the fixed
+/// 20-byte `u24 AlgorithmID / u8 IV_size / u8[16] KID` body.
+pub fn parse_piff_tenc(body: &[u8]) -> Result<PiffTencBox> {
+    if body.len() < 4 {
+        return Err(Error::invalid("PIFF tenc: missing FullBox header"));
+    }
+    if body[0] != 0 {
+        return Err(Error::invalid(format!(
+            "PIFF tenc: undefined version {}",
+            body[0]
+        )));
+    }
+    // body[1..4] — 24-bit flags, fixed 0 by PIFF; carried values are
+    // ignored rather than rejected (reader tolerance).
+    if body.len() < 4 + 20 {
+        return Err(Error::invalid("PIFF tenc: short payload"));
+    }
+    let algorithm_id = u32::from_be_bytes([0, body[4], body[5], body[6]]);
+    let iv_size = body[7];
+    if !matches!(iv_size, 0 | 8 | 16) {
+        return Err(Error::invalid(format!(
+            "PIFF tenc: default_IV_size {iv_size} not in {{0, 8, 16}}"
+        )));
+    }
+    let mut kid = [0u8; 16];
+    kid.copy_from_slice(&body[8..24]);
+    Ok(PiffTencBox {
+        algorithm_id,
+        iv_size,
+        kid,
+    })
+}
+
+/// Serialise a [`PiffTencBox`] into a complete
+/// `[size]['uuid'][usertype]` box with [`PIFF_TENC_USERTYPE`] — the
+/// byte-exact inverse of [`parse_piff_tenc`]. Rejects an
+/// `algorithm_id` that exceeds its 24-bit on-wire field and an
+/// `iv_size` outside {0, 8, 16}.
+pub fn build_piff_tenc_box(tenc: &PiffTencBox) -> Result<Vec<u8>> {
+    if tenc.algorithm_id > 0x00FF_FFFF {
+        return Err(Error::invalid(
+            "PIFF tenc build: AlgorithmID exceeds its 24-bit field",
+        ));
+    }
+    if !matches!(tenc.iv_size, 0 | 8 | 16) {
+        return Err(Error::invalid(format!(
+            "PIFF tenc build: default_IV_size {} not in {{0, 8, 16}}",
+            tenc.iv_size
+        )));
+    }
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&[0, 0, 0, 0]); // FullBox version 0 + flags 0
+    body.extend_from_slice(&tenc.algorithm_id.to_be_bytes()[1..4]);
+    body.push(tenc.iv_size);
+    body.extend_from_slice(&tenc.kid);
+    Ok(wrap_uuid_box(&PIFF_TENC_USERTYPE, &body))
+}
+
+/// The optional inline override triple of a PIFF SampleEncryptionBox
+/// (present when `flags & 0x000001` is set): fragment-local
+/// `AlgorithmID / IV_size / KID` values that override the track's
+/// [`PiffTencBox`] defaults for the samples this box describes. CENC
+/// later replaced this mechanism with the `seig` sample-group entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PiffSencOverride {
+    /// `AlgorithmID` — same value space as
+    /// [`PiffTencBox::algorithm_id`].
+    pub algorithm_id: u32,
+    /// `IV_size` — 0, 8, or 16; the width of every
+    /// `InitializationVector` in this box.
+    pub iv_size: u8,
+    /// `KID` — the 16-byte key identifier for these samples.
+    pub kid: [u8; 16],
+}
+
+/// PIFF `uuid` SampleEncryptionBox payload — per-sample IVs and an
+/// optional subsample map, carried in `traf` as a
+/// `FullBox('uuid', version=0, flags)` with [`PIFF_SENC_USERTYPE`].
+/// Unlike the CENC 4CC descendants, PIFF carries the auxiliary info
+/// **inline** (no `saio` / `saiz` indirection), and `flags & 1` may
+/// gate an inline override of the `tenc` defaults.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PiffSencBox {
+    /// FullBox flags, verbatim. Defined bits: `0x000001` = the
+    /// override triple is present ([`PiffSencBox::override_params`]);
+    /// `0x000002` = `UseSubSampleEncryption` (each entry carries a
+    /// subsample map).
+    pub flags: u32,
+    /// The `flags & 1` override triple; `Some` iff the bit is set.
+    pub override_params: Option<PiffSencOverride>,
+    /// Per-sample entries — same shape as the CENC `senc` table.
+    pub samples: Vec<SencSample>,
+}
+
+impl PiffSencBox {
+    /// Set when `flags & 0x000002 != 0` — each sample entry carries a
+    /// `(clear, encrypted)` subsample map.
+    pub fn uses_subsample_encryption(&self) -> bool {
+        (self.flags & 0x0000_0002) != 0
+    }
+
+    /// Set when `flags & 0x000001 != 0` — the box overrides the
+    /// track's `tenc` defaults with an inline
+    /// `AlgorithmID / IV_size / KID` triple.
+    pub fn has_override(&self) -> bool {
+        (self.flags & 0x0000_0001) != 0
+    }
+
+    /// Bridge into the CENC record shape: a [`SencBox`] carrying the
+    /// same per-sample IVs and subsample maps. Only the
+    /// `UseSubSampleEncryption` bit survives into the `senc` flags —
+    /// the PIFF-only override bit (`0x1`) has no CENC meaning (its
+    /// payload travels separately in
+    /// [`PiffSencBox::override_params`]), so it is masked out to keep
+    /// the result a valid §7.2 record.
+    pub fn to_senc(&self) -> SencBox {
+        SencBox {
+            flags: self.flags & 0x0000_0002,
+            samples: self.samples.clone(),
+        }
+    }
+}
+
+/// Parse a PIFF `uuid` SampleEncryptionBox body — everything after the
+/// 16-byte `usertype`, i.e. starting at the FullBox version byte.
+///
+/// When `flags & 1` is set the box carries its own IV width in the
+/// override triple and `default_iv_size` is ignored; otherwise the
+/// caller supplies the width from the track's PIFF (or CENC) `tenc`
+/// default — like the CENC `senc`, the entry table does not record it.
+///
+/// Layout (PIFF 1.1 / 1.3 — identical on the wire):
+/// ```text
+///   FullBox header                 (4 bytes: version=0 + flags)
+///   if (flags & 0x000001) {
+///       AlgorithmID                u24
+///       IV_size                    u8
+///       KID                        u8[16]
+///   }
+///   sample_count                   u32
+///   {
+///       InitializationVector       u8[IV_size]
+///       if (flags & 0x000002) {        // UseSubSampleEncryption
+///           NumberOfEntries        u16
+///           {
+///               BytesOfClearData       u16
+///               BytesOfEncryptedData   u32
+///           } × NumberOfEntries
+///       }
+///   } × sample_count
+/// ```
+pub fn parse_piff_senc(body: &[u8], default_iv_size: u8) -> Result<PiffSencBox> {
+    if body.len() < 4 {
+        return Err(Error::invalid("PIFF senc: missing FullBox header"));
+    }
+    if body[0] != 0 {
+        return Err(Error::invalid(format!(
+            "PIFF senc: undefined version {}",
+            body[0]
+        )));
+    }
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    let use_subsamples = (flags & 0x0000_0002) != 0;
+    let mut cursor = 4usize;
+    let override_params = if (flags & 0x0000_0001) != 0 {
+        if body.len() < cursor + 20 {
+            return Err(Error::invalid("PIFF senc: truncated override triple"));
+        }
+        let algorithm_id =
+            u32::from_be_bytes([0, body[cursor], body[cursor + 1], body[cursor + 2]]);
+        let iv_size = body[cursor + 3];
+        let mut kid = [0u8; 16];
+        kid.copy_from_slice(&body[cursor + 4..cursor + 20]);
+        cursor += 20;
+        Some(PiffSencOverride {
+            algorithm_id,
+            iv_size,
+            kid,
+        })
+    } else {
+        None
+    };
+    let iv_size = override_params
+        .as_ref()
+        .map(|o| o.iv_size)
+        .unwrap_or(default_iv_size);
+    if !matches!(iv_size, 0 | 8 | 16) {
+        return Err(Error::invalid(format!(
+            "PIFF senc: IV_size {iv_size} not in {{0, 8, 16}}"
+        )));
+    }
+    let samples = parse_senc_sample_table(body, cursor, use_subsamples, iv_size as usize)?;
+    Ok(PiffSencBox {
+        flags,
+        override_params,
+        samples,
+    })
+}
+
+/// Serialise a [`PiffSencBox`] into a complete
+/// `[size]['uuid'][usertype]` box with [`PIFF_SENC_USERTYPE`] — the
+/// byte-exact inverse of [`parse_piff_senc`]. Rejects records that
+/// would not round-trip:
+///
+/// * flags exceeding the 24-bit field,
+/// * an override triple whose presence disagrees with `flags & 1`, or
+///   whose `AlgorithmID` / `IV_size` exceed their fields,
+/// * per-sample IVs that don't share one width ∈ {0, 8, 16} (pinned to
+///   the override's `IV_size` when the triple is present),
+/// * subsample maps present while `UseSubSampleEncryption` is clear
+///   (they would be dropped on re-parse).
+pub fn build_piff_senc_box(senc: &PiffSencBox) -> Result<Vec<u8>> {
+    if senc.flags > 0x00FF_FFFF {
+        return Err(Error::invalid(
+            "PIFF senc build: flags exceed the 24-bit field",
+        ));
+    }
+    if senc.has_override() != senc.override_params.is_some() {
+        return Err(Error::invalid(
+            "PIFF senc build: flags & 1 disagrees with the override triple's presence",
+        ));
+    }
+    let iv_size = match &senc.override_params {
+        Some(o) => {
+            if o.algorithm_id > 0x00FF_FFFF {
+                return Err(Error::invalid(
+                    "PIFF senc build: override AlgorithmID exceeds its 24-bit field",
+                ));
+            }
+            o.iv_size as usize
+        }
+        // No override: like the CENC senc, the width is implicit —
+        // derive it from the first sample (the matching tenc default
+        // must agree at parse time).
+        None => senc
+            .samples
+            .first()
+            .map(|s| s.initialization_vector.len())
+            .unwrap_or(0),
+    };
+    if !matches!(iv_size, 0 | 8 | 16) {
+        return Err(Error::invalid(format!(
+            "PIFF senc build: per-sample IV length {iv_size} not in {{0, 8, 16}}"
+        )));
+    }
+    let mut body = Vec::with_capacity(4 + 20 + 4 + senc.samples.len() * (iv_size + 8));
+    body.push(0); // version 0
+    body.extend_from_slice(&senc.flags.to_be_bytes()[1..4]);
+    if let Some(o) = &senc.override_params {
+        body.extend_from_slice(&o.algorithm_id.to_be_bytes()[1..4]);
+        body.push(o.iv_size);
+        body.extend_from_slice(&o.kid);
+    }
+    build_senc_sample_table(
+        &mut body,
+        &senc.samples,
+        iv_size,
+        senc.uses_subsample_encryption(),
+    )?;
+    Ok(wrap_uuid_box(&PIFF_SENC_USERTYPE, &body))
+}
+
+/// Parse a PIFF `uuid` ProtectionSystemSpecificHeaderBox body —
+/// everything after the 16-byte `usertype`. The body is byte-identical
+/// to a CENC `pssh` **version 0** payload
+/// (`SystemID[16] / DataSize u32 / Data`), so the record shape is the
+/// shared [`PsshBox`]; a version other than 0 is rejected (PIFF
+/// predates the v1 KID list).
+pub fn parse_piff_pssh(body: &[u8]) -> Result<PsshBox> {
+    if !body.is_empty() && body[0] != 0 {
+        return Err(Error::invalid(format!(
+            "PIFF pssh: undefined version {}",
+            body[0]
+        )));
+    }
+    parse_pssh(body)
+}
+
+/// Serialise a [`PsshBox`] into a complete
+/// `[size]['uuid'][usertype]` box with [`PIFF_PSSH_USERTYPE`] — the
+/// byte-exact inverse of [`parse_piff_pssh`]. The record must be a
+/// version-0 `pssh` (no KID list): the PIFF layout has no place for
+/// the v1 fields.
+pub fn build_piff_pssh_box(pssh: &PsshBox) -> Result<Vec<u8>> {
+    if pssh.version != 0 {
+        return Err(Error::invalid(
+            "PIFF pssh build: only the version-0 pssh layout exists in PIFF",
+        ));
+    }
+    if !pssh.kids.is_empty() {
+        return Err(Error::invalid(
+            "PIFF pssh build: KID list requires the CENC v1 pssh, not the PIFF uuid form",
+        ));
+    }
+    let data_size = u32::try_from(pssh.data.len())
+        .map_err(|_| Error::invalid("PIFF pssh build: DataSize exceeds u32"))?;
+    let mut body = Vec::with_capacity(4 + 16 + 4 + pssh.data.len());
+    body.extend_from_slice(&[0, 0, 0, 0]); // FullBox version 0 + flags 0
+    body.extend_from_slice(&pssh.system_id);
+    body.extend_from_slice(&data_size.to_be_bytes());
+    body.extend_from_slice(&pssh.data);
+    Ok(wrap_uuid_box(&PIFF_PSSH_USERTYPE, &body))
+}
+
+/// Append a complete `[size]['uuid'][usertype]` extended-type box
+/// (ISO/IEC 14496-12 §4.2) around `body` bytes — the 16-byte
+/// `usertype` sits between the standard header and the body.
+fn wrap_uuid_box(usertype: &[u8; 16], body: &[u8]) -> Vec<u8> {
+    let total = 8 + 16 + body.len() as u32;
+    let mut out = Vec::with_capacity(total as usize);
+    out.extend_from_slice(&total.to_be_bytes());
+    out.extend_from_slice(b"uuid");
+    out.extend_from_slice(usertype);
+    out.extend_from_slice(body);
+    out
 }
 
 // ---- Per-sample cipher walker (§9.4–9.6) ------------------------------
@@ -2663,5 +3144,252 @@ mod tests {
         }
         assert_eq!(sum, total);
         assert_eq!(prev_end, total);
+    }
+
+    // ---- PIFF legacy `uuid` boxes --------------------------------------
+
+    fn piff_tenc_ctr() -> PiffTencBox {
+        PiffTencBox {
+            algorithm_id: PIFF_ALGORITHM_AES_CTR,
+            iv_size: 8,
+            kid: [0x11; 16],
+        }
+    }
+
+    #[test]
+    fn piff_tenc_round_trip() {
+        let t = piff_tenc_ctr();
+        let bytes = build_piff_tenc_box(&t).unwrap();
+        // Framing: [size]['uuid'][usertype][FullBox v0 f0][20-byte body].
+        assert_eq!(bytes.len(), 8 + 16 + 4 + 20);
+        assert_eq!(&bytes[4..8], b"uuid");
+        assert_eq!(&bytes[8..24], &PIFF_TENC_USERTYPE);
+        let back = parse_piff_tenc(&bytes[24..]).unwrap();
+        assert_eq!(back, t);
+    }
+
+    #[test]
+    fn piff_tenc_scheme_bridges() {
+        let ctr = piff_tenc_ctr();
+        assert_eq!(ctr.scheme(), Some(CencScheme::Cenc));
+        assert_eq!(ctr.cipher_mode(), Some(CipherMode::Ctr));
+        let tenc = ctr.to_tenc();
+        assert_eq!(tenc.version, 0);
+        assert_eq!(tenc.default_is_protected, 1);
+        assert_eq!(tenc.default_per_sample_iv_size, 8);
+        assert_eq!(tenc.default_kid, [0x11; 16]);
+        assert_eq!(tenc.default_constant_iv, None);
+        let decision = ctr.scheme_decision().expect("CTR routes to cenc");
+        assert_eq!(decision.cipher_mode(), Some(CipherMode::Ctr));
+
+        let cbc = PiffTencBox {
+            algorithm_id: PIFF_ALGORITHM_AES_CBC,
+            iv_size: 16,
+            kid: [0x22; 16],
+        };
+        assert_eq!(cbc.scheme(), Some(CencScheme::Cbc1));
+        assert_eq!(cbc.cipher_mode(), Some(CipherMode::Cbc));
+
+        let none = PiffTencBox {
+            algorithm_id: PIFF_ALGORITHM_NONE,
+            iv_size: 0,
+            kid: [0; 16],
+        };
+        assert_eq!(none.scheme(), None);
+        assert!(none.scheme_decision().is_err());
+        assert_eq!(none.to_tenc().default_is_protected, 0);
+    }
+
+    #[test]
+    fn piff_tenc_hostile_inputs() {
+        // Truncated FullBox header.
+        assert!(parse_piff_tenc(&[0, 0]).is_err());
+        // Undefined version.
+        assert!(parse_piff_tenc(&[1, 0, 0, 0, 0, 0, 1, 8]).is_err());
+        // Short payload (header only).
+        assert!(parse_piff_tenc(&[0, 0, 0, 0]).is_err());
+        // Bad IV size (9).
+        let mut body = vec![0u8; 24];
+        body[6] = 1; // AlgorithmID = 1
+        body[7] = 9;
+        let err = parse_piff_tenc(&body).expect_err("IV size 9 must fail");
+        assert!(format!("{err}").contains("IV_size"), "{err}");
+        // Build-side: 24-bit AlgorithmID overflow.
+        let bad = PiffTencBox {
+            algorithm_id: 0x0100_0000,
+            iv_size: 8,
+            kid: [0; 16],
+        };
+        assert!(build_piff_tenc_box(&bad).is_err());
+    }
+
+    fn piff_senc_with_override() -> PiffSencBox {
+        PiffSencBox {
+            flags: 0x0000_0003, // override + subsamples
+            override_params: Some(PiffSencOverride {
+                algorithm_id: PIFF_ALGORITHM_AES_CTR,
+                iv_size: 16,
+                kid: [0xAB; 16],
+            }),
+            samples: vec![
+                SencSample {
+                    initialization_vector: vec![0x01; 16],
+                    subsamples: vec![SubsampleEntry {
+                        bytes_of_clear_data: 9,
+                        bytes_of_protected_data: 480,
+                    }],
+                },
+                SencSample {
+                    initialization_vector: vec![0x02; 16],
+                    subsamples: vec![
+                        SubsampleEntry {
+                            bytes_of_clear_data: 5,
+                            bytes_of_protected_data: 128,
+                        },
+                        SubsampleEntry {
+                            bytes_of_clear_data: 0,
+                            bytes_of_protected_data: 64,
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn piff_senc_override_round_trip() {
+        let s = piff_senc_with_override();
+        let bytes = build_piff_senc_box(&s).unwrap();
+        assert_eq!(&bytes[4..8], b"uuid");
+        assert_eq!(&bytes[8..24], &PIFF_SENC_USERTYPE);
+        // default_iv_size deliberately wrong (8) — the override wins.
+        let back = parse_piff_senc(&bytes[24..], 8).unwrap();
+        assert_eq!(back, s);
+        assert!(back.has_override());
+        assert!(back.uses_subsample_encryption());
+    }
+
+    #[test]
+    fn piff_senc_default_iv_round_trip() {
+        // No override: the IV width comes from the caller (the track's
+        // tenc default), exactly like the CENC senc.
+        let s = PiffSencBox {
+            flags: 0,
+            override_params: None,
+            samples: vec![
+                SencSample {
+                    initialization_vector: vec![0x0A; 8],
+                    subsamples: Vec::new(),
+                },
+                SencSample {
+                    initialization_vector: vec![0x0B; 8],
+                    subsamples: Vec::new(),
+                },
+            ],
+        };
+        let bytes = build_piff_senc_box(&s).unwrap();
+        let back = parse_piff_senc(&bytes[24..], 8).unwrap();
+        assert_eq!(back, s);
+        // Parsing with the wrong width must fail cleanly (table
+        // over-run), not misalign silently into an Ok.
+        assert!(parse_piff_senc(&bytes[24..], 16).is_err());
+    }
+
+    #[test]
+    fn piff_senc_to_senc_masks_override_bit() {
+        let s = piff_senc_with_override();
+        let senc = s.to_senc();
+        assert_eq!(senc.flags, 0x0000_0002, "only the §7.2 bit survives");
+        assert!(senc.uses_subsample_encryption());
+        assert_eq!(senc.samples, s.samples);
+        // The bridged record must satisfy the CENC builder's round-trip
+        // rules as-is.
+        let senc_bytes = build_senc_box(&senc).unwrap();
+        let reparsed = parse_senc(&senc_bytes[8..], 16).unwrap();
+        assert_eq!(reparsed.samples, s.samples);
+    }
+
+    #[test]
+    fn piff_senc_hostile_inputs() {
+        // Undefined version.
+        assert!(parse_piff_senc(&[1, 0, 0, 0], 8).is_err());
+        // flags&1 set but body ends before the 20-byte triple.
+        let body = [0u8, 0, 0, 1, 0xAA, 0xBB];
+        let err = parse_piff_senc(&body, 8).expect_err("truncated override");
+        assert!(format!("{err}").contains("override"), "{err}");
+        // Declared sample_count larger than the byte budget.
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(&1000u32.to_be_bytes());
+        body.extend_from_slice(&[0x01; 8]); // one IV only
+        assert!(parse_piff_senc(&body, 8).is_err());
+        // Build-side: flag/override disagreement both ways.
+        let mut s = piff_senc_with_override();
+        s.flags = 0x0000_0002; // override cleared but triple present
+        assert!(build_piff_senc_box(&s).is_err());
+        let mut s2 = piff_senc_with_override();
+        s2.override_params = None; // flag set but triple missing
+        assert!(build_piff_senc_box(&s2).is_err());
+        // Build-side: IV width disagrees with the override's IV_size.
+        let mut s3 = piff_senc_with_override();
+        s3.samples[0].initialization_vector = vec![0x01; 8];
+        assert!(build_piff_senc_box(&s3).is_err());
+        // Build-side: subsamples carried while the flag is clear.
+        let s4 = PiffSencBox {
+            flags: 0,
+            override_params: None,
+            samples: vec![SencSample {
+                initialization_vector: vec![0x0A; 8],
+                subsamples: vec![SubsampleEntry {
+                    bytes_of_clear_data: 1,
+                    bytes_of_protected_data: 2,
+                }],
+            }],
+        };
+        assert!(build_piff_senc_box(&s4).is_err());
+    }
+
+    #[test]
+    fn piff_pssh_round_trip() {
+        let p = PsshBox {
+            version: 0,
+            system_id: [0x5E; 16],
+            kids: Vec::new(),
+            data: b"licence-acquisition-blob".to_vec(),
+        };
+        let bytes = build_piff_pssh_box(&p).unwrap();
+        assert_eq!(&bytes[4..8], b"uuid");
+        assert_eq!(&bytes[8..24], &PIFF_PSSH_USERTYPE);
+        let back = parse_piff_pssh(&bytes[24..]).unwrap();
+        assert_eq!(back, p);
+        // The body after the usertype is byte-identical to a v0 pssh
+        // payload: the standard 4CC builder must produce the same body.
+        let cenc_pssh = build_pssh_box(&p).unwrap();
+        assert_eq!(&bytes[24..], &cenc_pssh[8..]);
+    }
+
+    #[test]
+    fn piff_pssh_rejects_v1_shapes() {
+        // Parse: a version byte other than 0 has no PIFF layout.
+        let mut body = vec![1u8, 0, 0, 0];
+        body.extend_from_slice(&[0x5E; 16]);
+        body.extend_from_slice(&0u32.to_be_bytes()); // KID_count
+        body.extend_from_slice(&0u32.to_be_bytes()); // DataSize
+        let err = parse_piff_pssh(&body).expect_err("v1 must fail");
+        assert!(format!("{err}").contains("version"), "{err}");
+        // Build: v1 records and KID lists cannot be expressed.
+        let v1 = PsshBox {
+            version: 1,
+            system_id: [0x5E; 16],
+            kids: Vec::new(),
+            data: Vec::new(),
+        };
+        assert!(build_piff_pssh_box(&v1).is_err());
+        let with_kids = PsshBox {
+            version: 0,
+            system_id: [0x5E; 16],
+            kids: vec![[0x01; 16]],
+            data: Vec::new(),
+        };
+        assert!(build_piff_pssh_box(&with_kids).is_err());
     }
 }

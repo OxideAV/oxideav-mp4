@@ -608,6 +608,19 @@ pub const STYP: [u8; 4] = fourcc("styp");
 /// placement: must follow `styp`/`sidx` (if any) and precede the
 /// `moof` it refers to.
 pub const PRFT: [u8; 4] = fourcc("prft");
+/// `emsg` — DASH Event Message Box (ISO/IEC 23009-1 §5.10.3.3). A
+/// top-level FullBox carried in a media segment before the first
+/// `moof` of the segment it applies to; zero or more per segment, each
+/// carrying one timed in-band event (`scheme_id_uri` + `value` +
+/// timing triple + opaque `message_data`). Version 0 leads with the
+/// two null-terminated strings and uses a 32-bit segment-relative
+/// `presentation_time_delta`; version 1 leads with the integers and
+/// uses a 64-bit absolute `presentation_time`. Parsed via
+/// [`crate::emsg::parse_emsg_box`]; the demuxer captures instances
+/// during the top-level walk (keyed by the index of the following
+/// `moof`) and the fragmented muxer emits queued instances ahead of
+/// the next fragment.
+pub const EMSG: [u8; 4] = fourcc("emsg");
 // Random-access boxes (§8.8.10–12 + §8.16.3).
 pub const MFRA: [u8; 4] = fourcc("mfra");
 pub const TFRA: [u8; 4] = fourcc("tfra");
@@ -670,6 +683,17 @@ pub const STVI: [u8; 4] = fourcc("stvi");
 pub const TENC: [u8; 4] = fourcc("tenc");
 pub const PSSH: [u8; 4] = fourcc("pssh");
 pub const SENC: [u8; 4] = fourcc("senc");
+
+/// `uuid` — the reserved extended-type box (ISO/IEC 14496-12 §4.2).
+/// When `type == 'uuid'`, a 16-byte `usertype` (a full UUID, RFC 4122
+/// network/big-endian byte order) immediately follows the standard box
+/// header and precedes the body, letting a vendor define extension
+/// boxes without registering a FourCC. This crate recognises the three
+/// legacy PIFF (Protected Interoperable File Format) encryption
+/// usertypes — the pre-CENC predecessors of `senc` / `tenc` / `pssh` —
+/// via the constants and parsers in [`crate::cenc`]; any other
+/// usertype is skipped as an unknown box.
+pub const UUID: [u8; 4] = fourcc("uuid");
 
 // ---------------------------------------------------------------------------
 // HEIF / MIAF item-properties family (ISO/IEC 23008-12 §9.3, referenced from

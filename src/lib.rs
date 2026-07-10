@@ -11,6 +11,7 @@ pub mod cenc_cipher;
 pub mod cenc_packager;
 pub mod codec_id;
 pub mod demux;
+pub mod emsg;
 pub mod fd;
 pub mod frag;
 pub mod hint;
