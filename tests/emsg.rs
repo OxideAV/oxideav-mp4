@@ -336,3 +336,57 @@ fn hand_spliced_emsg_parses_like_muxer_emitted() {
     let pkt = dmx.next_packet().unwrap();
     assert_eq!(pkt.data, vec![0u8; 16]);
 }
+
+/// `Mp4Demuxer::emsg_absolute_time` — v0 deltas resolve against the
+/// earliest presentation time of the moof the box preceded (rescaled
+/// into the emsg timescale); v1 records pass their absolute time
+/// through; an un-anchorable v0 (box after the last moof) returns
+/// `None`.
+#[test]
+fn emsg_absolute_time_anchors_v0_deltas_to_the_following_moof() {
+    let stream = pcm_stream(0);
+    let tmp = std::env::temp_dir().join("oxideav-mp4-emsg-abs.mp4");
+    {
+        let mut mux = open_typed(&tmp, std::slice::from_ref(&stream), frag_options(2, false));
+        mux.write_header().unwrap();
+        // Fragment 1 (samples at pts 0, 1024): a v0 delta of 100.
+        let mut e0 = scte35_v0();
+        e0.presentation = EmsgTime::Delta(100);
+        mux.set_next_segment_emsg([e0]);
+        for i in 0..2i64 {
+            mux.write_packet(&audio_packet(&stream, i)).unwrap();
+        }
+        // Fragment 2 (samples at pts 2048, 3072): a v0 delta of 100 in
+        // a *different* timescale (24000 = half the track's 48000), so
+        // the anchor must rescale, plus a v1 for pass-through.
+        let mut e1 = scte35_v0();
+        e1.timescale = 24_000;
+        e1.presentation = EmsgTime::Delta(100);
+        mux.set_next_segment_emsg([e1, app_event_v1(5)]);
+        for i in 2..4i64 {
+            mux.write_packet(&audio_packet(&stream, i)).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let dmx = demux_file(&tmp);
+    let records = dmx.emsgs();
+    assert_eq!(records.len(), 3);
+
+    // Fragment 1 anchor: earliest pts 0 → 0 + 100.
+    assert_eq!(dmx.emsg_absolute_time(&records[0]), Some(100));
+    // Fragment 2 anchor: earliest pts 2048 @ 48000 → 1024 @ 24000,
+    // + 100 = 1124.
+    assert_eq!(records[1].next_moof_index, 1);
+    assert_eq!(dmx.emsg_absolute_time(&records[1]), Some(1124));
+    // v1: absolute value passes through untouched.
+    assert_eq!(dmx.emsg_absolute_time(&records[2]), Some(1_234_567));
+
+    // Un-anchorable v0: a record claiming to precede a moof that
+    // doesn't exist.
+    let orphan = oxideav_mp4::demux::EmsgRecord {
+        next_moof_index: 99,
+        emsg: scte35_v0(),
+    };
+    assert_eq!(dmx.emsg_absolute_time(&orphan), None);
+}

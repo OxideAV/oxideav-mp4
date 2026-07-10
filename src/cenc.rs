@@ -3368,6 +3368,47 @@ mod tests {
     }
 
     #[test]
+    fn piff_bodies_survive_every_truncation() {
+        // Property: every prefix of a valid body either parses (only
+        // possible where a trailing variable-length blob shortens
+        // legally) or returns a clean error — never a panic or a
+        // silent misread. Mirrors the emsg truncation sweep.
+        let tenc_bytes = build_piff_tenc_box(&piff_tenc_ctr()).unwrap();
+        let tenc_body = &tenc_bytes[24..];
+        for cut in 0..tenc_body.len() {
+            assert!(
+                parse_piff_tenc(&tenc_body[..cut]).is_err(),
+                "tenc is fixed-size; every truncation must fail (cut {cut})"
+            );
+        }
+
+        let senc = piff_senc_with_override();
+        let senc_bytes = build_piff_senc_box(&senc).unwrap();
+        let senc_body = &senc_bytes[24..];
+        for cut in 0..senc_body.len() {
+            assert!(
+                parse_piff_senc(&senc_body[..cut], 8).is_err(),
+                "senc table over-runs must fail (cut {cut})"
+            );
+        }
+
+        let pssh = PsshBox {
+            version: 0,
+            system_id: [0x5E; 16],
+            kids: Vec::new(),
+            data: b"blob".to_vec(),
+        };
+        let pssh_bytes = build_piff_pssh_box(&pssh).unwrap();
+        let pssh_body = &pssh_bytes[24..];
+        for cut in 0..pssh_body.len() {
+            assert!(
+                parse_piff_pssh(&pssh_body[..cut]).is_err(),
+                "pssh DataSize is length-prefixed; every truncation must fail (cut {cut})"
+            );
+        }
+    }
+
+    #[test]
     fn piff_pssh_rejects_v1_shapes() {
         // Parse: a version byte other than 0 has no PIFF layout.
         let mut body = vec![1u8, 0, 0, 0];

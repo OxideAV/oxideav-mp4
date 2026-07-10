@@ -370,7 +370,11 @@ Sample-entry FourCCs resolve to these codec ids:
   `EmsgTime` presentation, `event_duration` with the `0xFFFFFFFF`
   unknown sentinel, `id`, `message_data`). The demuxer collects
   instances in file order keyed by the index of the following `moof`
-  (`Mp4Demuxer::emsgs`, metadata `emsg_<n>`); the fragmented muxer
+  (`Mp4Demuxer::emsgs`, metadata `emsg_<n>`), and
+  `Mp4Demuxer::emsg_absolute_time` resolves a v0 delta to an absolute
+  presentation time by anchoring it to the earliest presentation time
+  of the moof the box preceded (rescaled into the emsg timescale; v1
+  passes through); the fragmented muxer
   queues them per segment via
   `FragmentedMuxer::set_next_segment_emsg`, writing them between the
   `styp` and the `moof` and counting their bytes into the `sidx`

@@ -251,7 +251,19 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let mut traf_sample_groups: Vec<TrafSampleGroupRecord> = Vec::new();
     let mut piff_senc_records: Vec<PiffSencRecord> = Vec::new();
     let mut piff_moof_psshes: Vec<MoofPsshRecord> = Vec::new();
+    // Per-moof earliest presentation time, captured while the samples
+    // each fragment contributes are still contiguous (before the
+    // global offset sort below). ISO/IEC 23009-1 §5.10.3.3 anchors a
+    // v0 emsg's `presentation_time_delta` to "the earliest
+    // presentation time of the segment" — this table lets
+    // `Mp4Demuxer::emsg_absolute_time` resolve that anchor without
+    // re-walking the file. Each entry is `(pts, track_timescale)` of
+    // the earliest-presented sample the moof added (compared across
+    // tracks by cross-multiplication so differing timescales order
+    // correctly); `None` for a moof that added no timed samples.
+    let mut moof_earliest: Vec<Option<(i64, u32)>> = Vec::with_capacity(moofs.len());
     for moof in &moofs {
+        let before = samples.len();
         parse_moof(
             moof,
             &parsed.tracks,
@@ -264,6 +276,25 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             &mut piff_senc_records,
             &mut piff_moof_psshes,
         )?;
+        let mut best: Option<(i64, u32)> = None;
+        for s in &samples[before..] {
+            let ts = parsed.tracks[s.track_idx as usize].timescale;
+            if ts == 0 {
+                continue;
+            }
+            best = match best {
+                None => Some((s.pts, ts)),
+                // `a/at < b/bt` ⇔ `a·bt < b·at` (timescales positive).
+                Some((b_pts, b_ts)) => {
+                    if (s.pts as i128) * (b_ts as i128) < (b_pts as i128) * (ts as i128) {
+                        Some((s.pts, ts))
+                    } else {
+                        Some((b_pts, b_ts))
+                    }
+                }
+            };
+        }
+        moof_earliest.push(best);
     }
 
     samples.sort_by_key(|s| s.offset);
@@ -727,6 +758,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         piff_senc_records,
         piff_tencs: parsed.tracks.iter().map(|t| t.piff_tenc.clone()).collect(),
         emsgs,
+        moof_earliest,
         meta_items,
         meco,
         movie_timescale: parsed.movie_timescale,
@@ -12403,6 +12435,13 @@ pub struct Mp4Demuxer {
     /// `emsg_<n>` flat-metadata summaries.
     #[allow(dead_code)]
     emsgs: Vec<EmsgRecord>,
+    /// Per-moof earliest presentation time `(pts, track_timescale)`,
+    /// indexed like `EmsgRecord::next_moof_index` — the anchor a v0
+    /// emsg's `presentation_time_delta` is relative to. `None` per
+    /// moof that contributed no timed samples. Consumed by
+    /// [`Mp4Demuxer::emsg_absolute_time`].
+    #[allow(dead_code)]
+    moof_earliest: Vec<Option<(i64, u32)>>,
     /// ISO/IEC 14496-12 §8.11 — the file-level `meta` box item
     /// infrastructure (HEIF / MIAF item catalogue), if the file carries
     /// one. Holds the primary item, item-location directory, item-info
@@ -12648,6 +12687,39 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn emsgs(&self) -> &[EmsgRecord] {
         &self.emsgs
+    }
+
+    /// Resolve an [`EmsgRecord`]'s event start to an **absolute**
+    /// position on the media presentation timeline, in the emsg's own
+    /// `timescale` units.
+    ///
+    /// * A **v1** record carries the absolute `presentation_time`
+    ///   directly — returned as-is (its `next_moof_index` plays no
+    ///   part).
+    /// * A **v0** record carries a `presentation_time_delta` relative
+    ///   to "the earliest presentation time of the segment"
+    ///   (ISO/IEC 23009-1 §5.10.3.3) — resolved against the earliest
+    ///   presentation time of the samples contributed by the `moof`
+    ///   the box preceded, rescaled from that track's timescale into
+    ///   the emsg timescale (truncating division), plus the delta.
+    ///
+    /// Returns `None` when a v0 record cannot be anchored: the box
+    /// preceded no moof (a producer slip placed it after the last
+    /// fragment), the anchoring moof contributed no timed samples, a
+    /// timescale is zero, or the resolved value falls outside `u64`.
+    #[allow(dead_code)]
+    pub fn emsg_absolute_time(&self, record: &EmsgRecord) -> Option<u64> {
+        match record.emsg.presentation {
+            crate::emsg::EmsgTime::Absolute(t) => Some(t),
+            crate::emsg::EmsgTime::Delta(delta) => {
+                let (pts, track_ts) = (*self.moof_earliest.get(record.next_moof_index)?)?;
+                if track_ts == 0 || record.emsg.timescale == 0 {
+                    return None;
+                }
+                let anchor = (pts as i128) * (record.emsg.timescale as i128) / (track_ts as i128);
+                u64::try_from(anchor + delta as i128).ok()
+            }
+        }
     }
 
     /// ISO/IEC 14496-12 §8.11 — the file-level `meta` box item
