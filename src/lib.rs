@@ -5,6 +5,10 @@
 //! Three brand presets are registered: `mp4`, `mov`, and `ismv` — all
 //! share one implementation and only differ in their `ftyp` preset.
 
+// Internal plumbing: low-level BMFF box-header reader + FourCC constant
+// table. Not part of the stable API (the README documents no `boxes::`
+// surface); exposed `pub` only so tests and sibling modules can share it.
+#[doc(hidden)]
 pub mod boxes;
 pub mod cenc;
 pub mod cenc_cipher;
