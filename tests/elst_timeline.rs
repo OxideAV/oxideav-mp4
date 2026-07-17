@@ -834,3 +834,83 @@ fn seek_uses_mapped_timeline() {
     let landed = dmx.seek_to(0, 0).unwrap();
     assert_eq!(landed, 0);
 }
+
+/// Foreign-file black-box equivalence: generate an AAC file with an
+/// independent encoder (`ffmpeg`, invoked as an opaque CLI — its elst
+/// carries the encoder-priming trim `media_time = 1024`), then assert
+/// this demuxer's mapped pts sequence matches what the independent
+/// reader (`ffprobe`) reports for the same file, packet for packet —
+/// including the negative pre-roll pts ahead of the trim, which our
+/// mapping additionally flags with `discard`.
+/// Skipped when the tools are not on `$PATH`.
+#[test]
+fn foreign_priming_trim_matches_independent_reader() {
+    use std::process::Command;
+
+    let have = |tool: &str| {
+        Command::new(tool)
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if !have("ffmpeg") || !have("ffprobe") {
+        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join(format!(
+        "oxideav-mp4-foreign-priming-{}.mp4",
+        std::process::id()
+    ));
+    let gen = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("sine=frequency=440:duration=1")
+        .args(["-c:a", "aac", "-b:a", "128k", "-y"])
+        .arg(&tmp)
+        .output()
+        .expect("run ffmpeg");
+    assert!(gen.status.success(), "ffmpeg generation failed");
+
+    // Independent reader's pts sequence.
+    let probe = Command::new("ffprobe")
+        .args([
+            "-hide_banner",
+            "-show_packets",
+            "-select_streams",
+            "a:0",
+            "-of",
+            "csv=p=0",
+            "-show_entries",
+            "packet=pts",
+        ])
+        .arg(&tmp)
+        .output()
+        .expect("run ffprobe");
+    let theirs: Vec<i64> = String::from_utf8_lossy(&probe.stdout)
+        .lines()
+        .filter_map(|l| l.split(',').next())
+        .filter(|f| !f.trim().is_empty())
+        .map(|f| f.trim().parse().expect("pts parses"))
+        .collect();
+    assert!(!theirs.is_empty(), "independent reader saw packets");
+
+    // Our mapped timeline.
+    let bytes = std::fs::read(&tmp).unwrap();
+    let ours = demux_timing(bytes);
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(
+        ours.len(),
+        theirs.len(),
+        "same packet count as the independent reader"
+    );
+    for (i, ((pts, _dts, discard), want)) in ours.iter().zip(theirs.iter()).enumerate() {
+        assert_eq!(pts, want, "packet {i} pts differs from independent reader");
+        // Packets entirely ahead of the mapped start are pre-roll.
+        assert_eq!(
+            *discard,
+            *pts < 0,
+            "packet {i} discard flag mirrors pre-roll position"
+        );
+    }
+}

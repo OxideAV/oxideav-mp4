@@ -134,10 +134,11 @@ Sample-entry FourCCs resolve to these codec ids:
   per-track defaults plus zero or more trailing `moof`+`mdat` pairs
   (`mfhd`, `traf`, `tfhd`, `tfdt`, `trun`) are stitched onto the
   initial sample table. `default-base-is-moof`, per-sample
-  size/duration/flags/composition-time-offset overrides, and
-  `tfhd.base_data_offset` are all honoured. `styp`, `sidx`, and `mfra`
-  segment-index boxes are skipped (segment-precision seek hint
-  consumption is a follow-up).
+  size/duration/flags/composition-time-offset overrides,
+  `tfhd.base_data_offset`, and the per-traf
+  `tfhd`/`trex` `sample_description_index` are all honoured. `styp`
+  markers are skipped; `sidx` and `mfra`/`tfra` are parsed and drive
+  the seek fast-paths (see "Seek strategy" below).
 - Movie extends header (ISO/IEC 14496-12 §8.8.2, `mehd`): a sealed
   fragmented file's `mvex/mehd` MovieExtendsHeaderBox carries the
   overall presentation `fragment_duration` (in the movie timescale,
