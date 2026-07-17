@@ -237,6 +237,35 @@ pub struct TrackSampleGroups {
     pub csgp: Vec<crate::sample_groups::CompactSampleToGroup>,
 }
 
+/// An explicit per-track edit list for the muxer (ISO/IEC 14496-12
+/// §8.6.5–6).
+///
+/// When a [`Mp4MuxerOptions::track_edit_lists`] entry targets a
+/// stream, the muxer emits that track's `edts/elst` from the given
+/// entries verbatim (serialised through `demux::build_elst_box`, so
+/// the §8.6.6.3 round-trip rules apply — `media_rate_integer` must be
+/// 0 or 1, the final entry may not be an empty edit, `media_time`
+/// may not sit below the `-1` empty-edit sentinel, and the entry list
+/// may not be empty; violations fail at `open` time). An explicit
+/// list *overrides* the automatic start-delay emission for that track
+/// and is written even when [`Mp4MuxerOptions::write_edit_list`] is
+/// `false` (the flag governs only the automatic behaviour).
+///
+/// This is the write-side dual of `Mp4Demuxer::edit_list`: a remuxer
+/// carries a source's elst across by feeding the demuxer's slice
+/// straight back in. Note the §8.6.6.3 unit split — each entry's
+/// `segment_duration` is in the *movie* timescale (this muxer writes
+/// movie timescale 1000) while `media_time` is in the track's media
+/// timescale.
+#[derive(Clone, Debug, Default)]
+pub struct TrackEditList {
+    /// Index into the muxer's `streams` slice (the stream slot that
+    /// owns this edit list).
+    pub stream_index: usize,
+    /// The `elst` entries, emitted in order.
+    pub entries: Vec<crate::demux::EditListEntry>,
+}
+
 /// Per-track CENC protection signalling for the muxer (ISO/IEC
 /// 14496-12 §8.12 envelope + ISO/IEC 23001-7 §4.1 carriage).
 ///
@@ -312,6 +341,14 @@ pub struct Mp4MuxerOptions {
     /// [`TrackSampleGroups`] entry's `sbgp` / `sgpd` boxes are emitted
     /// into the target track's `stbl` after the chunk-offset table.
     pub track_sample_groups: Vec<TrackSampleGroups>,
+    /// Explicit per-track edit lists (`edts`/`elst`, ISO/IEC 14496-12
+    /// §8.6.5–6). Empty by default — the automatic start-delay
+    /// emission (see [`Self::write_edit_list`]) covers the common
+    /// case. A [`TrackEditList`] entry overrides the automatic elst
+    /// for its stream and is emitted even when `write_edit_list` is
+    /// `false`. Validated at `open` through `demux::build_elst_box`'s
+    /// §8.6.6.3 round-trip rules.
+    pub track_edit_lists: Vec<TrackEditList>,
     /// Reserve a 64-bit `largesize` header for the `mdat` box so the
     /// media payload may exceed 4 GiB (ISO/IEC 14496-12 §4.2 extended
     /// size form: `size == 1` then an `unsigned int(64) largesize`).
@@ -356,6 +393,7 @@ impl Default for Mp4MuxerOptions {
             fragmented: None,
             write_edit_list: true,
             track_sample_groups: Vec::new(),
+            track_edit_lists: Vec::new(),
             large_mdat: false,
             track_protection: Vec::new(),
             pssh: Vec::new(),

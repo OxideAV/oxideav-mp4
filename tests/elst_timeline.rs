@@ -532,3 +532,172 @@ fn ffprobe_agrees_on_start_delay() {
     );
     let _ = std::fs::remove_file(&tmp);
 }
+
+// --- Mux-side explicit edit lists ----------------------------------------
+
+mod mux_explicit {
+    use super::demux_timing;
+    use oxideav_core::{
+        CodecId, CodecParameters, Packet, ReadSeek, StreamInfo, TimeBase, WriteSeek,
+    };
+    use oxideav_mp4::demux::EditListEntry;
+    use oxideav_mp4::{Mp4MuxerOptions, TrackEditList};
+    use std::io::Cursor;
+
+    fn pcm_stream() -> StreamInfo {
+        let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+        params.channels = Some(2);
+        params.sample_rate = Some(48_000);
+        StreamInfo {
+            index: 0,
+            time_base: TimeBase::new(1, 48_000),
+            duration: None,
+            start_time: Some(0),
+            params,
+        }
+    }
+
+    fn entry(dur: u64, mt: i64, rate: i16) -> EditListEntry {
+        EditListEntry {
+            segment_duration: dur,
+            media_time: mt,
+            media_rate_integer: rate,
+            media_rate_fraction: 0,
+        }
+    }
+
+    /// Mux 3 PCM packets (first pts `start_pts`) with `opts`, return
+    /// the produced bytes.
+    fn mux_pcm(start_pts: i64, opts: Mp4MuxerOptions) -> Vec<u8> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stream = pcm_stream();
+        let tmp = std::env::temp_dir().join(format!(
+            "oxideav-mp4-elst-explicit-{}-{n}.mp4",
+            std::process::id()
+        ));
+        {
+            let f = std::fs::File::create(&tmp).unwrap();
+            let ws: Box<dyn WriteSeek> = Box::new(f);
+            let mut mux =
+                oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), opts)
+                    .unwrap();
+            mux.write_header().unwrap();
+            for i in 0..3i64 {
+                let mut pkt = Packet::new(0, stream.time_base, vec![0u8; 1024 * 4]);
+                pkt.pts = Some(start_pts + i * 1024);
+                pkt.duration = Some(1024);
+                pkt.flags.keyframe = true;
+                mux.write_packet(&pkt).unwrap();
+            }
+            mux.write_trailer().unwrap();
+        }
+        let bytes = std::fs::read(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        bytes
+    }
+
+    /// An explicit edit list is emitted verbatim and drives the demux
+    /// timeline: a 250-movie-tick (0.25 s = 12000 @ 48 kHz) empty edit
+    /// delays every packet.
+    #[test]
+    fn explicit_list_muxed_and_recovered() {
+        let entries = vec![entry(250, -1, 1), entry(64, 0, 1)];
+        let opts = Mp4MuxerOptions {
+            track_edit_lists: vec![TrackEditList {
+                stream_index: 0,
+                entries: entries.clone(),
+            }],
+            ..Mp4MuxerOptions::default()
+        };
+        let bytes = mux_pcm(0, opts);
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.clone()));
+        let dmx = oxideav_mp4::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
+        assert_eq!(
+            dmx.edit_list(0),
+            entries.as_slice(),
+            "declared list recovered verbatim"
+        );
+        let got = demux_timing(bytes);
+        // 250 movie ticks @ 1000 = 12000 media ticks @ 48000.
+        assert_eq!(got[0], (12_000, 12_000, false));
+        assert_eq!(got[1], (13_024, 13_024, false));
+    }
+
+    /// An explicit list overrides the automatic start-delay emission:
+    /// a plain media_time = 0 list on a delayed input yields unshifted
+    /// output timestamps (the automatic form would have re-created the
+    /// 24_000-tick delay).
+    #[test]
+    fn explicit_list_overrides_automatic() {
+        let opts = Mp4MuxerOptions {
+            track_edit_lists: vec![TrackEditList {
+                stream_index: 0,
+                entries: vec![entry(64, 0, 1)],
+            }],
+            ..Mp4MuxerOptions::default()
+        };
+        let got = demux_timing(mux_pcm(24_000, opts));
+        assert_eq!(
+            got[0].0, 0,
+            "explicit media_time=0 list suppressed the delay"
+        );
+    }
+
+    /// An explicit list is written even when `write_edit_list` is
+    /// `false` — the flag governs only the automatic emission.
+    #[test]
+    fn explicit_list_ignores_write_edit_list_flag() {
+        let entries = vec![entry(250, -1, 1), entry(64, 0, 1)];
+        let opts = Mp4MuxerOptions {
+            write_edit_list: false,
+            track_edit_lists: vec![TrackEditList {
+                stream_index: 0,
+                entries,
+            }],
+            ..Mp4MuxerOptions::default()
+        };
+        let got = demux_timing(mux_pcm(0, opts));
+        assert_eq!(got[0].0, 12_000, "explicit list written despite the flag");
+    }
+
+    /// §8.6.6.3 violations and bad stream indices fail at `open`, not
+    /// at `write_trailer`.
+    #[test]
+    fn invalid_explicit_list_fails_at_open() {
+        let stream = pcm_stream();
+        let open_with = |tel: TrackEditList| {
+            let opts = Mp4MuxerOptions {
+                track_edit_lists: vec![tel],
+                ..Mp4MuxerOptions::default()
+            };
+            let ws: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
+            oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), opts)
+                .map(|_| ())
+        };
+        // Trailing empty edit (§8.6.6.3).
+        assert!(open_with(TrackEditList {
+            stream_index: 0,
+            entries: vec![entry(64, 0, 1), entry(100, -1, 1)],
+        })
+        .is_err());
+        // media_rate_integer outside {0, 1}.
+        assert!(open_with(TrackEditList {
+            stream_index: 0,
+            entries: vec![entry(64, 0, 2)],
+        })
+        .is_err());
+        // Empty entry list.
+        assert!(open_with(TrackEditList {
+            stream_index: 0,
+            entries: vec![],
+        })
+        .is_err());
+        // Out-of-range stream index.
+        assert!(open_with(TrackEditList {
+            stream_index: 3,
+            entries: vec![entry(64, 0, 1)],
+        })
+        .is_err());
+    }
+}

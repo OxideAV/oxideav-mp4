@@ -35,7 +35,9 @@ use std::io::{Cursor, Seek, SeekFrom, Write};
 use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
-use crate::options::{BrandPreset, FragmentedOptions, Mp4MuxerOptions, TrackSampleGroups};
+use crate::options::{
+    BrandPreset, FragmentedOptions, Mp4MuxerOptions, TrackEditList, TrackSampleGroups,
+};
 use crate::sample_entries::{
     apply_protection, sample_entry_for, subtitle_handler_for, subtitle_uses_sthd, SampleEntry,
 };
@@ -206,6 +208,20 @@ pub fn open_with_options(
             entry = apply_protection(entry, s.params.media_type, prot)?;
         }
         tracks.push(TrackState::new(s.clone(), entry));
+    }
+    // ISO/IEC 14496-12 §8.6.6: validate explicit edit lists up front so
+    // a list that would not round-trip (§8.6.6.3 rate / final-empty-edit
+    // / sentinel rules, enforced by `build_elst_box`) fails at `open`
+    // rather than at `write_trailer`.
+    for tel in &options.track_edit_lists {
+        if tel.stream_index >= streams.len() {
+            return Err(Error::invalid(format!(
+                "mp4 muxer: track_edit_lists stream_index {} out of range ({} streams)",
+                tel.stream_index,
+                streams.len()
+            )));
+        }
+        crate::demux::build_elst_box(&tel.entries)?;
     }
     Ok(Box::new(Mp4Muxer {
         output,
@@ -454,6 +470,7 @@ impl Mp4Muxer {
         let moov = build_moov(
             &self.tracks,
             self.options.write_edit_list,
+            &self.options.track_edit_lists,
             &self.options.track_sample_groups,
             &self.options.pssh,
         )?;
@@ -510,6 +527,7 @@ impl Mp4Muxer {
             let candidate = build_moov(
                 &self.tracks,
                 self.options.write_edit_list,
+                &self.options.track_edit_lists,
                 &self.options.track_sample_groups,
                 &self.options.pssh,
             )?;
@@ -552,6 +570,7 @@ impl Mp4Muxer {
 fn build_moov(
     tracks: &[TrackState],
     write_edit_list: bool,
+    track_edit_lists: &[TrackEditList],
     track_sample_groups: &[TrackSampleGroups],
     pssh: &[crate::cenc::PsshBox],
 ) -> Result<Vec<u8>> {
@@ -585,11 +604,18 @@ fn build_moov(
             track_sgpd.extend(tsg.sgpd.iter());
             track_csgp.extend(tsg.csgp.iter());
         }
+        // §8.6.6: an explicit edit list targeting this stream overrides
+        // the automatic start-delay emission (first match wins).
+        let explicit_elst = track_edit_lists
+            .iter()
+            .find(|e| e.stream_index == i)
+            .map(|e| e.entries.as_slice());
         moov_body.extend_from_slice(&build_trak(
             i as u32 + 1,
             t,
             movie_timescale,
             write_edit_list,
+            explicit_elst,
             &track_sbgp,
             &track_sgpd,
             &track_csgp,
@@ -644,6 +670,7 @@ fn build_trak(
     t: &TrackState,
     movie_timescale: u32,
     write_edit_list: bool,
+    explicit_elst: Option<&[crate::demux::EditListEntry]>,
     sbgp: &[&SampleToGroup],
     sgpd: &[&SampleGroupDescription],
     csgp: &[&CompactSampleToGroup],
@@ -652,9 +679,15 @@ fn build_trak(
     let track_duration_movie =
         rescale_u64(t.cumulative_duration, t.media_time_scale, movie_timescale);
     body.extend_from_slice(&build_tkhd(track_id, track_duration_movie, &t.stream));
-    // edts/elst (ISO/IEC 14496-12 §8.6.5–6) goes between tkhd and mdia. Emit
-    // it only when the track has a positive start delay to offset.
-    if write_edit_list {
+    // edts/elst (ISO/IEC 14496-12 §8.6.5–6) goes between tkhd and mdia. An
+    // explicit caller-supplied list is emitted verbatim (and regardless of
+    // `write_edit_list` — the flag governs only the automatic start-delay
+    // emission below); otherwise emit the automatic form when the track has
+    // a positive start delay to offset.
+    if let Some(entries) = explicit_elst {
+        let elst = crate::demux::build_elst_box(entries)?;
+        body.extend_from_slice(&wrap_box(b"edts", &elst));
+    } else if write_edit_list {
         if let Some(edts) = build_edts(t, movie_timescale, track_duration_movie) {
             body.extend_from_slice(&edts);
         }

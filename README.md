@@ -1513,6 +1513,21 @@ version 1 (64-bit) for over-32-bit durations. Tracks starting at PTS 0
 get no `edts`. Controlled by `Mp4MuxerOptions::write_edit_list`
 (default `true`).
 
+Explicit per-track edit lists: `Mp4MuxerOptions::track_edit_lists` (a
+list of `TrackEditList` records, each a `stream_index` plus
+`demux::EditListEntry` entries) emits a caller-supplied `edts/elst`
+verbatim, overriding the automatic start-delay form for that track —
+and is written even when `write_edit_list` is `false` (the flag
+governs only the automatic behaviour). Serialised through
+`demux::build_elst_box`, so §8.6.6.3 round-trip violations (a
+`media_rate_integer` outside {0, 1}, a final empty edit, a
+`media_time` below the -1 sentinel, an empty entry list) and
+out-of-range stream indices fail at `open`, never at `write_trailer`.
+This is the write-side dual of `Mp4Demuxer::edit_list`: a remuxer
+carries a source's elst across by feeding the demuxed slice straight
+back in (mind the §8.6.6.3 unit split — `segment_duration` is movie
+timescale, which this muxer writes as 1000).
+
 Sample groups (`sbgp` / `sgpd` / `csgp`, ISO/IEC 14496-12 §8.9.2 /
 §8.9.3 / §8.9.5) are emitted per-track when supplied via
 `Mp4MuxerOptions::track_sample_groups` (a list of `TrackSampleGroups`,
