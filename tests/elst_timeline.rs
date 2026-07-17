@@ -797,3 +797,40 @@ mod mux_explicit_fragmented {
         );
     }
 }
+
+// --- Timeline-consistency: start_time + seek -----------------------------
+
+/// `StreamInfo::start_time` reflects the mapped presentation start:
+/// a 300-movie-tick empty edit at movie ts 1000 / media ts 48000 puts
+/// the first presented sample at 14400.
+#[test]
+fn stream_start_time_reflects_delay() {
+    let edts = boxed(b"edts", &elst_v0(&[(300, -1, 1), (500, 100, 1)]));
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(build_file(1000, 48_000, 3, 100, &edts)));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    assert_eq!(dmx.streams()[0].start_time, Some(14_400));
+
+    // No elst → 0 as before.
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(build_file(1000, 48_000, 3, 100, &[])));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    assert_eq!(dmx.streams()[0].start_time, Some(0));
+}
+
+/// `seek_to` operates on the mapped presentation timeline: seeking to
+/// a post-trim pts lands on the sample whose *mapped* pts is at or
+/// before it, and the packet read after the seek carries that pts.
+#[test]
+fn seek_uses_mapped_timeline() {
+    // Trim at 200: samples map to pts -200, -100, 0, 100, 200, 300.
+    let edts = boxed(b"edts", &elst_v0(&[(400, 200, 1)]));
+    let file = build_file(1000, 1000, 6, 100, &edts);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let landed = dmx.seek_to(0, 150).unwrap();
+    assert_eq!(landed, 100, "nearest sync sample at-or-before mapped 150");
+    let pkt = dmx.next_packet().unwrap();
+    assert_eq!(pkt.pts, Some(100));
+    // Seeking to the mapped start lands on pts 0 (not the pre-roll).
+    let landed = dmx.seek_to(0, 0).unwrap();
+    assert_eq!(landed, 0);
+}

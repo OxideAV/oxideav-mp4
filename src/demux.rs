@@ -12636,11 +12636,25 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     }
 
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
+    // §8.6.6: a mapped edit list places the track's first presented
+    // sample at the first edit segment's presentation start (a leading
+    // empty edit delays the track; a plain trim starts at 0). Without
+    // an elst — or under the non-monotonic fallback — the track starts
+    // at presentation time 0 as before.
+    let start_time = if t.elst_timeline.mapped {
+        t.elst_timeline
+            .segments
+            .first()
+            .map(|s| s.pres_start)
+            .unwrap_or(0)
+    } else {
+        0
+    };
     StreamInfo {
         index,
         time_base: TimeBase::new(1, timescale as i64),
         duration: t.duration.map(|d| d as i64),
-        start_time: Some(0),
+        start_time: Some(start_time),
         params,
     }
 }

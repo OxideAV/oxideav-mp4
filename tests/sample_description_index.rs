@@ -336,3 +336,48 @@ mod fragmented {
         assert_eq!(drain_sdis(file), vec![1, 1, 2, 2, 1, 1]);
     }
 }
+
+/// Hostile `stsc.sample_description_index` values — 0 (spec-invalid;
+/// indices are 1-based) and one far past the `stsd` entry count — must
+/// not panic; the values are surfaced verbatim for the caller to
+/// judge.
+#[test]
+fn hostile_sdi_values_surfaced_verbatim() {
+    const SAMPLE: u32 = 4;
+    let build_moov = |off1: u32, off2: u32| -> Vec<u8> {
+        let mut stbl = Vec::new();
+        stbl.extend_from_slice(&stsd_two_entries());
+        stbl.extend_from_slice(&stts_uniform(4, 100));
+        stbl.extend_from_slice(&stsc(&[(1, 2, 0), (2, 2, 9999)]));
+        stbl.extend_from_slice(&stsz_uniform(4, SAMPLE));
+        stbl.extend_from_slice(&stco(&[off1, off2]));
+        let stbl = boxed(b"stbl", &stbl);
+        let mut minf = Vec::new();
+        minf.extend_from_slice(&smhd());
+        minf.extend_from_slice(&dinf_dref());
+        minf.extend_from_slice(&stbl);
+        let minf = boxed(b"minf", &minf);
+        let mut mdia = Vec::new();
+        mdia.extend_from_slice(&mdhd_audio(48_000));
+        mdia.extend_from_slice(&hdlr_soun());
+        mdia.extend_from_slice(&minf);
+        let mdia = boxed(b"mdia", &mdia);
+        let mut trak = Vec::new();
+        trak.extend_from_slice(&tkhd_audio(1));
+        trak.extend_from_slice(&mdia);
+        let trak = boxed(b"trak", &trak);
+        let mut moov = Vec::new();
+        moov.extend_from_slice(&mvhd(1000));
+        moov.extend_from_slice(&trak);
+        boxed(b"moov", &moov)
+    };
+    let ftyp_b = ftyp();
+    let moov_len = build_moov(0, 0).len();
+    let base = (ftyp_b.len() + moov_len + 8) as u32;
+    let moov = build_moov(base, base + 2 * SAMPLE);
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp_b);
+    file.extend_from_slice(&moov);
+    file.extend_from_slice(&boxed(b"mdat", &[0u8; 16]));
+    assert_eq!(drain_sdis(file), vec![0, 0, 9999, 9999]);
+}
