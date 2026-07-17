@@ -421,12 +421,14 @@ fn fragmented_two_segments_round_trip() {
     }
 }
 
-/// Multi-segment edit list: two `elst` entries (one empty + one media)
-/// must surface the *first non-empty* media_time as the leading shift.
+/// Multi-segment edit list: an empty edit followed by a media segment
+/// applies the full §8.6.6 mapping — the empty edit's duration pushes
+/// the presentation timeline out, and the media segment's `media_time`
+/// is subtracted from each sample's composition time.
 #[test]
-fn multi_segment_elst_uses_first_non_empty_media_time() {
+fn multi_segment_elst_applies_empty_edit_offset_and_media_time() {
     // A single-fragment fragmented file with an elst that has an empty
-    // dwell + a real media segment.
+    // edit + a real media segment.
     use std::io::Cursor;
 
     fn elst_v0(entries: &[(u32, i32)]) -> Vec<u8> {
@@ -465,8 +467,10 @@ fn multi_segment_elst_uses_first_non_empty_media_time() {
     let timescale = 48_000u32;
     let default_dur = 1u32;
 
-    // elst: dwell of 100 movie ticks (media_time = -1) + real segment
-    // starting at media_time = 5 (track-timescale) for 1000 ticks.
+    // elst: empty edit of 100 movie ticks (media_time = -1) + real
+    // segment starting at media_time = 5 (track-timescale) for 1000
+    // ticks. Movie timescale == media timescale here, so the empty
+    // edit contributes +100 and the segment delta is 100 - 5 = +95.
     let edts = edts_with(&[(100, -1), (1000, 5)]);
 
     let mut file = Vec::new();
@@ -493,8 +497,9 @@ fn multi_segment_elst_uses_first_non_empty_media_time() {
         }
     }
     assert_eq!(got.len(), 3);
-    // bmdt = 10, elst leading shift = 5 → first sample DTS = 10 - 5 = 5.
-    assert_eq!(got, vec![5, 6, 7], "elst leading shift not applied");
+    // bmdt = 10, segment delta = pres_start(100) - media_time(5) = 95
+    // → first sample DTS = 10 + 95 = 105.
+    assert_eq!(got, vec![105, 106, 107], "full elst mapping not applied");
 }
 
 /// Files with a `styp` segment-type box at the segment boundary

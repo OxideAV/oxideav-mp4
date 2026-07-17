@@ -1500,17 +1500,28 @@ fn edit_list_suppressed_by_option() {
 
 #[test]
 fn edit_list_roundtrips_through_demuxer() {
-    // A muxed edit list (empty edit + media_time 0) must not corrupt the
-    // demuxed packet bytes: the demuxer's leading-media-time shift only acts
-    // on the first NON-empty edit (media_time 0 here → zero shift).
+    // A muxed edit list (empty edit + media_time 0) round-trips the
+    // start delay: the §8.6.6 mapping adds the empty edit's duration
+    // back onto the presentation timeline, so the demuxed pts recover
+    // the original packet pts (24_000 @ 48 kHz = the 0.5 s delay the
+    // muxer wrote as a 500-tick empty edit at movie timescale 1000).
     let bytes = mux_pcm_with_start_pts_bytes(24_000, true);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
-    let mut count = 0;
+    let mut count: i64 = 0;
     loop {
         match dmx.next_packet() {
             Ok(p) => {
                 assert_eq!(p.data.len(), 1024 * 4, "packet {count} byte size preserved");
+                assert_eq!(
+                    p.pts,
+                    Some(24_000 + count * 1024),
+                    "packet {count} pts recovers the muxed start delay"
+                );
+                assert!(
+                    !p.flags.discard,
+                    "packet {count} is presented (no media excised)"
+                );
                 count += 1;
             }
             Err(oxideav_core::Error::Eof) => break,

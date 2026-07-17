@@ -155,6 +155,31 @@ Sample-entry FourCCs resolve to these codec ids:
   total against their own running tally). Absent `mehd`, the key is
   not emitted and `duration_micros` falls back to `mvhd.duration` as
   before.
+- Edit lists (ISO/IEC 14496-12 §8.6.5–6, `edts`/`elst`): the full
+  explicit timeline map is applied to packet timestamps. Each edit
+  segment contributes a constant presentation delta — a leading empty
+  edit (`media_time = -1`) pushes the track's start out by its
+  (movie-timescale) duration, an initial trim (`media_time > 0`)
+  subtracts the trim point, a dwell (`media_rate_integer = 0`) inserts
+  presentation time without consuming media, and multi-segment lists
+  hop each mapped media range onto its presentation position
+  (`segment_duration` is rescaled movie→media timescale with
+  saturating 128-bit math; a zero duration is the §8.6.6.1 open-ended
+  "from `media_time` onwards" form). Media the list never presents —
+  decode pre-roll before the first mapped composition time (e.g.
+  priming samples ahead of a trim) and ranges excised between
+  segments — is still delivered for decoding but carries the packet
+  `discard` flag. Both v0 (32-bit) and v1 (64-bit) entry layouts are
+  read. The mapping applies when the list is *media-monotonic*
+  (non-decreasing `media_time` and per-segment delta across
+  segments — every common shape: delay, trim, delay + trim, dwell
+  inserts, padded excisions); a list that re-orders or repeats media
+  falls back to the single leading-shift mapping so DTS stays
+  monotonic. The same mapping covers moov-resident sample tables and
+  `moof` fragments (the elst lives in the moov and spans the
+  fragments). A muxer-written start-delay elst round-trips: demuxing
+  our own output recovers the original packet pts including the
+  delay.
 - Seek: `seek_to(stream, pts)` lands on the nearest sync-sample ≤ pts
   (or the first keyframe of the stream if none qualify).
 - Metadata: 3GPP `udta` boxes (`titl`/`auth`/…) and iTunes-style

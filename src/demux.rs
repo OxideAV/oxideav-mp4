@@ -221,10 +221,20 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     }
     let moov = moov.ok_or_else(|| Error::invalid("MP4: missing moov box"))?;
 
-    let parsed = parse_moov(&moov)?;
+    let mut parsed = parse_moov(&moov)?;
     if parsed.tracks.is_empty() {
         return Err(Error::invalid("MP4: no tracks"));
     }
+
+    // Resolve each track's §8.6.6 edit list onto the presentation
+    // timeline. Deferred to here (not parse_trak) because the
+    // `segment_duration` rescale needs the movie timescale from
+    // `mvhd`, which may legitimately follow the `trak` boxes.
+    let movie_timescale = parsed.movie_timescale;
+    for t in &mut parsed.tracks {
+        t.elst_timeline = build_elst_timeline(&t.elst, movie_timescale, t.timescale);
+    }
+    let parsed = parsed;
 
     let mut streams: Vec<StreamInfo> = Vec::with_capacity(parsed.tracks.len());
     let mut samples: Vec<SampleRef> = Vec::new();
@@ -1479,6 +1489,11 @@ struct Track {
     /// An empty vector means "no edit list" (no shift, identity
     /// presentation timeline).
     elst: Vec<ElstEntry>,
+    /// The §8.6.6 presentation timeline precomputed from `elst` once
+    /// the movie timescale is known (after the whole moov is parsed —
+    /// `mvhd` may follow the `trak` boxes). Identity when `elst` is
+    /// empty.
+    elst_timeline: ElstTimeline,
     /// `mvex/trex` per-track defaults populated from the moov; supply
     /// the fall-back per-sample size / duration / flags / sample
     /// description index when a fragment's `tfhd` / `trun` doesn't
@@ -2640,17 +2655,168 @@ struct CopyrightRecord {
 
 /// Single entry of an `elst` (EditListBox).
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(dead_code)] // segment_duration/media_rate parsed for completeness; only media_time drives sample shift today
 struct ElstEntry {
     /// In *movie* timescale (per ISO/IEC 14496-12 §8.6.6.1).
     segment_duration: u64,
     /// In *track* (media) timescale. `-1` means "empty" (the segment
     /// has no underlying media; play silence/black for the duration).
     media_time: i64,
-    /// 16.16 fixed-point. Only `0x0001_0000` (1.0) is supported in
-    /// terms of timeline mapping; non-1.0 rates are recorded but the
-    /// presentation-time projection assumes 1.0.
+    /// 16.16 fixed-point. §8.6.6.3 allows only 1.0 (normal) and 0.0
+    /// (a "dwell": the media at `media_time` is held still for
+    /// `segment_duration`); any other value is treated as 1.0 for the
+    /// timeline projection.
     media_rate: u32,
+}
+
+/// One non-empty, non-dwell edit segment resolved onto the
+/// presentation timeline (§8.6.6). All fields are in the *media*
+/// timescale: `segment_duration` (movie timescale on the wire) is
+/// rescaled once at build time so the per-sample mapping is a pair of
+/// additions.
+#[derive(Clone, Copy, Debug)]
+struct ElstMappedSegment {
+    /// Presentation (composition) time this segment starts at —
+    /// the sum of every earlier segment's duration, including empty
+    /// edits and dwells.
+    pres_start: i64,
+    /// `media_time` — the media composition time this segment maps
+    /// from.
+    media_start: i64,
+    /// Media consumed by this segment (== presentation duration at
+    /// rate 1.0). `0` means open-ended: §8.6.6.1 allows a zero
+    /// `segment_duration` in the initial movie of a fragmented file,
+    /// meaning "from `media_time` onwards".
+    dur: i64,
+}
+
+/// The §8.6.6 explicit timeline map, precomputed per track once the
+/// movie timescale is known.
+///
+/// The full multi-segment mapping applies when the edit list is
+/// *media-monotonic*: successive non-empty segments have
+/// non-decreasing `media_time` and non-decreasing presentation deltas
+/// (`pres_start - media_start`), which guarantees decode-order DTS
+/// stays monotonic after mapping. Every common shape qualifies —
+/// initial empty-edit delay, initial trim (`media_time > 0`),
+/// delay + trim, dwell inserts, multi-segment appends. A list that
+/// re-orders or repeats media (a delta that moves backwards) falls
+/// back to the single leading-shift behaviour so timestamps stay
+/// monotonic.
+#[derive(Clone, Debug, Default)]
+struct ElstTimeline {
+    /// Non-empty, non-dwell segments in presentation order.
+    segments: Vec<ElstMappedSegment>,
+    /// First non-empty edit's `media_time` — the legacy constant
+    /// shift, used when `mapped` is false.
+    leading_shift: i64,
+    /// True when the per-segment mapping applies (see type docs).
+    mapped: bool,
+}
+
+impl ElstTimeline {
+    /// Map a sample's media composition time to `(delta, presented)`:
+    /// `delta` is added to the sample's CTS and DTS to land it on the
+    /// presentation timeline, and `presented` is false when the edit
+    /// list never presents this composition time (decode pre-roll
+    /// before the first segment, or media excised between segments) —
+    /// surfaced as the packet `discard` flag.
+    fn delta_for_cts(&self, cts: i64) -> (i64, bool) {
+        if !self.mapped || self.segments.is_empty() {
+            // Legacy single-shift behaviour: subtract the first
+            // non-empty edit's media_time.
+            return (self.leading_shift.saturating_neg(), true);
+        }
+        let first = &self.segments[0];
+        if cts < first.media_start {
+            // Decode pre-roll: media before the first mapped
+            // composition time is never presented (e.g. priming
+            // samples ahead of an initial trim). Extrapolate the first
+            // segment's delta so pre-roll timestamps stay ordered
+            // (they land before the segment's presentation start).
+            return (first.pres_start.saturating_sub(first.media_start), false);
+        }
+        // Last segment whose media_start <= cts (media-monotonic list,
+        // so this is the innermost candidate).
+        let mut chosen = 0usize;
+        for (i, s) in self.segments.iter().enumerate() {
+            if s.media_start <= cts {
+                chosen = i;
+            } else {
+                break;
+            }
+        }
+        let s = &self.segments[chosen];
+        let delta = s.pres_start.saturating_sub(s.media_start);
+        let in_range = s.dur == 0 || cts < s.media_start.saturating_add(s.dur);
+        if in_range {
+            (delta, true)
+        } else {
+            // Past the declared end of the chosen segment. Between two
+            // segments the media is excised (not presented); past the
+            // *last* segment we keep presenting — real files routinely
+            // declare an elst duration a frame or two short of the
+            // track, and §8.6.6.3 models the tail as an implicit empty
+            // edit on the *movie* timeline, not a sample drop.
+            (delta, chosen == self.segments.len() - 1)
+        }
+    }
+}
+
+/// Precompute the §8.6.6 presentation timeline for one track.
+///
+/// `segment_duration` is expressed in the movie timescale (§8.6.6.3);
+/// each is rescaled to the track's media timescale here, with `u128`
+/// intermediate math (a v1 entry carries a 64-bit duration) saturating
+/// to `i64::MAX` rather than wrapping.
+fn build_elst_timeline(
+    elst: &[ElstEntry],
+    movie_timescale: u32,
+    media_timescale: u32,
+) -> ElstTimeline {
+    let leading_shift = elst_leading_media_time(elst);
+    let mut segments: Vec<ElstMappedSegment> = Vec::new();
+    let mut pres: i128 = 0;
+    for e in elst {
+        let dur_media: i64 = if movie_timescale > 0 {
+            let d = (e.segment_duration as u128).saturating_mul(media_timescale as u128)
+                / movie_timescale as u128;
+            i64::try_from(d).unwrap_or(i64::MAX)
+        } else {
+            0
+        };
+        let rate_integer = (e.media_rate >> 16) as i16;
+        if e.media_time == -1 || rate_integer == 0 {
+            // Empty edit or dwell: presentation time advances, no
+            // media range is consumed. (A dwell holds the single
+            // composition instant `media_time` — repeating a frame is
+            // a renderer concern; at the container layer it inserts
+            // presentation time exactly like an empty edit.)
+            pres = pres.saturating_add(dur_media as i128);
+            continue;
+        }
+        segments.push(ElstMappedSegment {
+            pres_start: i64::try_from(pres).unwrap_or(i64::MAX),
+            media_start: e.media_time,
+            dur: dur_media,
+        });
+        pres = pres.saturating_add(dur_media as i128);
+    }
+    // Media-monotonicity: non-decreasing media_start AND
+    // non-decreasing delta across successive segments (see type docs).
+    let mut mapped = !segments.is_empty();
+    for w in segments.windows(2) {
+        let d0 = w[0].pres_start.saturating_sub(w[0].media_start);
+        let d1 = w[1].pres_start.saturating_sub(w[1].media_start);
+        if w[1].media_start < w[0].media_start || d1 < d0 {
+            mapped = false;
+            break;
+        }
+    }
+    ElstTimeline {
+        segments,
+        leading_shift,
+        mapped,
+    }
 }
 
 /// Per-track defaults from `mvex/trex` (ISO/IEC 14496-12 §8.8.3). All
@@ -5112,6 +5278,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
         stss: Vec::new(),
         ctts: Vec::new(),
         elst: Vec::new(),
+        elst_timeline: ElstTimeline::default(),
         trex: TrexDefaults::default(),
         protection_scheme: None,
         tenc: None,
@@ -6070,8 +6237,8 @@ fn parse_elst(body: &[u8], t: &mut Track) -> Result<()> {
 /// matches the legacy single-segment behaviour and is what B-frame
 /// `ctts` offsets compose against to land the first presented frame
 /// at pts 0.
-fn elst_leading_media_time(t: &Track) -> i64 {
-    for e in &t.elst {
+fn elst_leading_media_time(elst: &[ElstEntry]) -> i64 {
+    for e in elst {
         if e.media_time != -1 {
             return e.media_time;
         }
@@ -9754,9 +9921,13 @@ fn parse_traf(
             });
             let keyframe = (flags & SAMPLE_IS_NON_SYNC) == 0;
             let cts_off = s.composition_time_offset.unwrap_or(0) as i64;
-            let elst_shift = elst_leading_media_time(track);
-            let dts_v = frag_dts.saturating_sub(elst_shift);
-            let cts_v = frag_dts.saturating_add(cts_off).saturating_sub(elst_shift);
+            // §8.6.6 edit-list mapping — same per-segment delta +
+            // discard semantics as the moov sample-table path (the
+            // elst lives in the moov and spans the fragments).
+            let media_cts = frag_dts.saturating_add(cts_off);
+            let (elst_delta, presented) = track.elst_timeline.delta_for_cts(media_cts);
+            let dts_v = frag_dts.saturating_add(elst_delta);
+            let cts_v = media_cts.saturating_add(elst_delta);
 
             samples.push(SampleRef {
                 track_idx: state.track_idx as u32,
@@ -9766,6 +9937,7 @@ fn parse_traf(
                 dts: dts_v,
                 duration: dur,
                 keyframe,
+                discard: !presented,
             });
 
             sample_off = sample_off.saturating_add(size as u64);
@@ -10806,6 +10978,13 @@ struct SampleRef {
     dts: i64,
     duration: i64,
     keyframe: bool,
+    /// True when the §8.6.6 edit list never presents this sample's
+    /// composition time (decode pre-roll before the first edit
+    /// segment, or media excised between segments). Surfaced as the
+    /// packet `discard` flag: the sample must still be decoded (it may
+    /// be a reference frame / priming input) but its output is not
+    /// shown.
+    discard: bool,
 }
 
 fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result<()> {
@@ -10933,15 +11112,16 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
         // box leave `cts_offsets` zero-filled, so audio + intra-only
         // video continue to take the DTS path unchanged.
         //
-        // The edit list (§8.6.6) shifts the presentation timeline by
-        // the first non-empty edit's `media_time`; subtract it from
-        // CTS so the first presented frame's pts lands at zero.
-        // Tracks without elst leave the leading shift at 0 (no-op).
-        let elst_shift = elst_leading_media_time(t);
-        let cts_v = dts_v
-            .saturating_add(cts_offsets[i])
-            .saturating_sub(elst_shift);
-        let dts_v_shifted = dts_v.saturating_sub(elst_shift);
+        // The edit list (§8.6.6) maps the media composition time onto
+        // the presentation timeline: each edit segment contributes a
+        // constant delta (empty edits and dwells push later segments
+        // out), and media the list never presents is delivered with
+        // the discard flag set. Tracks without an elst take the
+        // identity mapping.
+        let media_cts = dts_v.saturating_add(cts_offsets[i]);
+        let (elst_delta, presented) = t.elst_timeline.delta_for_cts(media_cts);
+        let cts_v = media_cts.saturating_add(elst_delta);
+        let dts_v_shifted = dts_v.saturating_add(elst_delta);
         let one_based = (i as u32) + 1;
         let keyframe = stss_all_keyframes || stss_set.contains(&one_based);
         out.push(SampleRef {
@@ -10952,6 +11132,7 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
             dts: dts_v_shifted,
             duration: dur,
             keyframe,
+            discard: !presented,
         });
     }
     Ok(())
@@ -12776,6 +12957,10 @@ impl Demuxer for Mp4Demuxer {
         pkt.dts = Some(s.dts);
         pkt.duration = Some(s.duration);
         pkt.flags.keyframe = s.keyframe;
+        // §8.6.6: media the edit list never presents (decode pre-roll
+        // / excised ranges) is delivered for decoding but flagged so a
+        // player drops the decoded output instead of showing it.
+        pkt.flags.discard = s.discard;
         Ok(pkt)
     }
 
@@ -13776,6 +13961,7 @@ mod tests {
             stss: Vec::new(),
             ctts: Vec::new(),
             elst: Vec::new(),
+            elst_timeline: super::ElstTimeline::default(),
             trex: super::TrexDefaults::default(),
             protection_scheme: None,
             tenc: None,
@@ -14497,7 +14683,160 @@ mod tests {
         assert_eq!(t.elst[0].media_time, -1);
         assert_eq!(t.elst[1].media_time, 500);
         assert_eq!(t.elst[1].segment_duration, 2000);
-        assert_eq!(super::elst_leading_media_time(&t), 500);
+        assert_eq!(super::elst_leading_media_time(&t.elst), 500);
+    }
+
+    fn elst_entry(dur: u64, mt: i64, rate: u32) -> super::ElstEntry {
+        super::ElstEntry {
+            segment_duration: dur,
+            media_time: mt,
+            media_rate: rate,
+        }
+    }
+
+    const RATE_1: u32 = 0x0001_0000;
+    const RATE_0: u32 = 0;
+
+    /// No elst → identity mapping, everything presented.
+    #[test]
+    fn elst_timeline_identity_when_absent() {
+        let tl = super::build_elst_timeline(&[], 1000, 48_000);
+        assert_eq!(tl.delta_for_cts(0), (0, true));
+        assert_eq!(tl.delta_for_cts(123_456), (0, true));
+    }
+
+    /// Single trim (`media_time > 0`): the mapped delta is `-media_time`
+    /// and composition times before it are decode pre-roll (discard).
+    #[test]
+    fn elst_timeline_initial_trim() {
+        let tl = super::build_elst_timeline(&[elst_entry(2000, 1024, RATE_1)], 1000, 48_000);
+        assert!(tl.mapped);
+        assert_eq!(tl.delta_for_cts(1024), (-1024, true));
+        assert_eq!(tl.delta_for_cts(5000), (-1024, true));
+        // Pre-roll before the trim point: same delta, not presented.
+        assert_eq!(tl.delta_for_cts(0), (-1024, false));
+        assert_eq!(tl.delta_for_cts(1023), (-1024, false));
+    }
+
+    /// Delay + trim: a leading empty edit pushes the presentation start
+    /// out by its (rescaled) duration; movie timescale 1000 vs media
+    /// 48000 → 500 movie ticks = 24000 media ticks.
+    #[test]
+    fn elst_timeline_empty_edit_delay_rescales_movie_timescale() {
+        let elst = [elst_entry(500, -1, RATE_1), elst_entry(3000, 100, RATE_1)];
+        let tl = super::build_elst_timeline(&elst, 1000, 48_000);
+        assert!(tl.mapped);
+        // delta = pres_start(24000) - media_time(100).
+        assert_eq!(tl.delta_for_cts(100), (23_900, true));
+        assert_eq!(tl.delta_for_cts(0), (23_900, false)); // pre-roll
+    }
+
+    /// A dwell (`media_rate` 0) inserts presentation time exactly like
+    /// an empty edit: later segments shift out by its duration.
+    #[test]
+    fn elst_timeline_dwell_inserts_presentation_time() {
+        // Movie ts == media ts (1:1 rescale). Segment A maps media
+        // [0, 100); a 50-tick dwell holds; segment B maps media
+        // [100, 200) starting at presentation 150.
+        let elst = [
+            elst_entry(100, 0, RATE_1),
+            elst_entry(50, 100, RATE_0),
+            elst_entry(100, 100, RATE_1),
+        ];
+        let tl = super::build_elst_timeline(&elst, 1000, 1000);
+        assert!(tl.mapped);
+        assert_eq!(tl.delta_for_cts(0), (0, true));
+        assert_eq!(tl.delta_for_cts(99), (0, true));
+        // Media 100 belongs to segment B (pres 150): delta +50.
+        assert_eq!(tl.delta_for_cts(100), (50, true));
+        assert_eq!(tl.delta_for_cts(199), (50, true));
+    }
+
+    /// Media excised between two segments with an inserted empty edit
+    /// (deltas stay non-decreasing): the gap samples are delivered
+    /// with `presented == false`.
+    #[test]
+    fn elst_timeline_interior_gap_discards() {
+        // Segment A media [0, 100) → pres [0, 100); empty edit 150;
+        // segment B media [200, 300) → pres [250, 350). Media
+        // [100, 200) is never presented.
+        let elst = [
+            elst_entry(100, 0, RATE_1),
+            elst_entry(150, -1, RATE_1),
+            elst_entry(100, 200, RATE_1),
+        ];
+        let tl = super::build_elst_timeline(&elst, 1000, 1000);
+        assert!(tl.mapped);
+        assert_eq!(tl.delta_for_cts(50), (0, true));
+        // Interior gap: previous segment's delta, not presented.
+        assert_eq!(tl.delta_for_cts(100), (0, false));
+        assert_eq!(tl.delta_for_cts(199), (0, false));
+        // Segment B: delta = 250 - 200 = +50.
+        assert_eq!(tl.delta_for_cts(200), (50, true));
+        // Past the last segment's declared end: tolerated (sloppy
+        // durations), still presented.
+        assert_eq!(tl.delta_for_cts(305), (50, true));
+    }
+
+    /// A media-reordering list (delta moves backwards) falls back to
+    /// the leading-shift mapping so DTS stays monotonic.
+    #[test]
+    fn elst_timeline_non_monotonic_falls_back_to_leading_shift() {
+        // Excision with NO padding: seg A media [0,100) → pres
+        // [0,100), seg B media [200,300) → pres [100,200): delta drops
+        // from 0 to -100 → fallback.
+        let elst = [elst_entry(100, 0, RATE_1), elst_entry(100, 200, RATE_1)];
+        let tl = super::build_elst_timeline(&elst, 1000, 1000);
+        assert!(!tl.mapped);
+        // Leading shift = first non-empty media_time = 0 → identity.
+        assert_eq!(tl.delta_for_cts(150), (0, true));
+        assert_eq!(tl.delta_for_cts(250), (0, true));
+    }
+
+    /// §8.6.6.1 zero-duration edit in the initial movie of a
+    /// fragmented file: open-ended "from media_time onwards".
+    #[test]
+    fn elst_timeline_zero_duration_open_ended() {
+        let tl = super::build_elst_timeline(&[elst_entry(0, 20, RATE_1)], 1000, 1000);
+        assert!(tl.mapped);
+        assert_eq!(tl.delta_for_cts(20), (-20, true));
+        assert_eq!(tl.delta_for_cts(1_000_000), (-20, true));
+        assert_eq!(tl.delta_for_cts(0), (-20, false)); // pre-roll
+    }
+
+    /// Hostile v1 magnitudes: u64::MAX segment_duration must saturate,
+    /// not wrap or panic, through the movie→media rescale and the
+    /// presentation accumulator.
+    #[test]
+    fn elst_timeline_saturates_on_giant_durations() {
+        let elst = [
+            elst_entry(u64::MAX, -1, RATE_1),
+            elst_entry(u64::MAX, 10, RATE_1),
+        ];
+        let tl = super::build_elst_timeline(&elst, 1, 48_000);
+        // Must not panic; the mapped delta saturates.
+        let (d, _) = tl.delta_for_cts(10);
+        assert!(d >= 0, "saturated positive delta, got {d}");
+        let _ = tl.delta_for_cts(i64::MAX);
+        let _ = tl.delta_for_cts(i64::MIN);
+    }
+
+    /// A zero movie timescale (malformed mvhd) must not divide by zero;
+    /// all durations collapse to 0 (open-ended first segment wins).
+    #[test]
+    fn elst_timeline_zero_movie_timescale() {
+        let tl = super::build_elst_timeline(&[elst_entry(1000, 30, RATE_1)], 0, 48_000);
+        assert_eq!(tl.delta_for_cts(30), (-30, true));
+        assert_eq!(tl.delta_for_cts(29), (-30, false));
+    }
+
+    /// An all-empty edit list (spec-prohibited: the last edit shall
+    /// never be empty) degrades to the leading-shift fallback.
+    #[test]
+    fn elst_timeline_all_empty_list_falls_back() {
+        let tl = super::build_elst_timeline(&[elst_entry(100, -1, RATE_1)], 1000, 1000);
+        assert!(!tl.mapped);
+        assert_eq!(tl.delta_for_cts(0), (0, true));
     }
 
     /// §8.3.3 — `tref` carrying a single `chap` reference resolves to one
