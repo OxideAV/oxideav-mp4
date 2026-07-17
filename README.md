@@ -1526,7 +1526,13 @@ out-of-range stream indices fail at `open`, never at `write_trailer`.
 This is the write-side dual of `Mp4Demuxer::edit_list`: a remuxer
 carries a source's elst across by feeding the demuxed slice straight
 back in (mind the §8.6.6.3 unit split — `segment_duration` is movie
-timescale, which this muxer writes as 1000).
+timescale, which this muxer writes as 1000). The same option drives
+the fragmented muxer's init segment: the list is written into the
+init-`moov` trak, where the §8.6.6.1 zero-`segment_duration` form is
+the idiomatic choice ("the edit provides the offset for the movie and
+subsequent movie fragments") — e.g. a `media_time = 1024, duration =
+0` entry cuts AAC priming ahead of the first presented CMAF sample
+across every fragment.
 
 Sample groups (`sbgp` / `sgpd` / `csgp`, ISO/IEC 14496-12 §8.9.2 /
 §8.9.3 / §8.9.5) are emitted per-track when supplied via

@@ -251,6 +251,22 @@ pub fn open_fragmented_typed(
         base.samples_per_chunk_target = default_samples_per_chunk(&base.stream);
         tracks.push(FragTrackState::new(base, (i as u32) + 1, protection));
     }
+    // ISO/IEC 14496-12 §8.6.6: validate explicit edit lists up front so
+    // a list that would not round-trip (§8.6.6.3, enforced by
+    // `build_elst_box`) fails at `open` rather than at `write_header`.
+    // For a fragmented movie the §8.6.6.1 zero-`segment_duration` form
+    // is the idiomatic choice: the edit then provides the offset for
+    // the movie and all subsequent movie fragments.
+    for tel in &options.track_edit_lists {
+        if tel.stream_index >= streams.len() {
+            return Err(Error::invalid(format!(
+                "mp4 muxer: track_edit_lists stream_index {} out of range ({} streams)",
+                tel.stream_index,
+                streams.len()
+            )));
+        }
+        crate::demux::build_elst_box(&tel.entries)?;
+    }
     Ok(FragmentedMuxer {
         output,
         tracks,
@@ -332,6 +348,7 @@ impl Muxer for FragmentedMuxer {
         // override the zeroes.
         let moov = build_init_moov(
             &self.tracks,
+            &self.options.track_edit_lists,
             &self.frag_options.levels,
             &self.frag_options.treps,
             &self.options.pssh,
@@ -1234,6 +1251,7 @@ fn build_styp(brand: &BrandPreset) -> Vec<u8> {
 
 fn build_init_moov(
     tracks: &[FragTrackState],
+    track_edit_lists: &[crate::options::TrackEditList],
     levels: &[crate::demux::LevaEntry],
     treps: &[crate::demux::TrepRecord],
     pssh: &[crate::cenc::PsshBox],
@@ -1244,7 +1262,18 @@ fn build_init_moov(
     let mut moov_body = Vec::new();
     moov_body.extend_from_slice(&build_mvhd(movie_timescale, 0, (tracks.len() as u32) + 1));
     for t in tracks {
-        moov_body.extend_from_slice(&build_trak_init(t.track_id, &t.base, movie_timescale)?);
+        // §8.6.6: explicit edit list for this track (stream index is
+        // track_id - 1 — track IDs are assigned 1-based in open order).
+        let explicit_elst = track_edit_lists
+            .iter()
+            .find(|e| e.stream_index as u32 + 1 == t.track_id)
+            .map(|e| e.entries.as_slice());
+        moov_body.extend_from_slice(&build_trak_init(
+            t.track_id,
+            &t.base,
+            movie_timescale,
+            explicit_elst,
+        )?);
     }
     moov_body.extend_from_slice(&build_mvex(tracks, levels, treps)?);
     // ISO/IEC 23001-7 §8.1: moov-level pssh boxes, one per DRM system,
@@ -1255,11 +1284,23 @@ fn build_init_moov(
     Ok(wrap_box(b"moov", &moov_body))
 }
 
-fn build_trak_init(track_id: u32, t: &TrackState, movie_timescale: u32) -> Result<Vec<u8>> {
+fn build_trak_init(
+    track_id: u32,
+    t: &TrackState,
+    movie_timescale: u32,
+    explicit_elst: Option<&[crate::demux::EditListEntry]>,
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     // Duration is unknown at init time — use 0 so players read tfhd/trun
     // for actual timing. Per §8.2.2 a zero duration means "indefinite".
     body.extend_from_slice(&build_tkhd(track_id, 0, &t.stream));
+    // §8.6.5–6: a caller-supplied edit list goes between tkhd and mdia.
+    // The §8.6.6.1 zero-duration form makes it cover the whole
+    // fragmented presentation ("from media_time onwards").
+    if let Some(entries) = explicit_elst {
+        let elst = crate::demux::build_elst_box(entries)?;
+        body.extend_from_slice(&wrap_box(b"edts", &elst));
+    }
     // mdia uses the same builder as the non-fragmented path; sample
     // tables will be empty (the moov has no samples).
     body.extend_from_slice(&build_mdia(t)?);

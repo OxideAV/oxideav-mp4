@@ -701,3 +701,99 @@ mod mux_explicit {
         .is_err());
     }
 }
+
+// --- Fragmented muxer explicit edit lists --------------------------------
+
+mod mux_explicit_fragmented {
+    use super::demux_timing;
+    use oxideav_core::{
+        CodecId, CodecParameters, Packet, ReadSeek, StreamInfo, TimeBase, WriteSeek,
+    };
+    use oxideav_mp4::demux::EditListEntry;
+    use oxideav_mp4::{
+        BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions, TrackEditList,
+    };
+    use std::io::Cursor;
+
+    /// The §8.6.6.1 zero-duration fragmented idiom: an explicit
+    /// `media_time = 1024, segment_duration = 0` trim in the init
+    /// segment applies to every subsequent movie fragment ("the edit
+    /// provides the offset for the movie and subsequent movie
+    /// fragments") — the shape a packager uses to cut priming
+    /// samples ahead of the audio a CMAF track actually presents.
+    #[test]
+    fn fragmented_open_ended_trim_spans_fragments() {
+        let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+        params.channels = Some(2);
+        params.sample_rate = Some(48_000);
+        let stream = StreamInfo {
+            index: 0,
+            time_base: TimeBase::new(1, 48_000),
+            duration: None,
+            start_time: Some(0),
+            params,
+        };
+        let entries = vec![EditListEntry {
+            segment_duration: 0,
+            media_time: 1024,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        }];
+        let opts = Mp4MuxerOptions {
+            fragmented: Some(FragmentedOptions {
+                cadence: FragmentCadence::EveryNPackets(2),
+                styp: Some(BrandPreset::Custom {
+                    major: *b"msdh",
+                    compatible: vec![*b"msdh", *b"msix"],
+                }),
+                ..FragmentedOptions::default()
+            }),
+            track_edit_lists: vec![TrackEditList {
+                stream_index: 0,
+                entries: entries.clone(),
+            }],
+            ..Mp4MuxerOptions::default()
+        };
+        let tmp =
+            std::env::temp_dir().join(format!("oxideav-mp4-elst-frag-{}.mp4", std::process::id()));
+        {
+            let f = std::fs::File::create(&tmp).unwrap();
+            let ws: Box<dyn WriteSeek> = Box::new(f);
+            let mut mux =
+                oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), opts)
+                    .unwrap();
+            mux.write_header().unwrap();
+            // 4 packets × 1024 ticks → 2 fragments of 2 packets each.
+            for i in 0..4i64 {
+                let mut pkt = Packet::new(0, stream.time_base, vec![0u8; 1024 * 4]);
+                pkt.pts = Some(i * 1024);
+                pkt.duration = Some(1024);
+                pkt.flags.keyframe = true;
+                mux.write_packet(&pkt).unwrap();
+            }
+            mux.write_trailer().unwrap();
+        }
+        let bytes = std::fs::read(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        // Typed accessor recovers the declared list from the init moov.
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.clone()));
+        let dmx = oxideav_mp4::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
+        assert_eq!(dmx.edit_list(0), entries.as_slice());
+
+        // The trim spans both fragments: packet 0 (cts 0) is priming
+        // pre-roll (discard, pts -1024), packet 1 (cts 1024) is the
+        // first presented sample at pts 0, and packets 2..3 — in the
+        // SECOND fragment — keep the same -1024 delta.
+        let got = demux_timing(bytes);
+        assert_eq!(
+            got,
+            vec![
+                (-1024, -1024, true),
+                (0, 0, false),
+                (1024, 1024, false),
+                (2048, 2048, false),
+            ]
+        );
+    }
+}
