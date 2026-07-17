@@ -179,7 +179,17 @@ Sample-entry FourCCs resolve to these codec ids:
   `moof` fragments (the elst lives in the moov and spans the
   fragments). A muxer-written start-delay elst round-trips: demuxing
   our own output recovers the original packet pts including the
-  delay.
+  delay. The declared list is also surfaced verbatim: typed via
+  `Mp4Demuxer::edit_list(stream)` (a slice of `demux::EditListEntry` —
+  `segment_duration` / `media_time` / `media_rate_integer` /
+  `media_rate_fraction`, with `is_empty_edit()` / `is_dwell()`
+  helpers) and flat via `params.options` as `elst_entry_count` +
+  `elst_<n>` (`dur=<d> media_time=<mt> rate=<int>`). The standalone
+  byte pair `demux::parse_elst_box` / `build_elst_box` round-trips
+  the box byte-exact (auto v0/v1 width selection; build rejects
+  §8.6.6.3 violations — a rate outside {0, 1}, a final empty edit, a
+  `media_time` below the -1 sentinel, an empty entry list), so a
+  remuxer can carry a source's elst across unchanged.
 - Seek: `seek_to(stream, pts)` lands on the nearest sync-sample ≤ pts
   (or the first keyframe of the stream if none qualify).
 - Metadata: 3GPP `udta` boxes (`titl`/`auth`/…) and iTunes-style

@@ -389,6 +389,62 @@ fn hostile_giant_elst_values_do_not_panic() {
     }
 }
 
+/// The typed `Mp4Demuxer::edit_list` accessor and the flat
+/// `elst_entry_count` / `elst_<n>` options keys surface the declared
+/// list verbatim, and feeding the typed slice back through
+/// `build_elst_box` reproduces the on-the-wire entries.
+#[test]
+fn edit_list_surfaced_typed_and_flat() {
+    use oxideav_mp4::demux::{build_elst_box, parse_elst_box, EditListEntry};
+
+    let edts = boxed(b"edts", &elst_v0(&[(300, -1, 1), (500, 100, 1)]));
+    let file = build_file(1000, 48_000, 3, 100, &edts);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let dmx = oxideav_mp4::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
+
+    let expect = vec![
+        EditListEntry {
+            segment_duration: 300,
+            media_time: -1,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        },
+        EditListEntry {
+            segment_duration: 500,
+            media_time: 100,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        },
+    ];
+    assert_eq!(dmx.edit_list(0), expect.as_slice());
+    assert!(dmx.edit_list(7).is_empty(), "out-of-range index is empty");
+
+    use oxideav_core::Demuxer;
+    let opts = &dmx.streams()[0].params.options;
+    assert_eq!(opts.get("elst_entry_count"), Some("2"));
+    assert_eq!(opts.get("elst_0"), Some("dur=300 media_time=-1 rate=1"));
+    assert_eq!(opts.get("elst_1"), Some("dur=500 media_time=100 rate=1"));
+
+    // Remux path: typed slice → build_elst_box → parse_elst_box is the
+    // identity.
+    let rebuilt = build_elst_box(dmx.edit_list(0)).unwrap();
+    assert_eq!(parse_elst_box(&rebuilt[8..]).unwrap(), expect);
+}
+
+/// A track without `edts` emits neither the typed entries nor the
+/// flat keys.
+#[test]
+fn no_elst_no_surface() {
+    let file = build_file(1000, 48_000, 3, 100, &[]);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let dmx = oxideav_mp4::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
+    assert!(dmx.edit_list(0).is_empty());
+    use oxideav_core::Demuxer;
+    let opts = &dmx.streams()[0].params.options;
+    assert!(opts.get("elst_entry_count").is_none());
+    assert!(opts.get("elst_0").is_none());
+}
+
 /// Black-box cross-check: an independent reader (`ffprobe`, invoked as
 /// an opaque CLI) reports the same first-packet presentation time for a
 /// muxer-produced start-delay file as this crate's own demuxer.

@@ -774,6 +774,11 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         movie_timescale: parsed.movie_timescale,
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
+        edit_lists: parsed
+            .tracks
+            .iter()
+            .map(|t| t.elst.iter().map(elst_entry_to_public).collect())
+            .collect(),
     })
 }
 
@@ -6169,9 +6174,15 @@ fn parse_edts(body: &[u8], t: &mut Track) -> Result<()> {
 ///   is out of scope for this demuxer.
 ///
 /// Stores the full list so the multi-segment apply path
-/// (`apply_elst_segments`) can hop the presentation timeline
-/// across each segment correctly.
+/// (`build_elst_timeline` / `ElstTimeline::delta_for_cts`) can hop the
+/// presentation timeline across each segment correctly.
 fn parse_elst(body: &[u8], t: &mut Track) -> Result<()> {
+    parse_elst_into(body, &mut t.elst)
+}
+
+/// Body parser shared by the track walk ([`parse_elst`]) and the
+/// public standalone entry point ([`parse_elst_box`]).
+fn parse_elst_into(body: &[u8], out: &mut Vec<ElstEntry>) -> Result<()> {
     if body.len() < 8 {
         return Err(Error::invalid("MP4: elst too short"));
     }
@@ -6228,7 +6239,7 @@ fn parse_elst(body: &[u8], t: &mut Track) -> Result<()> {
         });
         off += entry_size;
     }
-    t.elst = entries;
+    *out = entries;
     Ok(())
 }
 
@@ -6244,6 +6255,124 @@ fn elst_leading_media_time(elst: &[ElstEntry]) -> i64 {
         }
     }
     0
+}
+
+/// One entry of an `elst` EditListBox (ISO/IEC 14496-12 §8.6.6) — the
+/// public typed form surfaced by [`Mp4Demuxer::edit_list`] and consumed
+/// by [`build_elst_box`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditListEntry {
+    /// Duration of this edit segment in units of the *movie* timescale
+    /// (`mvhd.timescale`, §8.6.6.3).
+    pub segment_duration: u64,
+    /// Starting composition time within the media of this edit segment
+    /// (*media* timescale). `-1` marks an empty edit.
+    pub media_time: i64,
+    /// §8.6.6.3: `1` plays the media normally, `0` is a dwell (the
+    /// media at `media_time` is held for `segment_duration`). No other
+    /// value is defined.
+    pub media_rate_integer: i16,
+    /// Specified as 0 by §8.6.6.2; preserved verbatim on parse.
+    pub media_rate_fraction: i16,
+}
+
+impl EditListEntry {
+    /// True when this entry is an empty edit (`media_time == -1`).
+    pub fn is_empty_edit(&self) -> bool {
+        self.media_time == -1
+    }
+
+    /// True when this entry is a §8.6.6.3 dwell
+    /// (`media_rate_integer == 0` on a non-empty edit).
+    pub fn is_dwell(&self) -> bool {
+        self.media_rate_integer == 0 && !self.is_empty_edit()
+    }
+}
+
+fn elst_entry_to_public(e: &ElstEntry) -> EditListEntry {
+    EditListEntry {
+        segment_duration: e.segment_duration,
+        media_time: e.media_time,
+        media_rate_integer: (e.media_rate >> 16) as i16,
+        media_rate_fraction: (e.media_rate & 0xFFFF) as i16,
+    }
+}
+
+/// Parse an `elst` (EditListBox, ISO/IEC 14496-12 §8.6.6) box *body*
+/// (FullBox header onwards, excluding the `[size][fourcc]` prefix)
+/// into typed entries. Both the v0 (32-bit) and v1 (64-bit) field
+/// widths are handled; a body shorter than its declared `entry_count`
+/// is rejected.
+pub fn parse_elst_box(body: &[u8]) -> Result<Vec<EditListEntry>> {
+    let mut t_elst: Vec<ElstEntry> = Vec::new();
+    parse_elst_into(body, &mut t_elst)?;
+    Ok(t_elst.iter().map(elst_entry_to_public).collect())
+}
+
+/// Build a complete `[size]["elst"]` EditListBox from typed entries —
+/// the byte-exact inverse of [`parse_elst_box`]. The FullBox `version`
+/// is auto-selected: v0 (32-bit widths) when every value fits, v1
+/// (64-bit) otherwise. Entries that would not survive a §8.6.6
+/// round-trip are rejected:
+///
+/// * `media_rate_integer` outside `{0, 1}` (§8.6.6.3 defines no other
+///   value),
+/// * a final empty edit (§8.6.6.3: "The last edit in a track shall
+///   never be an empty edit"),
+/// * `media_time < -1` (negative times other than the empty-edit
+///   sentinel are meaningless),
+/// * an empty entry list (write no `edts` at all instead).
+pub fn build_elst_box(entries: &[EditListEntry]) -> Result<Vec<u8>> {
+    if entries.is_empty() {
+        return Err(Error::invalid(
+            "MP4: elst with no entries (omit the box instead)",
+        ));
+    }
+    if let Some(last) = entries.last() {
+        if last.is_empty_edit() {
+            return Err(Error::invalid(
+                "MP4: the last edit in a track shall never be an empty edit (§8.6.6.3)",
+            ));
+        }
+    }
+    let mut use_v1 = false;
+    for e in entries {
+        if e.media_rate_integer != 0 && e.media_rate_integer != 1 {
+            return Err(Error::invalid(format!(
+                "MP4: elst media_rate_integer {} not in {{0, 1}} (§8.6.6.3)",
+                e.media_rate_integer
+            )));
+        }
+        if e.media_time < -1 {
+            return Err(Error::invalid(format!(
+                "MP4: elst media_time {} below the -1 empty-edit sentinel",
+                e.media_time
+            )));
+        }
+        if e.segment_duration > u32::MAX as u64 || e.media_time > i32::MAX as i64 {
+            use_v1 = true;
+        }
+    }
+    let mut body = Vec::with_capacity(8 + entries.len() * if use_v1 { 20 } else { 12 });
+    body.push(u8::from(use_v1)); // version
+    body.extend_from_slice(&[0, 0, 0]); // flags
+    body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for e in entries {
+        if use_v1 {
+            body.extend_from_slice(&e.segment_duration.to_be_bytes());
+            body.extend_from_slice(&e.media_time.to_be_bytes());
+        } else {
+            body.extend_from_slice(&(e.segment_duration as u32).to_be_bytes());
+            body.extend_from_slice(&(e.media_time as i32).to_be_bytes());
+        }
+        body.extend_from_slice(&e.media_rate_integer.to_be_bytes());
+        body.extend_from_slice(&e.media_rate_fraction.to_be_bytes());
+    }
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+    out.extend_from_slice(b"elst");
+    out.extend_from_slice(&body);
+    Ok(out)
 }
 
 fn parse_mdia(body: &[u8], t: &mut Track) -> Result<()> {
@@ -11303,6 +11432,31 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert("language", tag.clone());
     }
 
+    // ISO/IEC 14496-12 §8.6.6: surface the declared edit list as
+    // `elst_entry_count` + `elst_<n>` (0-based entry index) with value
+    // `"dur=<segment_duration> media_time=<media_time> rate=<int>"`
+    // (`segment_duration` in the movie timescale, `media_time` in the
+    // media timescale, `-1` = empty edit; `rate` is the
+    // §8.6.6.3 media_rate_integer — 1 normal, 0 dwell). The demuxer
+    // has already applied the mapping to packet timestamps; these keys
+    // expose the declaration for remuxers / validators. The typed form
+    // is `Mp4Demuxer::edit_list`. Absent `elst`, no keys are emitted.
+    if !t.elst.is_empty() {
+        params
+            .options
+            .insert("elst_entry_count", t.elst.len().to_string());
+        for (i, e) in t.elst.iter().enumerate() {
+            let p = elst_entry_to_public(e);
+            params.options.insert(
+                format!("elst_{}", i),
+                format!(
+                    "dur={} media_time={} rate={}",
+                    p.segment_duration, p.media_time, p.media_rate_integer
+                ),
+            );
+        }
+    }
+
     // ISO/IEC 14496-12 §8.3.3: surface track references as
     // `tref_<type>` → space-separated track IDs. Callers use this to
     // wire up subtitle→video (`subt`), chapter (`chap`), content
@@ -12648,6 +12802,12 @@ pub struct Mp4Demuxer {
     movie_timescale: u32,
     track_timescales: Vec<u32>,
     track_ids: Vec<u32>,
+    /// Per-stream §8.6.6 edit lists in typed form (empty Vec = no
+    /// `edts`/`elst` on that track). The demuxer has already applied
+    /// the timeline mapping to packet timestamps; this surface is for
+    /// tooling that wants the declared list itself (e.g. a remuxer
+    /// carrying the elst across, or a validator).
+    edit_lists: Vec<Vec<EditListEntry>>,
 }
 
 impl Mp4Demuxer {
@@ -12927,6 +13087,22 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn meco(&self) -> &MecoBox {
         &self.meco
+    }
+
+    /// The §8.6.6 edit list declared on `stream_index`'s track, in
+    /// typed form (empty slice = no `edts`/`elst`, or the index is out
+    /// of range). Packet timestamps have already been mapped through
+    /// this list; the raw entries are surfaced for tooling that wants
+    /// the declaration itself — a remuxer carrying the elst across
+    /// (feed the slice to [`build_elst_box`]), or a validator checking
+    /// §8.6.6.3 constraints. The same data appears on the stream's
+    /// `params.options` as `elst_entry_count` + `elst_<n>` flat keys.
+    #[allow(dead_code)]
+    pub fn edit_list(&self, stream_index: u32) -> &[EditListEntry] {
+        self.edit_lists
+            .get(stream_index as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -14837,6 +15013,123 @@ mod tests {
         let tl = super::build_elst_timeline(&[elst_entry(100, -1, RATE_1)], 1000, 1000);
         assert!(!tl.mapped);
         assert_eq!(tl.delta_for_cts(0), (0, true));
+    }
+
+    /// `build_elst_box` → `parse_elst_box` round-trips typed entries
+    /// through the v0 (32-bit) layout when every value fits.
+    #[test]
+    fn elst_box_roundtrip_v0() {
+        let entries = [
+            super::EditListEntry {
+                segment_duration: 500,
+                media_time: -1,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            },
+            super::EditListEntry {
+                segment_duration: 3000,
+                media_time: 1024,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            },
+        ];
+        let built = super::build_elst_box(&entries).unwrap();
+        assert_eq!(&built[4..8], b"elst");
+        assert_eq!(built[8], 0, "v0 when values fit 32 bits");
+        let parsed = super::parse_elst_box(&built[8..]).unwrap();
+        assert_eq!(parsed, entries);
+    }
+
+    /// Values past the 32-bit widths auto-promote the box to v1 and
+    /// still round-trip.
+    #[test]
+    fn elst_box_roundtrip_v1_promotion() {
+        let entries = [super::EditListEntry {
+            segment_duration: u32::MAX as u64 + 1,
+            media_time: i32::MAX as i64 + 7,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        }];
+        let built = super::build_elst_box(&entries).unwrap();
+        assert_eq!(built[8], 1, "v1 for over-32-bit values");
+        let parsed = super::parse_elst_box(&built[8..]).unwrap();
+        assert_eq!(parsed, entries);
+    }
+
+    /// A dwell entry (`media_rate_integer = 0`) is legal and preserved.
+    #[test]
+    fn elst_box_roundtrip_dwell() {
+        let entries = [
+            super::EditListEntry {
+                segment_duration: 100,
+                media_time: 0,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            },
+            super::EditListEntry {
+                segment_duration: 50,
+                media_time: 100,
+                media_rate_integer: 0,
+                media_rate_fraction: 0,
+            },
+            super::EditListEntry {
+                segment_duration: 100,
+                media_time: 100,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            },
+        ];
+        let built = super::build_elst_box(&entries).unwrap();
+        let parsed = super::parse_elst_box(&built[8..]).unwrap();
+        assert_eq!(parsed, entries);
+    }
+
+    /// §8.6.6.3 round-trip rejections: bad rate, trailing empty edit,
+    /// sub-sentinel media_time, empty list.
+    #[test]
+    fn elst_box_build_rejections() {
+        let normal = super::EditListEntry {
+            segment_duration: 100,
+            media_time: 0,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        };
+        // media_rate_integer outside {0, 1}.
+        let mut bad_rate = normal;
+        bad_rate.media_rate_integer = 2;
+        assert!(super::build_elst_box(&[bad_rate]).is_err());
+        let mut neg_rate = normal;
+        neg_rate.media_rate_integer = -1;
+        assert!(super::build_elst_box(&[neg_rate]).is_err());
+        // Final empty edit.
+        let empty_edit = super::EditListEntry {
+            segment_duration: 100,
+            media_time: -1,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        };
+        assert!(super::build_elst_box(&[normal, empty_edit]).is_err());
+        // Leading empty edit is fine.
+        assert!(super::build_elst_box(&[empty_edit, normal]).is_ok());
+        // media_time below the -1 sentinel.
+        let mut sub_sentinel = normal;
+        sub_sentinel.media_time = -2;
+        assert!(super::build_elst_box(&[sub_sentinel]).is_err());
+        // Empty list.
+        assert!(super::build_elst_box(&[]).is_err());
+    }
+
+    /// `parse_elst_box` rejects truncated bodies: shorter than the
+    /// FullBox+count header, and shorter than the declared entries.
+    #[test]
+    fn elst_box_parse_truncation() {
+        assert!(super::parse_elst_box(&[]).is_err());
+        assert!(super::parse_elst_box(&[0u8; 7]).is_err());
+        // Declares 2 v0 entries but carries bytes for 1.
+        let mut body = vec![0u8; 4];
+        body.extend_from_slice(&2u32.to_be_bytes());
+        body.extend_from_slice(&[0u8; 12]);
+        assert!(super::parse_elst_box(&body).is_err());
     }
 
     /// §8.3.3 — `tref` carrying a single `chap` reference resolves to one
