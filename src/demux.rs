@@ -779,6 +779,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             .iter()
             .map(|t| t.elst.iter().map(elst_entry_to_public).collect())
             .collect(),
+        last_sdi: None,
     })
 }
 
@@ -2829,7 +2830,6 @@ fn build_elst_timeline(
 /// consults these as a fall-back when a `tfhd` lacks the corresponding
 /// override flag.
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(dead_code)] // default_sample_description_index recorded for parity; we only use the first stsd entry
 struct TrexDefaults {
     /// `default_sample_description_index` — almost always 1.
     default_sample_description_index: u32,
@@ -9616,6 +9616,11 @@ struct TrafState {
     /// fragment, in the track's media timescale. `None` when no
     /// `tfdt` is present (then the running `next_dts` is used).
     base_media_decode_time: Option<i64>,
+    /// §8.8.7 `sample_description_index` for every sample in this
+    /// traf — from `tfhd` when its 0x000002 flag is set, else the
+    /// `trex` default. 1-based; 0 only when the file supplied 0 (a
+    /// spec violation preserved verbatim).
+    sample_description_index: u32,
 }
 
 /// `tfhd` flag bits (ISO/IEC 14496-12 §8.8.7.1).
@@ -10067,6 +10072,7 @@ fn parse_traf(
                 duration: dur,
                 keyframe,
                 discard: !presented,
+                sdi: state.sample_description_index,
             });
 
             sample_off = sample_off.saturating_add(size as u64);
@@ -10106,6 +10112,7 @@ fn parse_tfhd(body: &[u8], moof_start: u64, tracks: &[Track], state: &mut TrafSt
     state.default_sample_duration = trex.default_sample_duration;
     state.default_sample_size = trex.default_sample_size;
     state.default_sample_flags = trex.default_sample_flags;
+    state.sample_description_index = trex.default_sample_description_index;
 
     // Reset the per-traf bmdt — it'll be set by tfdt if present.
     state.base_media_decode_time = None;
@@ -10135,7 +10142,12 @@ fn parse_tfhd(body: &[u8], moof_start: u64, tracks: &[Track], state: &mut TrafSt
                 "MP4: tfhd sample_description_index truncated",
             ));
         }
-        // Currently unused; we only carry the first stsd entry.
+        // §8.8.7: overrides the trex default for every sample in this
+        // traf. Decode still uses stsd entry [0]; the index is carried
+        // per sample so callers can detect a mid-stream description
+        // switch (surfaced via `Mp4Demuxer::sample_description_index_of_last_packet`).
+        state.sample_description_index =
+            u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
         off += 4;
     }
     if flags & TFHD_DEFAULT_SAMPLE_DURATION_PRESENT != 0 {
@@ -11114,6 +11126,12 @@ struct SampleRef {
     /// be a reference frame / priming input) but its output is not
     /// shown.
     discard: bool,
+    /// 1-based `sample_description_index` naming the `stsd` entry this
+    /// sample decodes against — from the covering `stsc` entry
+    /// (§8.7.4) for moov-resident samples, or `tfhd` / `trex`
+    /// (§8.8.7) for fragment samples. Decode always uses entry [0];
+    /// this is surfaced so callers can detect a mid-stream switch.
+    sdi: u32,
 }
 
 fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result<()> {
@@ -11178,12 +11196,16 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
     // per stsc entry, matching what any well-formed file already does.
     let mut chunk_of_sample = Vec::with_capacity(n_samples);
     let mut sample_within_chunk = Vec::with_capacity(n_samples);
+    // §8.7.4: each stsc run also names the 1-based stsd entry its
+    // samples decode against; carried per sample so callers can detect
+    // a mid-stream sample-description switch.
+    let mut sdi_of_sample: Vec<u32> = Vec::with_capacity(n_samples);
     {
         let mut sample_i = 0;
         let mut chunk_i = 1u32;
         let n_samples_u32 = u32::try_from(n_samples).unwrap_or(u32::MAX);
         for entry_i in 0..t.stsc.len() {
-            let (fc, spc, _sdi) = t.stsc[entry_i];
+            let (fc, spc, sdi) = t.stsc[entry_i];
             let next_fc = t
                 .stsc
                 .get(entry_i + 1)
@@ -11199,6 +11221,7 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
                     }
                     chunk_of_sample.push(ch);
                     sample_within_chunk.push(s_in_ch);
+                    sdi_of_sample.push(sdi);
                     sample_i += 1;
                 }
                 ch += 1;
@@ -11210,6 +11233,7 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
         while sample_within_chunk.len() < n_samples {
             chunk_of_sample.push(*chunk_of_sample.last().unwrap_or(&1));
             sample_within_chunk.push(0);
+            sdi_of_sample.push(*sdi_of_sample.last().unwrap_or(&1));
         }
     }
 
@@ -11262,6 +11286,7 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
             duration: dur,
             keyframe,
             discard: !presented,
+            sdi: sdi_of_sample[i],
         });
     }
     Ok(())
@@ -12808,6 +12833,10 @@ pub struct Mp4Demuxer {
     /// tooling that wants the declared list itself (e.g. a remuxer
     /// carrying the elst across, or a validator).
     edit_lists: Vec<Vec<EditListEntry>>,
+    /// `sample_description_index` of the packet most recently returned
+    /// by `next_packet` (`None` before the first packet). See
+    /// [`Self::sample_description_index_of_last_packet`].
+    last_sdi: Option<u32>,
 }
 
 impl Mp4Demuxer {
@@ -13104,6 +13133,25 @@ impl Mp4Demuxer {
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
+
+    /// The 1-based §8.5.2 `sample_description_index` of the packet
+    /// most recently returned by `next_packet` (`None` before the
+    /// first packet). Resolved from the covering `stsc` entry (§8.7.4)
+    /// for moov-resident samples and from `tfhd` / `trex` (§8.8.7) for
+    /// fragment samples.
+    ///
+    /// Active decode always uses `stsd` entry `[0]` (index 1); a value
+    /// ≥ 2 tells the caller this packet was authored against a
+    /// different sample description — look it up via the stream's
+    /// `stsd_<n>` options (or re-open a decoder against that entry's
+    /// config) before feeding the packet on. Files that switch
+    /// descriptions mid-stream are rare but §8.5.2.3 permits them;
+    /// this surface closes the detection half of that gap (automatic
+    /// mid-stream codec re-dispatch remains out of scope).
+    #[allow(dead_code)]
+    pub fn sample_description_index_of_last_packet(&self) -> Option<u32> {
+        self.last_sdi
+    }
 }
 
 impl Demuxer for Mp4Demuxer {
@@ -13121,6 +13169,7 @@ impl Demuxer for Mp4Demuxer {
         }
         let s = self.samples[self.cursor];
         self.cursor += 1;
+        self.last_sdi = Some(s.sdi);
         self.input.seek(SeekFrom::Start(s.offset))?;
         let mut data = vec![0u8; s.size as usize];
         self.input.read_exact(&mut data)?;

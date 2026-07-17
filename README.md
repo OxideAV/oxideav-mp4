@@ -1743,12 +1743,16 @@ first that applies:
   mdat-resident auxiliary-information bytes that the `saio`
   offsets name are not pre-fetched — a CENC consumer reading them
   seeks the input itself using the surfaced offsets.
-- Per-sample *selection* of a non-active sample description. All
-  `stsd` entries are now parsed and surfaced (see §8.5.2 above), but
-  active decode always uses entry `[0]`: a per-chunk
-  `stsc.sample_description_index ≥ 2` or a fragment's
-  `tfhd.sample_description_index` override is recorded/surfaced but not
-  yet honoured to re-dispatch the codec mid-stream.
+- Automatic mid-stream codec re-dispatch on a sample-description
+  switch. All `stsd` entries are parsed and surfaced (§8.5.2), and the
+  per-packet `sample_description_index` is now resolved from the
+  covering `stsc` entry (§8.7.4) / the fragment's `tfhd`-or-`trex`
+  value (§8.8.7) and surfaced via
+  `Mp4Demuxer::sample_description_index_of_last_packet` — so a caller
+  *detects* the switch (index ≥ 2 = this packet was authored against
+  the `stsd_<n>` entry, not the active `[0]`) and re-opens its decoder
+  against that entry's config. What remains out of scope is doing that
+  re-dispatch automatically inside `next_packet`.
 
 ## Container registry
 
