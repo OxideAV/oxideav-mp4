@@ -224,6 +224,7 @@ pub fn open_fragmented_typed(
     if streams.is_empty() {
         return Err(Error::invalid("mp4 muxer: need at least one stream"));
     }
+    options.validate_track_header_timestamps(streams.len())?;
     let mut tracks = Vec::with_capacity(streams.len());
     for (i, s) in streams.iter().enumerate() {
         let mut entry = sample_entry_for(&s.params)?;
@@ -249,6 +250,10 @@ pub fn open_fragmented_typed(
         // chunking-target field is irrelevant — we only carry it to keep
         // TrackState happy.
         base.samples_per_chunk_target = default_samples_per_chunk(&base.stream);
+        // §8.3.2 / §8.4.2 header timestamps for the init segment's
+        // tkhd / mdhd: movie-wide values unless overridden per track.
+        base.tkhd_timestamps = options.resolve_track_timestamps(i);
+        base.mdhd_timestamps = options.resolve_media_timestamps(i);
         tracks.push(FragTrackState::new(base, (i as u32) + 1, protection));
     }
     // ISO/IEC 14496-12 §8.6.6: validate explicit edit lists up front so
@@ -361,6 +366,7 @@ impl Muxer for FragmentedMuxer {
             &self.frag_options.treps,
             &self.options.pssh,
             self.frag_options.write_mehd,
+            self.options.resolve_movie_timestamps(),
         )?;
         // §8.8.2 — remember where the reserved mehd fragment_duration
         // bytes landed in the file (ftyp precedes the moov) so
@@ -1380,12 +1386,18 @@ fn build_init_moov(
     treps: &[crate::demux::TrepRecord],
     pssh: &[crate::cenc::PsshBox],
     write_mehd: bool,
+    movie_times: crate::demux::HeaderTimestamps,
 ) -> Result<(Vec<u8>, Option<usize>)> {
     // Movie timescale: pick 1000 (matches the non-fragmented path).
     let movie_timescale: u32 = 1000;
 
     let mut moov_body = Vec::new();
-    moov_body.extend_from_slice(&build_mvhd(movie_timescale, 0, (tracks.len() as u32) + 1));
+    moov_body.extend_from_slice(&build_mvhd(
+        movie_timescale,
+        0,
+        (tracks.len() as u32) + 1,
+        movie_times,
+    ));
     for t in tracks {
         // §8.6.6: explicit edit list for this track (stream index is
         // track_id - 1 — track IDs are assigned 1-based in open order).
@@ -1424,7 +1436,7 @@ fn build_trak_init(
     let mut body = Vec::new();
     // Duration is unknown at init time — use 0 so players read tfhd/trun
     // for actual timing. Per §8.2.2 a zero duration means "indefinite".
-    body.extend_from_slice(&build_tkhd(track_id, 0, &t.stream));
+    body.extend_from_slice(&build_tkhd(track_id, 0, &t.stream, t.tkhd_timestamps));
     // §8.6.5–6: a caller-supplied edit list goes between tkhd and mdia.
     // The §8.6.6.1 zero-duration form makes it cover the whole
     // fragmented presentation ("from media_time onwards").

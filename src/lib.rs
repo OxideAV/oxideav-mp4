@@ -31,9 +31,14 @@ pub mod sample_groups;
 pub mod styp;
 
 pub use options::{
-    BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions, TrackEditList,
-    TrackProtection, TrackSampleGroups,
+    mp4_secs_from_system_time, mp4_secs_from_unix_secs, unix_secs_from_mp4_secs, BrandPreset,
+    FragmentCadence, FragmentedOptions, Mp4MuxerOptions, TrackEditList, TrackHeaderTimestamps,
+    TrackProtection, TrackSampleGroups, MP4_EPOCH_OFFSET_SECS,
 };
+// The header-timestamp pair is written through `Mp4MuxerOptions` and
+// read back off `Mp4Demuxer`, so it belongs at the root alongside the
+// options types even though it is defined in `demux`.
+pub use demux::HeaderTimestamps;
 
 use oxideav_core::ContainerRegistry;
 

@@ -1576,6 +1576,44 @@ subsequent movie fragments") — e.g. a `media_time = 1024, duration =
 0` entry cuts AAC priming ahead of the first presented CMAF sample
 across every fragment.
 
+Header timestamps (`mvhd` §8.2.2, `tkhd` §8.3.2, `mdhd` §8.4.2)
+default to zero — the historical output and the "unset" reading.
+`Mp4MuxerOptions::creation_time` stamps all three, in the ISOBMFF
+epoch: seconds since 1904-01-01 UTC, not the Unix one
+(`mp4_secs_from_unix_secs` / `mp4_secs_from_system_time` convert and
+reject pre-1904 instants; `unix_secs_from_mp4_secs` goes back;
+`MP4_EPOCH_OFFSET_SECS` is the raw constant). One value fills both
+`creation_time` and `modification_time` of each box — the common case
+of a file created and last modified at one instant — while
+`Mp4MuxerOptions::modification_time` drives the two apart. Per-track
+overrides go in `Mp4MuxerOptions::track_header_timestamps`, a list of
+`TrackHeaderTimestamps` keyed by `stream_index` whose `track` is the
+`tkhd` pair and `media` the `mdhd` one (§8.4.2 dates the media, §8.3.2
+the track, and a producer may stamp them apart). An entry replaces the
+pair it names rather than inheriting either half from the movie-wide
+options; `media: None` reusing `track` is the only defaulting step.
+`mvhd` keeps the movie-wide values, and an out-of-range index fails at
+`open`. A timestamp past 2040-02-06 in either half — where the value
+crosses `u32::MAX` — promotes that box from version 0 to version 1
+with 64-bit time and duration fields, the same auto-promotion the
+over-32-bit durations get. The plain, faststart and fragmented
+(init-segment) paths all honour it.
+
+The demuxer surfaces the same three pairs in the same units:
+`Mp4Demuxer::mvhd_timestamps()`, `::tkhd_timestamps(stream)` and
+`::mdhd_timestamps(stream)` (the latter two `None` for an unknown
+stream) return a `demux::HeaderTimestamps`, with the version 0 and
+version 1 layouts both widened to `u64` on intake. The same values
+appear on the flat metadata channel as `mvhd_creation_time` /
+`mvhd_modification_time` and the per-stream `tkhd_*` / `mdhd_*`
+equivalents, each emitted only when non-zero — zero is the "unset"
+encoding most files carry, and `HeaderTimestamps::is_unset` is the
+typed form of that check. The two surfaces reach the same six fields,
+so a remuxer carries a source's stamps across unchanged: same epoch,
+same units, no conversion. The HEIF item properties `crtt` / `mdft`
+are a separate surface — same 1904 origin, but microseconds, so these
+helpers do not apply to them.
+
 Sample groups (`sbgp` / `sgpd` / `csgp`, ISO/IEC 14496-12 §8.9.2 /
 §8.9.3 / §8.9.5) are emitted per-track when supplied via
 `Mp4MuxerOptions::track_sample_groups` (a list of `TrackSampleGroups`,
