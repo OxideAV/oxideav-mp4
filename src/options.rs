@@ -327,6 +327,117 @@ pub struct TrackProtection {
     pub tenc: crate::cenc::TencBox,
 }
 
+/// Seconds between the ISO/IEC 14496-12 epoch (1904-01-01 00:00:00 UTC,
+/// the QuickTime/ISOBMFF header-timestamp origin) and the Unix epoch
+/// (1970-01-01 00:00:00 UTC).
+///
+/// Header timestamps (`mvhd` / `tkhd` / `mdhd` `creation_time` and
+/// `modification_time`) count seconds from the *1904* origin, so a Unix
+/// timestamp has to be shifted by this constant before it goes into a
+/// box. [`mp4_secs_from_unix_secs`] does that with the range checks.
+///
+/// Note the unit: these three header fields count *seconds*. The
+/// ISO/IEC 23008-12 item properties `crtt` / `mdft` share the same 1904
+/// origin but count **microseconds**, so this constant does not convert
+/// them.
+pub const MP4_EPOCH_OFFSET_SECS: u64 = 2_082_844_800;
+
+/// Convert a Unix timestamp (seconds since 1970-01-01 UTC) into the
+/// ISO/IEC 14496-12 header form (seconds since 1904-01-01 UTC) for
+/// [`Mp4MuxerOptions::creation_time`].
+///
+/// Returns `None` for instants before 1904-01-01, which the unsigned
+/// box field cannot represent. [`unix_secs_from_mp4_secs`] is the
+/// inverse, for timestamps read back off a file.
+pub fn mp4_secs_from_unix_secs(unix_secs: i64) -> Option<u64> {
+    // i128 keeps the add exact for every i64 input; the result is then
+    // range-checked back into the unsigned box field.
+    let shifted = unix_secs as i128 + MP4_EPOCH_OFFSET_SECS as i128;
+    u64::try_from(shifted).ok()
+}
+
+/// Convert an ISO/IEC 14496-12 header timestamp (seconds since
+/// 1904-01-01 UTC, as carried by `mvhd` / `tkhd` / `mdhd` and surfaced
+/// by the demuxer's header-timestamp accessors) back to a Unix
+/// timestamp.
+///
+/// Never fails: values above `i64::MAX + MP4_EPOCH_OFFSET_SECS`
+/// saturate at `i64::MAX` rather than wrapping. The inverse of
+/// [`mp4_secs_from_unix_secs`].
+pub fn unix_secs_from_mp4_secs(mp4_secs: u64) -> i64 {
+    // Only the top needs clamping: shifting a u64 down by the offset
+    // floors the result at -MP4_EPOCH_OFFSET_SECS, so the i64 lower
+    // bound cannot be reached.
+    let shifted = mp4_secs as i128 - MP4_EPOCH_OFFSET_SECS as i128;
+    shifted.min(i64::MAX as i128) as i64
+}
+
+/// Convert a [`std::time::SystemTime`] into the ISO/IEC 14496-12 header
+/// form (seconds since 1904-01-01 UTC) for
+/// [`Mp4MuxerOptions::creation_time`].
+///
+/// Sub-second precision is floored — the whole-second field always
+/// names the second the instant falls *inside*, on both sides of 1970.
+/// Returns `None` for instants before 1904-01-01.
+pub fn mp4_secs_from_system_time(t: std::time::SystemTime) -> Option<u64> {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => MP4_EPOCH_OFFSET_SECS.checked_add(d.as_secs()),
+        // Before 1970: representable only if it is still at or after
+        // 1904. `e.duration()` counts *backwards* from the Unix epoch,
+        // so a sub-second remainder means the instant sits one second
+        // earlier than `as_secs()` alone would say — subtract it to
+        // floor rather than round toward the future.
+        Err(e) => {
+            let back = e.duration();
+            let secs = back
+                .as_secs()
+                .saturating_add(u64::from(back.subsec_nanos() > 0));
+            MP4_EPOCH_OFFSET_SECS.checked_sub(secs)
+        }
+    }
+}
+
+/// A per-track override for the header timestamps (ISO/IEC 14496-12
+/// §8.3.2 `tkhd` / §8.4.2 `mdhd`).
+///
+/// When a [`Mp4MuxerOptions::track_header_timestamps`] entry targets a
+/// stream, that track's `tkhd` and `mdhd` carry these timestamps
+/// instead of the movie-wide [`Mp4MuxerOptions::creation_time`] /
+/// [`Mp4MuxerOptions::modification_time`]. The movie header (`mvhd`)
+/// is unaffected — it only ever carries the movie-wide values. Tracks
+/// with no entry keep the movie-wide values.
+///
+/// All values are in the header epoch: seconds since 1904-01-01 UTC
+/// (see [`mp4_secs_from_unix_secs`]).
+///
+/// An entry is read as written — there is no per-field inheritance from
+/// the movie-wide values. [`Self::track`] *is* the `tkhd` pair, and
+/// [`Self::media`] is the `mdhd` pair when it carries one. The only
+/// defaulting is the common case of a track whose media shares its
+/// track's instants: `media: None` reuses [`Self::track`] rather than
+/// making callers write the same pair twice.
+///
+/// A track that wants the movie-wide values in one box and its own in
+/// the other spells both out — e.g. `track: movie_pair` alongside a
+/// `media` override, rather than leaving a field unset and relying on
+/// where it inherits from.
+#[derive(Clone, Debug, Default)]
+pub struct TrackHeaderTimestamps {
+    /// Index into the muxer's `streams` slice (the stream these
+    /// timestamps apply to). Out-of-range indices fail at `open`.
+    pub stream_index: usize,
+    /// The §8.3.2 `tkhd` pair for this track, verbatim. The all-zero
+    /// [`HeaderTimestamps::default`](crate::demux::HeaderTimestamps)
+    /// is a real "unstamped" value, not "inherit the movie's".
+    pub track: crate::demux::HeaderTimestamps,
+    /// The §8.4.2 `mdhd` pair, for a source whose *media* was created
+    /// or last modified at a different instant from the track that
+    /// carries it (§8.4.2 dates the media, §8.3.2 the track — a
+    /// producer may legitimately stamp them apart). `None` — the
+    /// common case — reuses [`Self::track`].
+    pub media: Option<crate::demux::HeaderTimestamps>,
+}
+
 /// Runtime options controlling how the MP4 muxer shapes its output.
 ///
 /// Call [`Mp4MuxerOptions::default`] for the historical behavior of the
@@ -398,6 +509,45 @@ pub struct Mp4MuxerOptions {
     /// envelope. See [`TrackProtection`] for the caller's encryption
     /// responsibilities.
     pub track_protection: Vec<TrackProtection>,
+    /// Header creation timestamp written into `mvhd` (§8.2.2), `tkhd`
+    /// (§8.3.2) and `mdhd` (§8.4.2), in **seconds since 1904-01-01
+    /// UTC** — the ISOBMFF header epoch, not the Unix one. Build the
+    /// value with [`mp4_secs_from_unix_secs`] /
+    /// [`mp4_secs_from_system_time`] rather than by hand.
+    ///
+    /// `None` (the default) leaves the creation half zero — the
+    /// historical behaviour and the §8.2.2 "unset" reading; the header
+    /// is all-zero only when nothing else stamps it, since
+    /// [`Self::modification_time`] and the per-track entries are
+    /// written independently. `Some(t)` writes `t` into both
+    /// `creation_time` and `modification_time` of all three headers,
+    /// matching `ffmpeg -metadata creation_time=…`; set
+    /// [`Self::modification_time`] to drive the two apart, and
+    /// [`Self::track_header_timestamps`] to override `tkhd` / `mdhd`
+    /// per track.
+    ///
+    /// A timestamp past 2040-02-06 exceeds `u32::MAX` and so cannot fit
+    /// the version-0 layout; the affected box is promoted to version 1
+    /// (64-bit time and duration fields) automatically, per box.
+    pub creation_time: Option<u64>,
+    /// Header modification timestamp for `mvhd` / `tkhd` / `mdhd`, in
+    /// seconds since 1904-01-01 UTC.
+    ///
+    /// `None` (the default) reuses [`Self::creation_time`] — a freshly
+    /// written file is created and last modified at one instant. Set
+    /// it when the two differ, e.g. a remux preserving a source's
+    /// history. Drives the version-1 promotion the same way
+    /// `creation_time` does, and is written even when `creation_time`
+    /// is `None`: the resulting `creation = 0, modification = t` is a
+    /// shape real files carry and the demuxer reports.
+    pub modification_time: Option<u64>,
+    /// Per-track overrides for the `tkhd` / `mdhd` timestamps. Empty by
+    /// default — [`Self::creation_time`] covers the common case of one
+    /// instant for the whole movie. An entry replaces both halves of
+    /// the pair for the track it names, rather than inheriting either
+    /// from the movie-wide values. First matching entry per stream
+    /// wins; see [`TrackHeaderTimestamps`].
+    pub track_header_timestamps: Vec<TrackHeaderTimestamps>,
     /// `pssh` (ProtectionSystemSpecificHeaderBox, ISO/IEC 23001-7
     /// §8.1) boxes emitted at `moov` level, after the `trak` boxes —
     /// one per DRM system the content keys are provisioned for.
@@ -420,7 +570,75 @@ impl Default for Mp4MuxerOptions {
             track_edit_lists: Vec::new(),
             large_mdat: false,
             track_protection: Vec::new(),
+            creation_time: None,
+            modification_time: None,
+            track_header_timestamps: Vec::new(),
             pssh: Vec::new(),
         }
+    }
+}
+
+impl Mp4MuxerOptions {
+    /// The `mvhd` (§8.2.2) pair. Movie-wide values only — a per-track
+    /// override never reaches the movie header. Unset collapses to 0,
+    /// the "not stamped" encoding.
+    pub(crate) fn resolve_movie_timestamps(&self) -> crate::demux::HeaderTimestamps {
+        crate::demux::HeaderTimestamps {
+            creation_time: self.creation_time.unwrap_or(0),
+            // A modification time set without a creation time is
+            // unusual but representable, and real files carry the
+            // shape — so write it rather than second-guessing.
+            modification_time: self.modification_time.or(self.creation_time).unwrap_or(0),
+        }
+    }
+
+    /// The `tkhd` (§8.3.2) pair for one track: the entry's `track`
+    /// pair verbatim when one targets this stream, else the movie-wide
+    /// pair.
+    pub(crate) fn resolve_track_timestamps(
+        &self,
+        stream_index: usize,
+    ) -> crate::demux::HeaderTimestamps {
+        match self.track_entry(stream_index) {
+            Some(e) => e.track,
+            None => self.resolve_movie_timestamps(),
+        }
+    }
+
+    /// The `mdhd` (§8.4.2) pair for one track: the entry's `media`
+    /// override if it carries one, else the same pair its `tkhd` got.
+    pub(crate) fn resolve_media_timestamps(
+        &self,
+        stream_index: usize,
+    ) -> crate::demux::HeaderTimestamps {
+        match self.track_entry(stream_index) {
+            Some(e) => e.media.unwrap_or(e.track),
+            None => self.resolve_movie_timestamps(),
+        }
+    }
+
+    /// First [`TrackHeaderTimestamps`] targeting `stream_index`, if any.
+    fn track_entry(&self, stream_index: usize) -> Option<&TrackHeaderTimestamps> {
+        self.track_header_timestamps
+            .iter()
+            .find(|c| c.stream_index == stream_index)
+    }
+
+    /// Reject [`TrackHeaderTimestamps`] entries that name a stream slot
+    /// that does not exist, at `open` rather than silently dropping
+    /// the override at `write_trailer`.
+    pub(crate) fn validate_track_header_timestamps(
+        &self,
+        stream_count: usize,
+    ) -> oxideav_core::Result<()> {
+        for c in &self.track_header_timestamps {
+            if c.stream_index >= stream_count {
+                return Err(oxideav_core::Error::invalid(format!(
+                    "mp4 muxer: track_header_timestamps stream_index {} out of range ({} streams)",
+                    c.stream_index, stream_count
+                )));
+            }
+        }
+        Ok(())
     }
 }
