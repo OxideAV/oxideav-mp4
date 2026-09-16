@@ -371,6 +371,27 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         metadata.push(("mehd_fragment_duration".to_string(), d.to_string()));
     }
 
+    // §8.2.2 mvhd creation / modification timestamps, in the box's own
+    // units (seconds since 1904-01-01 UTC) so the flat channel says
+    // exactly what the file says. Both keys are emitted only when the
+    // value is non-zero: zero is the "producer left it unset" encoding
+    // that the majority of files (including this crate's own default
+    // output) carry, and emitting it everywhere would be noise rather
+    // than information. The typed pair is always available through
+    // `Mp4Demuxer::mvhd_timestamps`.
+    if parsed.movie_timestamps.creation_time != 0 {
+        metadata.push((
+            "mvhd_creation_time".to_string(),
+            parsed.movie_timestamps.creation_time.to_string(),
+        ));
+    }
+    if parsed.movie_timestamps.modification_time != 0 {
+        metadata.push((
+            "mvhd_modification_time".to_string(),
+            parsed.movie_timestamps.modification_time.to_string(),
+        ));
+    }
+
     // Surface a parsed `pdin` (ProgressiveDownloadInfoBox, §8.1.3) on
     // the flat metadata channel. Quantity is zero or one per file
     // (§8.1.3.1); we emit:
@@ -847,6 +868,9 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             .iter()
             .map(|t| t.elst.iter().map(elst_entry_to_public).collect())
             .collect(),
+        mvhd_timestamps: parsed.movie_timestamps,
+        tkhd_timestamps: parsed.tracks.iter().map(|t| t.tkhd_timestamps).collect(),
+        mdhd_timestamps: parsed.tracks.iter().map(|t| t.mdhd_timestamps).collect(),
         last_sdi: None,
     })
 }
@@ -1459,11 +1483,47 @@ pub struct TrepRecord {
     pub children: Vec<TrepChild>,
 }
 
+/// The `creation_time` / `modification_time` pair carried by each of
+/// the three ISOBMFF header boxes — `mvhd` (§8.2.2), `tkhd` (§8.3.2)
+/// and `mdhd` (§8.4.2).
+///
+/// Both values are seconds since 1904-01-01 UTC — the ISOBMFF header
+/// epoch, exactly as the box records them, matching the write side's
+/// [`Mp4MuxerOptions::creation_time`](crate::options::Mp4MuxerOptions::creation_time).
+/// [`unix_secs_from_mp4_secs`](crate::options::unix_secs_from_mp4_secs)
+/// reaches a Unix timestamp. Version 0 carries the pair as 32-bit
+/// fields and version 1 as 64-bit; both widen to `u64` here. Zero is
+/// the conventional "unset" value — see [`is_unset`](Self::is_unset).
+///
+/// Not to be confused with the ISO/IEC 23008-12 `crtt` / `mdft` item
+/// properties, which share the 1904 origin but count microseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeaderTimestamps {
+    /// `creation_time` — seconds since 1904-01-01 UTC.
+    pub creation_time: u64,
+    /// `modification_time` — seconds since 1904-01-01 UTC.
+    pub modification_time: u64,
+}
+
+impl HeaderTimestamps {
+    /// `true` when both fields are zero — the "producer did not stamp
+    /// this box" encoding. Distinguishing it from a genuine
+    /// 1904-01-01 stamp is not possible in the format, and no real
+    /// file means the latter.
+    pub fn is_unset(&self) -> bool {
+        self.creation_time == 0 && self.modification_time == 0
+    }
+}
+
 #[derive(Default)]
 struct ParsedMoov {
     tracks: Vec<Track>,
     movie_timescale: u32,
     movie_duration: u64,
+    /// §8.2.2 `mvhd` header timestamps for the movie as a whole.
+    /// Defaults to the all-zero "unset" pair when the file leaves them
+    /// blank, which is the common case.
+    movie_timestamps: HeaderTimestamps,
     /// §8.8.2 (`mehd` MovieExtendsHeaderBox) — overall presentation
     /// duration of a fragmented movie, including fragments, in the
     /// movie timescale. `None` when the box is absent (per the spec
@@ -1523,6 +1583,13 @@ struct Track {
     /// Per-track timescale (ticks per second).
     timescale: u32,
     duration: Option<u64>,
+    /// §8.3.2 `tkhd` header timestamps for this track.
+    tkhd_timestamps: HeaderTimestamps,
+    /// §8.4.2 `mdhd` header timestamps for this track's media. A
+    /// producer may stamp these differently from the `tkhd` pair
+    /// (`mdhd` describes when the *media* was created, `tkhd` the
+    /// track), so both are kept rather than collapsed.
+    mdhd_timestamps: HeaderTimestamps,
     // Audio
     channels: Option<u16>,
     sample_rate: Option<u32>,
@@ -3126,8 +3193,41 @@ fn parse_trex(body: &[u8], tracks: &mut [Track]) -> Result<()> {
     Ok(())
 }
 
+/// Read the `creation_time` / `modification_time` pair that opens the
+/// body of every ISOBMFF header box (`mvhd` §8.2.2, `tkhd` §8.3.2,
+/// `mdhd` §8.4.2) right after the 4-byte FullBox preamble: two u32s at
+/// version 0, two u64s at version 1. All three boxes share this
+/// prefix, so one reader serves them.
+///
+/// Returns the all-zero (unset) pair when the body is too short to
+/// hold it. No caller can reach that path today — each parser's own
+/// length check is stricter than this one — but the guard keeps the
+/// helper correct on its own terms rather than on its callers'.
+fn read_header_timestamps(body: &[u8], version: u8) -> HeaderTimestamps {
+    let need = if version == 0 { 12 } else { 20 };
+    if body.len() < need {
+        return HeaderTimestamps::default();
+    }
+    if version == 0 {
+        HeaderTimestamps {
+            creation_time: u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as u64,
+            modification_time: u32::from_be_bytes([body[8], body[9], body[10], body[11]]) as u64,
+        }
+    } else {
+        HeaderTimestamps {
+            creation_time: u64::from_be_bytes([
+                body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
+            ]),
+            modification_time: u64::from_be_bytes([
+                body[12], body[13], body[14], body[15], body[16], body[17], body[18], body[19],
+            ]),
+        }
+    }
+}
+
 /// ISO/IEC 14496-12 §8.2.2 Movie Header box. Carries the movie-wide
-/// timescale and duration (in that timescale).
+/// timescale and duration (in that timescale), plus the movie's
+/// creation / modification timestamps.
 fn parse_mvhd(body: &[u8], out: &mut ParsedMoov) -> Result<()> {
     if body.is_empty() {
         return Err(Error::invalid("MP4: mvhd empty"));
@@ -3152,6 +3252,7 @@ fn parse_mvhd(body: &[u8], out: &mut ParsedMoov) -> Result<()> {
     };
     out.movie_timescale = timescale;
     out.movie_duration = duration;
+    out.movie_timestamps = read_header_timestamps(body, version);
     Ok(())
 }
 
@@ -5337,6 +5438,8 @@ fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
         codec_id_fourcc: [0; 4],
         timescale: 0,
         duration: None,
+        tkhd_timestamps: HeaderTimestamps::default(),
+        mdhd_timestamps: HeaderTimestamps::default(),
         channels: None,
         sample_rate: None,
         sample_size_bits: None,
@@ -6021,6 +6124,7 @@ fn parse_tkhd(body: &[u8], t: &mut Track) -> Result<()> {
         return Err(Error::invalid("MP4: tkhd too short"));
     }
     t.track_id = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    t.tkhd_timestamps = read_header_timestamps(body, version);
     Ok(())
 }
 
@@ -6496,6 +6600,7 @@ fn parse_mdhd(body: &[u8], t: &mut Track) -> Result<()> {
     };
     t.timescale = timescale;
     t.duration = Some(duration);
+    t.mdhd_timestamps = read_header_timestamps(body, version);
     Ok(())
 }
 
@@ -11933,6 +12038,30 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert(format!("subtrack_{n}"), s);
     }
 
+    // ISO/IEC 14496-12 §8.3.2 / §8.4.2: the track's `tkhd` and `mdhd`
+    // creation / modification timestamps, in the boxes' own units
+    // (seconds since 1904-01-01 UTC — *not* the Unix epoch; see
+    // `options::unix_secs_from_mp4_secs`). The two boxes are stamped
+    // separately by some producers (`mdhd` dating the media, `tkhd`
+    // the track), so both pairs are surfaced rather than collapsed.
+    // Each key appears only when its value is non-zero — zero is the
+    // "unset" encoding most files carry. The typed form is
+    // `Mp4Demuxer::tkhd_timestamps` / `::mdhd_timestamps`.
+    for (prefix, ts) in [("tkhd", &t.tkhd_timestamps), ("mdhd", &t.mdhd_timestamps)] {
+        if ts.creation_time != 0 {
+            params.options.insert(
+                format!("{prefix}_creation_time"),
+                ts.creation_time.to_string(),
+            );
+        }
+        if ts.modification_time != 0 {
+            params.options.insert(
+                format!("{prefix}_modification_time"),
+                ts.modification_time.to_string(),
+            );
+        }
+    }
+
     // ISO/IEC 14496-12 §8.6.1.4: when the track carries a `cslg`
     // (CompositionToDecodeBox), surface its five timeline-relation
     // fields on `params.options` as `cslg_<field>`. These document the
@@ -13118,6 +13247,13 @@ pub struct Mp4Demuxer {
     /// tooling that wants the declared list itself (e.g. a remuxer
     /// carrying the elst across, or a validator).
     edit_lists: Vec<Vec<EditListEntry>>,
+    /// §8.2.2 `mvhd` creation / modification timestamps for the movie.
+    /// See [`Self::mvhd_timestamps`].
+    mvhd_timestamps: HeaderTimestamps,
+    /// Per-stream §8.3.2 `tkhd` timestamps (parallel to `streams`).
+    tkhd_timestamps: Vec<HeaderTimestamps>,
+    /// Per-stream §8.4.2 `mdhd` timestamps (parallel to `streams`).
+    mdhd_timestamps: Vec<HeaderTimestamps>,
     /// `sample_description_index` of the packet most recently returned
     /// by `next_packet` (`None` before the first packet). See
     /// [`Self::sample_description_index_of_last_packet`].
@@ -13561,6 +13697,46 @@ impl Mp4Demuxer {
             .get(stream_index as usize)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// The movie-wide §8.2.2 `mvhd` creation / modification
+    /// timestamps, in seconds since 1904-01-01 UTC.
+    ///
+    /// `mvhd` is mandatory, so this always returns a pair; most files
+    /// leave it unstamped, which reads back as the all-zero
+    /// [`HeaderTimestamps::is_unset`] value. The same data appears on
+    /// the flat metadata channel as `mvhd_creation_time` /
+    /// `mvhd_modification_time` (emitted only when non-zero).
+    ///
+    /// This is the read-side dual of
+    /// [`Mp4MuxerOptions::creation_time`](crate::options::Mp4MuxerOptions::creation_time):
+    /// a remuxer preserves a source's stamp by feeding this value
+    /// straight back in — same epoch, same units, no conversion.
+    pub fn mvhd_timestamps(&self) -> HeaderTimestamps {
+        self.mvhd_timestamps
+    }
+
+    /// The §8.3.2 `tkhd` creation / modification timestamps of
+    /// `stream_index`'s track, in seconds since 1904-01-01 UTC.
+    /// `None` when the index names no stream.
+    ///
+    /// Surfaced flat on the stream's `params.options` as
+    /// `tkhd_creation_time` / `tkhd_modification_time` (only when
+    /// non-zero). See [`Self::mdhd_timestamps`] for the `mdhd` pair,
+    /// which a producer may stamp differently.
+    pub fn tkhd_timestamps(&self, stream_index: u32) -> Option<HeaderTimestamps> {
+        self.tkhd_timestamps.get(stream_index as usize).copied()
+    }
+
+    /// The §8.4.2 `mdhd` creation / modification timestamps of
+    /// `stream_index`'s track media, in seconds since 1904-01-01 UTC.
+    /// `None` when the index names no stream.
+    ///
+    /// Surfaced flat on the stream's `params.options` as
+    /// `mdhd_creation_time` / `mdhd_modification_time` (only when
+    /// non-zero).
+    pub fn mdhd_timestamps(&self, stream_index: u32) -> Option<HeaderTimestamps> {
+        self.mdhd_timestamps.get(stream_index as usize).copied()
     }
 
     /// The 1-based §8.5.2 `sample_description_index` of the packet
@@ -14617,6 +14793,8 @@ mod tests {
             codec_id_fourcc: [0; 4],
             timescale: 0,
             duration: None,
+            tkhd_timestamps: super::HeaderTimestamps::default(),
+            mdhd_timestamps: super::HeaderTimestamps::default(),
             channels: None,
             sample_rate: None,
             sample_size_bits: None,

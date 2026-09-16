@@ -85,6 +85,17 @@ pub(crate) struct TrackState {
     pub(crate) prev_pts_in_ts: Option<i64>,
     /// First PTS in media time scale (for duration calculation + elst).
     pub(crate) first_pts_in_ts: Option<i64>,
+
+    /// Header timestamps for this track's `tkhd` (§8.3.2), in seconds
+    /// since 1904-01-01 UTC. Resolved at `open` from
+    /// `Mp4MuxerOptions::creation_time` / `modification_time` plus any
+    /// `track_header_timestamps` override, which replaces the pair
+    /// outright; the all-zero pair means "unset" (the default).
+    pub(crate) tkhd_timestamps: crate::demux::HeaderTimestamps,
+    /// Header timestamps for this track's `mdhd` (§8.4.2). Same
+    /// resolution, but a `TrackHeaderTimestamps::media` override can date
+    /// the media apart from the track that carries it.
+    pub(crate) mdhd_timestamps: crate::demux::HeaderTimestamps,
 }
 
 impl TrackState {
@@ -113,6 +124,8 @@ impl TrackState {
             cumulative_duration: 0,
             prev_pts_in_ts: None,
             first_pts_in_ts: None,
+            tkhd_timestamps: crate::demux::HeaderTimestamps::default(),
+            mdhd_timestamps: crate::demux::HeaderTimestamps::default(),
         }
     }
 
@@ -193,8 +206,12 @@ pub fn open_with_options(
         ));
     }
     if let Some(frag_opts) = options.fragmented.clone() {
+        // The fragmented path runs its own copy of the checks below
+        // (`open_fragmented_typed` is a public entry point in its own
+        // right), so validate once per path rather than twice here.
         return crate::frag::open_fragmented(output, streams, options, frag_opts);
     }
+    options.validate_track_header_timestamps(streams.len())?;
     let mut tracks = Vec::with_capacity(streams.len());
     for (i, s) in streams.iter().enumerate() {
         let mut entry = sample_entry_for(&s.params)?;
@@ -207,7 +224,12 @@ pub fn open_with_options(
         {
             entry = apply_protection(entry, s.params.media_type, prot)?;
         }
-        tracks.push(TrackState::new(s.clone(), entry));
+        let mut track = TrackState::new(s.clone(), entry);
+        // §8.3.2 / §8.4.2 header timestamps: movie-wide value unless a
+        // per-track override targets this stream.
+        track.tkhd_timestamps = options.resolve_track_timestamps(i);
+        track.mdhd_timestamps = options.resolve_media_timestamps(i);
+        tracks.push(track);
     }
     // ISO/IEC 14496-12 §8.6.6: validate explicit edit lists up front so
     // a list that would not round-trip (§8.6.6.3 rate / final-empty-edit
@@ -473,6 +495,7 @@ impl Mp4Muxer {
             &self.options.track_edit_lists,
             &self.options.track_sample_groups,
             &self.options.pssh,
+            self.options.resolve_movie_timestamps(),
         )?;
         self.output.write_all(&moov)?;
         Ok(())
@@ -530,6 +553,7 @@ impl Mp4Muxer {
                 &self.options.track_edit_lists,
                 &self.options.track_sample_groups,
                 &self.options.pssh,
+                self.options.resolve_movie_timestamps(),
             )?;
             let candidate_size = candidate.len() as u64;
             let converged = candidate_size == moov_size;
@@ -573,6 +597,7 @@ fn build_moov(
     track_edit_lists: &[TrackEditList],
     track_sample_groups: &[TrackSampleGroups],
     pssh: &[crate::cenc::PsshBox],
+    movie_times: crate::demux::HeaderTimestamps,
 ) -> Result<Vec<u8>> {
     // mvhd: use the largest media-time-scale duration as a rough movie
     // duration at timescale 1000.
@@ -591,7 +616,12 @@ fn build_moov(
     let next_track_id = (tracks.len() as u32) + 1;
 
     let mut moov_body = Vec::new();
-    moov_body.extend_from_slice(&build_mvhd(movie_timescale, movie_duration, next_track_id));
+    moov_body.extend_from_slice(&build_mvhd(
+        movie_timescale,
+        movie_duration,
+        next_track_id,
+        movie_times,
+    ));
     for (i, t) in tracks.iter().enumerate() {
         // Gather all sample-group directives that target this stream index.
         // Multiple directives for the same stream accumulate in encounter
@@ -629,22 +659,37 @@ fn build_moov(
     Ok(wrap_box(b"moov", &moov_body))
 }
 
-pub(crate) fn build_mvhd(timescale: u32, duration: u64, next_track_id: u32) -> Vec<u8> {
-    // Choose version 0 if duration fits in u32, else version 1.
-    let use_v1 = duration > u32::MAX as u64;
+/// `true` when either half of a header-timestamp pair overflows the
+/// version-0 32-bit field, i.e. the box must be written as version 1.
+/// Shared by all three header builders so they promote alike.
+fn needs_64_bit_time(times: crate::demux::HeaderTimestamps) -> bool {
+    times.creation_time > u32::MAX as u64 || times.modification_time > u32::MAX as u64
+}
+
+pub(crate) fn build_mvhd(
+    timescale: u32,
+    duration: u64,
+    next_track_id: u32,
+    times: crate::demux::HeaderTimestamps,
+) -> Vec<u8> {
+    // Choose version 0 if every 32-bit field fits, else version 1. The
+    // §8.2.2 v0 layout carries duration *and* both timestamps as u32,
+    // so a post-2040 timestamp forces the promotion just as a
+    // >u32::MAX duration does.
+    let use_v1 = duration > u32::MAX as u64 || needs_64_bit_time(times);
     let mut body = Vec::with_capacity(120);
     if use_v1 {
         body.push(1); // version
         body.extend_from_slice(&[0, 0, 0]); // flags
-        body.extend_from_slice(&0u64.to_be_bytes()); // creation_time
-        body.extend_from_slice(&0u64.to_be_bytes()); // modification_time
+        body.extend_from_slice(&times.creation_time.to_be_bytes());
+        body.extend_from_slice(&times.modification_time.to_be_bytes());
         body.extend_from_slice(&timescale.to_be_bytes());
         body.extend_from_slice(&duration.to_be_bytes());
     } else {
         body.push(0); // version
         body.extend_from_slice(&[0, 0, 0]); // flags
-        body.extend_from_slice(&0u32.to_be_bytes()); // creation_time
-        body.extend_from_slice(&0u32.to_be_bytes()); // modification_time
+        body.extend_from_slice(&(times.creation_time as u32).to_be_bytes());
+        body.extend_from_slice(&(times.modification_time as u32).to_be_bytes());
         body.extend_from_slice(&timescale.to_be_bytes());
         body.extend_from_slice(&(duration as u32).to_be_bytes());
     }
@@ -678,7 +723,12 @@ fn build_trak(
     let mut body = Vec::new();
     let track_duration_movie =
         rescale_u64(t.cumulative_duration, t.media_time_scale, movie_timescale);
-    body.extend_from_slice(&build_tkhd(track_id, track_duration_movie, &t.stream));
+    body.extend_from_slice(&build_tkhd(
+        track_id,
+        track_duration_movie,
+        &t.stream,
+        t.tkhd_timestamps,
+    ));
     // edts/elst (ISO/IEC 14496-12 §8.6.5–6) goes between tkhd and mdia. An
     // explicit caller-supplied list is emitted verbatim (and regardless of
     // `write_edit_list` — the flag governs only the automatic start-delay
@@ -762,23 +812,30 @@ fn push_elst_entry(
     out.extend_from_slice(&media_rate.to_be_bytes());
 }
 
-pub(crate) fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> Vec<u8> {
-    let use_v1 = duration > u32::MAX as u64;
+pub(crate) fn build_tkhd(
+    track_id: u32,
+    duration: u64,
+    stream: &StreamInfo,
+    times: crate::demux::HeaderTimestamps,
+) -> Vec<u8> {
+    // §8.3.2: as in mvhd, the v0 layout is u32 for duration and both
+    // timestamps — any of them overflowing promotes the box to v1.
+    let use_v1 = duration > u32::MAX as u64 || needs_64_bit_time(times);
     let mut body = Vec::new();
     let flags: u32 = 0x0000_0007; // track_enabled | track_in_movie | track_in_preview
     if use_v1 {
         body.push(1);
         body.extend_from_slice(&flags.to_be_bytes()[1..4]);
-        body.extend_from_slice(&0u64.to_be_bytes()); // creation_time
-        body.extend_from_slice(&0u64.to_be_bytes()); // modification_time
+        body.extend_from_slice(&times.creation_time.to_be_bytes());
+        body.extend_from_slice(&times.modification_time.to_be_bytes());
         body.extend_from_slice(&track_id.to_be_bytes());
         body.extend_from_slice(&0u32.to_be_bytes()); // reserved
         body.extend_from_slice(&duration.to_be_bytes());
     } else {
         body.push(0);
         body.extend_from_slice(&flags.to_be_bytes()[1..4]);
-        body.extend_from_slice(&0u32.to_be_bytes()); // creation_time
-        body.extend_from_slice(&0u32.to_be_bytes()); // modification_time
+        body.extend_from_slice(&(times.creation_time as u32).to_be_bytes());
+        body.extend_from_slice(&(times.modification_time as u32).to_be_bytes());
         body.extend_from_slice(&track_id.to_be_bytes());
         body.extend_from_slice(&0u32.to_be_bytes()); // reserved
         body.extend_from_slice(&(duration as u32).to_be_bytes());
@@ -831,20 +888,22 @@ fn build_mdia_with_sample_groups(
 
 fn build_mdhd(t: &TrackState) -> Vec<u8> {
     let duration = t.cumulative_duration;
-    let use_v1 = duration > u32::MAX as u64;
+    let times = t.mdhd_timestamps;
+    // §8.4.2: same v0/v1 field-width rule as mvhd and tkhd.
+    let use_v1 = duration > u32::MAX as u64 || needs_64_bit_time(times);
     let mut body = Vec::new();
     if use_v1 {
         body.push(1);
         body.extend_from_slice(&[0, 0, 0]); // flags
-        body.extend_from_slice(&0u64.to_be_bytes()); // creation
-        body.extend_from_slice(&0u64.to_be_bytes()); // modification
+        body.extend_from_slice(&times.creation_time.to_be_bytes());
+        body.extend_from_slice(&times.modification_time.to_be_bytes());
         body.extend_from_slice(&t.media_time_scale.to_be_bytes());
         body.extend_from_slice(&duration.to_be_bytes());
     } else {
         body.push(0);
         body.extend_from_slice(&[0, 0, 0]); // flags
-        body.extend_from_slice(&0u32.to_be_bytes());
-        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&(times.creation_time as u32).to_be_bytes());
+        body.extend_from_slice(&(times.modification_time as u32).to_be_bytes());
         body.extend_from_slice(&t.media_time_scale.to_be_bytes());
         body.extend_from_slice(&(duration as u32).to_be_bytes());
     }

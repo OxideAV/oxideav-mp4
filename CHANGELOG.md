@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Header timestamps on the muxer (ISO/IEC 14496-12 §8.2.2 `mvhd` / §8.3.2 `tkhd` / §8.4.2 `mdhd`), previously hardcoded to zero: `Mp4MuxerOptions::creation_time` stamps all three in the header epoch — seconds since 1904-01-01 UTC, converted by the public `mp4_secs_from_unix_secs` / `mp4_secs_from_system_time` (`None` before 1904), its inverse `unix_secs_from_mp4_secs`, and the `MP4_EPOCH_OFFSET_SECS` constant. One value fills both `creation_time` and `modification_time` of each box; `Mp4MuxerOptions::modification_time` drives them apart. `Mp4MuxerOptions::track_header_timestamps` (new `TrackHeaderTimestamps` record — `track` is the `tkhd` pair, `media` the `mdhd` one) replaces the pair for the stream it names rather than inheriting either half, `media: None` reusing `track` being the only defaulting step; `mvhd` keeps the movie-wide values and out-of-range indices fail at `open`. A value past 2040-02-06 in either half promotes that box to version 1 with 64-bit time + duration fields, per box and automatic. Plain, faststart and fragmented init-segment paths all honour it; the default `None` keeps the all-zero version-0 headers byte-identical to the historical output
+
+- Header-timestamp read side: `Mp4Demuxer::mvhd_timestamps()` / `::tkhd_timestamps(stream)` / `::mdhd_timestamps(stream)` return the new `demux::HeaderTimestamps` (`creation_time` + `modification_time`, `is_unset()` for the all-zero encoding; re-exported at the crate root, since the muxer options take it too) in the boxes' own units, so a value read here feeds straight back into the muxer — the two surfaces reach the same six fields, making a remux carry-across lossless. `tkhd` and `mdhd` stay separate rather than collapsing, since a producer may date the media apart from the track; v0 and v1 layouts both widen to `u64`, read by one shared reader for all three boxes. Flat metadata mirrors as `mvhd_creation_time` / `mvhd_modification_time` and the per-stream `tkhd_*` / `mdhd_*`, emitted only when non-zero so an unstamped file adds no keys. 15 integration tests (six distinct values byte-patched into the six fields, so a swapped or shared read cannot pass; a PATH-gated cross-check reading back a stamp written by `ffmpeg`; v1 promotion across the plain, faststart and fragmented paths)
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.9...v0.0.10) - 2026-08-15
 
 ### Other
