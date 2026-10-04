@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- AAC could not be muxed into MP4: an AAC stream without extradata was
+  refused ("missing extradata"), and ADTS-framed packets would have
+  been stored with their headers in `mdat`. The muxers (plain,
+  faststart, fragmented) now strip ADTS headers so each sample is one
+  bare access unit (ISO/IEC 14496-14 §3.1.2), and synthesise the `esds`
+  AudioSpecificConfig when the stream carries none — from the first
+  ADTS header (non-fragmented) or from the stream's rate / channels.
+- `.mov` mapped to the `mov` container, which had a muxer but no
+  demuxer in an MP4-only registry; the MP4 demuxer is now registered as
+  the `mov` demuxer unless another QuickTime demuxer already holds it.
+
+### Added
+
+- Edit list for decode pre-roll: a track whose first packet has a
+  negative PTS (e.g. AAC priming carried over from a trimmed source)
+  gets one `elst` entry with `media_time = -first_pts` running to the
+  end of the presented range.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.9...v0.0.10) - 2026-08-15
 
 ### Other

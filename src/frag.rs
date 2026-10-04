@@ -226,6 +226,15 @@ pub fn open_fragmented_typed(
     }
     let mut tracks = Vec::with_capacity(streams.len());
     for (i, s) in streams.iter().enumerate() {
+        // AAC without extradata: the init segment is written before any
+        // sample, so the AudioSpecificConfig comes from the geometry.
+        let s = &match crate::aac::with_asc(&s.params)? {
+            Some(params) => StreamInfo {
+                params,
+                ..s.clone()
+            },
+            None => s.clone(),
+        };
         let mut entry = sample_entry_for(&s.params)?;
         // ISO/IEC 14496-12 §8.12: wrap the entry into its protected
         // enc* form when a protection directive targets this stream.
@@ -681,15 +690,24 @@ impl FragmentedMuxer {
             _ => 0,
         };
 
+        // AAC: one bare access unit per sample (ISO/IEC 14496-14
+        // §3.1.2) — drop an ADTS transport header. Protected samples are
+        // stored as handed over (their subsample map covers those bytes).
+        let data =
+            if senc.is_none() && self.tracks[idx].base.stream.params.codec_id.as_str() == "aac" {
+                crate::aac::strip_adts(&packet.data)?.into_owned()
+            } else {
+                packet.data.clone()
+            };
         let flags = sample_flags_for(packet.flags.keyframe);
-        let size = packet.data.len() as u32;
+        let size = data.len() as u32;
         let track = &mut self.tracks[idx];
 
         // Lock trex defaults from first packet (any track).
         track.lock_trex(dur, size, flags);
 
         track.pending.push(PendingSample {
-            data: packet.data.clone(),
+            data,
             duration: dur,
             flags,
             composition_time_offset: cts_off,
