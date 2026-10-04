@@ -14,6 +14,9 @@
 //!   extradata — from the first ADTS header when one is available
 //!   ([`asc_from_adts`]), else AAC-LC from the stream's sample rate and
 //!   channel count ([`lc_asc_from_params`]).
+//!
+//! The demuxer uses [`asc_rates`] to report an HE-AAC stream at its SBR
+//! output rate when the sample entry carries the core rate.
 
 use std::borrow::Cow;
 
@@ -133,6 +136,99 @@ pub(crate) fn lc_asc_from_params(params: &CodecParameters) -> Result<Vec<u8>> {
     Ok(asc_bytes(2, idx, cfg))
 }
 
+/// The rate-relevant summary of an `AudioSpecificConfig`
+/// (ISO/IEC 14496-3 §1.6.2.1 Table 1.15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AscRates {
+    /// Core (AAC) sampling frequency.
+    pub core_rate: u32,
+    /// SBR output sampling frequency, when SBR is signalled —
+    /// explicitly (`audioObjectType` 5 / 29) or through the §1.6.5
+    /// backward-compatible `syncExtensionType 0x2b7` trailer.
+    pub sbr_rate: Option<u32>,
+}
+
+struct Bits<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl Bits<'_> {
+    fn read(&mut self, n: usize) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            let byte = *self.data.get(self.pos / 8)?;
+            v = (v << 1) | u32::from((byte >> (7 - self.pos % 8)) & 1);
+            self.pos += 1;
+        }
+        Some(v)
+    }
+    fn remaining(&self) -> usize {
+        (self.data.len() * 8).saturating_sub(self.pos)
+    }
+    fn aot(&mut self) -> Option<u32> {
+        match self.read(5)? {
+            31 => Some(32 + self.read(6)?),
+            v => Some(v),
+        }
+    }
+    fn rate(&mut self) -> Option<u32> {
+        match self.read(4)? {
+            15 => self.read(24),
+            i => SAMPLE_RATES.get(i as usize).copied(),
+        }
+    }
+}
+
+/// Parse the sampling-frequency fields of an `AudioSpecificConfig`.
+/// The §1.6.5 trailing SBR probe is only attempted for the plain
+/// General-Audio object types (1–4) without an inline PCE, whose
+/// `GASpecificConfig` length is fixed; anything else reports the core
+/// rate alone (`None` only when the leading fields do not parse).
+pub(crate) fn asc_rates(asc: &[u8]) -> Option<AscRates> {
+    let mut b = Bits { data: asc, pos: 0 };
+    let aot = b.aot()?;
+    let core = b.rate()?;
+    let chan_cfg = b.read(4)?;
+    if aot == 5 || aot == 29 {
+        // Hierarchical signalling: the leading rate is the core rate,
+        // extensionSamplingFrequency the SBR output rate.
+        let ext = b.rate()?;
+        return Some(AscRates {
+            core_rate: core,
+            sbr_rate: Some(ext),
+        });
+    }
+    let mut out = AscRates {
+        core_rate: core,
+        sbr_rate: None,
+    };
+    if !(1..=4).contains(&aot) || chan_cfg == 0 {
+        return Some(out);
+    }
+    // GASpecificConfig (Table 4.1) for AOT 1-4: frameLengthFlag,
+    // dependsOnCoreCoder (+ 14-bit coreCoderDelay), extensionFlag
+    // (+ extensionFlag3 for these AOTs).
+    let parse_tail = |b: &mut Bits<'_>| -> Option<Option<u32>> {
+        b.read(1)?;
+        if b.read(1)? == 1 {
+            b.read(14)?;
+        }
+        if b.read(1)? == 1 {
+            b.read(1)?;
+        }
+        if b.remaining() < 16 || b.read(11)? != 0x2B7 {
+            return Some(None);
+        }
+        if b.aot()? != 5 || b.read(1)? != 1 {
+            return Some(None);
+        }
+        Some(Some(b.rate()?))
+    };
+    out.sbr_rate = parse_tail(&mut b).flatten();
+    Some(out)
+}
+
 fn asc_bytes(aot: u8, sfi: u8, cfg: u8) -> Vec<u8> {
     // audioObjectType(5) samplingFrequencyIndex(4) channelConfiguration(4)
     // frameLengthFlag(1)=0 dependsOnCoreCoder(1)=0 extensionFlag(1)=0
@@ -194,6 +290,27 @@ mod tests {
     #[test]
     fn multi_block_frames_are_rejected() {
         assert!(strip_adts(&adts(10, false, 2)).is_err());
+    }
+
+    #[test]
+    fn asc_rates_cover_all_sbr_signalling_forms() {
+        assert_eq!(asc_rates(&[0x12, 0x10]).unwrap().sbr_rate, None);
+        assert_eq!(
+            asc_rates(&[0x13, 0x90, 0x56, 0xE5, 0xA0]),
+            Some(AscRates {
+                core_rate: 22_050,
+                sbr_rate: Some(44_100)
+            })
+        );
+        assert_eq!(
+            asc_rates(&[0x12, 0x10, 0x56, 0xE5, 0x00]).unwrap().sbr_rate,
+            None
+        );
+        assert_eq!(
+            asc_rates(&[0x2B, 0x92, 0x08, 0x00]).unwrap().sbr_rate,
+            Some(44_100)
+        );
+        assert_eq!(asc_rates(&[]), None);
     }
 
     #[test]

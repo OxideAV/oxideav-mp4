@@ -214,3 +214,20 @@ fn mov_files_open_through_the_mov_demuxer_name() {
     assert_eq!(d.streams()[0].params.extradata, vec![0x12, 0x10]);
     assert_eq!(d.next_packet().unwrap().data, aus[0]);
 }
+
+#[test]
+fn he_aac_with_a_core_rate_sample_entry_demuxes_at_the_sbr_rate() {
+    // A writer that put the 22.05 kHz core rate in the sample entry of a
+    // backward-compatible HE-AAC stream (44.1 kHz SBR output).
+    let mut s = aac_stream(vec![0x13, 0x90, 0x56, 0xE5, 0xA0]);
+    s.params.sample_rate = Some(22_050);
+    s.time_base = TimeBase::new(1, 22_050);
+    let aus = access_units(2);
+    let packets: Vec<_> = aus
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.clone(), i as i64 * 1024))
+        .collect();
+    let (st, _) = demux(mux(oxideav_mp4::muxer::open, &s, &packets));
+    assert_eq!(st.params.sample_rate, Some(44_100));
+}

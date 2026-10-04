@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare access unit (ISO/IEC 14496-14 §3.1.2), and synthesise the `esds`
   AudioSpecificConfig when the stream carries none — from the first
   ADTS header (non-fragmented) or from the stream's rate / channels.
+- HE-AAC tracks whose `mp4a` sample entry carries the AAC core rate are
+  reported at the SBR output rate the AudioSpecificConfig declares (the
+  rate the decoder emits).
 - `.mov` mapped to the `mov` container, which had a muxer but no
   demuxer in an MP4-only registry; the MP4 demuxer is now registered as
   the `mov` demuxer unless another QuickTime demuxer already holds it.

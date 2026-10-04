@@ -11621,6 +11621,18 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     params.width = t.width;
     params.height = t.height;
     params.extradata = t.extradata.clone();
+    // HE-AAC: some writers put the AAC *core* rate in the `mp4a` sample
+    // entry. The decoder emits the SBR output rate the ASC declares, so
+    // report that (ISO/IEC 14496-3 §1.6.5 / §4.6.18).
+    if params.codec_id.as_str() == "aac" {
+        if let Some(r) = crate::aac::asc_rates(&params.extradata) {
+            if let (Some(out), Some(entry)) = (r.sbr_rate, params.sample_rate) {
+                if entry == r.core_rate && out != entry {
+                    params.sample_rate = Some(out);
+                }
+            }
+        }
+    }
     // The decoded-picture layout, from the avcC / hvcC record, so
     // consumers can plan pixel-format conversions before decoding.
     if params.media_type == MediaType::Video && params.pixel_format.is_none() {
