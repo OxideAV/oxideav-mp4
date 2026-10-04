@@ -8,6 +8,8 @@
 //!
 //! `next_packet` then serves them in order by seeking into the mdat.
 
+mod video_config;
+
 use std::collections::HashSet;
 use std::io::SeekFrom;
 
@@ -11619,6 +11621,12 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     params.width = t.width;
     params.height = t.height;
     params.extradata = t.extradata.clone();
+    // The decoded-picture layout, from the avcC / hvcC record, so
+    // consumers can plan pixel-format conversions before decoding.
+    if params.media_type == MediaType::Video && params.pixel_format.is_none() {
+        params.pixel_format =
+            video_config::pixel_format_from_config(params.codec_id.as_str(), &params.extradata);
+    }
 
     // ISO/IEC 14496-12 §8.12: when the track's sample entry was wrapped
     // as `enc*`, surface the recovered scheme type so callers can
