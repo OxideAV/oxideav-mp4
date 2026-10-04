@@ -249,8 +249,17 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let movie_timescale = parsed.movie_timescale;
     for t in &mut parsed.tracks {
         t.elst_timeline = build_elst_timeline(&t.elst, movie_timescale, t.timescale);
+        fix_legacy_pcm_sample_sizes(t);
     }
     let parsed = parsed;
+    // Big-endian PCM tracks are delivered little-endian (the PCM
+    // codecs are little-endian): bytes per sample to reverse, per
+    // stream.
+    let pcm_swap: Vec<usize> = parsed
+        .tracks
+        .iter()
+        .map(|t| t.pcm.map_or(0, |l| l.swap_width()))
+        .collect();
 
     let mut streams: Vec<StreamInfo> = Vec::with_capacity(parsed.tracks.len());
     let mut samples: Vec<SampleRef> = Vec::new();
@@ -809,6 +818,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     Ok(Mp4Demuxer {
         input,
         input_len: file_size,
+        pcm_swap,
         streams,
         samples,
         cursor: 0,
@@ -1529,6 +1539,13 @@ struct Track {
     channels: Option<u16>,
     sample_rate: Option<u32>,
     sample_size_bits: Option<u16>,
+    /// `stsd` FullBox version (§8.5.2.2): 1 when the box may hold
+    /// `AudioSampleEntryV1` entries.
+    stsd_version: u8,
+    /// Uncompressed-audio layout of the active sample entry (ISO/IEC
+    /// 23003-5 `ipcm` / `fpcm`, QuickTime `sowt` / `twos` / `lpcm` /
+    /// `in24` / `in32` / `fl32` / `fl64` / `raw `), when it is one.
+    pcm: Option<PcmLayout>,
     // Video
     width: Option<u32>,
     height: Option<u32>,
@@ -5342,6 +5359,8 @@ fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
         channels: None,
         sample_rate: None,
         sample_size_bits: None,
+        stsd_version: 0,
+        pcm: None,
         width: None,
         height: None,
         extradata: Vec::new(),
@@ -7270,6 +7289,7 @@ fn parse_stsd(body: &[u8], t: &mut Track) -> Result<()> {
         return Err(Error::invalid("MP4: stsd too short"));
     }
     let entry_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    t.stsd_version = body[0];
     if entry_count == 0 {
         return Ok(());
     }
@@ -7676,17 +7696,116 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
     t.sample_size_bits = Some(sample_size);
     t.sample_rate = Some(sample_rate);
 
-    // Child boxes (dfLa, dOps, esds, ...).
-    let mut cur = std::io::Cursor::new(&entry[28..]);
-    let end = (entry.len() - 28) as u64;
-    while cur.position() < end {
+    // Where the child boxes start, by entry version:
+    // * ISO/IEC 14496-12 §8.5.2.2 AudioSampleEntryV1 (entry version 1
+    //   inside an `stsd` of version 1) keeps the 28-byte layout;
+    // * QuickTime sound description v1 (version 1 in a version-0
+    //   `stsd`) appends samplesPerPacket / bytesPerPacket /
+    //   bytesPerFrame / bytesPerSample (4 × u32);
+    // * QuickTime sound description v2 replaces the tail with a
+    //   36-byte block carrying a Float64 sample rate, a 32-bit channel
+    //   count, constBitsPerChannel and the LPCM formatSpecificFlags
+    //   (QTFF 2012 "Sound Sample Description (Version 2)").
+    let entry_version = u16::from_be_bytes([entry[8], entry[9]]);
+    let mut children_at = 28;
+    let mut hints = PcmHints::default();
+    match entry_version {
+        1 if t.stsd_version == 0 && entry.len() >= 44 => children_at = 44,
+        2 if entry.len() >= 64 => {
+            let be32 =
+                |o: usize| u32::from_be_bytes([entry[o], entry[o + 1], entry[o + 2], entry[o + 3]]);
+            let rate = f64::from_bits(u64::from_be_bytes([
+                entry[32], entry[33], entry[34], entry[35], entry[36], entry[37], entry[38],
+                entry[39],
+            ]));
+            if rate.is_finite() && rate >= 1.0 && rate <= f64::from(u32::MAX) {
+                t.sample_rate = Some(rate.round() as u32);
+            }
+            if let Ok(ch) = u16::try_from(be32(40)) {
+                t.channels = Some(ch);
+            }
+            let bits = be32(48);
+            if let Ok(b) = u16::try_from(bits) {
+                if b != 0 {
+                    t.sample_size_bits = Some(b);
+                }
+            }
+            hints.lpcm_flags = Some(be32(52));
+            children_at = 64;
+        }
+        _ => {}
+    }
+
+    parse_audio_children(&entry[children_at..], t, &mut hints)?;
+    t.pcm = PcmLayout::for_entry(&t.codec_id_fourcc, t.sample_size_bits, &hints);
+    Ok(())
+}
+
+/// QuickTime convention for uncompressed audio in version-0 sound
+/// descriptions: the sample table counts one "sample" per PCM frame
+/// but records a constant sample size of 1 byte. Each sample really
+/// spans one frame (`channels × bytes per sample`), so the sizes are
+/// rewritten before the sample offsets are derived from them.
+fn fix_legacy_pcm_sample_sizes(t: &mut Track) {
+    let Some(layout) = t.pcm else {
+        return;
+    };
+    let frame = u32::from(t.channels.unwrap_or(1).max(1)) * u32::from(layout.bits.div_ceil(8));
+    if frame > 1 && !t.stsz.is_empty() && t.stsz.iter().all(|&s| s == 1) {
+        t.stsz.fill(frame);
+    }
+}
+
+/// PCM facts collected from a sample entry's tail and child boxes.
+#[derive(Default)]
+struct PcmHints {
+    /// ISO/IEC 23003-5 `pcmC`: `(format_flags, PCM_sample_size)`.
+    pcmc: Option<(u8, u8)>,
+    /// QuickTime v2 `formatSpecificFlags` (LPCM flag values).
+    lpcm_flags: Option<u32>,
+    /// QuickTime `enda` (inside `wave`): non-zero = little-endian.
+    little_endian: Option<bool>,
+}
+
+/// Walk an audio sample entry's child boxes (and the boxes nested in a
+/// QuickTime `wave` decompression-parameters atom).
+fn parse_audio_children(buf: &[u8], t: &mut Track, hints: &mut PcmHints) -> Result<()> {
+    let mut cur = std::io::Cursor::new(buf);
+    let end = buf.len() as u64;
+    while cur.position() + 8 <= end {
         let hdr = match read_box_header(&mut cur)? {
             Some(h) => h,
             None => break,
         };
+        // QuickTime terminator atom (size 8, type 0) ends the list.
+        if hdr.fourcc == [0; 4] {
+            break;
+        }
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         let body = read_bytes_vec(&mut cur, psz)?;
         match &hdr.fourcc {
+            // ISO/IEC 23003-5 PCMConfig: FullBox + format_flags (bit 0
+            // set = little-endian) + PCM_sample_size (bits).
+            b"pcmC" if body.len() >= 6 => {
+                hints.pcmc = Some((body[4], body[5]));
+            }
+            // ISO/IEC 14496-12 §12.2.3 SamplingRateBox: FullBox + the
+            // 32-bit sampling rate, authoritative over the 16.16
+            // `samplerate` field of an AudioSampleEntryV1.
+            b"srat" if body.len() >= 8 => {
+                let rate = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+                if rate > 0 {
+                    t.sample_rate = Some(rate);
+                }
+            }
+            // QuickTime `wave` (siDecompressionParam): nested atoms —
+            // `frma`, `enda`, `esds`, … — then a terminator.
+            b"wave" => parse_audio_children(&body, t, hints)?,
+            // QuickTime `enda`: 16-bit flag, non-zero = little-endian
+            // samples (for `in24` / `in32` / `fl32` / `fl64`).
+            b"enda" if body.len() >= 2 => {
+                hints.little_endian = Some(u16::from_be_bytes([body[0], body[1]]) != 0);
+            }
             // FLAC-in-MP4 dfLa: 1 byte version + 3 bytes flags + metadata blocks.
             // Our FLAC decoder wants just the metadata blocks.
             b"dfLa" if body.len() > 4 => {
@@ -7739,6 +7858,128 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Layout of uncompressed audio samples in a track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PcmLayout {
+    /// Bits per sample (8 / 16 / 24 / 32 / 64).
+    bits: u16,
+    float: bool,
+    signed: bool,
+    big_endian: bool,
+}
+
+impl PcmLayout {
+    /// The layout a sample entry of type `fourcc` declares, `None` for
+    /// compressed formats or a layout without a codec here.
+    fn for_entry(fourcc: &[u8; 4], sample_size: Option<u16>, h: &PcmHints) -> Option<Self> {
+        let int = |bits: u16, big_endian: bool| PcmLayout {
+            bits,
+            float: false,
+            signed: true,
+            big_endian,
+        };
+        let float = |bits: u16, big_endian: bool| PcmLayout {
+            bits,
+            float: true,
+            signed: true,
+            big_endian,
+        };
+        let qt_le = h.little_endian.unwrap_or(false);
+        let layout = match fourcc {
+            // ISO/IEC 23003-5: integer / IEEE-float PCM, endianness and
+            // sample size from `pcmC`.
+            b"ipcm" | b"fpcm" => {
+                let (flags, bits) = h.pcmc?;
+                let le = flags & 1 != 0;
+                if fourcc == b"fpcm" {
+                    float(u16::from(bits), !le)
+                } else {
+                    int(u16::from(bits), !le)
+                }
+            }
+            // QuickTime: `sowt` little-endian / `twos` big-endian
+            // signed integers, 8 or 16 bits (`samplesize`).
+            b"sowt" => int(sample_size.unwrap_or(16), false),
+            b"twos" => int(sample_size.unwrap_or(16), true),
+            // QuickTime `raw `: 8-bit offset-binary (unsigned).
+            b"raw " if sample_size.unwrap_or(8) == 8 => PcmLayout {
+                bits: 8,
+                float: false,
+                signed: false,
+                big_endian: false,
+            },
+            // QuickTime `in24` / `in32` / `fl32` / `fl64`: big-endian
+            // unless an `enda` atom says little-endian.
+            b"in24" => int(24, !qt_le),
+            b"in32" => int(32, !qt_le),
+            b"fl32" => float(32, !qt_le),
+            b"fl64" => float(64, !qt_le),
+            // QuickTime v2 `lpcm`: LPCM flag values — IsFloat (0x1),
+            // IsBigEndian (0x2), IsSignedInteger (0x4) — and
+            // constBitsPerChannel.
+            b"lpcm" => {
+                let flags = h.lpcm_flags?;
+                PcmLayout {
+                    bits: sample_size?,
+                    float: flags & 0x1 != 0,
+                    signed: flags & 0x1 != 0 || flags & 0x4 != 0,
+                    big_endian: flags & 0x2 != 0,
+                }
+            }
+            _ => return None,
+        };
+        layout.codec_id().map(|_| layout)
+    }
+
+    /// The (little-endian) PCM codec carrying these samples once the
+    /// demuxer has put them in little-endian order.
+    fn codec_id(&self) -> Option<&'static str> {
+        Some(match (self.float, self.bits, self.signed) {
+            (true, 32, _) => "pcm_f32le",
+            (true, 64, _) => "pcm_f64le",
+            (false, 8, true) => "pcm_s8",
+            (false, 8, false) => "pcm_u8",
+            (false, 16, true) => "pcm_s16le",
+            (false, 24, true) => "pcm_s24le",
+            (false, 32, true) => "pcm_s32le",
+            _ => return None,
+        })
+    }
+
+    fn sample_format(&self) -> Option<SampleFormat> {
+        Some(match self.codec_id()? {
+            "pcm_f32le" => SampleFormat::F32,
+            "pcm_f64le" => SampleFormat::F64,
+            "pcm_s8" => SampleFormat::S8,
+            "pcm_u8" => SampleFormat::U8,
+            "pcm_s16le" => SampleFormat::S16,
+            "pcm_s24le" => SampleFormat::S24,
+            _ => SampleFormat::S32,
+        })
+    }
+
+    /// Bytes per sample to reverse when the stored order is big-endian
+    /// (0 = samples are already little-endian / single bytes).
+    fn swap_width(&self) -> usize {
+        if self.big_endian && self.bits > 8 {
+            usize::from(self.bits / 8)
+        } else {
+            0
+        }
+    }
+}
+
+/// Reverse every `width`-byte group of `data` in place (big-endian
+/// samples → little-endian). A trailing partial group is left as-is.
+fn swap_sample_bytes(data: &mut [u8], width: usize) {
+    if width < 2 {
+        return;
+    }
+    for group in data.chunks_exact_mut(width) {
+        group.reverse();
+    }
 }
 
 /// What we extract from an esds box: the DecoderSpecificInfo (empty when
@@ -11593,7 +11834,10 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             let ctx = build_ctx(&tag, t);
             resolved = codecs.resolve_tag(&ctx);
         }
-        resolved.unwrap_or_else(|| match t.esds_oti {
+        // Uncompressed audio: the sample entry pins the layout (the
+        // demuxer delivers it little-endian), whatever the FourCC.
+        let pcm = t.pcm.and_then(|l| l.codec_id()).map(CodecId::new);
+        pcm.or(resolved).unwrap_or_else(|| match t.esds_oti {
             Some(oti) => from_sample_entry_with_oti(&t.codec_id_fourcc, oti),
             None => from_sample_entry(&t.codec_id_fourcc),
         })
@@ -11616,7 +11860,7 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         ("flac", Some(24)) => Some(SampleFormat::S24),
         ("flac", Some(32)) => Some(SampleFormat::S32),
         ("pcm_s16le", _) => Some(SampleFormat::S16),
-        _ => None,
+        _ => t.pcm.and_then(|l| l.sample_format()),
     };
     params.width = t.width;
     params.height = t.height;
@@ -11638,6 +11882,18 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     if params.media_type == MediaType::Video && params.pixel_format.is_none() {
         params.pixel_format =
             video_config::pixel_format_from_config(params.codec_id.as_str(), &params.extradata);
+    }
+    // The picture size the decoder emits: the SPS's cropping window
+    // wins over a sample entry that declares the coded
+    // (macroblock-aligned) size, e.g. 1920x1088 for a 1080p stream.
+    if params.media_type == MediaType::Video {
+        if let Some((w, h)) = video_config::cropped_dimensions_from_config(
+            params.codec_id.as_str(),
+            &params.extradata,
+        ) {
+            params.width = Some(w);
+            params.height = Some(h);
+        }
     }
 
     // ISO/IEC 14496-12 §8.12: when the track's sample entry was wrapped
@@ -12952,6 +13208,10 @@ pub struct Mp4Demuxer {
     /// Total input length in bytes (established at `open`). Used to
     /// reject sample sizes the input cannot back before allocating.
     input_len: u64,
+    /// Per stream: bytes per PCM sample to reverse so big-endian
+    /// uncompressed audio (`twos`, big-endian `ipcm` / `fpcm` / `lpcm`,
+    /// `in24` …) reaches the little-endian PCM codecs; 0 = as stored.
+    pcm_swap: Vec<usize>,
     streams: Vec<StreamInfo>,
     samples: Vec<SampleRef>,
     cursor: usize,
@@ -13638,6 +13898,9 @@ impl Demuxer for Mp4Demuxer {
         self.input.seek(SeekFrom::Start(s.offset))?;
         let mut data = vec![0u8; s.size as usize];
         self.input.read_exact(&mut data)?;
+        if let Some(&width) = self.pcm_swap.get(s.track_idx as usize) {
+            swap_sample_bytes(&mut data, width);
+        }
         let stream = &self.streams[s.track_idx as usize];
         let mut pkt = Packet::new(s.track_idx, stream.time_base, data);
         // CTS for `pts` (display order), DTS for `dts` (decode order).
@@ -14640,6 +14903,8 @@ mod tests {
             channels: None,
             sample_rate: None,
             sample_size_bits: None,
+            stsd_version: 0,
+            pcm: None,
             width: None,
             height: None,
             extradata: Vec::new(),

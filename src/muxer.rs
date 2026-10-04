@@ -1077,7 +1077,15 @@ fn build_stbl_with_sample_groups(
 
 fn build_stsd(t: &TrackState) -> Vec<u8> {
     let mut body = Vec::new();
-    body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+    // ISO/IEC 14496-12 §8.5.2.2: an AudioSampleEntryV1 (entry version
+    // 1 in the first 16 bits after `data_reference_index`) may only
+    // appear in a version-1 SampleDescriptionBox.
+    let entry = &t.sample_entry.body;
+    let audio_v1 = t.stream.params.media_type == MediaType::Audio
+        && entry.len() >= 28
+        && entry[8..10] == [0, 1];
+    body.push(u8::from(audio_v1)); // version
+    body.extend_from_slice(&[0, 0, 0]); // flags
     body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
                                                  // The sample entry is itself a box of type = `fourcc`, size = 8 + body.len().
     body.extend_from_slice(&wrap_box(&t.sample_entry.fourcc, &t.sample_entry.body));

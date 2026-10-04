@@ -29,7 +29,14 @@ pub(crate) struct SampleEntry {
 /// has no MP4 packaging in our table.
 pub(crate) fn sample_entry_for(params: &CodecParameters) -> Result<SampleEntry> {
     match params.codec_id.as_str() {
-        "pcm_s16le" => pcm_sowt(params),
+        // ISO/IEC 23003-5 uncompressed audio: `ipcm` (two's-complement
+        // integers) / `fpcm` (IEEE floats) + `pcmC`.
+        "pcm_s8" => pcm_entry(params, *b"ipcm", 8),
+        "pcm_s16le" => pcm_entry(params, *b"ipcm", 16),
+        "pcm_s24le" => pcm_entry(params, *b"ipcm", 24),
+        "pcm_s32le" => pcm_entry(params, *b"ipcm", 32),
+        "pcm_f32le" => pcm_entry(params, *b"fpcm", 32),
+        "pcm_f64le" => pcm_entry(params, *b"fpcm", 64),
         "flac" => flac_entry(params),
         "aac" => aac_entry(params),
         "h264" => h264_entry(params),
@@ -144,9 +151,23 @@ fn audio_preamble(channels: u16, sample_size: u16, sample_rate: u32) -> [u8; 28]
     out[18..20].copy_from_slice(&sample_size.to_be_bytes());
     // 2 bytes pre_defined + 2 bytes reserved
     // sample_rate as 16.16 fixed-point at offset 24
-    let sr_fixed = sample_rate << 16;
+    let sr_fixed = samplerate_field(sample_rate) << 16;
     out[24..28].copy_from_slice(&sr_fixed.to_be_bytes());
     out
+}
+
+/// The integer part of the 16.16 `samplerate` field for `rate`.
+/// Rates above 65535 Hz do not fit: ISO/IEC 14496-12 §12.2.3 then
+/// carries the true rate in a SamplingRateBox (`srat`) and the field
+/// holds an integer divisor of it that fits (96000 → 48000); 0 when no
+/// such divisor exists.
+fn samplerate_field(rate: u32) -> u32 {
+    if rate <= 0xFFFF {
+        return rate;
+    }
+    (rate.div_ceil(0xFFFF).max(2)..=rate)
+        .find(|k| rate % k == 0)
+        .map_or(0, |k| rate / k)
 }
 
 /// 78-byte VisualSampleEntry preamble.
@@ -178,19 +199,56 @@ fn visual_preamble(width: u32, height: u32) -> [u8; 78] {
     out
 }
 
-fn pcm_sowt(params: &CodecParameters) -> Result<SampleEntry> {
+/// ISO/IEC 23003-5 uncompressed-audio sample entry (`ipcm` / `fpcm`):
+///
+/// * an AudioSampleEntry whose `samplesize` is the PCM sample size —
+///   version 1 with a SamplingRateBox (`srat`, ISO/IEC 14496-12
+///   §12.2.3) when the rate exceeds the 16-bit `samplerate` field (the
+///   `stsd` is then written as version 1, see the muxer);
+/// * a ChannelLayout box (`chnl`, §12.2.4) for mono / stereo — the
+///   `definedLayout` values 1 / 2 of ISO/IEC 23091-3 — (other channel
+///   counts carry no implied speaker layout here, so none is claimed);
+/// * the PCMConfig box (`pcmC`): FullBox + `format_flags` (bit 0 set
+///   = little-endian, which every PCM codec here is) +
+///   `PCM_sample_size` in bits.
+///
+/// Each sample is one packet: a whole number of interleaved PCM
+/// frames.
+fn pcm_entry(params: &CodecParameters, fourcc: [u8; 4], bits: u8) -> Result<SampleEntry> {
+    if params.media_type != MediaType::Audio {
+        return Err(Error::invalid("mp4 muxer: PCM must be audio"));
+    }
     let channels = params
         .channels
+        .filter(|&c| c > 0)
         .ok_or_else(|| Error::invalid("mp4 muxer: PCM requires channels"))?;
     let sample_rate = params
         .sample_rate
+        .filter(|&r| r > 0)
         .ok_or_else(|| Error::invalid("mp4 muxer: PCM requires sample_rate"))?;
-    // sowt is 16-bit signed little-endian PCM; hard-coded 16 bps.
-    let body = audio_preamble(channels, 16, sample_rate).to_vec();
-    Ok(SampleEntry {
-        fourcc: *b"sowt",
-        body,
-    })
+    let mut body = audio_preamble(channels, u16::from(bits), sample_rate).to_vec();
+    if sample_rate > 0xFFFF {
+        // AudioSampleEntryV1: entry_version = 1 in the first 16 bits
+        // of the reserved block.
+        body[8..10].copy_from_slice(&1u16.to_be_bytes());
+        let mut srat = vec![0u8; 4];
+        srat.extend_from_slice(&sample_rate.to_be_bytes());
+        body.extend_from_slice(&write_simple_box(b"srat", &srat));
+    }
+    if let Some(layout) = match channels {
+        1 => Some(1u8),
+        2 => Some(2u8),
+        _ => None,
+    } {
+        // FullBox v0 + stream_structure = 1 (channelStructured) +
+        // definedLayout + omittedChannelsMap (u64, none omitted).
+        let mut chnl = vec![0u8, 0, 0, 0, 1, layout];
+        chnl.extend_from_slice(&0u64.to_be_bytes());
+        body.extend_from_slice(&write_simple_box(b"chnl", &chnl));
+    }
+    let pcmc = [0u8, 0, 0, 0, 0x01, bits];
+    body.extend_from_slice(&write_simple_box(b"pcmC", &pcmc));
+    Ok(SampleEntry { fourcc, body })
 }
 
 fn flac_entry(params: &CodecParameters) -> Result<SampleEntry> {
@@ -611,18 +669,65 @@ mod tests {
     use oxideav_core::{CodecId, CodecParameters, SampleFormat};
 
     #[test]
-    fn pcm_sowt_shape() {
+    fn pcm_ipcm_shape() {
         let mut p = CodecParameters::audio(CodecId::new("pcm_s16le"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
         p.sample_format = Some(SampleFormat::S16);
         let e = sample_entry_for(&p).unwrap();
-        assert_eq!(&e.fourcc, b"sowt");
-        assert_eq!(e.body.len(), 28);
+        assert_eq!(&e.fourcc, b"ipcm");
         // channels big-endian at offset 16
         assert_eq!(u16::from_be_bytes([e.body[16], e.body[17]]), 2);
         // sample size at offset 18
         assert_eq!(u16::from_be_bytes([e.body[18], e.body[19]]), 16);
+        assert_eq!(&e.body[8..10], &[0, 0], "entry version 0");
+        assert_eq!(
+            u32::from_be_bytes([e.body[24], e.body[25], e.body[26], e.body[27]]),
+            48_000 << 16
+        );
+        // chnl (stereo, definedLayout 2) then pcmC (LE, 16 bits).
+        assert_eq!(&e.body[32..36], b"chnl");
+        assert_eq!(&e.body[40..42], &[1, 2]);
+        assert_eq!(&e.body[54..58], b"pcmC");
+        assert_eq!(&e.body[58..64], &[0, 0, 0, 0, 1, 16]);
+        assert_eq!(e.body.len(), 64);
+    }
+
+    #[test]
+    fn pcm_entries_cover_every_layout() {
+        for (codec, fourcc, bits) in [
+            ("pcm_s8", b"ipcm", 8u8),
+            ("pcm_s24le", b"ipcm", 24),
+            ("pcm_s32le", b"ipcm", 32),
+            ("pcm_f32le", b"fpcm", 32),
+            ("pcm_f64le", b"fpcm", 64),
+        ] {
+            let mut p = CodecParameters::audio(CodecId::new(codec));
+            p.channels = Some(6);
+            p.sample_rate = Some(44_100);
+            let e = sample_entry_for(&p).unwrap();
+            assert_eq!(&e.fourcc, fourcc, "{codec}");
+            // No implied layout for 6 channels: preamble + pcmC only.
+            assert_eq!(&e.body[32..36], b"pcmC", "{codec}");
+            assert_eq!(e.body[41], bits, "{codec}");
+        }
+        let p = CodecParameters::audio(CodecId::new("pcm_u8"));
+        assert!(sample_entry_for(&p).is_err(), "unsigned has no ipcm form");
+    }
+
+    #[test]
+    fn pcm_high_rates_use_entry_v1_with_srat() {
+        let mut p = CodecParameters::audio(CodecId::new("pcm_s24le"));
+        p.channels = Some(1);
+        p.sample_rate = Some(192_000);
+        let e = sample_entry_for(&p).unwrap();
+        assert_eq!(&e.body[8..10], &[0, 1], "entry version 1");
+        let field = u32::from_be_bytes([e.body[24], e.body[25], e.body[26], e.body[27]]) >> 16;
+        assert!(field <= 0xFFFF && 192_000 % field == 0, "{field}");
+        assert_eq!(&e.body[32..36], b"srat");
+        assert_eq!(&e.body[40..44], &192_000u32.to_be_bytes());
+        assert_eq!(samplerate_field(96_000), 48_000);
+        assert_eq!(samplerate_field(44_100), 44_100);
     }
 
     #[test]
