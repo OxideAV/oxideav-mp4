@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.10...v0.0.11) - 2026-10-04
+
+### Other
+
+- PCM audio: ISO/IEC 23003-5 ipcm / fpcm mux + demux, QuickTime PCM demux; SPS-cropped sizes
+- report HE-AAC at the ASC's SBR output rate when mp4a carries the core rate
+- AAC carriage: bare access units + synthesised esds ASC; mov demuxer alias; pre-roll edit list
+- declare the H.264 / HEVC picture layout from avcC / hvcC
+- README install snippet drops the retired oxideav-codec/oxideav-container crates
+- README examples use the current registry API
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Fixed
 
 - AAC could not be muxed into MP4: an AAC stream without extradata was
