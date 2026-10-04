@@ -26,23 +26,23 @@ oxideav-mp4 = "0.0"
 ### Demux an MP4 and feed packets into a codec
 
 ```rust
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
+use oxideav_core::{ReadSeek, RuntimeContext};
 
-let mut codecs = CodecRegistry::new();
-let mut containers = ContainerRegistry::new();
-oxideav_mp4::register(&mut containers);
-// ... register whichever codecs you care about (aac, flac, h264, mjpeg, ...)
+let mut ctx = RuntimeContext::new();
+oxideav_mp4::register(&mut ctx);
+// ... register whichever codecs you care about (aac, flac, h264, mjpeg, ...),
+// or everything at once with `oxideav_meta::register_all(&mut ctx)`.
 
-let input: Box<dyn oxideav_container::ReadSeek> =
-    Box::new(std::fs::File::open("clip.mp4")?);
-let mut dmx = containers.open("mp4", input)?;
+let input: Box<dyn ReadSeek> = Box::new(std::fs::File::open("clip.mp4")?);
+let mut dmx = ctx.containers.open_demuxer("mp4", input, &ctx.codecs)?;
 
 // Sample entries are resolved to concrete codec ids. For `mp4a`/`mp4v`
 // tracks the esds `objectTypeIndication` is honoured, so MP3-in-mp4
 // comes out as "mp3", MPEG-1 video as "mpeg1video", AAC as "aac", etc.
-let stream = &dmx.streams()[0];
-let mut dec = codecs.make_decoder(&stream.params)?;
+let params = dmx.streams()[0].params.clone();
+let mut dec = ctx.codecs.first_decoder(&params)?;
+// (or `oxideav_pipeline::make_decoder(&ctx.codecs, &params)` for
+// priority / preference-aware selection among several implementations)
 
 loop {
     match dmx.next_packet() {
@@ -63,7 +63,9 @@ loop {
 ### Mux packets into an MP4
 
 ```rust
-use oxideav_container::WriteSeek;
+use oxideav_core::WriteSeek;
+# let streams: Vec<oxideav_core::StreamInfo> = Vec::new();
+# let packets: Vec<oxideav_core::Packet> = Vec::new();
 
 let f = std::fs::File::create("out.mp4")?;
 let ws: Box<dyn WriteSeek> = Box::new(f);
@@ -78,6 +80,8 @@ mux.write_trailer()?;
 
 ```rust
 use oxideav_mp4::{BrandPreset, Mp4MuxerOptions};
+# let ws: Box<dyn oxideav_core::WriteSeek> = Box::new(std::fs::File::create("out.mp4")?);
+# let streams: Vec<oxideav_core::StreamInfo> = Vec::new();
 
 let opts = Mp4MuxerOptions {
     brand: BrandPreset::Mp4,
@@ -85,6 +89,7 @@ let opts = Mp4MuxerOptions {
     ..Mp4MuxerOptions::default()
 };
 let mut mux = oxideav_mp4::muxer::open_with_options(ws, &streams, opts)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 In faststart mode the muxer buffers mdat in memory and writes
@@ -1835,15 +1840,19 @@ first that applies:
 ## Container registry
 
 ```rust
-let mut reg = oxideav_container::ContainerRegistry::new();
-oxideav_mp4::register(&mut reg);
+let mut ctx = oxideav_core::RuntimeContext::new();
+oxideav_mp4::register(&mut ctx);
+// or, with a bare container registry:
+let mut reg = oxideav_core::ContainerRegistry::new();
+oxideav_mp4::register_containers(&mut reg);
 ```
 
 Registers:
 
 - Demuxer `"mp4"` (also serving `.mp4`, `.m4a`, `.m4v`, `.3gp`, `.mov`,
   `.ismv`).
-- Muxers `"mp4"`, `"mov"`, `"ismv"`.
+- Muxers `"mp4"`, `"mov"`, `"ismv"`, and the fragmented `"dash"` /
+  `"cmaf"` (`.m4s`).
 - A content probe that recognises `ftyp` / `wide`+`ftyp` / `moov`.
 
 ## Fuzzing
