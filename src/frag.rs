@@ -741,7 +741,7 @@ impl FragmentedMuxer {
 
         // Maybe emit a fragment now.
         if self.should_flush(idx, packet.flags.keyframe) {
-            self.flush_fragment()?;
+            self.flush_fragment_on_cadence()?;
         }
         Ok(())
     }
@@ -1043,10 +1043,26 @@ impl FragmentedMuxer {
         }
     }
 
-    /// Emit one `styp? + moof + mdat` triple. For `EveryKeyframe` the
-    /// just-pushed keyframe is detached from `pending` and re-pushed after
-    /// the flush — see `should_flush` doc.
-    fn flush_fragment(&mut self) -> Result<()> {
+    /// Force the pending samples into one media fragment.
+    ///
+    /// This is the explicit segment-boundary operation for callers that own
+    /// the delivery cadence, such as a WebSocket fMP4 sink. Unlike the
+    /// automatic `EveryKeyframe` cadence path, this method keeps every sample
+    /// currently pending in the fragment, including a trailing keyframe.
+    /// Calling it with no pending samples is a no-op.
+    ///
+    /// The init segment must already have been written with
+    /// [`Muxer::write_header`](oxideav_core::Muxer::write_header). Call
+    /// [`Muxer::write_trailer`](oxideav_core::Muxer::write_trailer) when the
+    /// stream is complete.
+    pub fn flush_fragment(&mut self) -> Result<()> {
+        self.flush_fragment_inner(false)
+    }
+
+    /// Emit one `styp? + moof + mdat` triple because the configured cadence
+    /// fired. For `EveryKeyframe`, the just-pushed keyframe is detached from
+    /// `pending` and re-pushed after the flush — see `should_flush`.
+    fn flush_fragment_on_cadence(&mut self) -> Result<()> {
         self.flush_fragment_inner(true)
     }
 
