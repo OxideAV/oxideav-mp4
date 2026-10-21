@@ -836,6 +836,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         ));
     }
 
+    let gapless = gapless_timings(&parsed.tracks, &metadata, parsed.movie_timescale);
     Ok(Mp4Demuxer {
         input,
         input_len: file_size,
@@ -875,6 +876,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         movie_timescale: parsed.movie_timescale,
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
+        gapless,
         edit_lists: parsed
             .tracks
             .iter()
@@ -3393,6 +3395,12 @@ fn parse_ilst(body: &[u8], metadata: &mut Vec<(String, String)>) {
         cur.set_position((start + psz) as u64);
         // Recurse one level: look for a `data` child.
         let item = &body[start..start + psz];
+        if &hdr.fourcc == b"----" {
+            if let Some(entry) = parse_freeform_item(item) {
+                metadata.push(entry);
+            }
+            continue;
+        }
         let key = ilst_key_for(&hdr.fourcc);
         if key.is_none() {
             continue;
@@ -3423,6 +3431,33 @@ fn parse_ilst(body: &[u8], metadata: &mut Vec<(String, String)>) {
             }
         }
     }
+}
+
+/// An iTunes freeform `----` item: its `mean` and `name` FullBoxes and
+/// its `data` value, as `("----:<mean>:<name>", value)`.
+fn parse_freeform_item(item: &[u8]) -> Option<(String, String)> {
+    let (mut mean, mut name, mut value) = (None, None, None);
+    let mut cur = std::io::Cursor::new(item);
+    while cur.position() < item.len() as u64 {
+        let h = read_box_header(&mut cur).ok().flatten()?;
+        let len = h.payload_size().unwrap_or(0) as usize;
+        let start = cur.position() as usize;
+        let body = item.get(start..start + len)?;
+        cur.set_position((start + len) as u64);
+        match &h.fourcc {
+            b"mean" if body.len() >= 4 => {
+                mean = Some(String::from_utf8_lossy(&body[4..]).into_owned())
+            }
+            b"name" if body.len() >= 4 => {
+                name = Some(String::from_utf8_lossy(&body[4..]).into_owned())
+            }
+            b"data" if body.len() >= 8 => {
+                value = Some(String::from_utf8_lossy(&body[8..]).trim().to_string())
+            }
+            _ => {}
+        }
+    }
+    Some((format!("----:{}:{}", mean?, name?), value?))
 }
 
 fn ilst_key_for(fourcc: &[u8; 4]) -> Option<&'static str> {
@@ -6472,6 +6507,91 @@ fn elst_leading_media_time(elst: &[ElstEntry]) -> i64 {
         }
     }
     0
+}
+
+/// Gapless timing of an audio track, in samples at the track's sample
+/// rate: encoder priming before the first valid sample, the valid
+/// samples, and the padding (remainder) after them
+/// ([`Mp4Demuxer::gapless_timing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GaplessTiming {
+    pub priming: u64,
+    pub valid: u64,
+    pub remainder: u64,
+    pub source: GaplessSource,
+}
+
+/// Where a [`GaplessTiming`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GaplessSource {
+    /// The iTunes `iTunSMPB` freeform item (M4A).
+    ITunSmpb,
+    /// A single-entry `elst` on a track with an AAC `roll` sample group.
+    EditList,
+}
+
+/// `iTunSMPB`'s value: hex fields, the second priming, the third the
+/// remainder, the fourth the valid sample count.
+fn parse_itunsmpb(value: &str) -> Option<(u64, u64, u64)> {
+    let f: Vec<u64> = value
+        .split_ascii_whitespace()
+        .take(4)
+        .map(|w| u64::from_str_radix(w, 16).ok())
+        .collect::<Option<_>>()?;
+    (f.len() == 4).then(|| (f[1], f[2], f[3]))
+}
+
+fn gapless_timings(
+    tracks: &[Track],
+    metadata: &[(String, String)],
+    movie_timescale: u32,
+) -> Vec<Option<GaplessTiming>> {
+    let smpb = metadata
+        .iter()
+        .find(|(k, _)| k == "----:com.apple.iTunes:iTunSMPB")
+        .and_then(|(_, v)| parse_itunsmpb(v));
+    let first_audio = tracks.iter().position(|t| t.media_type == MediaType::Audio);
+    tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            if t.media_type != MediaType::Audio {
+                return None;
+            }
+            if let (Some((priming, remainder, valid)), true) = (smpb, Some(i) == first_audio) {
+                return Some(GaplessTiming {
+                    priming,
+                    valid,
+                    remainder,
+                    source: GaplessSource::ITunSmpb,
+                });
+            }
+            let rate = u64::from(t.sample_rate?);
+            let scale = u64::from(t.timescale).max(1);
+            let roll = t.sgpd.iter().any(|g| &g.grouping_type == b"roll");
+            match t.elst.as_slice() {
+                [e] if roll && e.media_time >= 0 && movie_timescale > 0 => {
+                    let priming = e.media_time as u64 * rate / scale;
+                    let valid = e.segment_duration * rate / u64::from(movie_timescale);
+                    // Every packet holds a full frame: the last one's
+                    // unused tail is the remainder too.
+                    let packets: u64 = t.stts.iter().map(|&(n, _)| u64::from(n)).sum();
+                    let total = match t.stts.first() {
+                        Some(&(_, frame)) => packets * u64::from(frame),
+                        None => t.duration?,
+                    } * rate
+                        / scale;
+                    Some(GaplessTiming {
+                        priming,
+                        valid,
+                        remainder: total.saturating_sub(priming + valid),
+                        source: GaplessSource::EditList,
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// One entry of an `elst` EditListBox (ISO/IEC 14496-12 §8.6.6) — the
@@ -13565,6 +13685,8 @@ pub struct Mp4Demuxer {
     tkhd_timestamps: Vec<HeaderTimestamps>,
     /// Per-stream §8.4.2 `mdhd` timestamps (parallel to `streams`).
     mdhd_timestamps: Vec<HeaderTimestamps>,
+    /// Per-stream gapless audio timing ([`Self::gapless_timing`]).
+    gapless: Vec<Option<GaplessTiming>>,
     /// `sample_description_index` of the packet most recently returned
     /// by `next_packet` (`None` before the first packet). See
     /// [`Self::sample_description_index_of_last_packet`].
@@ -14048,6 +14170,15 @@ impl Mp4Demuxer {
     /// non-zero).
     pub fn mdhd_timestamps(&self, stream_index: u32) -> Option<HeaderTimestamps> {
         self.mdhd_timestamps.get(stream_index as usize).copied()
+    }
+
+    /// The gapless timing of `stream_index`'s audio track: from the
+    /// M4A `iTunSMPB` item, else from a single-entry edit list on a
+    /// track with an AAC `roll` sample group; `None` otherwise (or for
+    /// a non-audio stream).
+    #[allow(dead_code)]
+    pub fn gapless_timing(&self, stream_index: u32) -> Option<GaplessTiming> {
+        self.gapless.get(stream_index as usize).copied().flatten()
     }
 
     /// The 1-based §8.5.2 `sample_description_index` of the packet
