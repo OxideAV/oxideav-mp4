@@ -180,6 +180,50 @@ impl Bits<'_> {
     }
 }
 
+/// The output channel count an `AudioSpecificConfig` declares: its
+/// default `channelConfiguration` (Table 1.19: 1-6 channels, 7 is 7.1 =
+/// 8), or 2 for a mono core with parametric stereo signalled
+/// hierarchically (AOT 29) or by the §1.6.6 backward-compatible sync
+/// extension (`0x2B7` SBR, then `0x548` with `psPresentFlag`). `None`
+/// for configuration 0 (a PCE describes the channels) or when the
+/// leading fields do not parse.
+pub(crate) fn asc_channel_count(asc: &[u8]) -> Option<u16> {
+    let mut b = Bits { data: asc, pos: 0 };
+    let aot = b.aot()?;
+    b.rate()?;
+    let n = match b.read(4)? {
+        cfg @ 1..=6 => cfg as u16,
+        7 => 8,
+        _ => return None,
+    };
+    if n != 1 {
+        return Some(n);
+    }
+    if aot == 29 {
+        return Some(2);
+    }
+    if !(1..=4).contains(&aot) {
+        return Some(1);
+    }
+    // GASpecificConfig (Table 4.1) for AOT 1-4, then the sync extensions.
+    let ps = (|| {
+        b.read(1)?;
+        if b.read(1)? == 1 {
+            b.read(14)?;
+        }
+        if b.read(1)? == 1 {
+            b.read(1)?;
+        }
+        if b.remaining() < 16 || b.read(11)? != 0x2B7 || b.aot()? != 5 || b.read(1)? != 1 {
+            return Some(false);
+        }
+        b.rate()?;
+        Some(b.remaining() >= 12 && b.read(11)? == 0x548 && b.read(1)? == 1)
+    })()
+    .unwrap_or(false);
+    Some(if ps { 2 } else { 1 })
+}
+
 /// Parse the sampling-frequency fields of an `AudioSpecificConfig`.
 /// The §1.6.5 trailing SBR probe is only attempted for the plain
 /// General-Audio object types (1–4) without an inline PCE, whose
@@ -290,6 +334,24 @@ mod tests {
     #[test]
     fn multi_block_frames_are_rejected() {
         assert!(strip_adts(&adts(10, false, 2)).is_err());
+    }
+
+    #[test]
+    fn asc_channel_count_follows_channel_configuration() {
+        assert_eq!(asc_channel_count(&[0x12, 0x10]), Some(2)); // LC 44.1k stereo
+        assert_eq!(asc_channel_count(&[0x11, 0xB0]), Some(6)); // LC 48k 5.1
+        assert_eq!(asc_channel_count(&[0x11, 0xB8]), Some(8)); // LC 48k 7.1
+        assert_eq!(asc_channel_count(&[0x11, 0x88]), Some(1)); // LC 48k mono
+                                                               // HE-AAC v2, sync-extension signalling (macOS's encoder):
+                                                               // 22.05k mono core, SBR to 44.1k, psPresentFlag.
+        assert_eq!(
+            asc_channel_count(&[0x13, 0x88, 0x56, 0xE5, 0xA5, 0x48, 0x80]),
+            Some(2)
+        );
+        // HE-AAC v1 mono: SBR, no PS extension.
+        assert_eq!(asc_channel_count(&[0x13, 0x08, 0x56, 0xE5, 0x98]), Some(1));
+        assert_eq!(asc_channel_count(&[0x11, 0x80]), None); // PCE
+        assert_eq!(asc_channel_count(&[]), None);
     }
 
     #[test]

@@ -11997,6 +11997,15 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     // entry. The decoder emits the SBR output rate the ASC declares, so
     // report that (ISO/IEC 14496-3 §1.6.5 / §4.6.18).
     if params.codec_id.as_str() == "aac"
+        // The `mp4a` entry's channelcount is commonly 2 whatever the
+        // stream carries (ISO/IEC 14496-12 §12.2.3 leaves it to the
+        // codec); the AudioSpecificConfig declares what the decoder
+        // emits.
+        && let Some(n) = crate::aac::asc_channel_count(&params.extradata)
+    {
+        params.channels = Some(n);
+    }
+    if params.codec_id.as_str() == "aac"
         && let Some(r) = crate::aac::asc_rates(&params.extradata)
         && let (Some(out), Some(entry)) = (r.sbr_rate, params.sample_rate)
         && entry == r.core_rate
