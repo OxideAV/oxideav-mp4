@@ -1579,6 +1579,24 @@ subsequent movie fragments") — e.g. a `media_time = 1024, duration =
 0` entry cuts AAC priming ahead of the first presented CMAF sample
 across every fragment.
 
+Gapless audio timing: `Mp4Demuxer::gapless_timing(stream)` returns a
+`demux::GaplessTiming` — encoder `priming`, `valid` and `remainder`
+sample counts, plus the `GaplessSource` they came from — for an audio
+track that carries them: the iTunes `iTunSMPB` freeform item (M4A;
+fields two to four of its hex string, applied to the first audio
+track), else a single-entry `elst` on a track with an AAC `roll`
+sample group (`priming = media_time`, `valid = segment_duration`,
+`remainder` = the last frame's unused tail), and `None` otherwise —
+the "assume 2112 for AAC" fallback is reader policy and stays with the
+caller. Counts are in samples at the stream's reported `sample_rate`:
+an HE-AAC file that stores the core rate in its `mp4a` entry keeps its
+counts in core-rate frames, and they are scaled by the SBR factor to
+match the reported output rate. The same four values appear on the
+stream's options as `gapless_priming` / `gapless_valid` /
+`gapless_remainder` / `gapless_source` (`"iTunSMPB"` or `"elst"`).
+iTunes freeform `----` items (`mean` / `name` / `data`) reach
+`metadata()` as `----:<mean>:<name>` with their trimmed string value.
+
 Header timestamps (`mvhd` §8.2.2, `tkhd` §8.3.2, `mdhd` §8.4.2)
 default to zero — the historical output and the "unset" reading.
 `Mp4MuxerOptions::creation_time` stamps all three, in the ISOBMFF

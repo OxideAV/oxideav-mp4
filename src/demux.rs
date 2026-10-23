@@ -836,7 +836,18 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         ));
     }
 
-    let gapless = gapless_timings(&parsed.tracks, &metadata, parsed.movie_timescale);
+    let gapless = gapless_timings(&parsed.tracks, &streams, &metadata, parsed.movie_timescale);
+    // Flat mirror of the typed accessor, the way the `elst_*` keys
+    // mirror `edit_list`.
+    for (s, g) in streams.iter_mut().zip(&gapless) {
+        if let Some(g) = g {
+            let o = &mut s.params.options;
+            o.insert("gapless_priming".to_string(), g.priming.to_string());
+            o.insert("gapless_valid".to_string(), g.valid.to_string());
+            o.insert("gapless_remainder".to_string(), g.remainder.to_string());
+            o.insert("gapless_source".to_string(), g.source.as_str().to_string());
+        }
+    }
     Ok(Mp4Demuxer {
         input,
         input_len: file_size,
@@ -6509,25 +6520,70 @@ fn elst_leading_media_time(elst: &[ElstEntry]) -> i64 {
     0
 }
 
-/// Gapless timing of an audio track, in samples at the track's sample
-/// rate: encoder priming before the first valid sample, the valid
-/// samples, and the padding (remainder) after them
-/// ([`Mp4Demuxer::gapless_timing`]).
+/// Gapless timing of an audio track ([`Mp4Demuxer::gapless_timing`]):
+/// encoder priming before the first valid sample, the valid samples,
+/// and the padding (remainder) after them, so a consumer can trim the
+/// decoded PCM to the original length.
+///
+/// All three counts are in samples at the stream's reported
+/// `params.sample_rate` — the rate the decoder emits. An HE-AAC file
+/// whose `mp4a` entry carries the AAC core rate stores its counts in
+/// core-rate frames (`iTunSMPB`) or core-rate media ticks (`elst`);
+/// they are scaled by the SBR factor here so they line up with the
+/// reported rate.
+///
+/// Mirrored on the stream's `params.options` as `gapless_priming` /
+/// `gapless_valid` / `gapless_remainder` / `gapless_source`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GaplessTiming {
+    /// Encoder delay: decoded samples to drop before the first valid
+    /// one.
     pub priming: u64,
+    /// Valid samples — the original signal's length.
     pub valid: u64,
+    /// Padding after the valid samples (the unused tail of the last
+    /// frame).
     pub remainder: u64,
+    /// Which carrier the numbers came from.
     pub source: GaplessSource,
+}
+
+impl GaplessTiming {
+    /// A timing record with every field given.
+    pub fn new(priming: u64, valid: u64, remainder: u64, source: GaplessSource) -> Self {
+        Self {
+            priming,
+            valid,
+            remainder,
+            source,
+        }
+    }
+
+    /// `priming + valid + remainder`: the decoded length of the track.
+    pub fn total(&self) -> u64 {
+        self.priming + self.valid + self.remainder
+    }
 }
 
 /// Where a [`GaplessTiming`] came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GaplessSource {
     /// The iTunes `iTunSMPB` freeform item (M4A).
     ITunSmpb,
     /// A single-entry `elst` on a track with an AAC `roll` sample group.
     EditList,
+}
+
+impl GaplessSource {
+    /// The `gapless_source` option value: `"iTunSMPB"` or `"elst"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GaplessSource::ITunSmpb => "iTunSMPB",
+            GaplessSource::EditList => "elst",
+        }
+    }
 }
 
 /// `iTunSMPB`'s value: hex fields, the second priming, the third the
@@ -6541,8 +6597,14 @@ fn parse_itunsmpb(value: &str) -> Option<(u64, u64, u64)> {
     (f.len() == 4).then(|| (f[1], f[2], f[3]))
 }
 
+/// Per-track gapless timing, in samples at each stream's reported
+/// `sample_rate` (`streams` is parallel to `tracks`). `iTunSMPB` counts
+/// frames at the `mp4a` entry's rate; when the stream reports a higher
+/// rate (HE-AAC with the core rate in the entry) the counts are scaled
+/// by that integer factor so they describe the decoder's output.
 fn gapless_timings(
     tracks: &[Track],
+    streams: &[StreamInfo],
     metadata: &[(String, String)],
     movie_timescale: u32,
 ) -> Vec<Option<GaplessTiming>> {
@@ -6553,20 +6615,27 @@ fn gapless_timings(
     let first_audio = tracks.iter().position(|t| t.media_type == MediaType::Audio);
     tracks
         .iter()
+        .zip(streams)
         .enumerate()
-        .map(|(i, t)| {
+        .map(|(i, (t, s))| {
             if t.media_type != MediaType::Audio {
                 return None;
             }
+            let entry_rate = t.sample_rate?;
+            let rate = s.params.sample_rate.unwrap_or(entry_rate);
             if let (Some((priming, remainder, valid)), true) = (smpb, Some(i) == first_audio) {
+                let factor = match (entry_rate, rate) {
+                    (e, o) if e > 0 && o > e && o.is_multiple_of(e) => u64::from(o / e),
+                    _ => 1,
+                };
                 return Some(GaplessTiming {
-                    priming,
-                    valid,
-                    remainder,
+                    priming: priming * factor,
+                    valid: valid * factor,
+                    remainder: remainder * factor,
                     source: GaplessSource::ITunSmpb,
                 });
             }
-            let rate = u64::from(t.sample_rate?);
+            let rate = u64::from(rate);
             let scale = u64::from(t.timescale).max(1);
             let roll = t.sgpd.iter().any(|g| &g.grouping_type == b"roll");
             match t.elst.as_slice() {
@@ -14175,8 +14244,8 @@ impl Mp4Demuxer {
     /// The gapless timing of `stream_index`'s audio track: from the
     /// M4A `iTunSMPB` item, else from a single-entry edit list on a
     /// track with an AAC `roll` sample group; `None` otherwise (or for
-    /// a non-audio stream).
-    #[allow(dead_code)]
+    /// a non-audio stream). Counts are in samples at the stream's
+    /// reported `sample_rate`; see [`GaplessTiming`].
     pub fn gapless_timing(&self, stream_index: u32) -> Option<GaplessTiming> {
         self.gapless.get(stream_index as usize).copied().flatten()
     }

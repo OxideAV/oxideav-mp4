@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Gapless audio timing (#12): `Mp4Demuxer::gapless_timing(stream)`
+  returns a `demux::GaplessTiming` (priming, valid, remainder samples
+  at the stream's reported rate, plus its `GaplessSource`) from the M4A
+  `iTunSMPB` item, else from a single-entry `elst` on a track with an
+  AAC `roll` sample group; `None` otherwise. HE-AAC counts stored at the
+  core rate are scaled to the reported SBR output rate. Mirrored flat as
+  `gapless_priming` / `gapless_valid` / `gapless_remainder` /
+  `gapless_source` on the stream's options.
+- iTunes freeform `----` metadata items (`mean` / `name` / `data`) reach
+  `metadata()` as `----:<mean>:<name>`.
 - `FragmentedMuxer::flush_fragment()`: an explicit segment boundary for
   callers that own the delivery cadence. Every pending sample (a
   trailing keyframe included) goes into one `styp? + moof + mdat`
