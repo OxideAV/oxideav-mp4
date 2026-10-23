@@ -8455,7 +8455,9 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
     }
     let mut cur = std::io::Cursor::new(&entry[78..]);
     let end = (entry.len() - 78) as u64;
-    while cur.position() < end {
+    // A QuickTime description can end in a four-byte zero terminator,
+    // shorter than any box: stop where no box header fits.
+    while cur.position() + 8 <= end {
         let hdr = match read_box_header(&mut cur)? {
             Some(h) => h,
             None => break,
