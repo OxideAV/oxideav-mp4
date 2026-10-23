@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.10...v0.0.11) - 2026-10-23
+
+### Added
+
+- expose explicit fragmented muxer flush
+
+### Fixed
+
+- fixup for #14: ALAC sample format from the cookie's bitDepth, CHANGELOG
+- fixup for #13: counts at the reported rate, flat gapless_* keys, #[non_exhaustive] records
+- fixup for #11: channelConfiguration 11-14, Table 1.23 citation, fmt, CHANGELOG
+- fixup for #10: CHANGELOG + README entry for the explicit fragment flush
+- fixup for #8: edition-2024 import order, #[non_exhaustive] header-timestamp records
+
+### Other
+
+- an ALAC track's channel count and rate come from its ALACSpecificConfig
+- gapless audio timing from iTunSMPB or an edit list with a roll group (draft for #12)
+- an AAC track's channel count comes from its AudioSpecificConfig
+- header creation/modification timestamps, read and write
+- edition 2024, MSRV 1.95
+- PCM audio: ISO/IEC 23003-5 ipcm / fpcm mux + demux, QuickTime PCM demux; SPS-cropped sizes
+- report HE-AAC at the ASC's SBR output rate when mp4a carries the core rate
+- AAC carriage: bare access units + synthesised esds ASC; mov demuxer alias; pre-roll edit list
+- declare the H.264 / HEVC picture layout from avcC / hvcC
+- README install snippet drops the retired oxideav-codec/oxideav-container crates
+- README examples use the current registry API
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Changed
 
 - edition 2024, MSRV 1.95
