@@ -422,6 +422,7 @@ pub fn mp4_secs_from_system_time(t: std::time::SystemTime) -> Option<u64> {
 /// `media` override, rather than leaving a field unset and relying on
 /// where it inherits from.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct TrackHeaderTimestamps {
     /// Index into the muxer's `streams` slice (the stream these
     /// timestamps apply to). Out-of-range indices fail at `open`.
@@ -436,6 +437,24 @@ pub struct TrackHeaderTimestamps {
     /// producer may legitimately stamp them apart). `None` — the
     /// common case — reuses [`Self::track`].
     pub media: Option<crate::demux::HeaderTimestamps>,
+}
+
+impl TrackHeaderTimestamps {
+    /// An override for `stream_index` whose `tkhd` carries `track` and
+    /// whose `mdhd` reuses it (`media: None`).
+    pub fn new(stream_index: usize, track: crate::demux::HeaderTimestamps) -> Self {
+        Self {
+            stream_index,
+            track,
+            media: None,
+        }
+    }
+
+    /// Date the `mdhd` apart from the `tkhd`.
+    pub fn with_media(mut self, media: crate::demux::HeaderTimestamps) -> Self {
+        self.media = Some(media);
+        self
+    }
 }
 
 /// Runtime options controlling how the MP4 muxer shapes its output.

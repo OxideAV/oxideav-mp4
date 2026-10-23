@@ -1510,6 +1510,7 @@ pub struct TrepRecord {
 /// Not to be confused with the ISO/IEC 23008-12 `crtt` / `mdft` item
 /// properties, which share the 1904 origin but count microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HeaderTimestamps {
     /// `creation_time` — seconds since 1904-01-01 UTC.
     pub creation_time: u64,
@@ -1518,6 +1519,32 @@ pub struct HeaderTimestamps {
 }
 
 impl HeaderTimestamps {
+    /// A pair with both halves given, in seconds since 1904-01-01 UTC.
+    pub fn new(creation_time: u64, modification_time: u64) -> Self {
+        Self {
+            creation_time,
+            modification_time,
+        }
+    }
+
+    /// The common shape: one instant in both `creation_time` and
+    /// `modification_time` (a file created and last modified at once).
+    pub fn stamped(time: u64) -> Self {
+        Self::new(time, time)
+    }
+
+    /// Replace the `creation_time` half.
+    pub fn with_creation_time(mut self, creation_time: u64) -> Self {
+        self.creation_time = creation_time;
+        self
+    }
+
+    /// Replace the `modification_time` half.
+    pub fn with_modification_time(mut self, modification_time: u64) -> Self {
+        self.modification_time = modification_time;
+        self
+    }
+
     /// `true` when both fields are zero — the "producer did not stamp
     /// this box" encoding. Distinguishing it from a genuine
     /// 1904-01-01 stamp is not possible in the format, and no real

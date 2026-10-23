@@ -29,36 +29,26 @@ use oxideav_core::{ReadSeek, WriteSeek};
 // the README hands callers — importing from `demux::` / `options::`
 // here would leave those `pub use`s unexercised by any compiled code.
 use oxideav_mp4::{
-    mp4_secs_from_system_time, mp4_secs_from_unix_secs, unix_secs_from_mp4_secs, FragmentedOptions,
-    Mp4MuxerOptions, MP4_EPOCH_OFFSET_SECS,
+    FragmentedOptions, MP4_EPOCH_OFFSET_SECS, Mp4MuxerOptions, mp4_secs_from_system_time,
+    mp4_secs_from_unix_secs, unix_secs_from_mp4_secs,
 };
 use oxideav_mp4::{HeaderTimestamps, TrackHeaderTimestamps};
 
 /// The pair a single-value stamp produces: the same instant in both
 /// `creation_time` and `modification_time`.
 fn stamped(t: u64) -> HeaderTimestamps {
-    HeaderTimestamps {
-        creation_time: t,
-        modification_time: t,
-    }
+    HeaderTimestamps::stamped(t)
 }
 
 /// A distinct pair, for asserting the two fields stay apart.
 fn pair(creation_time: u64, modification_time: u64) -> HeaderTimestamps {
-    HeaderTimestamps {
-        creation_time,
-        modification_time,
-    }
+    HeaderTimestamps::new(creation_time, modification_time)
 }
 
 /// The common per-track override: one instant in both halves of the
 /// `tkhd` pair, with `mdhd` reusing it.
 fn track_time(stream_index: usize, creation_time: u64) -> TrackHeaderTimestamps {
-    TrackHeaderTimestamps {
-        stream_index,
-        track: stamped(creation_time),
-        media: None,
-    }
+    TrackHeaderTimestamps::new(stream_index, stamped(creation_time))
 }
 
 // --- Box walking ---------------------------------------------------------
@@ -514,11 +504,9 @@ fn fragmented_init_segment_stamps_the_headers() {
         // Track 1 dates its media apart from its track, so the init
         // segment's tkhd and mdhd must come out different — a path
         // that would look identical under the one-value shorthand.
-        track_header_timestamps: vec![TrackHeaderTimestamps {
-            stream_index: 1,
-            track: stamped(track1),
-            media: Some(stamped(media1)),
-        }],
+        track_header_timestamps: vec![
+            TrackHeaderTimestamps::new(1, stamped(track1)).with_media(stamped(media1)),
+        ],
         ..Mp4MuxerOptions::default()
     };
     let file = mux(&streams, opts, "fragmented");
@@ -758,10 +746,6 @@ fn each_header_field_is_read_from_its_own_bytes() {
 
         let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(file));
         let dmx = oxideav_mp4::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
-        let pair = |c: u64, m: u64| HeaderTimestamps {
-            creation_time: c,
-            modification_time: m,
-        };
         assert_eq!(
             dmx.mvhd_timestamps(),
             pair(want[0], want[1]),
@@ -795,11 +779,9 @@ fn every_readable_field_is_independently_writable() {
     let opts = Mp4MuxerOptions {
         creation_time: Some(mv_c),
         modification_time: Some(mv_m),
-        track_header_timestamps: vec![TrackHeaderTimestamps {
-            stream_index: 0,
-            track: pair(tk_c, tk_m),
-            media: Some(pair(md_c, md_m)),
-        }],
+        track_header_timestamps: vec![
+            TrackHeaderTimestamps::new(0, pair(tk_c, tk_m)).with_media(pair(md_c, md_m)),
+        ],
         ..Mp4MuxerOptions::default()
     };
     let file = mux(&streams, opts, "full-parity");
@@ -843,21 +825,13 @@ fn an_entry_replaces_the_pair_and_media_defaults_to_track() {
             track_time(0, track_c),
             // Track 2: "created, never modified" — a zero modification
             // half is an ordinary value here, not a fallback trigger.
-            TrackHeaderTimestamps {
-                stream_index: 2,
-                track: pair(track_c, 0),
-                media: None,
-            },
+            TrackHeaderTimestamps::new(2, pair(track_c, 0)),
             // Track 3 overrides only its *media* dates while its track
             // keeps the movie's pair. Because `track` is stated rather
             // than inherited, the movie's modification half survives —
             // the case a per-field inheritance cascade got wrong by
             // collapsing tkhd's modification time onto its creation.
-            TrackHeaderTimestamps {
-                stream_index: 3,
-                track: pair(movie_c, movie_m),
-                media: Some(stamped(media3)),
-            },
+            TrackHeaderTimestamps::new(3, pair(movie_c, movie_m)).with_media(stamped(media3)),
         ],
         ..Mp4MuxerOptions::default()
     };
