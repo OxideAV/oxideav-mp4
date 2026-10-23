@@ -8455,8 +8455,11 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
     }
     let mut cur = std::io::Cursor::new(&entry[78..]);
     let end = (entry.len() - 78) as u64;
-    // A QuickTime description can end in a four-byte zero terminator,
-    // shorter than any box: stop where no box header fits.
+    // A QuickTime video sample description can end in an optional
+    // four-byte all-zero terminator after its extensions, counted in
+    // the description's size (QuickTime File Format, "Video Sample
+    // Description"); it is shorter than any box header, so stop where
+    // no header fits, as the audio entry's walk does.
     while cur.position() + 8 <= end {
         let hdr = match read_box_header(&mut cur)? {
             Some(h) => h,

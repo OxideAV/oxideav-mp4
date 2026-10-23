@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A QuickTime video sample description ending in the optional
+  four-byte zero terminator (QTFF "Video Sample Description"; written
+  by AVAssetWriter after a ProRes entry's `colr` / `fiel`) no longer
+  fails the open as a truncated extension box.
 - An ALAC track's `channels`, `sample_rate` and `sample_format` come
   from its ALACSpecificConfig cookie (`numChannels`, `sampleRate`,
   `bitDepth`) rather than the `alac` entry's legacy fields, which
