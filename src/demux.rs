@@ -12202,6 +12202,15 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     {
         params.sample_rate = Some(out);
     }
+    // ALAC: the `alac` sample entry's channelcount and samplerate are
+    // legacy fields (macOS's ALAC writer leaves them at 2 and 44100 for
+    // other streams); the ALACSpecificConfig cookie declares the
+    // stream's: numChannels at byte 9, sampleRate at bytes 20..24.
+    if params.codec_id.as_str() == "alac" && params.extradata.len() >= 24 {
+        let c = &params.extradata;
+        params.channels = Some(u16::from(c[9]));
+        params.sample_rate = Some(u32::from_be_bytes([c[20], c[21], c[22], c[23]]));
+    }
     // The decoded-picture layout, from the avcC / hvcC record, so
     // consumers can plan pixel-format conversions before decoding.
     if params.media_type == MediaType::Video && params.pixel_format.is_none() {
