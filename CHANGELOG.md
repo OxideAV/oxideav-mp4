@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An ALAC track's `channels`, `sample_rate` and `sample_format` come
+  from its ALACSpecificConfig cookie (`numChannels`, `sampleRate`,
+  `bitDepth`) rather than the `alac` entry's legacy fields, which
+  macOS's writer leaves at 2 / 44100 / 16 whatever the stream carries.
 - An AAC track's `channels` comes from its AudioSpecificConfig rather
   than the `mp4a` entry's `channelcount` (which macOS's AAC writer sets
   to 2 for mono and 5.1 alike): `channelConfiguration` 1-7 and 11-14
