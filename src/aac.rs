@@ -181,11 +181,13 @@ impl Bits<'_> {
 }
 
 /// The output channel count an `AudioSpecificConfig` declares: its
-/// default `channelConfiguration` (Table 1.19: 1-6 channels, 7 is 7.1 =
-/// 8), or 2 for a mono core with parametric stereo signalled
-/// hierarchically (AOT 29) or by the §1.6.6 backward-compatible sync
-/// extension (`0x2B7` SBR, then `0x548` with `psPresentFlag`). `None`
-/// for configuration 0 (a PCE describes the channels) or when the
+/// `channelConfiguration` (ISO/IEC 14496-3:2019 Table 1.23: 1-6
+/// channels, 7 is 7.1 Front = 8, 11 is 6.1 = 7, 12 is 7.1 Back = 8,
+/// 13 is 22.2 = 24, 14 is 7.1 Top = 8), or 2 for a mono core with
+/// parametric stereo signalled hierarchically (AOT 29) or by the
+/// §1.6.6 backward-compatible sync extension (`0x2B7` SBR, then
+/// `0x548` with `psPresentFlag`). `None` for configuration 0 (a PCE
+/// describes the channels), the reserved values 8-10 / 15, or when the
 /// leading fields do not parse.
 pub(crate) fn asc_channel_count(asc: &[u8]) -> Option<u16> {
     let mut b = Bits { data: asc, pos: 0 };
@@ -193,7 +195,9 @@ pub(crate) fn asc_channel_count(asc: &[u8]) -> Option<u16> {
     b.rate()?;
     let n = match b.read(4)? {
         cfg @ 1..=6 => cfg as u16,
-        7 => 8,
+        7 | 12 | 14 => 8,
+        11 => 7,
+        13 => 24,
         _ => return None,
     };
     if n != 1 {
@@ -342,8 +346,8 @@ mod tests {
         assert_eq!(asc_channel_count(&[0x11, 0xB0]), Some(6)); // LC 48k 5.1
         assert_eq!(asc_channel_count(&[0x11, 0xB8]), Some(8)); // LC 48k 7.1
         assert_eq!(asc_channel_count(&[0x11, 0x88]), Some(1)); // LC 48k mono
-                                                               // HE-AAC v2, sync-extension signalling (macOS's encoder):
-                                                               // 22.05k mono core, SBR to 44.1k, psPresentFlag.
+        // HE-AAC v2, sync-extension signalling (macOS's encoder):
+        // 22.05k mono core, SBR to 44.1k, psPresentFlag.
         assert_eq!(
             asc_channel_count(&[0x13, 0x88, 0x56, 0xE5, 0xA5, 0x48, 0x80]),
             Some(2)
@@ -352,6 +356,14 @@ mod tests {
         assert_eq!(asc_channel_count(&[0x13, 0x08, 0x56, 0xE5, 0x98]), Some(1));
         assert_eq!(asc_channel_count(&[0x11, 0x80]), None); // PCE
         assert_eq!(asc_channel_count(&[]), None);
+        // Table 1.23 configurations 11-14 (6.1, 7.1 Back, 22.2, 7.1
+        // Top); 8-10 and 15 are reserved.
+        assert_eq!(asc_channel_count(&[0x11, 0xD8]), Some(7)); // LC 48k cc 11
+        assert_eq!(asc_channel_count(&[0x11, 0xE0]), Some(8)); // LC 48k cc 12
+        assert_eq!(asc_channel_count(&[0x11, 0xE8]), Some(24)); // LC 48k cc 13
+        assert_eq!(asc_channel_count(&[0x11, 0xF0]), Some(8)); // LC 48k cc 14
+        assert_eq!(asc_channel_count(&[0x11, 0xC0]), None); // reserved 8
+        assert_eq!(asc_channel_count(&[0x11, 0xF8]), None); // reserved 15
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! AudioSpecificConfig declares 5.1 (as macOS's AAC file writer emits)
 //! reports the ASC's six channels.
 
-use oxideav_core::{Demuxer, MediaType, RuntimeContext};
+use oxideav_core::{MediaType, RuntimeContext};
 
 #[test]
 fn apple_5_1_m4a_reports_six_channels() {

@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An AAC track's `channels` comes from its AudioSpecificConfig rather
+  than the `mp4a` entry's `channelcount` (which macOS's AAC writer sets
+  to 2 for mono and 5.1 alike): `channelConfiguration` 1-7 and 11-14
+  per ISO/IEC 14496-3 Table 1.23, or 2 for a mono core with parametric
+  stereo (AOT 29 or the §1.6.6 sync extension). Configuration 0 (PCE)
+  keeps the entry's count.
 - AAC could not be muxed into MP4: an AAC stream without extradata was
   refused ("missing extradata"), and ADTS-framed packets would have
   been stored with their headers in `mdat`. The muxers (plain,
