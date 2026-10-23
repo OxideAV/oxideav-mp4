@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `FragmentedMuxer::flush_fragment()`: an explicit segment boundary for
+  callers that own the delivery cadence. Every pending sample (a
+  trailing keyframe included) goes into one `styp? + moof + mdat`
+  segment; a call with nothing pending is a no-op. The automatic
+  cadence path is unchanged.
 - Edit list for decode pre-roll: a track whose first packet has a
   negative PTS (e.g. AAC priming carried over from a trimmed source)
   gets one `elst` entry with `media_time = -first_pts` running to the

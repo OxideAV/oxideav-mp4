@@ -1672,6 +1672,15 @@ also exposed via the public `oxideav_mp4::styp` module —
 mirroring the read-side `parse_styp` in oxideav-mov so a producer
 round-tripping a parsed `Styp` can emit the same byte sequence.
 
+A caller that owns the segment boundary (a live fMP4 sink pushing
+segments on its own clock, for instance) forces one with
+`FragmentedMuxer::flush_fragment()`: every pending sample — a trailing
+keyframe included, unlike the automatic `EveryKeyframe` cadence, which
+holds the just-pushed keyframe back to open the next fragment — is
+written as one `styp? + moof + mdat` segment, and a call with nothing
+pending is a no-op. The configured cadence keeps firing between
+explicit calls; `write_trailer` flushes whatever remains.
+
 One or more `pssh` (ProtectionSystemSpecificHeaderBox, ISO/IEC 23001-7
 §8.1) boxes can be attached to the *next* fragment's `moof` via
 `FragmentedMuxer::set_next_segment_pssh(iter)`. Per §8.1.1 a `pssh` may
