@@ -399,7 +399,7 @@ fn real_flac_encoder_roundtrip() {
             match decoder.receive_frame() {
                 Ok(Frame::Audio(a)) => {
                     for plane in &a.data {
-                        for chunk in plane.chunks_exact(2) {
+                        for chunk in plane.as_chunks::<2>().0 {
                             decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                         }
                     }
@@ -416,7 +416,7 @@ fn real_flac_encoder_roundtrip() {
         match decoder.receive_frame() {
             Ok(Frame::Audio(a)) => {
                 for plane in &a.data {
-                    for chunk in plane.chunks_exact(2) {
+                    for chunk in plane.as_chunks::<2>().0 {
                         decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                 }
@@ -820,7 +820,7 @@ fn faststart_roundtrip_flac() {
                     match decoder.receive_frame() {
                         Ok(Frame::Audio(a)) => {
                             for plane in &a.data {
-                                for chunk in plane.chunks_exact(2) {
+                                for chunk in plane.as_chunks::<2>().0 {
                                     decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                                 }
                             }
@@ -841,7 +841,7 @@ fn faststart_roundtrip_flac() {
         match decoder.receive_frame() {
             Ok(Frame::Audio(a)) => {
                 for plane in &a.data {
-                    for chunk in plane.chunks_exact(2) {
+                    for chunk in plane.as_chunks::<2>().0 {
                         decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                 }

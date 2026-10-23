@@ -8,7 +8,7 @@ use oxideav_core::{
     CodecId, CodecParameters, Demuxer, Muxer, Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase,
     WriteSeek,
 };
-use oxideav_mp4::emsg::{build_emsg_box, EmsgBox, EmsgTime, EMSG_UNKNOWN_DURATION};
+use oxideav_mp4::emsg::{EMSG_UNKNOWN_DURATION, EmsgBox, EmsgTime, build_emsg_box};
 use oxideav_mp4::{FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
 
 fn pcm_stream(index: u32) -> StreamInfo {

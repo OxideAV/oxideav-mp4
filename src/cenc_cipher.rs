@@ -89,7 +89,7 @@ pub fn expand_iv(iv: &[u8]) -> Result<[u8; 16]> {
         n => {
             return Err(Error::invalid(format!(
                 "CENC cipher: IV length {n} not in {{8, 16}} (§9.1)"
-            )))
+            )));
         }
     }
     Ok(block)
@@ -234,7 +234,7 @@ fn run_steps_in_place(
                     )));
                 }
                 let range = step.offset as usize..(step.offset + step.len) as usize;
-                for block in data[range].chunks_exact_mut(16) {
+                for block in data[range].as_chunks_mut::<16>().0 {
                     match direction {
                         CipherDirection::Decrypt => {
                             dec.decrypt_block_mut(GenericArray::from_mut_slice(block))
@@ -338,43 +338,44 @@ fn run_sample_in_place(
         Error::invalid("CENC cipher: unknown scheme — no §10-registered cipher mode")
     })?;
     let supplied = per_sample_iv.filter(|iv| !iv.is_empty());
-    let iv: &[u8] =
-        match decision.iv_supply() {
-            IvSupply::None => return Err(Error::invalid(
+    let iv: &[u8] = match decision.iv_supply() {
+        IvSupply::None => {
+            return Err(Error::invalid(
                 "CENC cipher: track default is unprotected (isProtected == 0) — nothing to cipher",
-            )),
-            IvSupply::PerSample { size } => {
-                let iv = supplied.ok_or_else(|| {
-                    Error::invalid(format!(
-                        "CENC cipher: Per_Sample_IV_Size {size} requires a per-sample IV (§9.2)"
-                    ))
-                })?;
-                if iv.len() != size as usize {
-                    return Err(Error::invalid(format!(
-                        "CENC cipher: per-sample IV is {} bytes but Per_Sample_IV_Size is {size}",
-                        iv.len()
-                    )));
-                }
-                iv
+            ));
+        }
+        IvSupply::PerSample { size } => {
+            let iv = supplied.ok_or_else(|| {
+                Error::invalid(format!(
+                    "CENC cipher: Per_Sample_IV_Size {size} requires a per-sample IV (§9.2)"
+                ))
+            })?;
+            if iv.len() != size as usize {
+                return Err(Error::invalid(format!(
+                    "CENC cipher: per-sample IV is {} bytes but Per_Sample_IV_Size is {size}",
+                    iv.len()
+                )));
             }
-            IvSupply::Constant => {
-                if supplied.is_some() {
-                    return Err(Error::invalid(
-                        "CENC cipher: constant-IV configuration was handed a per-sample IV \
+            iv
+        }
+        IvSupply::Constant => {
+            if supplied.is_some() {
+                return Err(Error::invalid(
+                    "CENC cipher: constant-IV configuration was handed a per-sample IV \
                      (§9.2 — IVs are either constant or per-sample)",
-                    ));
-                }
-                decision
-                    .tenc
-                    .default_constant_iv
-                    .as_deref()
-                    .ok_or_else(|| {
-                        Error::invalid(
-                            "CENC cipher: constant-IV configuration without default_constant_IV",
-                        )
-                    })?
+                ));
             }
-        };
+            decision
+                .tenc
+                .default_constant_iv
+                .as_deref()
+                .ok_or_else(|| {
+                    Error::invalid(
+                        "CENC cipher: constant-IV configuration without default_constant_IV",
+                    )
+                })?
+        }
+    };
     let plan = crate::cenc::plan_sample_cipher(decision, subsamples, data.len() as u64)?;
     run_steps_in_place(mode, key, iv, &plan, data, direction)
 }
@@ -607,7 +608,7 @@ mod tests {
             GenericArray::from_slice(&KEY),
             GenericArray::from_slice(&iv16),
         );
-        for block in ct[..32].chunks_exact_mut(16) {
+        for block in ct[..32].as_chunks_mut::<16>().0 {
             enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
         }
         assert_eq!(
@@ -644,7 +645,7 @@ mod tests {
             GenericArray::from_slice(&iv16),
         );
         for (start, end) in [(5usize, 37usize), (44, 60)] {
-            for block in ct[start..end].chunks_exact_mut(16) {
+            for block in ct[start..end].as_chunks_mut::<16>().0 {
                 enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
             }
         }
@@ -783,7 +784,7 @@ mod tests {
                 GenericArray::from_slice(&KEY),
                 GenericArray::from_slice(&iv16),
             );
-            for block in ct[sub * 32..sub * 32 + 32].chunks_exact_mut(16) {
+            for block in ct[sub * 32..sub * 32 + 32].as_chunks_mut::<16>().0 {
                 enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
             }
         }
@@ -812,7 +813,7 @@ mod tests {
             GenericArray::from_slice(&KEY),
             GenericArray::from_slice(&iv16),
         );
-        for block in ct[..48].chunks_exact_mut(16) {
+        for block in ct[..48].as_chunks_mut::<16>().0 {
             enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
         }
         let d = cbcs_decision(1, 0, iv16);
@@ -966,7 +967,7 @@ mod tests {
             GenericArray::from_slice(&KEY),
             GenericArray::from_slice(&iv16),
         );
-        for block in expected[..32].chunks_exact_mut(16) {
+        for block in expected[..32].as_chunks_mut::<16>().0 {
             enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
         }
         assert_eq!(ct, expected, "whole blocks CBC-encrypted, tail clear");

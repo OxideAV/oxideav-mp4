@@ -39,10 +39,10 @@ use crate::options::{
     BrandPreset, FragmentedOptions, Mp4MuxerOptions, TrackEditList, TrackSampleGroups,
 };
 use crate::sample_entries::{
-    apply_protection, sample_entry_for, subtitle_handler_for, subtitle_uses_sthd, SampleEntry,
+    SampleEntry, apply_protection, sample_entry_for, subtitle_handler_for, subtitle_uses_sthd,
 };
 use crate::sample_groups::{
-    build_csgp, build_sbgp, build_sgpd, CompactSampleToGroup, SampleGroupDescription, SampleToGroup,
+    CompactSampleToGroup, SampleGroupDescription, SampleToGroup, build_csgp, build_sbgp, build_sgpd,
 };
 
 /// Per-track state kept between `write_packet` calls.
@@ -697,7 +697,7 @@ pub(crate) fn build_mvhd(timescale: u32, duration: u64, next_track_id: u32) -> V
     body.extend_from_slice(&0x0100u16.to_be_bytes()); // volume
     body.extend_from_slice(&[0, 0]); // reserved u16
     body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // reserved 2x u32
-                                                       // identity matrix (9 × 32-bit fixed-point, 3x3)
+    // identity matrix (9 × 32-bit fixed-point, 3x3)
     let identity: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
     for v in identity {
         body.extend_from_slice(&v.to_be_bytes());
@@ -731,10 +731,10 @@ fn build_trak(
     if let Some(entries) = explicit_elst {
         let elst = crate::demux::build_elst_box(entries)?;
         body.extend_from_slice(&wrap_box(b"edts", &elst));
-    } else if write_edit_list {
-        if let Some(edts) = build_edts(t, movie_timescale, track_duration_movie) {
-            body.extend_from_slice(&edts);
-        }
+    } else if write_edit_list
+        && let Some(edts) = build_edts(t, movie_timescale, track_duration_movie)
+    {
+        body.extend_from_slice(&edts);
     }
     body.extend_from_slice(&build_mdia_with_sample_groups(t, sbgp, sgpd, csgp)?);
     Ok(wrap_box(b"trak", &body))
@@ -859,7 +859,7 @@ pub(crate) fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> V
     body.extend_from_slice(&[0u8; 8]); // reserved 2x u32
     body.extend_from_slice(&0i16.to_be_bytes()); // layer
     body.extend_from_slice(&0i16.to_be_bytes()); // alternate_group
-                                                 // volume: 1.0 for audio, 0 for non-audio
+    // volume: 1.0 for audio, 0 for non-audio
     let volume: u16 = if stream.params.media_type == MediaType::Audio {
         0x0100
     } else {
@@ -867,7 +867,7 @@ pub(crate) fn build_tkhd(track_id: u32, duration: u64, stream: &StreamInfo) -> V
     };
     body.extend_from_slice(&volume.to_be_bytes());
     body.extend_from_slice(&[0, 0]); // reserved u16
-                                     // identity matrix
+    // identity matrix
     let identity: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
     for v in identity {
         body.extend_from_slice(&v.to_be_bytes());
@@ -1023,7 +1023,7 @@ fn build_dinf() -> Vec<u8> {
     let mut dref_body = Vec::new();
     dref_body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
     dref_body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-                                                      // "url " box, FullBox, flags=1 means "self-contained, no location".
+    // "url " box, FullBox, flags=1 means "self-contained, no location".
     let mut url_body = Vec::new();
     url_body.extend_from_slice(&[0, 0, 0, 1]);
     dref_body.extend_from_slice(&wrap_box(b"url ", &url_body));
@@ -1087,7 +1087,7 @@ fn build_stsd(t: &TrackState) -> Vec<u8> {
     body.push(u8::from(audio_v1)); // version
     body.extend_from_slice(&[0, 0, 0]); // flags
     body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-                                                 // The sample entry is itself a box of type = `fourcc`, size = 8 + body.len().
+    // The sample entry is itself a box of type = `fourcc`, size = 8 + body.len().
     body.extend_from_slice(&wrap_box(&t.sample_entry.fourcc, &t.sample_entry.body));
     wrap_box(b"stsd", &body)
 }
@@ -1128,7 +1128,7 @@ fn build_stsc(runs: &[(u32, u32, u32)]) -> Vec<u8> {
 fn build_stsz(sizes: &[u32]) -> Vec<u8> {
     let mut body = Vec::with_capacity(12 + sizes.len() * 4);
     body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
-                                           // If all sizes are the same, use uniform. Otherwise 0 + per-sample table.
+    // If all sizes are the same, use uniform. Otherwise 0 + per-sample table.
     let uniform = if !sizes.is_empty() && sizes.iter().all(|&s| s == sizes[0]) {
         sizes[0]
     } else {
@@ -1201,12 +1201,12 @@ pub(crate) fn default_samples_per_chunk(stream: &StreamInfo) -> u32 {
 
 fn compute_delta(t: &TrackState, packet: &Packet, pts_in_ts: Option<i64>) -> u32 {
     // Preferred: use packet.duration if present, rescaled to media timescale.
-    if let Some(d) = packet.duration {
-        if d > 0 {
-            let v = rescale_to_media_ts(d, packet.time_base, t.media_time_scale);
-            if v > 0 {
-                return v as u32;
-            }
+    if let Some(d) = packet.duration
+        && d > 0
+    {
+        let v = rescale_to_media_ts(d, packet.time_base, t.media_time_scale);
+        if v > 0 {
+            return v as u32;
         }
     }
     // Otherwise: diff against previous packet's PTS.

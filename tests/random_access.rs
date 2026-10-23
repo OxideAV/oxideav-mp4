@@ -219,10 +219,10 @@ fn tfra_v1_64bit_fields_round_trip() {
     let mut body = vec![0u8; 4];
     body[0] = 1; // version 1
     body.extend_from_slice(&5u32.to_be_bytes()); // track_id
-                                                 // lengths: traf=2, trun=3, sample=4 → encoded (1,2,3) → (1<<4)|(2<<2)|3 = 0x1B
+    // lengths: traf=2, trun=3, sample=4 → encoded (1,2,3) → (1<<4)|(2<<2)|3 = 0x1B
     body.extend_from_slice(&0x0000_001Bu32.to_be_bytes());
     body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-                                                 // entry: 8-byte time, 8-byte moof, 2 traf, 3 trun, 4 sample
+    // entry: 8-byte time, 8-byte moof, 2 traf, 3 trun, 4 sample
     body.extend_from_slice(&0x1234_5678_9ABC_DEF0u64.to_be_bytes());
     body.extend_from_slice(&0xCAFE_BABE_DEAD_BEEFu64.to_be_bytes());
     body.extend_from_slice(&[0x12, 0x34]); // traf_n = 0x1234

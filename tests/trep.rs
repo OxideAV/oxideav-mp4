@@ -363,7 +363,7 @@ fn trep_v1_assp_child_surfaces_keyed_offsets() {
 
 #[test]
 fn assp_public_build_parse_round_trips() {
-    use oxideav_mp4::demux::{build_assp_box, parse_assp_box, AsspEntry, AsspRecord};
+    use oxideav_mp4::demux::{AsspEntry, AsspRecord, build_assp_box, parse_assp_box};
 
     // v0: a single implied entry.
     let v0 = AsspRecord {

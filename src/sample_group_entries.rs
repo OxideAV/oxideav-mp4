@@ -419,13 +419,13 @@ pub fn parse_alst(blob: &[u8]) -> Result<AlternativeStartupEntry> {
     }
     // Optional output-rate tail: read 4-byte pieces until the entry ends.
     let tail = &blob[off..];
-    if tail.len() % 4 != 0 {
+    if !tail.len().is_multiple_of(4) {
         return Err(Error::invalid(
             "sgpd alst entry: output-rate tail not a whole number of (out,total) pieces",
         ));
     }
     let mut output_rate_pieces = Vec::with_capacity(tail.len() / 4);
-    for chunk in tail.chunks_exact(4) {
+    for chunk in tail.as_chunks::<4>().0 {
         output_rate_pieces.push(AlstOutputRatePiece {
             num_output_samples: u16::from_be_bytes([chunk[0], chunk[1]]),
             num_total_samples: u16::from_be_bytes([chunk[2], chunk[3]]),

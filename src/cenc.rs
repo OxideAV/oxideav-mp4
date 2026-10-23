@@ -228,15 +228,15 @@ impl CencSchemeDecision {
     /// consumer can then decide whether to refuse the file or treat it
     /// as a known-bad fixture.
     pub fn new(scheme: CencScheme, tenc: TencBox) -> Result<CencSchemeDecision> {
-        if let Some(req) = scheme.required_tenc_version() {
-            if tenc.version != req {
-                return Err(Error::invalid(format!(
-                    "CENC scheme decision: scheme {} requires tenc version {} but tenc.version = {}",
-                    fourcc_str(&scheme.fourcc()),
-                    req,
-                    tenc.version
-                )));
-            }
+        if let Some(req) = scheme.required_tenc_version()
+            && tenc.version != req
+        {
+            return Err(Error::invalid(format!(
+                "CENC scheme decision: scheme {} requires tenc version {} but tenc.version = {}",
+                fourcc_str(&scheme.fourcc()),
+                req,
+                tenc.version
+            )));
         }
         if scheme.uses_pattern_encryption()
             && tenc.default_crypt_byte_block == 0

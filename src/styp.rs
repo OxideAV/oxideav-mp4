@@ -165,7 +165,7 @@ mod tests {
         let rest = &bytes[16..];
         assert_eq!(rest.len() % 4, 0, "compat-brand tail not 4-aligned");
         let mut brands = Vec::with_capacity(rest.len() / 4);
-        for c in rest.chunks_exact(4) {
+        for c in rest.as_chunks::<4>().0 {
             let mut b = [0u8; 4];
             b.copy_from_slice(c);
             brands.push(b);

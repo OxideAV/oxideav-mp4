@@ -10,7 +10,7 @@
 //! fragment-local high bit of a `sample_group_description_index`.
 
 use oxideav_mp4::demux::parse_csgp_box;
-use oxideav_mp4::sample_groups::{build_csgp, CompactSampleToGroup, CompactSampleToGroupPattern};
+use oxideav_mp4::sample_groups::{CompactSampleToGroup, CompactSampleToGroupPattern, build_csgp};
 
 #[test]
 fn build_csgp_box_header_is_well_formed() {
@@ -160,13 +160,14 @@ fn build_then_parse_resolves_fragment_local_msb() {
     assert_eq!(r2.value, 3);
 
     // Out-of-range index → None.
-    assert!(pat
-        .resolve_index(
+    assert!(
+        pat.resolve_index(
             3,
             parsed.index_msb_indicates_fragment_local_description,
             parsed.index_field_bits
         )
-        .is_none());
+        .is_none()
+    );
 }
 
 /// When the flag is **clear**, the resolver returns indices verbatim with

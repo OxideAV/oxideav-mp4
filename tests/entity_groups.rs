@@ -9,7 +9,7 @@
 //! `build_entity_to_group_box`) with parse→build→parse round-trips.
 
 use oxideav_mp4::demux::{
-    build_entity_to_group_box, build_grpl_box, parse_grpl_box, EntityGroups, EntityToGroup,
+    EntityGroups, EntityToGroup, build_entity_to_group_box, build_grpl_box, parse_grpl_box,
 };
 
 fn body_of(boxed: &[u8]) -> &[u8] {

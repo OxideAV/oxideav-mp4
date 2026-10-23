@@ -220,8 +220,8 @@ fn heif_meta_surfaces_item_catalogue() {
 /// + colr + an essential irot; item 2 (the thumbnail) gets ispe + pixi.
 fn build_heif_meta_with_iprp() -> Vec<u8> {
     use oxideav_mp4::demux::{
-        build_iprp_box, ColrRecord, ItemProperties, ItemProperty, ItemPropertyAssociationEntry,
-        PropertyAssociation,
+        ColrRecord, ItemProperties, ItemProperty, ItemPropertyAssociationEntry,
+        PropertyAssociation, build_iprp_box,
     };
 
     let base = build_heif_meta();
@@ -340,7 +340,7 @@ fn heif_meta_surfaces_item_properties() {
 /// 23008-12 §9.4) with one `altr` alternative set and one `ster` stereo
 /// pair, built via the public `build_grpl_box`.
 fn build_heif_meta_with_grpl() -> Vec<u8> {
-    use oxideav_mp4::demux::{build_grpl_box, EntityGroups, EntityToGroup};
+    use oxideav_mp4::demux::{EntityGroups, EntityToGroup, build_grpl_box};
 
     let base = build_heif_meta();
     let meta_body = &base[8..];

@@ -76,7 +76,7 @@ fn mvhd(timescale: u32) -> Vec<u8> {
     body[16..20].copy_from_slice(&0u32.to_be_bytes()); // duration (will be 0; no moov samples)
     body[20..24].copy_from_slice(&0x00010000u32.to_be_bytes()); // rate
     body[24..26].copy_from_slice(&0x0100u16.to_be_bytes()); // volume
-                                                            // matrix (identity): a=1, b=0, u=0, c=0, d=1, v=0, x=0, y=0, w=1
+    // matrix (identity): a=1, b=0, u=0, c=0, d=1, v=0, x=0, y=0, w=1
     let matrix_off = 36;
     let identity: [u32; 9] = [0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000];
     for (i, v) in identity.iter().enumerate() {
@@ -96,9 +96,9 @@ fn tkhd_audio(track_id: u32) -> Vec<u8> {
     body[12..16].copy_from_slice(&track_id.to_be_bytes());
     // 4 reserved
     body[20..24].copy_from_slice(&0u32.to_be_bytes()); // duration
-                                                       // 4+4 reserved + 2 layer + 2 alt_group
+    // 4+4 reserved + 2 layer + 2 alt_group
     body[36..38].copy_from_slice(&0x0100u16.to_be_bytes()); // volume = 1.0 (audio)
-                                                            // 2 reserved
+    // 2 reserved
     let matrix_off = 40;
     let identity: [u32; 9] = [0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000];
     for (i, v) in identity.iter().enumerate() {
@@ -753,8 +753,8 @@ fn moof_mdat_pair_with_traf_boxes(
 #[test]
 fn traf_local_sgpd_and_csgp_surface_per_fragment() {
     use oxideav_mp4::sample_groups::{
-        build_csgp, build_sgpd, CompactSampleToGroup, CompactSampleToGroupPattern,
-        SampleGroupDescription,
+        CompactSampleToGroup, CompactSampleToGroupPattern, SampleGroupDescription, build_csgp,
+        build_sgpd,
     };
 
     let track_id = 1u32;

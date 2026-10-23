@@ -26,7 +26,7 @@
 //! battery + bounded drain + both seek paths run on every mutant.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_mp4_fuzz::{exercise_demux, MuxPlan, Recipe};
+use oxideav_mp4_fuzz::{MuxPlan, Recipe, exercise_demux};
 
 /// Structural FourCCs whose trailing bytes get targeted overwrites.
 const TARGET_FOURCCS: &[&[u8; 4]] = &[

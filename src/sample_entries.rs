@@ -166,7 +166,7 @@ fn samplerate_field(rate: u32) -> u32 {
         return rate;
     }
     (rate.div_ceil(0xFFFF).max(2)..=rate)
-        .find(|k| rate % k == 0)
+        .find(|k| rate.is_multiple_of(*k))
         .map_or(0, |k| rate / k)
 }
 

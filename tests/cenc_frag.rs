@@ -466,7 +466,7 @@ fn plain_writes_on_protected_track_emit_no_aux_boxes() {
 /// `traf_sample_groups()` must hand all of it back.
 #[test]
 fn seig_key_rotation_emits_fragment_local_groups() {
-    use oxideav_mp4::cenc::{parse_seig, SeigEntry};
+    use oxideav_mp4::cenc::{SeigEntry, parse_seig};
     let default_kid = [0x5A; 16];
     let rotated_kid = [0xB7; 16];
     let stream = pcm_stream(0);
@@ -610,7 +610,7 @@ fn seig_iv_width_change_is_rejected() {
 /// group, §6) rides along without disturbing the senc channel.
 #[test]
 fn seig_clear_group_round_trips() {
-    use oxideav_mp4::cenc::{parse_seig, SeigEntry};
+    use oxideav_mp4::cenc::{SeigEntry, parse_seig};
     let stream = pcm_stream(0);
     let options = protected_options(*b"cenc", tenc_iv8([0x0C; 16]), frag_opts(2));
     let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-seig-clear.mp4");

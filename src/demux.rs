@@ -21,12 +21,12 @@ use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::boxes::*;
 use crate::cenc::{
-    parse_piff_pssh, parse_piff_senc, parse_piff_tenc, parse_pssh, parse_senc, parse_tenc,
-    PiffSencBox, PiffTencBox, PsshBox, SencBox, TencBox, PIFF_PSSH_USERTYPE, PIFF_SENC_USERTYPE,
-    PIFF_TENC_USERTYPE,
+    PIFF_PSSH_USERTYPE, PIFF_SENC_USERTYPE, PIFF_TENC_USERTYPE, PiffSencBox, PiffTencBox, PsshBox,
+    SencBox, TencBox, parse_piff_pssh, parse_piff_senc, parse_piff_tenc, parse_pssh, parse_senc,
+    parse_tenc,
 };
 use crate::codec_id::{from_sample_entry, from_sample_entry_with_oti};
-use crate::emsg::{parse_emsg_box, EmsgBox};
+use crate::emsg::{EmsgBox, parse_emsg_box};
 
 pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     Ok(Box::new(open_typed(input, codecs)?))
@@ -623,13 +623,13 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // keys are emitted.
     if let Some(declared) = mfro_size {
         metadata.push(("mfro_size".to_string(), declared.to_string()));
-        if let Some(actual) = mfra_actual_size {
-            if declared as u64 != actual {
-                metadata.push((
-                    "mfro_size_mismatch".to_string(),
-                    format!("declared={declared} actual={actual}"),
-                ));
-            }
+        if let Some(actual) = mfra_actual_size
+            && declared as u64 != actual
+        {
+            metadata.push((
+                "mfro_size_mismatch".to_string(),
+                format!("declared={declared} actual={actual}"),
+            ));
         }
     }
 
@@ -2988,10 +2988,11 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
             // dropped, not fatal. Unknown usertypes are skipped.
             UUID => {
                 let body = read_bytes_vec(&mut cur, psz)?;
-                if body.len() >= 16 && body[..16] == PIFF_PSSH_USERTYPE {
-                    if let Ok(p) = parse_piff_pssh(&body[16..]) {
-                        out.piff_psshes.push(p);
-                    }
+                if body.len() >= 16
+                    && body[..16] == PIFF_PSSH_USERTYPE
+                    && let Ok(p) = parse_piff_pssh(&body[16..])
+                {
+                    out.piff_psshes.push(p);
                 }
             }
             _ => {
@@ -3060,10 +3061,10 @@ fn parse_mvex(
             // non-fatal: dropped, file remains parseable.
             LEVA => {
                 let b = read_bytes_vec(&mut cur, psz)?;
-                if leva.is_none() {
-                    if let Ok(r) = parse_leva(&b) {
-                        *leva = Some(r);
-                    }
+                if leva.is_none()
+                    && let Ok(r) = parse_leva(&b)
+                {
+                    *leva = Some(r);
                 }
             }
             // §8.8.15 — `trep` TrackExtensionPropertiesBox. Optional
@@ -3320,8 +3321,8 @@ fn ilst_key_for(fourcc: &[u8; 4]) -> Option<&'static str> {
 fn decode_utf8_or_utf16(buf: &[u8]) -> String {
     if buf.len() >= 2 && buf[0] == 0xFE && buf[1] == 0xFF {
         // UTF-16BE with BOM.
-        let pairs = buf[2..].chunks_exact(2);
-        let units: Vec<u16> = pairs.map(|p| u16::from_be_bytes([p[0], p[1]])).collect();
+        let pairs = buf[2..].as_chunks::<2>().0.iter();
+        let units: Vec<u16> = pairs.map(|p| u16::from_be_bytes(*p)).collect();
         return String::from_utf16_lossy(&units)
             .trim_end_matches('\0')
             .trim()
@@ -4054,10 +4055,10 @@ pub fn parse_iinf_box(body: &[u8]) -> Option<IinfBox> {
             break;
         }
         cur.set_position((start + psz) as u64);
-        if hdr.fourcc == INFE {
-            if let Some(e) = parse_infe(&region[start..start + psz]) {
-                out.entries.push(e);
-            }
+        if hdr.fourcc == INFE
+            && let Some(e) = parse_infe(&region[start..start + psz])
+        {
+            out.entries.push(e);
         }
         seen += 1;
     }
@@ -5463,11 +5464,7 @@ fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
             }
         }
     }
-    if has_media {
-        Ok(Some(t))
-    } else {
-        Ok(None)
-    }
+    if has_media { Ok(Some(t)) } else { Ok(None) }
 }
 
 /// Walk a *track-level* `udta` body and pick up any boxes whose semantics
@@ -5886,10 +5883,10 @@ fn parse_strd(body: &[u8]) -> Vec<SubTrackSampleGroup> {
         }
         let start = cur.position() as usize;
         cur.set_position((start + psz) as u64);
-        if hdr.fourcc == STSG {
-            if let Some(sg) = parse_stsg(&body[start..start + psz]) {
-                out.push(sg);
-            }
+        if hdr.fourcc == STSG
+            && let Some(sg) = parse_stsg(&body[start..start + psz])
+        {
+            out.push(sg);
         }
     }
     out
@@ -6085,7 +6082,7 @@ fn parse_tref(body: &[u8], t: &mut Track) -> Result<()> {
             return Err(Error::invalid("MP4: tref child not a multiple of 4 bytes"));
         }
         let mut ids = Vec::with_capacity(child.len() / 4);
-        for chunk in child.chunks_exact(4) {
+        for chunk in child.as_chunks::<4>().0 {
             let id = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             if id != 0 {
                 ids.push(id);
@@ -6417,12 +6414,12 @@ pub fn build_elst_box(entries: &[EditListEntry]) -> Result<Vec<u8>> {
             "MP4: elst with no entries (omit the box instead)",
         ));
     }
-    if let Some(last) = entries.last() {
-        if last.is_empty_edit() {
-            return Err(Error::invalid(
-                "MP4: the last edit in a track shall never be an empty edit (§8.6.6.3)",
-            ));
-        }
+    if let Some(last) = entries.last()
+        && last.is_empty_edit()
+    {
+        return Err(Error::invalid(
+            "MP4: the last edit in a track shall never be an empty edit (§8.6.6.3)",
+        ));
     }
     let mut use_v1 = false;
     for e in entries {
@@ -6539,10 +6536,10 @@ fn parse_elng(body: &[u8], t: &mut Track) {
     // Take everything up to the first NUL terminator (or the whole
     // remainder if no NUL is present).
     let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-    if let Ok(tag) = std::str::from_utf8(&s[..end]) {
-        if !tag.is_empty() {
-            t.elng = Some(tag.to_string());
-        }
+    if let Ok(tag) = std::str::from_utf8(&s[..end])
+        && !tag.is_empty()
+    {
+        t.elng = Some(tag.to_string());
     }
 }
 
@@ -6588,10 +6585,10 @@ fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
                 let sub = read_bytes_vec(&mut cur, psz)?;
                 // §12.1.2 fixes the quantity at exactly one; keep the
                 // first instance seen and ignore any stray duplicates.
-                if t.vmhd.is_none() {
-                    if let Ok(v) = parse_vmhd(&sub) {
-                        t.vmhd = Some(v);
-                    }
+                if t.vmhd.is_none()
+                    && let Ok(v) = parse_vmhd(&sub)
+                {
+                    t.vmhd = Some(v);
                 }
             }
             HMHD => {
@@ -6600,10 +6597,10 @@ fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
                 // `minf`; keep the first parseable `hmhd` and ignore stray
                 // duplicates. A malformed one is dropped (informational —
                 // the track still demuxes), so the walk never aborts.
-                if t.hmhd.is_none() {
-                    if let Ok(h) = parse_hmhd(&sub) {
-                        t.hmhd = Some(h);
-                    }
+                if t.hmhd.is_none()
+                    && let Ok(h) = parse_hmhd(&sub)
+                {
+                    t.hmhd = Some(h);
                 }
             }
             GMHD => {
@@ -6627,10 +6624,10 @@ fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
                 // still demuxes against the single-source default), so the
                 // dinf walk never aborts the surrounding `minf` parse.
                 let sub = read_bytes_vec(&mut cur, psz)?;
-                if t.dref.is_none() {
-                    if let Some(d) = parse_dinf(&sub) {
-                        t.dref = Some(d);
-                    }
+                if t.dref.is_none()
+                    && let Some(d) = parse_dinf(&sub)
+                {
+                    t.dref = Some(d);
                 }
             }
             _ => skip_cursor_bytes(&mut cur, psz),
@@ -7725,10 +7722,10 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
                 t.channels = Some(ch);
             }
             let bits = be32(48);
-            if let Ok(b) = u16::try_from(bits) {
-                if b != 0 {
-                    t.sample_size_bits = Some(b);
-                }
+            if let Ok(b) = u16::try_from(bits)
+                && b != 0
+            {
+                t.sample_size_bits = Some(b);
             }
             hints.lpcm_flags = Some(be32(52));
             children_at = 64;
@@ -10389,17 +10386,16 @@ fn parse_traf(
     // it without the matching scheme box, but there's nothing the
     // demuxer can do with it without an IV-size key.
     let mut standard_senc_recorded = false;
-    if let Some(body) = senc_body {
-        if let Some(tenc) = &track.tenc {
-            if let Ok(senc) = parse_senc(&body, tenc.default_per_sample_iv_size) {
-                senc_records.push(SencRecord {
-                    track_idx: state.track_idx as u32,
-                    moof_sequence,
-                    senc,
-                });
-                standard_senc_recorded = true;
-            }
-        }
+    if let Some(body) = senc_body
+        && let Some(tenc) = &track.tenc
+        && let Ok(senc) = parse_senc(&body, tenc.default_per_sample_iv_size)
+    {
+        senc_records.push(SencRecord {
+            track_idx: state.track_idx as u32,
+            moof_sequence,
+            senc,
+        });
+        standard_senc_recorded = true;
     }
 
     // PIFF legacy `uuid` SampleEncryptionBox. The IV width resolves
@@ -11043,7 +11039,7 @@ fn parse_pdin(body: &[u8]) -> Result<PdinRecord> {
     // version = 0 and flags = 0; we tolerate anything the producer
     // wrote because the payload layout is unambiguous.
     let payload = &body[4..];
-    if payload.len() % 8 != 0 {
+    if !payload.len().is_multiple_of(8) {
         return Err(Error::invalid(
             "MP4: pdin payload not a multiple of 8 bytes (rate + initial_delay pairs)",
         ));
@@ -11868,14 +11864,13 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     // HE-AAC: some writers put the AAC *core* rate in the `mp4a` sample
     // entry. The decoder emits the SBR output rate the ASC declares, so
     // report that (ISO/IEC 14496-3 §1.6.5 / §4.6.18).
-    if params.codec_id.as_str() == "aac" {
-        if let Some(r) = crate::aac::asc_rates(&params.extradata) {
-            if let (Some(out), Some(entry)) = (r.sbr_rate, params.sample_rate) {
-                if entry == r.core_rate && out != entry {
-                    params.sample_rate = Some(out);
-                }
-            }
-        }
+    if params.codec_id.as_str() == "aac"
+        && let Some(r) = crate::aac::asc_rates(&params.extradata)
+        && let (Some(out), Some(entry)) = (r.sbr_rate, params.sample_rate)
+        && entry == r.core_rate
+        && out != entry
+    {
+        params.sample_rate = Some(out);
     }
     // The decoded-picture layout, from the avcC / hvcC record, so
     // consumers can plan pixel-format conversions before decoding.
@@ -11886,14 +11881,14 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     // The picture size the decoder emits: the SPS's cropping window
     // wins over a sample entry that declares the coded
     // (macroblock-aligned) size, e.g. 1920x1088 for a 1080p stream.
-    if params.media_type == MediaType::Video {
-        if let Some((w, h)) = video_config::cropped_dimensions_from_config(
+    if params.media_type == MediaType::Video
+        && let Some((w, h)) = video_config::cropped_dimensions_from_config(
             params.codec_id.as_str(),
             &params.extradata,
-        ) {
-            params.width = Some(w);
-            params.height = Some(h);
-        }
+        )
+    {
+        params.width = Some(w);
+        params.height = Some(h);
     }
 
     // ISO/IEC 14496-12 §8.12: when the track's sample entry was wrapped
@@ -14736,8 +14731,8 @@ pub fn build_stvi_box(record: &StviRecord) -> Result<Vec<u8>> {
     out.extend_from_slice(&((8 + body_len) as u32).to_be_bytes());
     out.extend_from_slice(b"stvi");
     out.extend_from_slice(&[0u8; 4]); // FullBox version 0, flags 0
-                                      // First word: reserved(30) = 0 in the high bits, single_view_allowed
-                                      // in the low 2 bits.
+    // First word: reserved(30) = 0 in the high bits, single_view_allowed
+    // in the low 2 bits.
     out.extend_from_slice(&((record.single_view_allowed as u32) & 0x3).to_be_bytes());
     out.extend_from_slice(&record.stereo_scheme.to_be_bytes());
     out.extend_from_slice(&(length as u32).to_be_bytes());
@@ -14885,7 +14880,7 @@ mod tests {
         out.extend_from_slice(&16u16.to_be_bytes()); // sample_size
         out.extend_from_slice(&[0u8; 4]); // pre_defined + reserved
         out.extend_from_slice(&((48_000u32) << 16).to_be_bytes()); // sample_rate 16.16
-                                                                   // Child box: 4-byte size + 4-byte fourcc + body.
+        // Child box: 4-byte size + 4-byte fourcc + body.
         let total = (8 + child_body.len()) as u32;
         out.extend_from_slice(&total.to_be_bytes());
         out.extend_from_slice(child_fourcc);
@@ -15039,7 +15034,7 @@ mod tests {
         entry_body.extend_from_slice(&[0u8; 32]); // compressorname
         entry_body.extend_from_slice(&0x0018u16.to_be_bytes()); // depth
         entry_body.extend_from_slice(&(-1i16).to_be_bytes()); // pre_defined
-                                                              // Total preamble: 78 bytes.
+        // Total preamble: 78 bytes.
         assert_eq!(entry_body.len(), 78);
 
         let mut sinf_body = Vec::new();
@@ -16571,14 +16566,14 @@ mod tests {
         mdhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
         mdhd.extend_from_slice(&0u32.to_be_bytes()); // duration
         mdhd.extend_from_slice(&[0u8; 4]); // language + pre_defined
-                                           // Minimal hdlr identifying a video track.
+        // Minimal hdlr identifying a video track.
         let mut hdlr = Vec::new();
         hdlr.extend_from_slice(&[0u8; 4]); // FullBox
         hdlr.extend_from_slice(&[0u8; 4]); // pre_defined
         hdlr.extend_from_slice(b"vide"); // handler_type
         hdlr.extend_from_slice(&[0u8; 12]); // reserved
         hdlr.push(0); // name (empty C string)
-                      // Wrap the mdhd + hdlr into a minimal mdia.
+        // Wrap the mdhd + hdlr into a minimal mdia.
         let mut mdia = Vec::new();
         mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
         mdia.extend(wrap_box_full_size(b"hdlr", &hdlr));
@@ -16857,14 +16852,14 @@ mod tests {
         mdhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
         mdhd.extend_from_slice(&0u32.to_be_bytes()); // duration
         mdhd.extend_from_slice(&[0u8; 4]); // language + pre_defined
-                                           // Minimal hdlr identifying a video track.
+        // Minimal hdlr identifying a video track.
         let mut hdlr = Vec::new();
         hdlr.extend_from_slice(&[0u8; 4]); // FullBox
         hdlr.extend_from_slice(&[0u8; 4]); // pre_defined
         hdlr.extend_from_slice(b"vide"); // handler_type
         hdlr.extend_from_slice(&[0u8; 12]); // reserved
         hdlr.push(0); // name (empty C string)
-                      // Wrap mdhd + hdlr into a minimal mdia.
+        // Wrap mdhd + hdlr into a minimal mdia.
         let mut mdia = Vec::new();
         mdia.extend(wrap_box_full_size(b"mdhd", &mdhd));
         mdia.extend(wrap_box_full_size(b"hdlr", &hdlr));
@@ -19833,7 +19828,7 @@ mod tests {
         body.extend_from_slice(&[0u8, 0, 0, 0x2A]); // version 0 + flags
         body.extend_from_slice(b"roll"); // grouping_type
         body.extend_from_slice(&2u32.to_be_bytes()); // pattern_count = 2
-                                                     // pattern 1: length 1, sample_count 3
+        // pattern 1: length 1, sample_count 3
         body.extend_from_slice(&1u16.to_be_bytes());
         body.extend_from_slice(&3u16.to_be_bytes());
         // pattern 2: length 2, sample_count 1
@@ -19864,9 +19859,9 @@ mod tests {
         body.extend_from_slice(&[0u8, 0, 0, 0]); // version 0 + flags 0
         body.extend_from_slice(b"sync"); // grouping_type
         body.extend_from_slice(&1u32.to_be_bytes()); // pattern_count = 1
-                                                     // pattern_length=3 (0b0011), sample_count=2 (0b0010) → 0x32
-                                                     // indices [1, 2, 4] → 0b0001 0010 0100 = 0x12 0x4_ (12 bits,
-                                                     // padded to a byte boundary by the box's size).
+        // pattern_length=3 (0b0011), sample_count=2 (0b0010) → 0x32
+        // indices [1, 2, 4] → 0b0001 0010 0100 = 0x12 0x4_ (12 bits,
+        // padded to a byte boundary by the box's size).
         body.push(0x32);
         body.push(0x12);
         body.push(0x40); // top nibble = index 4, low nibble padding
@@ -20647,8 +20642,8 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&[0u8; 4]);
         body.extend_from_slice(&2u32.to_be_bytes()); // sample_count = 2
-                                                     // pad1 = 5 (0b101) with reserved bit set: nibble = 0b1101 = 0xD
-                                                     // pad2 = 2 (0b010) with reserved bit set: nibble = 0b1010 = 0xA
+        // pad1 = 5 (0b101) with reserved bit set: nibble = 0b1101 = 0xD
+        // pad2 = 2 (0b010) with reserved bit set: nibble = 0b1010 = 0xA
         body.push(0xDA);
         let v = super::parse_padb(&body).unwrap();
         assert_eq!(v, vec![5u8, 2]);
@@ -20951,7 +20946,7 @@ mod tests {
     fn parse_pdin_big_endian_byte_order() {
         let mut body = Vec::new();
         body.extend_from_slice(&[0u8; 4]); // preamble
-                                           // rate = 0x01_02_03_04, initial_delay = 0x05_06_07_08 in big-endian.
+        // rate = 0x01_02_03_04, initial_delay = 0x05_06_07_08 in big-endian.
         body.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
         body.extend_from_slice(&[0x05, 0x06, 0x07, 0x08]);
         let r = super::parse_pdin(&body).unwrap();
@@ -21146,7 +21141,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&[0u8; 4]); // preamble
         body.push(1); // level_count = 1
-                      // Only 4 bytes of the 5-byte header (track_id but no packed byte).
+        // Only 4 bytes of the 5-byte header (track_id but no packed byte).
         body.extend_from_slice(&[0u8; 4]);
         assert!(super::parse_leva(&body).is_err());
     }
@@ -21160,7 +21155,7 @@ mod tests {
         body.push(1); // level_count
         body.extend_from_slice(&5u32.to_be_bytes()); // track_id
         body.push(0); // padding=0 | at=0
-                      // Only 3 of 4 grouping_type bytes.
+        // Only 3 of 4 grouping_type bytes.
         body.extend_from_slice(&[0u8; 3]);
         assert!(super::parse_leva(&body).is_err());
     }
@@ -21175,7 +21170,7 @@ mod tests {
         body.extend_from_slice(&5u32.to_be_bytes()); // track_id
         body.push(1); // padding=0 | at=1
         body.extend_from_slice(&7u32.to_be_bytes()); // grouping_type
-                                                     // Missing the 4-byte grouping_type_parameter.
+        // Missing the 4-byte grouping_type_parameter.
         assert!(super::parse_leva(&body).is_err());
     }
 
@@ -21201,7 +21196,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&[0u8; 4]); // preamble
         body.push(2); // level_count = 2
-                      // Entry 0: track_id = 9, padding = 1, at = 5 (reserved).
+        // Entry 0: track_id = 9, padding = 1, at = 5 (reserved).
         body.extend_from_slice(&9u32.to_be_bytes());
         body.push(0x80 | 5);
         // Entry 1: track_id = 10, padding = 0, at = 2 (no tail).
@@ -21570,32 +21565,38 @@ mod tests {
     #[test]
     fn assp_build_rejects_invalid_records() {
         // v0 entry carrying a grouping_type_parameter (no v0 wire slot)
-        assert!(super::build_assp_box(&super::AsspRecord {
-            version: 0,
-            entries: vec![super::AsspEntry {
-                grouping_type_parameter: Some(1),
-                min_initial_alt_startup_offset: 0,
-            }],
-        })
-        .is_err());
-        // v0 with two entries
-        assert!(super::build_assp_box(&super::AsspRecord {
-            version: 0,
-            entries: vec![
-                super::AsspEntry {
-                    grouping_type_parameter: None,
+        assert!(
+            super::build_assp_box(&super::AsspRecord {
+                version: 0,
+                entries: vec![super::AsspEntry {
+                    grouping_type_parameter: Some(1),
                     min_initial_alt_startup_offset: 0,
-                };
-                2
-            ],
-        })
-        .is_err());
+                }],
+            })
+            .is_err()
+        );
+        // v0 with two entries
+        assert!(
+            super::build_assp_box(&super::AsspRecord {
+                version: 0,
+                entries: vec![
+                    super::AsspEntry {
+                        grouping_type_parameter: None,
+                        min_initial_alt_startup_offset: 0,
+                    };
+                    2
+                ],
+            })
+            .is_err()
+        );
         // unsupported version
-        assert!(super::build_assp_box(&super::AsspRecord {
-            version: 9,
-            entries: vec![],
-        })
-        .is_err());
+        assert!(
+            super::build_assp_box(&super::AsspRecord {
+                version: 9,
+                entries: vec![],
+            })
+            .is_err()
+        );
     }
 
     /// When an `assp` child of a `trep` decodes cleanly, the `TrepChild`
@@ -21665,31 +21666,35 @@ mod tests {
     #[test]
     fn build_trep_box_rejects_inconsistent_children() {
         // assp record under a non-assp fourcc
-        assert!(super::build_trep_box(&super::TrepRecord {
-            track_id: 1,
-            children: vec![super::TrepChild {
-                fourcc: *b"abcd",
-                payload_len: 0,
-                assp: Some(super::AsspRecord {
-                    version: 0,
-                    entries: vec![super::AsspEntry {
-                        grouping_type_parameter: None,
-                        min_initial_alt_startup_offset: 0,
-                    }],
-                }),
-            }],
-        })
-        .is_err());
+        assert!(
+            super::build_trep_box(&super::TrepRecord {
+                track_id: 1,
+                children: vec![super::TrepChild {
+                    fourcc: *b"abcd",
+                    payload_len: 0,
+                    assp: Some(super::AsspRecord {
+                        version: 0,
+                        entries: vec![super::AsspEntry {
+                            grouping_type_parameter: None,
+                            min_initial_alt_startup_offset: 0,
+                        }],
+                    }),
+                }],
+            })
+            .is_err()
+        );
         // opaque child with non-zero payload_len
-        assert!(super::build_trep_box(&super::TrepRecord {
-            track_id: 1,
-            children: vec![super::TrepChild {
-                fourcc: *b"abcd",
-                payload_len: 4,
-                assp: None,
-            }],
-        })
-        .is_err());
+        assert!(
+            super::build_trep_box(&super::TrepRecord {
+                track_id: 1,
+                children: vec![super::TrepChild {
+                    fourcc: *b"abcd",
+                    payload_len: 4,
+                    assp: None,
+                }],
+            })
+            .is_err()
+        );
     }
 
     /// `parse_ssix_box` (the public wrapper) routes through the same
@@ -22026,10 +22031,12 @@ mod tests {
     #[test]
     fn build_subs_box_empty_and_degenerate() {
         let empty = super::build_subs_box(&super::SubsBox::default()).unwrap();
-        assert!(super::parse_subs_box(&empty[8..])
-            .unwrap()
-            .entries
-            .is_empty());
+        assert!(
+            super::parse_subs_box(&empty[8..])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         let degenerate = super::SubsBox {
             version: 0,
             flags: 0,
@@ -23165,7 +23172,7 @@ mod tests {
         b.extend_from_slice(&1u16.to_be_bytes()); // item_count
         b.extend_from_slice(&1u16.to_be_bytes()); // item_ID
         b.extend_from_slice(&0u16.to_be_bytes()); // data_reference_index
-                                                  // base_offset omitted (size 0)
+        // base_offset omitted (size 0)
         b.extend_from_slice(&1u16.to_be_bytes()); // extent_count
         b.extend_from_slice(&0x1000u32.to_be_bytes()); // extent_offset
         b.extend_from_slice(&0x40u32.to_be_bytes()); // extent_length
@@ -23451,9 +23458,10 @@ mod tests {
         // The flat metadata surface carries the partition count.
         let mut kv = Vec::new();
         super::surface_meta_items(&mi, &mut kv);
-        assert!(kv
-            .iter()
-            .any(|(k, v)| k == "meta_fiin_partitions" && v == "1"));
+        assert!(
+            kv.iter()
+                .any(|(k, v)| k == "meta_fiin_partitions" && v == "1")
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //!
 //! Spec layout reference: `docs/container/isobmff/bmff.txt` §8.15.4.2.
 
-use oxideav_mp4::demux::{build_stvi_box, parse_stvi_box, StviRecord};
+use oxideav_mp4::demux::{StviRecord, build_stvi_box, parse_stvi_box};
 
 /// Strip the 8-byte box header (`size` u32 + `type` u32) from a complete
 /// box, returning the preamble-relative body that `parse_stvi_box`

@@ -395,7 +395,7 @@ fn hostile_giant_elst_values_do_not_panic() {
 /// `build_elst_box` reproduces the on-the-wire entries.
 #[test]
 fn edit_list_surfaced_typed_and_flat() {
-    use oxideav_mp4::demux::{build_elst_box, parse_elst_box, EditListEntry};
+    use oxideav_mp4::demux::{EditListEntry, build_elst_box, parse_elst_box};
 
     let edts = boxed(b"edts", &elst_v0(&[(300, -1, 1), (500, 100, 1)]));
     let file = build_file(1000, 48_000, 3, 100, &edts);
@@ -676,29 +676,37 @@ mod mux_explicit {
                 .map(|_| ())
         };
         // Trailing empty edit (§8.6.6.3).
-        assert!(open_with(TrackEditList {
-            stream_index: 0,
-            entries: vec![entry(64, 0, 1), entry(100, -1, 1)],
-        })
-        .is_err());
+        assert!(
+            open_with(TrackEditList {
+                stream_index: 0,
+                entries: vec![entry(64, 0, 1), entry(100, -1, 1)],
+            })
+            .is_err()
+        );
         // media_rate_integer outside {0, 1}.
-        assert!(open_with(TrackEditList {
-            stream_index: 0,
-            entries: vec![entry(64, 0, 2)],
-        })
-        .is_err());
+        assert!(
+            open_with(TrackEditList {
+                stream_index: 0,
+                entries: vec![entry(64, 0, 2)],
+            })
+            .is_err()
+        );
         // Empty entry list.
-        assert!(open_with(TrackEditList {
-            stream_index: 0,
-            entries: vec![],
-        })
-        .is_err());
+        assert!(
+            open_with(TrackEditList {
+                stream_index: 0,
+                entries: vec![],
+            })
+            .is_err()
+        );
         // Out-of-range stream index.
-        assert!(open_with(TrackEditList {
-            stream_index: 3,
-            entries: vec![entry(64, 0, 1)],
-        })
-        .is_err());
+        assert!(
+            open_with(TrackEditList {
+                stream_index: 3,
+                entries: vec![entry(64, 0, 1)],
+            })
+            .is_err()
+        );
     }
 }
 
@@ -863,14 +871,14 @@ fn foreign_priming_trim_matches_independent_reader() {
         "oxideav-mp4-foreign-priming-{}.mp4",
         std::process::id()
     ));
-    let gen = Command::new("ffmpeg")
+    let r#gen = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
         .arg("sine=frequency=440:duration=1")
         .args(["-c:a", "aac", "-b:a", "128k", "-y"])
         .arg(&tmp)
         .output()
         .expect("run ffmpeg");
-    assert!(gen.status.success(), "ffmpeg generation failed");
+    assert!(r#gen.status.success(), "ffmpeg generation failed");
 
     // Independent reader's pts sequence.
     let probe = Command::new("ffprobe")

@@ -16,7 +16,7 @@ use oxideav_core::{
     WriteSeek,
 };
 use oxideav_mp4::cenc::{
-    parse_seig, CencScheme, CencSchemeDecision, SencSample, SubsampleEntry, TencBox,
+    CencScheme, CencSchemeDecision, SencSample, SubsampleEntry, TencBox, parse_seig,
 };
 use oxideav_mp4::cenc_cipher::{decrypt_sample_in_place, encrypt_sample_in_place};
 use oxideav_mp4::{FragmentCadence, FragmentedOptions, Mp4MuxerOptions, TrackProtection};

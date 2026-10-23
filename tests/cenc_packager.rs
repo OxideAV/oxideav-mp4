@@ -8,7 +8,7 @@ use oxideav_core::{
     CodecId, CodecParameters, Demuxer, Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase,
     WriteSeek,
 };
-use oxideav_mp4::cenc::{parse_seig, CencScheme, CencSchemeDecision, SubsampleEntry, TencBox};
+use oxideav_mp4::cenc::{CencScheme, CencSchemeDecision, SubsampleEntry, TencBox, parse_seig};
 use oxideav_mp4::cenc_cipher::decrypt_sample_in_place;
 use oxideav_mp4::cenc_packager::{CencFragmentPackager, TrackKey};
 use oxideav_mp4::{FragmentCadence, FragmentedOptions, Mp4MuxerOptions, TrackProtection};

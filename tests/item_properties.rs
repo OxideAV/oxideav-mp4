@@ -10,9 +10,9 @@
 //! round-trips for every base property box.
 
 use oxideav_mp4::demux::{
-    build_ipco_box, build_ipma_box, build_iprp_box, build_item_property, parse_ipco_box,
-    parse_ipma_box, parse_iprp_box, ClapRecord, ColrRecord, ItemProperties, ItemProperty,
-    ItemPropertyAssociationEntry, PaspRecord, PropertyAssociation,
+    ClapRecord, ColrRecord, ItemProperties, ItemProperty, ItemPropertyAssociationEntry, PaspRecord,
+    PropertyAssociation, build_ipco_box, build_ipma_box, build_iprp_box, build_item_property,
+    parse_ipco_box, parse_ipma_box, parse_iprp_box,
 };
 
 /// Strip the 8-byte `[size:u32][fourcc]` header off a built box, returning
@@ -399,11 +399,11 @@ fn truncated_ipma_entry_ends_walk_cleanly() {
     let mut body = vec![0u8]; // version 0
     body.extend_from_slice(&[0, 0, 0]); // flags 0
     body.extend_from_slice(&2u32.to_be_bytes()); // entry_count = 2
-                                                 // entry 1: item_id 1, 1 assoc.
+    // entry 1: item_id 1, 1 assoc.
     body.extend_from_slice(&1u16.to_be_bytes());
     body.push(1);
     body.push(0x81); // essential, index 1
-                     // entry 2: item_id present but assoc list truncated.
+    // entry 2: item_id present but assoc list truncated.
     body.extend_from_slice(&2u16.to_be_bytes());
     // (no association_count byte) — walk must stop after entry 1.
     let parsed = parse_ipma_box(&body);

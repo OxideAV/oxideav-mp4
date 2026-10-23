@@ -154,12 +154,12 @@ impl CencFragmentPackager {
             slot.keys.insert(slot.tenc.default_kid, tk.key);
         }
         for (i, t) in tracks.iter().enumerate() {
-            if let Some(t) = t {
-                if t.keys.is_empty() {
-                    return Err(Error::invalid(format!(
-                        "CENC packager: protected stream {i} has no content key"
-                    )));
-                }
+            if let Some(t) = t
+                && t.keys.is_empty()
+            {
+                return Err(Error::invalid(format!(
+                    "CENC packager: protected stream {i} has no content key"
+                )));
             }
         }
         let muxer = crate::frag::open_fragmented_typed(output, streams, options, frag_options)?;
@@ -220,7 +220,7 @@ impl CencFragmentPackager {
             None => {
                 return Err(Error::invalid(format!(
                     "CENC packager: unknown stream index {idx}"
-                )))
+                )));
             }
         };
 
@@ -242,7 +242,7 @@ impl CencFragmentPackager {
                 return Err(Error::invalid(format!(
                     "CENC packager: stream {idx} effective parameters are unprotected \
                      (isProtected == 0) — route clear samples through the muxer directly"
-                )))
+                )));
             }
         };
 

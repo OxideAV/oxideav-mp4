@@ -92,13 +92,13 @@ pub fn read_box_header<R: Read + Seek + ?Sized>(r: &mut R) -> Result<Option<BoxH
     // `size=1` extended box whose `largesize = u64::MAX` overflows
     // every downstream `start + total_size` arithmetic site in debug
     // builds (panic) and silently wraps in release builds.
-    if let Some(t) = total_size {
-        if start.checked_add(t).is_none() {
-            return Err(Error::invalid(format!(
-                "MP4: box '{}' declared size {t} from offset {start} overflows u64",
-                std::str::from_utf8(&fourcc).unwrap_or("????"),
-            )));
-        }
+    if let Some(t) = total_size
+        && start.checked_add(t).is_none()
+    {
+        return Err(Error::invalid(format!(
+            "MP4: box '{}' declared size {t} from offset {start} overflows u64",
+            std::str::from_utf8(&fourcc).unwrap_or("????"),
+        )));
     }
 
     Ok(Some(BoxHeader {

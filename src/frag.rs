@@ -34,8 +34,8 @@ use std::io::{Seek, SeekFrom, Write};
 use oxideav_core::{Error, Muxer, Packet, Result, StreamInfo, WriteSeek};
 
 use crate::muxer::{
-    build_mdia, build_mvhd, build_tkhd, default_samples_per_chunk, rescale_to_media_ts, wrap_box,
-    TrackState,
+    TrackState, build_mdia, build_mvhd, build_tkhd, default_samples_per_chunk, rescale_to_media_ts,
+    wrap_box,
 };
 use crate::options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
 use crate::sample_entries::sample_entry_for;
@@ -541,19 +541,17 @@ impl FragmentedMuxer {
             // §6 round-trip validation (pattern nibbles, IV-size set,
             // constant-IV coherence) — fail here, not at flush.
             crate::cenc::build_seig_entry(entry)?;
-            if let Some(track) = self.tracks.get(idx) {
-                if let Some(decision) = &track.protection {
-                    if entry.is_protected == 1
-                        && entry.per_sample_iv_size != decision.tenc.default_per_sample_iv_size
-                    {
-                        return Err(Error::invalid(format!(
-                            "mp4 muxer: stream {idx} seig override changes \
+            if let Some(track) = self.tracks.get(idx)
+                && let Some(decision) = &track.protection
+                && entry.is_protected == 1
+                && entry.per_sample_iv_size != decision.tenc.default_per_sample_iv_size
+            {
+                return Err(Error::invalid(format!(
+                    "mp4 muxer: stream {idx} seig override changes \
                              Per_Sample_IV_Size from {} to {} — the fragment's senc stores \
                              one IV width for all samples (§7.2.3)",
-                            decision.tenc.default_per_sample_iv_size, entry.per_sample_iv_size
-                        )));
-                    }
-                }
+                    decision.tenc.default_per_sample_iv_size, entry.per_sample_iv_size
+                )));
             }
         }
         self.queue_packet_impl(packet, Some(senc), seig)
@@ -663,11 +661,7 @@ impl FragmentedMuxer {
         let media_ts = self.tracks[idx].base.media_time_scale;
         let dur = if let Some(d) = packet.duration {
             let v = rescale_to_media_ts(d, packet.time_base, media_ts);
-            if v > 0 {
-                v as u32
-            } else {
-                1
-            }
+            if v > 0 { v as u32 } else { 1 }
         } else if let (Some(prev), Some(cur)) = (
             self.tracks[idx].base.prev_pts_in_ts,
             packet
@@ -1071,26 +1065,25 @@ impl FragmentedMuxer {
             && matches!(self.frag_options.cadence, FragmentCadence::EveryKeyframe)
         {
             let anchor = 0usize;
-            if let Some(last) = self.tracks[anchor].pending.last() {
-                if last.flags & SAMPLE_IS_NON_SYNC == 0 {
-                    let s = self.tracks[anchor].pending.pop().unwrap();
-                    let cenc = if self.tracks[anchor].pending_senc.len()
-                        > self.tracks[anchor].pending.len()
-                    {
+            if let Some(s) = self.tracks[anchor]
+                .pending
+                .pop_if(|last| last.flags & SAMPLE_IS_NON_SYNC == 0)
+            {
+                let cenc =
+                    if self.tracks[anchor].pending_senc.len() > self.tracks[anchor].pending.len() {
                         let senc = self.tracks[anchor].pending_senc.pop().unwrap();
                         let seig = self.tracks[anchor].pending_seig.pop().flatten();
                         Some((senc, seig))
                     } else {
                         None
                     };
-                    // Roll back cumulative_duration so the next fragment
-                    // re-accounts for this keyframe.
-                    self.tracks[anchor].base.cumulative_duration = self.tracks[anchor]
-                        .base
-                        .cumulative_duration
-                        .saturating_sub(s.duration as u64);
-                    detached.push((anchor, s, cenc));
-                }
+                // Roll back cumulative_duration so the next fragment
+                // re-accounts for this keyframe.
+                self.tracks[anchor].base.cumulative_duration = self.tracks[anchor]
+                    .base
+                    .cumulative_duration
+                    .saturating_sub(s.duration as u64);
+                detached.push((anchor, s, cenc));
             }
         }
 
@@ -2125,10 +2118,10 @@ fn build_sidx(
     body.extend_from_slice(&0u64.to_be_bytes()); // first_offset = 0
     body.extend_from_slice(&0u16.to_be_bytes()); // reserved
     body.extend_from_slice(&1u16.to_be_bytes()); // reference_count = 1
-                                                 // Per-reference 12-byte record:
-                                                 //   [bit 31] reference_type (0 = media), [bits 30..0] referenced_size
-                                                 //   subsegment_duration (u32)
-                                                 //   [bit 31] starts_with_SAP, [bits 30..28] SAP_type, [bits 27..0] SAP_delta_time
+    // Per-reference 12-byte record:
+    //   [bit 31] reference_type (0 = media), [bits 30..0] referenced_size
+    //   subsegment_duration (u32)
+    //   [bit 31] starts_with_SAP, [bits 30..28] SAP_type, [bits 27..0] SAP_delta_time
     let r0 = (referenced_size.min(0x7FFF_FFFF) as u32) & 0x7FFF_FFFF; // bit 31 = 0 (not sidx)
     body.extend_from_slice(&r0.to_be_bytes());
     body.extend_from_slice(&subsegment_duration.to_be_bytes());

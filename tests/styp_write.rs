@@ -18,7 +18,7 @@
 use oxideav_core::{
     CodecId, CodecParameters, Muxer, Packet, SampleFormat, StreamInfo, TimeBase, WriteSeek,
 };
-use oxideav_mp4::frag::{open_fragmented_typed, FragmentedMuxer};
+use oxideav_mp4::frag::{FragmentedMuxer, open_fragmented_typed};
 use oxideav_mp4::options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
 use oxideav_mp4::styp;
 
