@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The muxer writes composition time offsets (`ctts`) from the packets'
+  presentation and decode timestamps, version 1 when an offset is
+  negative, with a `cslg` (ISO/IEC 14496-12 §8.6.1.3-4).
+
 ### Changed
 
 - edition 2024, MSRV 1.95

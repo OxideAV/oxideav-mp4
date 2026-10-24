@@ -61,6 +61,9 @@ pub(crate) struct TrackState {
     pub(crate) stts: Vec<(u32, u32)>,
     /// `stss`: 1-based sample indices of keyframes.
     pub(crate) keyframes: Vec<u32>,
+    /// `ctts`: run-length `(sample_count, composition_offset)` pairs, the
+    /// offset being `pts - dts` in the media time scale.
+    pub(crate) ctts: Vec<(u32, i32)>,
     /// `stco`/`co64`: absolute file offsets of chunks.
     pub(crate) chunk_offsets: Vec<u64>,
     /// `stsc`: run-length `(first_chunk, samples_per_chunk, sample_desc_idx)`.
@@ -121,6 +124,7 @@ impl TrackState {
             sample_sizes: Vec::new(),
             stts: Vec::new(),
             keyframes: Vec::new(),
+            ctts: Vec::new(),
             chunk_offsets: Vec::new(),
             stsc: Vec::new(),
             current_chunk_samples: 0,
@@ -445,6 +449,21 @@ impl Muxer for Mp4Muxer {
             _ => t.stts.push((1, delta)),
         }
         t.cumulative_duration += delta as u64;
+        // ISO/IEC 14496-12 §8.6.1.3: the composition offset of a sample
+        // is its presentation time minus its decode time.
+        let dts_in_ts = packet
+            .dts
+            .map(|v| rescale_to_media_ts(v, packet.time_base, t.media_time_scale));
+        let offset = match (pts_in_ts, dts_in_ts) {
+            (Some(p), Some(d)) => i32::try_from(p - d).map_err(|_| {
+                Error::invalid("mp4 muxer: composition offset outside the 32-bit range")
+            })?,
+            _ => 0,
+        };
+        match t.ctts.last_mut() {
+            Some((count, o)) if *o == offset => *count += 1,
+            _ => t.ctts.push((1, offset)),
+        }
         if packet.flags.keyframe {
             t.keyframes.push(t.next_sample_index + 1);
         }
@@ -1112,6 +1131,12 @@ fn build_stbl_with_sample_groups(
     let mut body = Vec::new();
     body.extend_from_slice(&build_stsd(t));
     body.extend_from_slice(&build_stts(&t.stts));
+    if t.ctts.iter().any(|&(_, o)| o != 0) {
+        body.extend_from_slice(&build_ctts(&t.ctts));
+        if let Some(cslg) = build_cslg(t) {
+            body.extend_from_slice(&cslg);
+        }
+    }
     if !t.keyframes.is_empty() {
         body.extend_from_slice(&build_stss(&t.keyframes));
     }
@@ -1159,6 +1184,63 @@ fn build_stts(runs: &[(u32, u32)]) -> Vec<u8> {
         body.extend_from_slice(&delta.to_be_bytes());
     }
     wrap_box(b"stts", &body)
+}
+
+/// `ctts` (§8.6.1.3): version 0 while every offset is non-negative,
+/// version 1 (signed offsets) once one is negative.
+fn build_ctts(runs: &[(u32, i32)]) -> Vec<u8> {
+    let version = u8::from(runs.iter().any(|&(_, o)| o < 0));
+    let mut body = Vec::with_capacity(8 + runs.len() * 8);
+    body.extend_from_slice(&[version, 0, 0, 0]);
+    body.extend_from_slice(&(runs.len() as u32).to_be_bytes());
+    for (count, offset) in runs {
+        body.extend_from_slice(&count.to_be_bytes());
+        body.extend_from_slice(&offset.to_be_bytes());
+    }
+    wrap_box(b"ctts", &body)
+}
+
+/// `cslg` (§8.6.1.4) for a track with negative composition offsets:
+/// the shift that makes every offset non-negative, the least and greatest
+/// offsets, and the composition interval the samples cover.
+fn build_cslg(t: &TrackState) -> Option<Vec<u8>> {
+    let least = t.ctts.iter().map(|&(_, o)| o).min()?;
+    if least >= 0 {
+        return None;
+    }
+    let greatest = t.ctts.iter().map(|&(_, o)| o).max()?;
+    let mut decode: i64 = 0;
+    let mut start = i64::MAX;
+    let mut end = i64::MIN;
+    let mut durations = t
+        .stts
+        .iter()
+        .flat_map(|&(n, d)| std::iter::repeat(d).take(n as usize));
+    for &(count, offset) in &t.ctts {
+        for _ in 0..count {
+            let duration = i64::from(durations.next().unwrap_or(0));
+            start = start.min(decode + i64::from(offset));
+            end = end.max(decode + i64::from(offset) + duration);
+            decode += duration;
+        }
+    }
+    let fields = [
+        i64::from(least).checked_neg()?,
+        i64::from(least),
+        i64::from(greatest),
+        start,
+        end,
+    ];
+    let wide = fields.iter().any(|&v| i32::try_from(v).is_err());
+    let mut body = vec![u8::from(wide), 0, 0, 0];
+    for v in fields {
+        if wide {
+            body.extend_from_slice(&v.to_be_bytes());
+        } else {
+            body.extend_from_slice(&(v as i32).to_be_bytes());
+        }
+    }
+    Some(wrap_box(b"cslg", &body))
 }
 
 fn build_stss(keyframes: &[u32]) -> Vec<u8> {
