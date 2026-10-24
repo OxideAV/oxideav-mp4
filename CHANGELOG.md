@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Mp4Demuxer::movie_header()` (new `demux::MovieHeader`: `mvhd`
+  timescale, stored duration, preferred rate, volume and matrix), and
+  `TrackHeader` gains `tkhd`'s layer, alternate group, volume and
+  matrix — the display transform a rotated track declares.
 - Track-table accessors on `Mp4Demuxer`: `track_header(stream)` (new
   `demux::TrackHeader`: `tkhd` track ID / flags / presentation size,
   `hdlr` handler type, `mdhd` timescale / duration / packed language),

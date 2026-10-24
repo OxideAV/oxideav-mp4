@@ -6768,9 +6768,11 @@ pub struct TrackHeader {
     /// `mdhd`'s packed language: three 5-bit letters (ISO 639-2/T, each
     /// `letter - 0x60`) below a zero pad bit.
     pub language: u16,
-    /// `tkhd` layer, alternate group and volume (signed 8.8).
+    /// `tkhd` layer: front-to-back ordering, lower in front.
     pub layer: i16,
+    /// `tkhd` alternate group (0: not in an alternate group).
     pub alternate_group: i16,
+    /// `tkhd` volume, signed 8.8 (`0x0100` full volume).
     pub volume: i16,
     /// `tkhd` transformation matrix `{a, b, u, c, d, v, x, y, w}`: `u`,
     /// `v` and `w` signed 2.30, the others signed 16.16.
@@ -6780,12 +6782,15 @@ pub struct TrackHeader {
 /// The movie header (`mvhd`, §8.2.2) as the file declares it
 /// ([`Mp4Demuxer::movie_header`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MovieHeader {
+    /// Movie timescale (ticks per second).
     pub timescale: u32,
     /// Duration in the movie timescale, as stored (before any `mehd`).
     pub duration: u64,
-    /// Preferred rate, signed 16.16, and volume, signed 8.8.
+    /// Preferred rate, signed 16.16 (`0x0001_0000` normal speed).
     pub rate: i32,
+    /// Preferred volume, signed 8.8 (`0x0100` full volume).
     pub volume: i16,
     /// Transformation matrix, laid out as [`TrackHeader::matrix`].
     pub matrix: [i32; 9],
