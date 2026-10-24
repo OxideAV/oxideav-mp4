@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The muxer writes composition time offsets (`ctts`) from the packets'
   presentation and decode timestamps, version 1 when an offset is
   negative, with a `cslg` (ISO/IEC 14496-12 §8.6.1.3-4).
+- `Mp4MuxerOptions::chunking`: `ChunkPolicy::PacketBoundaries` ends a
+  chunk after each packet with `flags.unit_boundary`.
 
 ### Changed
 
@@ -19,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A track's open chunk ends where another track's sample follows it in
+  `mdat`; interleaved tracks no longer get chunk offsets that skip the
+  other track's bytes.
 - An ALAC track's `channels`, `sample_rate` and `sample_format` come
   from its ALACSpecificConfig cookie (`numChannels`, `sampleRate`,
   `bitDepth`) rather than the `alac` entry's legacy fields, which
