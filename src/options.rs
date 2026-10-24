@@ -457,6 +457,21 @@ impl TrackHeaderTimestamps {
     }
 }
 
+/// How the non-fragmented muxer groups a track's samples into chunks
+/// (ISO/IEC 14496-12 §8.7.4). Whatever the policy, a chunk also ends
+/// when another track's sample is written after it, since a chunk is a
+/// contiguous run of one track's samples.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChunkPolicy {
+    /// About one second of compressed audio (50 samples), one sample of
+    /// video or PCM, per chunk.
+    #[default]
+    SampleCount,
+    /// A chunk ends after each packet whose `flags.unit_boundary` is set,
+    /// so the caller decides the interleave and the chunk sizes.
+    PacketBoundaries,
+}
+
 /// Runtime options controlling how the MP4 muxer shapes its output.
 ///
 /// Call [`Mp4MuxerOptions::default`] for the historical behavior of the
@@ -576,6 +591,8 @@ pub struct Mp4MuxerOptions {
     /// `write_trailer` (non-fragmented) / `write_header` (fragmented
     /// init segment) rather than emitting a malformed box.
     pub pssh: Vec<crate::cenc::PsshBox>,
+    /// How samples are grouped into chunks (non-fragmented output).
+    pub chunking: ChunkPolicy,
 }
 
 impl Default for Mp4MuxerOptions {
@@ -593,6 +610,7 @@ impl Default for Mp4MuxerOptions {
             modification_time: None,
             track_header_timestamps: Vec::new(),
             pssh: Vec::new(),
+            chunking: ChunkPolicy::default(),
         }
     }
 }
