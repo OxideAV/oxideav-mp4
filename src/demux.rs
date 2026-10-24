@@ -890,6 +890,13 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         meta_items,
         meco,
         movie_timescale: parsed.movie_timescale,
+        movie_header: MovieHeader {
+            timescale: parsed.movie_timescale,
+            duration: parsed.movie_duration,
+            rate: parsed.movie_rate,
+            volume: parsed.movie_volume,
+            matrix: parsed.movie_matrix,
+        },
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
         gapless,
@@ -1592,6 +1599,9 @@ struct ParsedMoov {
     /// Defaults to the all-zero "unset" pair when the file leaves them
     /// blank, which is the common case.
     movie_timestamps: HeaderTimestamps,
+    movie_rate: i32,
+    movie_volume: i16,
+    movie_matrix: [i32; 9],
     /// §8.8.2 (`mehd` MovieExtendsHeaderBox) — overall presentation
     /// duration of a fragmented movie, including fragments, in the
     /// movie timescale. `None` when the box is absent (per the spec
@@ -3333,7 +3343,23 @@ fn parse_mvhd(body: &[u8], out: &mut ParsedMoov) -> Result<()> {
     out.movie_timescale = timescale;
     out.movie_duration = duration;
     out.movie_timestamps = read_header_timestamps(body, version);
+    // rate, volume, ten reserved bytes and the matrix follow the duration.
+    let at = if version == 0 { 20 } else { 32 };
+    if let Some(d) = body.get(at..at + 52) {
+        out.movie_rate = i32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+        out.movie_volume = i16::from_be_bytes([d[4], d[5]]);
+        out.movie_matrix = read_matrix(&d[16..52]);
+    }
     Ok(())
+}
+
+/// A 3x3 transformation matrix: nine big-endian signed words.
+fn read_matrix(d: &[u8]) -> [i32; 9] {
+    let mut m = [0i32; 9];
+    for (i, word) in m.iter_mut().enumerate() {
+        *word = i32::from_be_bytes([d[4 * i], d[4 * i + 1], d[4 * i + 2], d[4 * i + 3]]);
+    }
+    m
 }
 
 /// Parse a `udta` box body. May contain 3GPP-style boxes (titl/auth/cprt/…)
@@ -6240,11 +6266,19 @@ fn parse_tkhd(body: &[u8], t: &mut Track) -> Result<()> {
     t.tkhd_timestamps = read_header_timestamps(body, version);
     t.header.track_id = t.track_id;
     t.header.flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
-    // width / height follow the 36-byte matrix: at 76 (v0) / 88 (v1).
+    // width / height follow the 36-byte matrix: at 76 (v0) / 88 (v1);
+    // layer, alternate group and volume precede the matrix's two
+    // reserved bytes.
     let dims = if version == 0 { 76 } else { 88 };
     if let Some(d) = body.get(dims..dims + 8) {
         t.header.width = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
         t.header.height = u32::from_be_bytes([d[4], d[5], d[6], d[7]]);
+    }
+    if let Some(d) = body.get(dims - 44..dims) {
+        t.header.layer = i16::from_be_bytes([d[0], d[1]]);
+        t.header.alternate_group = i16::from_be_bytes([d[2], d[3]]);
+        t.header.volume = i16::from_be_bytes([d[4], d[5]]);
+        t.header.matrix = read_matrix(&d[8..44]);
     }
     Ok(())
 }
@@ -6712,6 +6746,27 @@ pub struct TrackHeader {
     /// `mdhd`'s packed language: three 5-bit letters (ISO 639-2/T, each
     /// `letter - 0x60`) below a zero pad bit.
     pub language: u16,
+    /// `tkhd` layer, alternate group and volume (signed 8.8).
+    pub layer: i16,
+    pub alternate_group: i16,
+    pub volume: i16,
+    /// `tkhd` transformation matrix `{a, b, u, c, d, v, x, y, w}`: `u`,
+    /// `v` and `w` signed 2.30, the others signed 16.16.
+    pub matrix: [i32; 9],
+}
+
+/// The movie header (`mvhd`, §8.2.2) as the file declares it
+/// ([`Mp4Demuxer::movie_header`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MovieHeader {
+    pub timescale: u32,
+    /// Duration in the movie timescale, as stored (before any `mehd`).
+    pub duration: u64,
+    /// Preferred rate, signed 16.16, and volume, signed 8.8.
+    pub rate: i32,
+    pub volume: i16,
+    /// Transformation matrix, laid out as [`TrackHeader::matrix`].
+    pub matrix: [i32; 9],
 }
 
 /// One `stsd` sample entry (§8.5.2) as stored ([`Mp4Demuxer::sample_entry`]).
@@ -13860,6 +13915,7 @@ pub struct Mp4Demuxer {
     /// asserts later if they diverge).
     #[allow(dead_code)]
     movie_timescale: u32,
+    movie_header: MovieHeader,
     track_timescales: Vec<u32>,
     track_ids: Vec<u32>,
     /// Per-stream §8.6.6 edit lists in typed form (empty Vec = no
@@ -14382,6 +14438,11 @@ impl Mp4Demuxer {
     /// `mvhd`'s timescale: the unit of the edit lists' segment durations.
     pub fn movie_timescale(&self) -> u32 {
         self.movie_timescale
+    }
+
+    /// The `mvhd` MovieHeaderBox's fields (§8.2.2).
+    pub fn movie_header(&self) -> MovieHeader {
+        self.movie_header
     }
 
     /// The `ftyp` FileTypeBox's major brand (§4.3), e.g. `M4A ` or `qt  `.
