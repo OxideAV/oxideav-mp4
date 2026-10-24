@@ -923,6 +923,13 @@ fn empty_duration_traf_inserts_gap_before_tfdt_less_fragment() {
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
     let mut dmx = oxideav_mp4::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
 
+    // The fragments' samples in decode order, on the media timeline.
+    assert!(dmx.is_fragmented());
+    let samples = dmx.samples(0);
+    let times: Vec<i64> = samples.iter().map(|s| s.decode_time).collect();
+    assert_eq!(times, vec![0, 1, 2, 3, 504, 505, 506]);
+    assert!(samples.iter().all(|s| s.size == 4 && s.duration == 1));
+
     // Typed records: one gap, on track 0, in fragment 2, 500 ticks.
     let recs = dmx.empty_duration_records();
     assert_eq!(recs.len(), 1);
