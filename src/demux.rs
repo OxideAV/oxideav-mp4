@@ -45,6 +45,8 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // fragmented / DASH / HLS / Smooth Streaming MP4 emits after the
     // initial movie header. ISO/IEC 14496-12 §8.8.
     let mut saw_ftyp = false;
+    // §4.3 — the first `ftyp`'s major brand.
+    let mut major_brand: Option<[u8; 4]> = None;
     let mut moov: Option<Vec<u8>> = None;
     let mut moofs: Vec<MoofRecord> = Vec::new();
     let mut sidxes: Vec<SidxRecord> = Vec::new();
@@ -94,7 +96,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         match hdr.fourcc {
             FTYP => {
                 saw_ftyp = true;
-                skip_box_body(&mut *input, &hdr)?;
+                let body = read_box_body(&mut *input, &hdr)?;
+                if major_brand.is_none() {
+                    major_brand = body.get(..4).map(|b| [b[0], b[1], b[2], b[3]]);
+                }
             }
             // §8.1.3 — `pdin` ProgressiveDownloadInfoBox. Top-level
             // FullBox carrying (rate, initial_delay) u32 pairs that hint
@@ -888,6 +893,14 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
         gapless,
+        fragmented: parsed.fragmented,
+        major_brand,
+        track_headers: parsed.tracks.iter().map(|t| t.header).collect(),
+        sample_entries: parsed
+            .tracks
+            .iter()
+            .map(|t| t.stsd_entries.clone())
+            .collect(),
         edit_lists: parsed
             .tracks
             .iter()
@@ -1570,6 +1583,9 @@ impl HeaderTimestamps {
 #[derive(Default)]
 struct ParsedMoov {
     tracks: Vec<Track>,
+    /// The moov carries an `mvex` (§8.8.1): the movie may continue in
+    /// fragments.
+    fragmented: bool,
     movie_timescale: u32,
     movie_duration: u64,
     /// §8.2.2 `mvhd` header timestamps for the movie as a whole.
@@ -2007,6 +2023,7 @@ struct Track {
     /// is left empty only when the `stsd` was absent or `entry_count`
     /// was zero (both non-conforming).
     stsd_entries: Vec<StsdEntry>,
+    header: TrackHeader,
 }
 
 /// One `stsd` (SampleDescriptionBox, §8.5.2) entry header. Every
@@ -2027,6 +2044,8 @@ struct StsdEntry {
     /// `dref` table naming where the samples using this description are
     /// stored. Almost always `1` (samples in this same file).
     data_reference_index: u16,
+    /// The entry's body: everything after its box header.
+    payload: Vec<u8>,
 }
 
 /// One entry of an `sdtp` (SampleDependencyTypeBox, §8.6.4) — decoded
@@ -3064,6 +3083,7 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
             }
             MVEX => {
                 let body = read_bytes_vec(&mut cur, psz)?;
+                out.fragmented = true;
                 parse_mvex(
                     &body,
                     &mut out.tracks,
@@ -5590,6 +5610,7 @@ fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
         saiz: Vec::new(),
         saio: Vec::new(),
         stsd_entries: Vec::new(),
+        header: TrackHeader::default(),
     };
     let mut has_media = false;
     let mut cur = std::io::Cursor::new(body);
@@ -6200,9 +6221,10 @@ pub fn build_strk_box(
     Some(wrap_box(&STRK, &body))
 }
 
-/// §8.3.2 — `tkhd` (TrackHeaderBox). We only need `track_ID` for
-/// fragmented-MP4 traf-to-track matching; the matrix / w/h preview
-/// fields are the visual entry's job.
+/// §8.3.2 — `tkhd` (TrackHeaderBox): `track_ID` (fragmented-MP4
+/// traf-to-track matching), the flags (enabled / in movie / in preview)
+/// and the presentation width and height, surfaced through
+/// [`Mp4Demuxer::track_header`].
 fn parse_tkhd(body: &[u8], t: &mut Track) -> Result<()> {
     if body.is_empty() {
         return Err(Error::invalid("MP4: tkhd empty"));
@@ -6216,6 +6238,14 @@ fn parse_tkhd(body: &[u8], t: &mut Track) -> Result<()> {
     }
     t.track_id = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
     t.tkhd_timestamps = read_header_timestamps(body, version);
+    t.header.track_id = t.track_id;
+    t.header.flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    // width / height follow the 36-byte matrix: at 76 (v0) / 88 (v1).
+    let dims = if version == 0 { 76 } else { 88 };
+    if let Some(d) = body.get(dims..dims + 8) {
+        t.header.width = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+        t.header.height = u32::from_be_bytes([d[4], d[5], d[6], d[7]]);
+    }
     Ok(())
 }
 
@@ -6663,6 +6693,54 @@ fn gapless_timings(
         .collect()
 }
 
+/// A track's header fields ([`Mp4Demuxer::track_header`]): `tkhd`
+/// (§8.3.2), the `hdlr` handler type (§8.4.3) and `mdhd` (§8.4.2), as
+/// the file declares them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackHeader {
+    pub track_id: u32,
+    /// The 24 `tkhd` flags: `0x1` enabled, `0x2` in movie, `0x4` in
+    /// preview.
+    pub flags: u32,
+    /// `tkhd` presentation width and height, unsigned 16.16.
+    pub width: u32,
+    pub height: u32,
+    pub handler_type: [u8; 4],
+    pub media_timescale: u32,
+    /// `mdhd` duration in the media timescale (all ones when unknown).
+    pub media_duration: u64,
+    /// `mdhd`'s packed language: three 5-bit letters (ISO 639-2/T, each
+    /// `letter - 0x60`) below a zero pad bit.
+    pub language: u16,
+}
+
+/// One `stsd` sample entry (§8.5.2) as stored ([`Mp4Demuxer::sample_entry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleEntry<'a> {
+    /// The entry's box type (for a protected entry, its `enc*` type).
+    pub format: [u8; 4],
+    pub data_reference_index: u16,
+    /// Everything after the box header.
+    pub payload: &'a [u8],
+}
+
+/// One sample of a track's sample table or fragments
+/// ([`Mp4Demuxer::samples`]): its byte range and its times on the media
+/// timeline, before the edit list maps them onto the presentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleInfo {
+    pub offset: u64,
+    pub size: u32,
+    /// Decoding time (§8.6.1.2), in the media timescale.
+    pub decode_time: i64,
+    /// Composition time (§8.6.1.3): decoding time plus its offset.
+    pub composition_time: i64,
+    pub duration: i64,
+    pub sync: bool,
+    /// 1-based `stsd` entry the sample decodes against.
+    pub sample_description_index: u32,
+}
+
 /// One entry of an `elst` EditListBox (ISO/IEC 14496-12 §8.6.6) — the
 /// public typed form surfaced by [`Mp4Demuxer::edit_list`] and consumed
 /// by [`build_elst_box`].
@@ -6835,6 +6913,14 @@ fn parse_mdhd(body: &[u8], t: &mut Track) -> Result<()> {
     t.timescale = timescale;
     t.duration = Some(duration);
     t.mdhd_timestamps = read_header_timestamps(body, version);
+    t.header.media_timescale = timescale;
+    t.header.media_duration = duration;
+    // The packed ISO 639-2/T language follows the duration: at 20 (v0) /
+    // 32 (v1).
+    let language = if version == 0 { 20 } else { 32 };
+    if let Some(l) = body.get(language..language + 2) {
+        t.header.language = u16::from_be_bytes([l[0], l[1]]);
+    }
     Ok(())
 }
 
@@ -6872,6 +6958,7 @@ fn parse_hdlr(body: &[u8], t: &mut Track) -> Result<()> {
     }
     let mut handler = [0u8; 4];
     handler.copy_from_slice(&body[8..12]);
+    t.header.handler_type = handler;
     t.media_type = match &handler {
         h if *h == HANDLER_SOUN => MediaType::Audio,
         h if *h == HANDLER_VIDE => MediaType::Video,
@@ -7655,6 +7742,7 @@ fn parse_stsd(body: &[u8], t: &mut Track) -> Result<()> {
         t.stsd_entries.push(StsdEntry {
             format: hdr.fourcc,
             data_reference_index,
+            payload: entry.clone(),
         });
         if i == 0 {
             first_entry = Some((hdr, entry));
@@ -10866,6 +10954,9 @@ fn parse_traf(
                 keyframe,
                 discard: !presented,
                 sdi: state.sample_description_index,
+                media_dts: frag_dts,
+                cts_offset: cts_off,
+                seq: samples.len() as u64,
             });
 
             sample_off = sample_off.saturating_add(size as u64);
@@ -11949,6 +12040,14 @@ struct SampleRef {
     /// (§8.8.7) for fragment samples. Decode always uses entry [0];
     /// this is surfaced so callers can detect a mid-stream switch.
     sdi: u32,
+    /// Decoding time and composition offset on the media timeline,
+    /// before the edit list (§8.6.1.2 / §8.6.1.3), for
+    /// [`Mp4Demuxer::samples`].
+    media_dts: i64,
+    cts_offset: i64,
+    /// Order of expansion: a track's samples in decode order (the
+    /// sample table, then its fragments in file order).
+    seq: u64,
 }
 
 fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result<()> {
@@ -12104,6 +12203,9 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
             keyframe,
             discard: !presented,
             sdi: sdi_of_sample[i],
+            media_dts: dts_v,
+            cts_offset: cts_offsets[i],
+            seq: out.len() as u64,
         });
     }
     Ok(())
@@ -13775,6 +13877,14 @@ pub struct Mp4Demuxer {
     mdhd_timestamps: Vec<HeaderTimestamps>,
     /// Per-stream gapless audio timing ([`Self::gapless_timing`]).
     gapless: Vec<Option<GaplessTiming>>,
+    /// The moov carries an `mvex` ([`Self::is_fragmented`]).
+    fragmented: bool,
+    /// The first `ftyp`'s major brand ([`Self::major_brand`]).
+    major_brand: Option<[u8; 4]>,
+    /// Per-stream header fields ([`Self::track_header`]).
+    track_headers: Vec<TrackHeader>,
+    /// Per-stream `stsd` entries ([`Self::sample_entry`]).
+    sample_entries: Vec<Vec<StsdEntry>>,
     /// `sample_description_index` of the packet most recently returned
     /// by `next_packet` (`None` before the first packet). See
     /// [`Self::sample_description_index_of_last_packet`].
@@ -14267,6 +14377,72 @@ impl Mp4Demuxer {
     /// reported `sample_rate`; see [`GaplessTiming`].
     pub fn gapless_timing(&self, stream_index: u32) -> Option<GaplessTiming> {
         self.gapless.get(stream_index as usize).copied().flatten()
+    }
+
+    /// `mvhd`'s timescale: the unit of the edit lists' segment durations.
+    pub fn movie_timescale(&self) -> u32 {
+        self.movie_timescale
+    }
+
+    /// The `ftyp` FileTypeBox's major brand (§4.3), e.g. `M4A ` or `qt  `.
+    pub fn major_brand(&self) -> Option<[u8; 4]> {
+        self.major_brand
+    }
+
+    /// Whether the moov carries an `mvex` MovieExtendsBox (§8.8.1): the
+    /// movie may continue in fragments, whether or not any follow.
+    pub fn is_fragmented(&self) -> bool {
+        self.fragmented
+    }
+
+    /// The stream's track header fields (`tkhd`, `hdlr`, `mdhd`).
+    pub fn track_header(&self, stream_index: u32) -> Option<TrackHeader> {
+        self.track_headers.get(stream_index as usize).copied()
+    }
+
+    /// The stream's number of `stsd` sample entries.
+    pub fn sample_entry_count(&self, stream_index: u32) -> u32 {
+        self.sample_entries
+            .get(stream_index as usize)
+            .map_or(0, |e| e.len() as u32)
+    }
+
+    /// The stream's `stsd` entry with this 1-based index (a sample's
+    /// `sample_description_index`), as stored in the file.
+    pub fn sample_entry(&self, stream_index: u32, index: u32) -> Option<SampleEntry<'_>> {
+        let e = self
+            .sample_entries
+            .get(stream_index as usize)?
+            .get((index as usize).checked_sub(1)?)?;
+        Some(SampleEntry {
+            format: e.format,
+            data_reference_index: e.data_reference_index,
+            payload: &e.payload,
+        })
+    }
+
+    /// The stream's samples in decode order: its sample table, then its
+    /// movie fragments in file order. Times are on the media timeline;
+    /// [`Self::edit_list`] maps them onto the presentation.
+    pub fn samples(&self, stream_index: u32) -> Vec<SampleInfo> {
+        let mut track: Vec<&SampleRef> = self
+            .samples
+            .iter()
+            .filter(|s| s.track_idx == stream_index)
+            .collect();
+        track.sort_by_key(|s| s.seq);
+        track
+            .into_iter()
+            .map(|s| SampleInfo {
+                offset: s.offset,
+                size: s.size,
+                decode_time: s.media_dts,
+                composition_time: s.media_dts.saturating_add(s.cts_offset),
+                duration: s.duration,
+                sync: s.keyframe,
+                sample_description_index: s.sdi,
+            })
+            .collect()
     }
 
     /// The 1-based §8.5.2 `sample_description_index` of the packet
@@ -15385,6 +15561,7 @@ mod tests {
             saiz: Vec::new(),
             saio: Vec::new(),
             stsd_entries: Vec::new(),
+            header: super::TrackHeader::default(),
         }
     }
 
