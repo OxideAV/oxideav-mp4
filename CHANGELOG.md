@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decode time, so a B-frame stream whose DTS starts below zero still
   presents its first frame at 0; without packet durations, decode
   deltas come from the DTS sequence rather than the reordered PTS.
+- `Mp4MuxerOptions::chunking`: `ChunkPolicy::PacketBoundaries` ends a
+  chunk after each packet with `flags.unit_boundary`.
 
 ### Changed
 
@@ -27,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   four-byte zero terminator (QTFF "Video Sample Description"; written
   by AVAssetWriter after a ProRes entry's `colr` / `fiel`) no longer
   fails the open as a truncated extension box.
+- A track's open chunk ends where another track's sample follows it in
+  `mdat`; interleaved tracks no longer get chunk offsets that skip the
+  other track's bytes.
 - An ALAC track's `channels`, `sample_rate` and `sample_format` come
   from its ALACSpecificConfig cookie (`numChannels`, `sampleRate`,
   `bitDepth`) rather than the `alac` entry's legacy fields, which

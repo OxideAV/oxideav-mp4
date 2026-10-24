@@ -36,7 +36,7 @@ use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 use crate::options::{
-    BrandPreset, FragmentedOptions, Mp4MuxerOptions, TrackEditList, TrackSampleGroups,
+    BrandPreset, ChunkPolicy, FragmentedOptions, Mp4MuxerOptions, TrackEditList, TrackSampleGroups,
 };
 use crate::sample_entries::{
     SampleEntry, apply_protection, sample_entry_for, subtitle_handler_for, subtitle_uses_sthd,
@@ -291,6 +291,7 @@ pub fn open_with_options(
         mdat_start_offset: 0,
         mdat_bytes: 0,
         mdat_buffer: None,
+        last_track: None,
         header_written: false,
         trailer_written: false,
     }))
@@ -312,6 +313,9 @@ struct Mp4Muxer {
     mdat_bytes: u64,
     /// In-memory mdat payload. `Some` iff `options.faststart` is `true`.
     mdat_buffer: Option<Cursor<Vec<u8>>>,
+    /// Track whose sample was written last: its open chunk ends when
+    /// another track's sample follows it in `mdat`.
+    last_track: Option<usize>,
     header_written: bool,
     trailer_written: bool,
 }
@@ -429,6 +433,15 @@ impl Muxer for Mp4Muxer {
             std::borrow::Cow::Borrowed(&packet.data[..])
         };
 
+        // A chunk is a contiguous run of one track's samples (§8.7.4): the
+        // previous track's open chunk ends where this sample starts.
+        if let Some(last) = self.last_track {
+            if last != idx {
+                self.tracks[last].close_current_chunk();
+            }
+        }
+        self.last_track = Some(idx);
+
         // Bytes first: capture offset, append payload, update mdat counter.
         // `cur_offset` is absolute in direct-write mode and relative-to-mdat
         // in faststart mode (patched up at trailer time).
@@ -490,7 +503,11 @@ impl Muxer for Mp4Muxer {
             t.current_chunk_start_offset = cur_offset;
         }
         t.current_chunk_samples += 1;
-        if t.current_chunk_samples >= t.samples_per_chunk_target {
+        let chunk_ends = match self.options.chunking {
+            ChunkPolicy::SampleCount => t.current_chunk_samples >= t.samples_per_chunk_target,
+            ChunkPolicy::PacketBoundaries => packet.flags.unit_boundary,
+        };
+        if chunk_ends {
             t.close_current_chunk();
         }
 
