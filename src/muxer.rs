@@ -435,10 +435,10 @@ impl Muxer for Mp4Muxer {
 
         // A chunk is a contiguous run of one track's samples (§8.7.4): the
         // previous track's open chunk ends where this sample starts.
-        if let Some(last) = self.last_track {
-            if last != idx {
-                self.tracks[last].close_current_chunk();
-            }
+        if let Some(last) = self.last_track
+            && last != idx
+        {
+            self.tracks[last].close_current_chunk();
         }
         self.last_track = Some(idx);
 

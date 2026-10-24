@@ -462,6 +462,7 @@ impl TrackHeaderTimestamps {
 /// when another track's sample is written after it, since a chunk is a
 /// contiguous run of one track's samples.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChunkPolicy {
     /// About one second of compressed audio (50 samples), one sample of
     /// video or PCM, per chunk.
