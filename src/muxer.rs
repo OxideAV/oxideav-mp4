@@ -88,6 +88,13 @@ pub(crate) struct TrackState {
     pub(crate) prev_pts_in_ts: Option<i64>,
     /// First PTS in media time scale (for duration calculation + elst).
     pub(crate) first_pts_in_ts: Option<i64>,
+    /// First DTS in media time scale. With composition offsets (`ctts`)
+    /// the media timeline starts at the first sample's *decode* time, so
+    /// this — not the first PTS — is where presentation time 0 sits on
+    /// it (§8.6.1.3); `None` when the packets carry no DTS.
+    pub(crate) first_dts_in_ts: Option<i64>,
+    /// Previous packet's DTS in media time scale, for decode deltas.
+    pub(crate) prev_dts_in_ts: Option<i64>,
     /// End of the presented range (`pts + duration` of the latest
     /// packet) in media time scale — the edit-list segment end when the
     /// track starts with pre-roll (negative first PTS).
@@ -136,6 +143,8 @@ impl TrackState {
             cumulative_duration: 0,
             prev_pts_in_ts: None,
             first_pts_in_ts: None,
+            first_dts_in_ts: None,
+            prev_dts_in_ts: None,
             presentation_end_in_ts: None,
             aac_asc_synthesised: false,
             tkhd_timestamps: crate::demux::HeaderTimestamps::default(),
@@ -438,9 +447,12 @@ impl Muxer for Mp4Muxer {
         let pts_in_ts = packet
             .pts
             .map(|v| rescale_to_media_ts(v, packet.time_base, t.media_time_scale));
-        // Decode delta: if pts is available, use difference from previous; else
-        // fall back to packet.duration rescaled.
-        let delta = compute_delta(t, packet, pts_in_ts);
+        let dts_in_ts = packet
+            .dts
+            .map(|v| rescale_to_media_ts(v, packet.time_base, t.media_time_scale));
+        // Decode delta: packet.duration rescaled; else the difference
+        // from the previous packet's DTS (or PTS when there is no DTS).
+        let delta = compute_delta(t, packet, pts_in_ts, dts_in_ts);
 
         t.sample_sizes.push(data.len() as u32);
         // stts RLE: append a new (1, delta) or extend the last run.
@@ -451,9 +463,12 @@ impl Muxer for Mp4Muxer {
         t.cumulative_duration += delta as u64;
         // ISO/IEC 14496-12 §8.6.1.3: the composition offset of a sample
         // is its presentation time minus its decode time.
-        let dts_in_ts = packet
-            .dts
-            .map(|v| rescale_to_media_ts(v, packet.time_base, t.media_time_scale));
+        if let Some(d) = dts_in_ts {
+            if t.next_sample_index == 0 {
+                t.first_dts_in_ts = Some(d);
+            }
+            t.prev_dts_in_ts = Some(d);
+        }
         let offset = match (pts_in_ts, dts_in_ts) {
             (Some(p), Some(d)) => i32::try_from(p - d).map_err(|_| {
                 Error::invalid("mp4 muxer: composition offset outside the 32-bit range")
@@ -827,7 +842,16 @@ fn build_trak(
 /// `version` is chosen per §8.6.6.2: version 1 (64-bit fields) when any
 /// duration exceeds the 32-bit range, else version 0.
 fn build_edts(t: &TrackState, movie_timescale: u32, track_duration_movie: u64) -> Option<Vec<u8>> {
-    let first_pts = t.first_pts_in_ts?;
+    // Media time 0 is the first sample's decode time. Without composition
+    // offsets that is its PTS; with them (§8.6.1.3) the first DTS is the
+    // origin, so the edit starts where input time 0 lands on the
+    // composition timeline (§8.6.1.4 recommends the first edit begin at
+    // the smallest CTS).
+    let first_pts = if t.ctts.iter().any(|&(_, o)| o != 0) {
+        t.first_dts_in_ts.or(t.first_pts_in_ts)?
+    } else {
+        t.first_pts_in_ts?
+    };
     if first_pts < 0 {
         return build_preroll_edts(t, first_pts, movie_timescale);
     }
@@ -1209,21 +1233,27 @@ fn build_cslg(t: &TrackState) -> Option<Vec<u8>> {
         return None;
     }
     let greatest = t.ctts.iter().map(|&(_, o)| o).max()?;
+    // compositionStartTime: the smallest CTS; compositionEndTime: the
+    // CTS plus composition duration of the sample with the largest CTS.
     let mut decode: i64 = 0;
     let mut start = i64::MAX;
-    let mut end = i64::MIN;
+    let mut last = (i64::MIN, 0i64);
     let mut durations = t
         .stts
         .iter()
-        .flat_map(|&(n, d)| std::iter::repeat(d).take(n as usize));
+        .flat_map(|&(n, d)| std::iter::repeat_n(d, n as usize));
     for &(count, offset) in &t.ctts {
         for _ in 0..count {
             let duration = i64::from(durations.next().unwrap_or(0));
-            start = start.min(decode + i64::from(offset));
-            end = end.max(decode + i64::from(offset) + duration);
+            let cts = decode + i64::from(offset);
+            start = start.min(cts);
+            if cts >= last.0 {
+                last = (cts, duration);
+            }
             decode += duration;
         }
     }
+    let end = last.0 + last.1;
     let fields = [
         i64::from(least).checked_neg()?,
         i64::from(least),
@@ -1339,7 +1369,12 @@ pub(crate) fn default_samples_per_chunk(stream: &StreamInfo) -> u32 {
     }
 }
 
-fn compute_delta(t: &TrackState, packet: &Packet, pts_in_ts: Option<i64>) -> u32 {
+fn compute_delta(
+    t: &TrackState,
+    packet: &Packet,
+    pts_in_ts: Option<i64>,
+    dts_in_ts: Option<i64>,
+) -> u32 {
     // Preferred: use packet.duration if present, rescaled to media timescale.
     if let Some(d) = packet.duration
         && d > 0
@@ -1349,8 +1384,18 @@ fn compute_delta(t: &TrackState, packet: &Packet, pts_in_ts: Option<i64>) -> u32
             return v as u32;
         }
     }
-    // Otherwise: diff against previous packet's PTS.
-    if let (Some(prev), Some(cur)) = (t.prev_pts_in_ts, pts_in_ts) {
+    // Otherwise: diff against the previous packet's DTS — decode order,
+    // so reordered (B-frame) PTS cannot produce a bogus delta — or its
+    // PTS when the packets carry no DTS.
+    if let (Some(prev), Some(cur)) = (t.prev_dts_in_ts, dts_in_ts) {
+        let d = cur - prev;
+        if d > 0 {
+            return u32::try_from(d).unwrap_or(u32::MAX);
+        }
+    }
+    if dts_in_ts.is_none()
+        && let (Some(prev), Some(cur)) = (t.prev_pts_in_ts, pts_in_ts)
+    {
         let d = (cur - prev).max(0);
         if d > 0 {
             return d as u32;

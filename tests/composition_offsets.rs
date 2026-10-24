@@ -107,3 +107,71 @@ fn equal_timestamps_write_no_ctts() {
     let file = mux("equal", &[(0, 0), (20, 20), (40, 40)]);
     assert!(stbl_box(&file, "ctts").is_none());
 }
+
+/// A B-frame stream whose decode times start before zero (here one
+/// frame early, as encoders with reordering commonly emit): media time 0
+/// is the first sample's *decode* time, so the edit list has to start
+/// one frame in for the first frame to present at time 0 again.
+#[test]
+fn negative_first_dts_maps_presentation_zero_through_the_edit_list() {
+    use oxideav_core::{Error, NullCodecResolver, ReadSeek};
+    let file = mux("origin", &[(-20, 0), (0, 60), (20, 20), (40, 40)]);
+    let elst = find(&file, &["moov", "trak", "edts", "elst"]).expect("elst");
+    // version 0, one entry: segment_duration, media_time (33 ms = 20/600 s)
+    assert_eq!(u32::from_be_bytes(elst[4..8].try_into().unwrap()), 1);
+    assert_eq!(i32::from_be_bytes(elst[12..16].try_into().unwrap()), 33);
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(file));
+    let mut d = oxideav_mp4::demux::open(rs, &NullCodecResolver).unwrap();
+    let mut pts = Vec::new();
+    loop {
+        match d.next_packet() {
+            Ok(p) => pts.push(p.pts.unwrap()),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    // Presentation order restored, starting at 0 (1/1000 s; DTS and PTS
+    // round to the media time scale separately).
+    assert_eq!(pts, vec![0, 100, 33, 66]);
+}
+
+/// Without packet durations the decode deltas come from the DTS
+/// sequence, not from the reordered PTS (which would go backwards).
+#[test]
+fn decode_deltas_follow_dts_without_durations() {
+    let stream = video();
+    let path = std::env::temp_dir().join("oxideav-mp4-ctts-nodur.mp4");
+    {
+        let out: Box<dyn WriteSeek> = Box::new(std::fs::File::create(&path).unwrap());
+        let mut mux = oxideav_mp4::muxer::open(out, std::slice::from_ref(&stream)).unwrap();
+        mux.write_header().unwrap();
+        for (i, &(dts, pts)) in [(0, 20), (20, 80), (40, 40), (60, 60)].iter().enumerate() {
+            let mut p = Packet::new(0, stream.time_base, vec![i as u8; 8]);
+            p.dts = Some(dts);
+            p.pts = Some(pts);
+            p.flags.keyframe = i == 0;
+            mux.write_packet(&p).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let file = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let stts = stbl_box(&file, "stts").expect("stts");
+    let runs: Vec<(u32, u32)> = stts[8..]
+        .chunks(8)
+        .map(|c| {
+            (
+                u32::from_be_bytes(c[0..4].try_into().unwrap()),
+                u32::from_be_bytes(c[4..8].try_into().unwrap()),
+            )
+        })
+        .collect();
+    // The first sample has no predecessor (1-tick fallback); every later
+    // delta is the 33 ms DTS step, never the PTS jump back from 133 to 67.
+    assert_eq!(runs.iter().map(|r| r.0).sum::<u32>(), 4);
+    assert!(
+        runs[1..].iter().all(|&(_, d)| d == 33 || d == 34),
+        "{runs:?}"
+    );
+}
