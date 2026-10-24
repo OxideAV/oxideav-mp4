@@ -43,6 +43,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Track-table accessors on `Mp4Demuxer`: `track_header(stream)` (new
+  `demux::TrackHeader`: `tkhd` track ID / flags / presentation size,
+  `hdlr` handler type, `mdhd` timescale / duration / packed language),
+  `movie_timescale()`, `major_brand()`, `is_fragmented()` (moov carries
+  an `mvex`), `sample_entry_count(stream)` / `sample_entry(stream,
+  index)` (new `demux::SampleEntry`: each `stsd` entry as stored) and
+  `samples(stream)` (new `demux::SampleInfo`: byte range, decode /
+  composition time on the media timeline before the edit list,
+  duration, sync flag, sample description index; sample table then
+  fragments, in decode order).
 - Gapless audio timing (#12): `Mp4Demuxer::gapless_timing(stream)`
   returns a `demux::GaplessTiming` (priming, valid, remainder samples
   at the stream's reported rate, plus its `GaplessSource`) from the M4A

@@ -96,9 +96,26 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         match hdr.fourcc {
             FTYP => {
                 saw_ftyp = true;
-                let body = read_box_body(&mut *input, &hdr)?;
-                if major_brand.is_none() {
-                    major_brand = body.get(..4).map(|b| [b[0], b[1], b[2], b[3]]);
+                // §4.3: only the major brand (the body's first four
+                // bytes) is kept. Read those and skip the rest, as the
+                // box was skipped before, so an oversized or open-ended
+                // `ftyp` is not buffered whole.
+                let mut brand = [0u8; 4];
+                let fits = hdr.payload_size().is_none_or(|p| p >= 4);
+                let got = fits && std::io::Read::read_exact(&mut *input, &mut brand).is_ok();
+                if got && major_brand.is_none() {
+                    major_brand = Some(brand);
+                }
+                match hdr.payload_size() {
+                    Some(p) => {
+                        let rest = p - if got { 4 } else { 0 };
+                        if rest > 0 {
+                            input.seek(SeekFrom::Current(rest as i64))?;
+                        }
+                    }
+                    None => {
+                        input.seek(SeekFrom::End(0))?;
+                    }
                 }
             }
             // §8.1.3 — `pdin` ProgressiveDownloadInfoBox. Top-level
@@ -6697,15 +6714,20 @@ fn gapless_timings(
 /// (§8.3.2), the `hdlr` handler type (§8.4.3) and `mdhd` (§8.4.2), as
 /// the file declares them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackHeader {
+    /// `tkhd` `track_ID`.
     pub track_id: u32,
     /// The 24 `tkhd` flags: `0x1` enabled, `0x2` in movie, `0x4` in
     /// preview.
     pub flags: u32,
-    /// `tkhd` presentation width and height, unsigned 16.16.
+    /// `tkhd` presentation width, unsigned 16.16.
     pub width: u32,
+    /// `tkhd` presentation height, unsigned 16.16.
     pub height: u32,
+    /// `hdlr` `handler_type` (`soun`, `vide`, `hint`, `meta`, ...).
     pub handler_type: [u8; 4],
+    /// `mdhd` timescale (ticks per second of the media timeline).
     pub media_timescale: u32,
     /// `mdhd` duration in the media timescale (all ones when unknown).
     pub media_duration: u64,
@@ -6716,9 +6738,11 @@ pub struct TrackHeader {
 
 /// One `stsd` sample entry (§8.5.2) as stored ([`Mp4Demuxer::sample_entry`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SampleEntry<'a> {
     /// The entry's box type (for a protected entry, its `enc*` type).
     pub format: [u8; 4],
+    /// 1-based `dref` entry naming where the samples are stored.
     pub data_reference_index: u16,
     /// Everything after the box header.
     pub payload: &'a [u8],
@@ -6728,14 +6752,19 @@ pub struct SampleEntry<'a> {
 /// ([`Mp4Demuxer::samples`]): its byte range and its times on the media
 /// timeline, before the edit list maps them onto the presentation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SampleInfo {
+    /// Absolute file offset of the sample's first byte.
     pub offset: u64,
+    /// Sample size in bytes.
     pub size: u32,
     /// Decoding time (§8.6.1.2), in the media timescale.
     pub decode_time: i64,
     /// Composition time (§8.6.1.3): decoding time plus its offset.
     pub composition_time: i64,
+    /// Sample duration, in the media timescale.
     pub duration: i64,
+    /// Sync (random-access) sample.
     pub sync: bool,
     /// 1-based `stsd` entry the sample decodes against.
     pub sample_description_index: u32,
