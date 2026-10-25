@@ -15,7 +15,7 @@ use std::io::SeekFrom;
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, ProbeContext,
-    Result, SampleFormat, StreamInfo, TimeBase,
+    Rational, Result, SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
@@ -858,6 +858,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         ));
     }
 
+    fill_params_from_samples(&mut streams, &parsed.tracks, &samples, &mut *input)?;
     let gapless = gapless_timings(&parsed.tracks, &streams, &metadata, parsed.movie_timescale);
     // Flat mirror of the typed accessor, the way the `elst_*` keys
     // mirror `edit_list`.
@@ -12326,6 +12327,85 @@ fn build_ctx<'a>(tag: &'a CodecTag, t: &'a Track) -> ProbeContext<'a> {
         ctx = ctx.height(h);
     }
     ctx
+}
+
+/// Stream parameters only the sample tables (or the samples
+/// themselves) state, filled once every moov and fragment sample is
+/// known:
+///
+/// * `frame_rate` of a video track whose samples all last the same
+///   (ISO/IEC 14496-12 §8.6.1.2 `stts` / §8.8.8 `trun` durations): one
+///   frame per duration, in the track's timescale. The last sample in
+///   decoding order may differ — writers commonly trim it to the
+///   movie's end — and is not counted. Varying durations leave it
+///   `None` (a variable-rate track has no nominal rate to declare).
+/// * `pixel_format` of a VP9 track, from the first frame's
+///   uncompressed header ([`video_config::vp9_frame_pixel_format`]):
+///   the `vpcC` record is kept verbatim but not read here. Skipped for
+///   protected tracks, whose sample bytes may be encrypted.
+fn fill_params_from_samples(
+    streams: &mut [StreamInfo],
+    tracks: &[Track],
+    samples: &[SampleRef],
+    input: &mut dyn ReadSeek,
+) -> Result<()> {
+    for (i, (stream, t)) in streams.iter_mut().zip(tracks).enumerate() {
+        if stream.params.media_type != MediaType::Video {
+            continue;
+        }
+        let mut first: Option<&SampleRef> = None;
+        let mut last: Option<&SampleRef> = None;
+        for s in samples.iter().filter(|s| s.track_idx as usize == i) {
+            if first.is_none_or(|f| s.dts < f.dts) {
+                first = Some(s);
+            }
+            if last.is_none_or(|l| s.dts >= l.dts) {
+                last = Some(s);
+            }
+        }
+        let (Some(first), Some(last)) = (first, last) else {
+            continue;
+        };
+        if stream.params.frame_rate.is_none() {
+            let mut delta: Option<i64> = None;
+            let mut constant = true;
+            for s in samples.iter().filter(|s| s.track_idx as usize == i) {
+                if std::ptr::eq(s, last) && !std::ptr::eq(s, first) {
+                    continue;
+                }
+                match delta {
+                    None => delta = Some(s.duration),
+                    Some(d) if d == s.duration => {}
+                    Some(_) => {
+                        constant = false;
+                        break;
+                    }
+                }
+            }
+            let tb = stream.time_base.0;
+            if constant
+                && let Some(d) = delta
+                && d > 0
+                && tb.num > 0
+                && tb.den > 0
+                && let Some(n) = tb.num.checked_mul(d)
+            {
+                stream.params.frame_rate = Some(Rational::new(tb.den, n).reduced());
+            }
+        }
+        if stream.params.codec_id.as_str() == "vp9"
+            && stream.params.pixel_format.is_none()
+            && t.protection_scheme.is_none()
+            && first.size > 0
+        {
+            let mut head = vec![0u8; first.size.min(16) as usize];
+            input.seek(SeekFrom::Start(first.offset))?;
+            if input.read_exact(&mut head).is_ok() {
+                stream.params.pixel_format = video_config::vp9_frame_pixel_format(&head);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> StreamInfo {

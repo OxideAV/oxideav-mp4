@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deltas come from the DTS sequence rather than the reordered PTS.
 - `Mp4MuxerOptions::chunking`: `ChunkPolicy::PacketBoundaries` ends a
   chunk after each packet with `flags.unit_boundary`.
+- Video streams declare `pixel_format` for AV1 (from `av1C`:
+  `high_bitdepth` / `twelve_bit` / `monochrome` / chroma subsampling)
+  and VP9 (from the first frame's uncompressed header, VP9 §6.2.2),
+  and for H.264 records without an SPS (`avc3`) from the
+  `AVCDecoderConfigurationRecord`'s high-profile `chroma_format` /
+  bit-depth fields (ISO/IEC 14496-15 §5.3.2.1.2).
+- Video streams declare `frame_rate` when every sample (bar the last
+  in decoding order) lasts the same, moov and fragment samples alike:
+  `timescale / duration`, reduced (30000/1001, 25/1, …).
 
 ### Changed
 

@@ -131,6 +131,12 @@ Sample-entry FourCCs resolve to these codec ids:
 - Codec-specific config records (`avcC`, `hvcC`, `av1C`, `vpcC`,
   `dfLa`, `dOps`, `dac3`, `dec3`, esds DSI) are forwarded as
   `extradata`.
+- Video stream parameters state what the decoder will emit:
+  `pixel_format` from `avcC` (SPS, or the record's high-profile fields
+  when it holds no SPS), `hvcC` and `av1C`, and for VP9 from the first
+  frame's uncompressed header; `width` / `height` reduced by the
+  H.264 / HEVC SPS cropping window; `frame_rate` when every sample
+  (the last aside) has the same duration.
 - Sample-table expansion: `stts`, `stsc`, `stsz`/`stz2`, `stco`/`co64`,
   `stss`. `next_packet` serves samples in file-offset order.
 - Fragmented MP4 (DASH / HLS / Smooth Streaming / CMAF): `mvex/trex`
