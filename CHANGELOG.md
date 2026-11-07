@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.10...v0.0.11) - 2026-10-25
+
+### Added
+
+- expose explicit fragmented muxer flush
+
+### Fixed
+
+- fixup for #19: let-chain for clippy's collapsible_if, #[non_exhaustive] ChunkPolicy
+- fixup for #18: edit list anchored on the first DTS, DTS decode deltas, repeat_n
+- fixup for #17: #[non_exhaustive] MovieHeader, field docs, CHANGELOG
+- fixup for #16: ftyp reads only its major brand, #[non_exhaustive] track-table records, CHANGELOG
+- fixup for #15: QTFF citation + CHANGELOG entry for the sample-description terminator
+- fixup for #14: ALAC sample format from the cookie's bitDepth, CHANGELOG
+- fixup for #13: counts at the reported rate, flat gapless_* keys, #[non_exhaustive] records
+- fixup for #11: channelConfiguration 11-14, Table 1.23 citation, fmt, CHANGELOG
+- fixup for #10: CHANGELOG + README entry for the explicit fragment flush
+- fixup for #8: edition-2024 import order, #[non_exhaustive] header-timestamp records
+
+### Other
+
+- pixel_format for AV1 (av1C) and VP9 (first frame), frame_rate from sample durations
+- a chunk ends where another track's sample follows it; ChunkPolicy::PacketBoundaries
+- composition time offsets (ctts, cslg) from packet timestamps
+- the movie header's rate, volume and matrix, and a track header's layer, alternate group, volume and matrix
+- track header fields, stored sample entries and the media-timeline sample table
+- a QuickTime video sample description's four-byte terminator
+- an ALAC track's channel count and rate come from its ALACSpecificConfig
+- gapless audio timing from iTunSMPB or an edit list with a roll group (draft for #12)
+- an AAC track's channel count comes from its AudioSpecificConfig
+- header creation/modification timestamps, read and write
+- edition 2024, MSRV 1.95
+- PCM audio: ISO/IEC 23003-5 ipcm / fpcm mux + demux, QuickTime PCM demux; SPS-cropped sizes
+- report HE-AAC at the ASC's SBR output rate when mp4a carries the core rate
+- AAC carriage: bare access units + synthesised esds ASC; mov demuxer alias; pre-roll edit list
+- declare the H.264 / HEVC picture layout from avcC / hvcC
+- README install snippet drops the retired oxideav-codec/oxideav-container crates
+- README examples use the current registry API
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Added
 
 - The muxer writes composition time offsets (`ctts`) from the packets'
