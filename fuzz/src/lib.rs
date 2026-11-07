@@ -309,7 +309,10 @@ impl MuxPlan {
             } else {
                 None
             };
-            let options = FragmentedOptions::default().with_cadence(cadence).with_styp(styp).with_emit_random_access_indexes(layout == 3);
+            let options = FragmentedOptions::default()
+                .with_cadence(cadence)
+                .with_styp(styp)
+                .with_emit_random_access_indexes(layout == 3);
 
             // Optional empty-time insert on track 0 — shifts every
             // later timestamp on that track, so drop the pts check.
@@ -349,8 +352,10 @@ impl MuxPlan {
         };
 
         let options = Mp4MuxerOptions::default()
-// fragmented goes through open_fragmented_typed
-.with_brand(brand).with_faststart(layout == 1).with_fragmented(None);
+            // fragmented goes through open_fragmented_typed
+            .with_brand(brand)
+            .with_faststart(layout == 1)
+            .with_fragmented(None);
 
         MuxPlan {
             tracks,
