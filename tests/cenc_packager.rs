@@ -51,12 +51,10 @@ fn audio_packet(stream: &StreamInfo, i: i64, data: Vec<u8>) -> Packet {
 }
 
 fn frag_opts(n: u32) -> FragmentedOptions {
-    FragmentedOptions {
-        cadence: FragmentCadence::EveryNPackets(n),
-        emit_random_access_indexes: false,
-        styp: None,
-        ..FragmentedOptions::default()
-    }
+    FragmentedOptions::default()
+        .with_cadence(FragmentCadence::EveryNPackets(n))
+        .with_emit_random_access_indexes(false)
+        .with_styp(None)
 }
 
 fn tenc_cenc_iv8() -> TencBox {
@@ -84,16 +82,9 @@ fn tenc_cbcs(constant_iv: Vec<u8>) -> TencBox {
 }
 
 fn options_for(scheme: [u8; 4], tenc: TencBox, frag: FragmentedOptions) -> Mp4MuxerOptions {
-    Mp4MuxerOptions {
-        fragmented: Some(frag),
-        track_protection: vec![TrackProtection {
-            stream_index: 0,
-            scheme_type: scheme,
-            scheme_version: 0x0001_0000,
-            tenc,
-        }],
-        ..Mp4MuxerOptions::default()
-    }
+    Mp4MuxerOptions::default()
+        .with_fragmented(Some(frag))
+        .with_track_protection(vec![TrackProtection::new(0, scheme, 0x0001_0000, tenc)])
 }
 
 fn new_packager(
@@ -427,10 +418,7 @@ fn missing_key_for_protected_stream_fails_at_new() {
 #[test]
 fn key_for_unprotected_stream_fails_at_new() {
     let stream = pcm_stream(0);
-    let options = Mp4MuxerOptions {
-        fragmented: Some(frag_opts(2)),
-        ..Mp4MuxerOptions::default()
-    };
+    let options = Mp4MuxerOptions::default().with_fragmented(Some(frag_opts(2)));
     let frag = options.fragmented.clone().unwrap();
     let ws: Box<dyn WriteSeek> = Box::new(std::io::Cursor::new(Vec::new()));
     let err = CencFragmentPackager::new(

@@ -19,6 +19,7 @@
 /// * [`Ismv`](BrandPreset::Ismv): `iso4` / `iso4 piff iso6 isml`
 /// * [`Custom`](BrandPreset::Custom): caller-supplied major + compatible list
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum BrandPreset {
     /// Standard MP4 — `major=mp42`, compatible=`isom mp42 mp41 iso2`.
     Mp4,
@@ -61,6 +62,7 @@ impl BrandPreset {
 /// In a true CMAF / DASH `init+seg*` workflow each `moof+mdat` becomes one
 /// addressable HTTP range; the cadence picks how big each one is.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum FragmentCadence {
     /// Flush whenever the running fragment duration of the *first* track
     /// (typically video) reaches `seconds`. Falls back to per-track total
@@ -96,6 +98,7 @@ pub enum FragmentCadence {
 /// matching ISO/IEC 14496-12 §8.8 (Movie Fragments) + §8.16 (sidx) + §8.8.10
 /// (mfra) + DASH-IF Interop guidelines for `styp` brands.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct FragmentedOptions {
     /// When to flush a fragment; see [`FragmentCadence`].
     pub cadence: FragmentCadence,
@@ -209,6 +212,56 @@ pub struct FragmentedOptions {
     pub write_mehd: bool,
 }
 
+impl FragmentedOptions {
+    /// Set `cadence`.
+    pub fn with_cadence(mut self, cadence: FragmentCadence) -> Self {
+        self.cadence = cadence;
+        self
+    }
+
+    /// Set `styp`.
+    pub fn with_styp(mut self, styp: Option<BrandPreset>) -> Self {
+        self.styp = styp;
+        self
+    }
+
+    /// Set `emit_random_access_indexes`.
+    pub fn with_emit_random_access_indexes(mut self, emit_random_access_indexes: bool) -> Self {
+        self.emit_random_access_indexes = emit_random_access_indexes;
+        self
+    }
+
+    /// Set `levels`.
+    pub fn with_levels(mut self, levels: Vec<crate::demux::LevaEntry>) -> Self {
+        self.levels = levels;
+        self
+    }
+
+    /// Set `emit_ssix`.
+    pub fn with_emit_ssix(mut self, emit_ssix: bool) -> Self {
+        self.emit_ssix = emit_ssix;
+        self
+    }
+
+    /// Set `ssix_levels`.
+    pub fn with_ssix_levels(mut self, ssix_levels: (u8, u8)) -> Self {
+        self.ssix_levels = ssix_levels;
+        self
+    }
+
+    /// Set `treps`.
+    pub fn with_treps(mut self, treps: Vec<crate::demux::TrepRecord>) -> Self {
+        self.treps = treps;
+        self
+    }
+
+    /// Set `write_mehd`.
+    pub fn with_write_mehd(mut self, write_mehd: bool) -> Self {
+        self.write_mehd = write_mehd;
+        self
+    }
+}
+
 impl Default for FragmentedOptions {
     fn default() -> Self {
         Self {
@@ -245,6 +298,7 @@ impl Default for FragmentedOptions {
 /// with a given `grouping_type` may exist per track"); a caller picks
 /// one form per `grouping_type` and never both.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct TrackSampleGroups {
     /// Index into the muxer's `streams` slice (the stream slot that
     /// owns these groups).
@@ -259,6 +313,32 @@ pub struct TrackSampleGroups {
     /// and they follow any `sbgp`. Use `csgp` *or* `sbgp` for a given
     /// `grouping_type`, never both.
     pub csgp: Vec<crate::sample_groups::CompactSampleToGroup>,
+}
+
+impl TrackSampleGroups {
+    /// Set `stream_index`.
+    pub fn with_stream_index(mut self, stream_index: usize) -> Self {
+        self.stream_index = stream_index;
+        self
+    }
+
+    /// Set `sbgp`.
+    pub fn with_sbgp(mut self, sbgp: Vec<crate::sample_groups::SampleToGroup>) -> Self {
+        self.sbgp = sbgp;
+        self
+    }
+
+    /// Set `sgpd`.
+    pub fn with_sgpd(mut self, sgpd: Vec<crate::sample_groups::SampleGroupDescription>) -> Self {
+        self.sgpd = sgpd;
+        self
+    }
+
+    /// Set `csgp`.
+    pub fn with_csgp(mut self, csgp: Vec<crate::sample_groups::CompactSampleToGroup>) -> Self {
+        self.csgp = csgp;
+        self
+    }
 }
 
 /// An explicit per-track edit list for the muxer (ISO/IEC 14496-12
@@ -282,12 +362,27 @@ pub struct TrackSampleGroups {
 /// movie timescale 1000) while `media_time` is in the track's media
 /// timescale.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct TrackEditList {
     /// Index into the muxer's `streams` slice (the stream slot that
     /// owns this edit list).
     pub stream_index: usize,
     /// The `elst` entries, emitted in order.
     pub entries: Vec<crate::demux::EditListEntry>,
+}
+
+impl TrackEditList {
+    /// Set `stream_index`.
+    pub fn with_stream_index(mut self, stream_index: usize) -> Self {
+        self.stream_index = stream_index;
+        self
+    }
+
+    /// Set `entries`.
+    pub fn with_entries(mut self, entries: Vec<crate::demux::EditListEntry>) -> Self {
+        self.entries = entries;
+        self
+    }
 }
 
 /// Per-track CENC protection signalling for the muxer (ISO/IEC
@@ -309,6 +404,7 @@ pub struct TrackEditList {
 /// pair) and carries the per-sample IVs / subsample maps through its
 /// own `senc` / `saiz` / `saio` channel.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TrackProtection {
     /// Index into the muxer's `streams` slice (the stream to protect).
     pub stream_index: usize,
@@ -325,6 +421,47 @@ pub struct TrackProtection {
     /// pins the `tenc` version; pattern schemes need a non-zero
     /// pattern pair) — violations fail at `open`.
     pub tenc: crate::cenc::TencBox,
+}
+
+impl TrackProtection {
+    /// Build a record from its mandatory fields.
+    pub fn new(
+        stream_index: usize,
+        scheme_type: [u8; 4],
+        scheme_version: u32,
+        tenc: crate::cenc::TencBox,
+    ) -> Self {
+        Self {
+            stream_index,
+            scheme_type,
+            scheme_version,
+            tenc,
+        }
+    }
+
+    /// Set `stream_index`.
+    pub fn with_stream_index(mut self, stream_index: usize) -> Self {
+        self.stream_index = stream_index;
+        self
+    }
+
+    /// Set `scheme_type`.
+    pub fn with_scheme_type(mut self, scheme_type: [u8; 4]) -> Self {
+        self.scheme_type = scheme_type;
+        self
+    }
+
+    /// Set `scheme_version`.
+    pub fn with_scheme_version(mut self, scheme_version: u32) -> Self {
+        self.scheme_version = scheme_version;
+        self
+    }
+
+    /// Set `tenc`.
+    pub fn with_tenc(mut self, tenc: crate::cenc::TencBox) -> Self {
+        self.tenc = tenc;
+        self
+    }
 }
 
 /// Seconds between the ISO/IEC 14496-12 epoch (1904-01-01 00:00:00 UTC,
@@ -478,6 +615,7 @@ pub enum ChunkPolicy {
 /// Call [`Mp4MuxerOptions::default`] for the historical behavior of the
 /// plain `"mp4"` registry entry (major=`mp42`, no faststart, no fragmentation).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Mp4MuxerOptions {
     /// `ftyp` brand preset written at the beginning of the file.
     pub brand: BrandPreset,
@@ -594,6 +732,89 @@ pub struct Mp4MuxerOptions {
     pub pssh: Vec<crate::cenc::PsshBox>,
     /// How samples are grouped into chunks (non-fragmented output).
     pub chunking: ChunkPolicy,
+}
+
+impl Mp4MuxerOptions {
+    /// Set `brand`.
+    pub fn with_brand(mut self, brand: BrandPreset) -> Self {
+        self.brand = brand;
+        self
+    }
+
+    /// Set `faststart`.
+    pub fn with_faststart(mut self, faststart: bool) -> Self {
+        self.faststart = faststart;
+        self
+    }
+
+    /// Set `fragmented`.
+    pub fn with_fragmented(mut self, fragmented: Option<FragmentedOptions>) -> Self {
+        self.fragmented = fragmented;
+        self
+    }
+
+    /// Set `write_edit_list`.
+    pub fn with_write_edit_list(mut self, write_edit_list: bool) -> Self {
+        self.write_edit_list = write_edit_list;
+        self
+    }
+
+    /// Set `track_sample_groups`.
+    pub fn with_track_sample_groups(mut self, track_sample_groups: Vec<TrackSampleGroups>) -> Self {
+        self.track_sample_groups = track_sample_groups;
+        self
+    }
+
+    /// Set `track_edit_lists`.
+    pub fn with_track_edit_lists(mut self, track_edit_lists: Vec<TrackEditList>) -> Self {
+        self.track_edit_lists = track_edit_lists;
+        self
+    }
+
+    /// Set `large_mdat`.
+    pub fn with_large_mdat(mut self, large_mdat: bool) -> Self {
+        self.large_mdat = large_mdat;
+        self
+    }
+
+    /// Set `track_protection`.
+    pub fn with_track_protection(mut self, track_protection: Vec<TrackProtection>) -> Self {
+        self.track_protection = track_protection;
+        self
+    }
+
+    /// Set `creation_time`.
+    pub fn with_creation_time(mut self, creation_time: Option<u64>) -> Self {
+        self.creation_time = creation_time;
+        self
+    }
+
+    /// Set `modification_time`.
+    pub fn with_modification_time(mut self, modification_time: Option<u64>) -> Self {
+        self.modification_time = modification_time;
+        self
+    }
+
+    /// Set `track_header_timestamps`.
+    pub fn with_track_header_timestamps(
+        mut self,
+        track_header_timestamps: Vec<TrackHeaderTimestamps>,
+    ) -> Self {
+        self.track_header_timestamps = track_header_timestamps;
+        self
+    }
+
+    /// Set `pssh`.
+    pub fn with_pssh(mut self, pssh: Vec<crate::cenc::PsshBox>) -> Self {
+        self.pssh = pssh;
+        self
+    }
+
+    /// Set `chunking`.
+    pub fn with_chunking(mut self, chunking: ChunkPolicy) -> Self {
+        self.chunking = chunking;
+        self
+    }
 }
 
 impl Default for Mp4MuxerOptions {

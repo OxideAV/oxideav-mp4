@@ -145,33 +145,30 @@ fn write_fragmented_segment_with_styp_overrides_one_segment() {
     //   - first  segment: default styp(msdh,  [msdh, msix])
     //   - second segment: overridden styp(cmfs, [cmfs, cmff])
     //   - third  segment: default styp again (override consumed on use)
-    let opts = Mp4MuxerOptions {
-        brand: BrandPreset::Custom {
+    let opts = Mp4MuxerOptions::default()
+        .with_brand(BrandPreset::Custom {
             major: *b"iso6",
             compatible: vec![*b"iso6", *b"dash"],
-        },
-        faststart: false,
-        fragmented: None,
-        write_edit_list: true,
-        track_sample_groups: Vec::new(),
-        large_mdat: false,
-        ..Mp4MuxerOptions::default()
-    };
-    let frag_opts = FragmentedOptions {
-        cadence: FragmentCadence::EveryNPackets(1),
-        styp: Some(BrandPreset::Custom {
+        })
+        .with_faststart(false)
+        .with_fragmented(None)
+        .with_write_edit_list(true)
+        .with_track_sample_groups(Vec::new())
+        .with_large_mdat(false);
+    let frag_opts = FragmentedOptions::default()
+        .with_cadence(FragmentCadence::EveryNPackets(1))
+        .with_styp(Some(BrandPreset::Custom {
             major: *b"msdh",
             compatible: vec![*b"msdh", *b"msix"],
-        }),
+        }))
         // Disable sidx to keep the per-segment byte layout simple:
         // each segment is just `styp + moof + mdat`.
-        emit_random_access_indexes: false,
-        levels: Vec::new(),
-        emit_ssix: false,
-        ssix_levels: (1, 2),
-        treps: Vec::new(),
-        write_mehd: false,
-    };
+        .with_emit_random_access_indexes(false)
+        .with_levels(Vec::new())
+        .with_emit_ssix(false)
+        .with_ssix_levels((1, 2))
+        .with_treps(Vec::new())
+        .with_write_mehd(false);
     let path = std::env::temp_dir().join("oxideav-mp4-r127-styp-override.mp4");
     {
         let f = std::fs::File::create(&path).unwrap();
@@ -235,28 +232,25 @@ fn write_fragmented_segment_with_styp_emits_styp_when_preset_is_none() {
     // Configure with `frag_options.styp = None` (no per-segment styp by
     // default) but explicitly request one for the first segment via the
     // override. Exactly one styp must appear in the file.
-    let opts = Mp4MuxerOptions {
-        brand: BrandPreset::Custom {
+    let opts = Mp4MuxerOptions::default()
+        .with_brand(BrandPreset::Custom {
             major: *b"iso6",
             compatible: vec![*b"iso6", *b"dash"],
-        },
-        faststart: false,
-        fragmented: None,
-        write_edit_list: true,
-        track_sample_groups: Vec::new(),
-        large_mdat: false,
-        ..Mp4MuxerOptions::default()
-    };
-    let frag_opts = FragmentedOptions {
-        cadence: FragmentCadence::EveryNPackets(1),
-        styp: None,
-        emit_random_access_indexes: false,
-        levels: Vec::new(),
-        emit_ssix: false,
-        ssix_levels: (1, 2),
-        treps: Vec::new(),
-        write_mehd: false,
-    };
+        })
+        .with_faststart(false)
+        .with_fragmented(None)
+        .with_write_edit_list(true)
+        .with_track_sample_groups(Vec::new())
+        .with_large_mdat(false);
+    let frag_opts = FragmentedOptions::default()
+        .with_cadence(FragmentCadence::EveryNPackets(1))
+        .with_styp(None)
+        .with_emit_random_access_indexes(false)
+        .with_levels(Vec::new())
+        .with_emit_ssix(false)
+        .with_ssix_levels((1, 2))
+        .with_treps(Vec::new())
+        .with_write_mehd(false);
     let (mut mux, path) =
         open_to_tempfile("oxideav-mp4-r127-styp-preset-none.mp4", opts, frag_opts);
     mux.write_header().unwrap();
@@ -292,28 +286,25 @@ fn write_fragmented_segment_with_styp_precedes_moof() {
     // Per §8.16.2 "Valid segment type boxes shall be the first box in a
     // segment". For the override flow that means: the override styp must
     // appear immediately before the segment's moof, not after it.
-    let opts = Mp4MuxerOptions {
-        brand: BrandPreset::Custom {
+    let opts = Mp4MuxerOptions::default()
+        .with_brand(BrandPreset::Custom {
             major: *b"iso6",
             compatible: vec![*b"iso6", *b"dash"],
-        },
-        faststart: false,
-        fragmented: None,
-        write_edit_list: true,
-        track_sample_groups: Vec::new(),
-        large_mdat: false,
-        ..Mp4MuxerOptions::default()
-    };
-    let frag_opts = FragmentedOptions {
-        cadence: FragmentCadence::EveryNPackets(1),
-        styp: None,
-        emit_random_access_indexes: false,
-        levels: Vec::new(),
-        emit_ssix: false,
-        ssix_levels: (1, 2),
-        treps: Vec::new(),
-        write_mehd: false,
-    };
+        })
+        .with_faststart(false)
+        .with_fragmented(None)
+        .with_write_edit_list(true)
+        .with_track_sample_groups(Vec::new())
+        .with_large_mdat(false);
+    let frag_opts = FragmentedOptions::default()
+        .with_cadence(FragmentCadence::EveryNPackets(1))
+        .with_styp(None)
+        .with_emit_random_access_indexes(false)
+        .with_levels(Vec::new())
+        .with_emit_ssix(false)
+        .with_ssix_levels((1, 2))
+        .with_treps(Vec::new())
+        .with_write_mehd(false);
     let (mut mux, path) =
         open_to_tempfile("oxideav-mp4-r127-styp-precedes-moof.mp4", opts, frag_opts);
     mux.write_header().unwrap();
@@ -355,28 +346,25 @@ fn write_fragmented_segment_with_styp_empty_compat_emits_sixteen_bytes() {
     // Override with an empty compat list — the emitted box body is just
     // the 8-byte (major + minor), so the total box is exactly 16 bytes.
     // Per §4.3 (inherited by §8.16.2) this is a legal styp.
-    let opts = Mp4MuxerOptions {
-        brand: BrandPreset::Custom {
+    let opts = Mp4MuxerOptions::default()
+        .with_brand(BrandPreset::Custom {
             major: *b"iso6",
             compatible: vec![*b"iso6"],
-        },
-        faststart: false,
-        fragmented: None,
-        write_edit_list: true,
-        track_sample_groups: Vec::new(),
-        large_mdat: false,
-        ..Mp4MuxerOptions::default()
-    };
-    let frag_opts = FragmentedOptions {
-        cadence: FragmentCadence::EveryNPackets(1),
-        styp: None,
-        emit_random_access_indexes: false,
-        levels: Vec::new(),
-        emit_ssix: false,
-        ssix_levels: (1, 2),
-        treps: Vec::new(),
-        write_mehd: false,
-    };
+        })
+        .with_faststart(false)
+        .with_fragmented(None)
+        .with_write_edit_list(true)
+        .with_track_sample_groups(Vec::new())
+        .with_large_mdat(false);
+    let frag_opts = FragmentedOptions::default()
+        .with_cadence(FragmentCadence::EveryNPackets(1))
+        .with_styp(None)
+        .with_emit_random_access_indexes(false)
+        .with_levels(Vec::new())
+        .with_emit_ssix(false)
+        .with_ssix_levels((1, 2))
+        .with_treps(Vec::new())
+        .with_write_mehd(false);
     let (mut mux, path) =
         open_to_tempfile("oxideav-mp4-r127-styp-empty-compat.mp4", opts, frag_opts);
     mux.write_header().unwrap();

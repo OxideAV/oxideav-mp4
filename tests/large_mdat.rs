@@ -51,15 +51,13 @@ fn make_packets(n: usize, frames: i64) -> Vec<Packet> {
 }
 
 fn base_opts() -> Mp4MuxerOptions {
-    Mp4MuxerOptions {
-        brand: BrandPreset::Mp4,
-        faststart: false,
-        fragmented: None,
-        write_edit_list: true,
-        track_sample_groups: Vec::new(),
-        large_mdat: true,
-        ..Mp4MuxerOptions::default()
-    }
+    Mp4MuxerOptions::default()
+        .with_brand(BrandPreset::Mp4)
+        .with_faststart(false)
+        .with_fragmented(None)
+        .with_write_edit_list(true)
+        .with_track_sample_groups(Vec::new())
+        .with_large_mdat(true)
 }
 
 /// Find the top-level `mdat` box header and return

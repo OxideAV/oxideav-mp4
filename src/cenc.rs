@@ -78,6 +78,7 @@ use oxideav_core::{Error, Result};
 /// dedicated accessors so the caller does not have to re-read the
 /// FourCC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CencScheme {
     /// `cenc` — AES-CTR full-sample or video-NAL subsample encryption
     /// (§10.1). Counter mode. No pattern. Mandatory to support per
@@ -182,6 +183,7 @@ impl CencScheme {
 /// constant-IV vs no-IV configuration) so that a caller with a key
 /// blob in hand has a single typed value to switch on.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CencSchemeDecision {
     /// The parsed `scheme_type` from `sinf/schm`.
     pub scheme: CencScheme,
@@ -202,6 +204,7 @@ pub struct CencSchemeDecision {
 ///   `seig` group entry); no per-sample IV bytes are stored.
 /// * **None** (`isProtected == 0`) — the sample is unprotected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IvSupply {
     /// Per-sample IV stored on the wire; width is 8 or 16 bytes.
     PerSample { size: u8 },
@@ -1631,6 +1634,7 @@ pub enum CipherStepKind {
 /// list + sample length). The executing AES layer is
 /// [`crate::cenc_cipher::decrypt_steps_in_place`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CipherStep {
     /// Byte offset from the start of the sample payload.
     pub offset: u64,

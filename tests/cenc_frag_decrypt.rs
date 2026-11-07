@@ -46,25 +46,16 @@ fn plaintext(i: usize, len: usize) -> Vec<u8> {
 }
 
 fn frag_options() -> FragmentedOptions {
-    FragmentedOptions {
-        cadence: FragmentCadence::EveryNPackets(2),
-        emit_random_access_indexes: false,
-        styp: None,
-        ..FragmentedOptions::default()
-    }
+    FragmentedOptions::default()
+        .with_cadence(FragmentCadence::EveryNPackets(2))
+        .with_emit_random_access_indexes(false)
+        .with_styp(None)
 }
 
 fn mux_options(scheme: [u8; 4], tenc: TencBox) -> Mp4MuxerOptions {
-    Mp4MuxerOptions {
-        fragmented: Some(frag_options()),
-        track_protection: vec![TrackProtection {
-            stream_index: 0,
-            scheme_type: scheme,
-            scheme_version: 0x0001_0000,
-            tenc,
-        }],
-        ..Mp4MuxerOptions::default()
-    }
+    Mp4MuxerOptions::default()
+        .with_fragmented(Some(frag_options()))
+        .with_track_protection(vec![TrackProtection::new(0, scheme, 0x0001_0000, tenc)])
 }
 
 /// Package `plaintexts` under `(scheme, tenc)` — encrypting each sample

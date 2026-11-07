@@ -42,12 +42,10 @@ fn open_muxer(path: &std::path::Path) -> oxideav_mp4::frag::FragmentedMuxer {
     let file = std::fs::File::create(path).unwrap();
     let output: Box<dyn WriteSeek> = Box::new(file);
     let options = Mp4MuxerOptions::default();
-    let fragment_options = FragmentedOptions {
-        cadence: FragmentCadence::EverySeconds(1000.0),
-        styp: None,
-        emit_random_access_indexes: false,
-        ..FragmentedOptions::default()
-    };
+    let fragment_options = FragmentedOptions::default()
+        .with_cadence(FragmentCadence::EverySeconds(1000.0))
+        .with_styp(None)
+        .with_emit_random_access_indexes(false);
     open_fragmented_typed(output, &[pcm_stream()], options, fragment_options).unwrap()
 }
 

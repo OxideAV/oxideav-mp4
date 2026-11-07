@@ -974,6 +974,7 @@ struct MoofRecord {
 /// and a SAP-type flag (we keep the sync-bit surface but only use the
 /// "starts-with-SAP" marker).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SidxRecord {
     /// `reference_ID` — usually a `tkhd.track_ID` for a single-track
     /// segment, or a hierarchical index ID for nested sidx.
@@ -994,6 +995,7 @@ pub struct SidxRecord {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct SidxReference {
     /// True when this reference points to another `sidx` (hierarchical
     /// index), false when it points to the actual media subsegment.
@@ -1058,12 +1060,14 @@ pub struct SsixRange {
 /// table of moof byte offsets keyed by presentation time. One entry per
 /// random-access point in the track.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TfraRecord {
     pub track_id: u32,
     pub entries: Vec<TfraEntry>,
 }
 
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct TfraEntry {
     /// Decoding time of the random-access sample in the track's media
     /// timescale (NOT the movie timescale).
@@ -1088,6 +1092,7 @@ pub struct TfraEntry {
 /// so a low-latency DASH/CMAF live consumer can match production
 /// wall-clock to media presentation time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrftRecord {
     /// `track_ID` of the reference track whose `media_time` this box
     /// annotates (§8.16.5.3 reference_track_ID).
@@ -1158,6 +1163,7 @@ impl PrftRecord {
 /// message and the ISO/IEC 23091-3 (CICP) ambient-viewing-environment
 /// parameters. The body is a fixed 8 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AmveRecord {
     /// Environmental illuminance of the ambient viewing environment, in
     /// units of 0.0001 lux (i.e. `lux = ambient_illuminance / 10000`).
@@ -1188,6 +1194,7 @@ pub struct AmveRecord {
 /// that do not carry an `esds` (e.g. `avc1` / `hvc1` / `av01` video,
 /// `Opus` / `fLaC` audio).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BtrtRecord {
     /// Size of the decoding buffer for the elementary stream, in bytes
     /// (§8.5.2.3 `bufferSizeDB`).
@@ -1242,6 +1249,7 @@ pub struct ClapRecord {
 /// `colour_type`; the payload that follows depends on it. The three
 /// base-spec types are modelled; an unknown type keeps the raw payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColrRecord {
     /// `nclx` (§12.1.5.2) — on-screen colours: `colour_primaries`,
     /// `transfer_characteristics`, `matrix_coefficients` (each a
@@ -1332,6 +1340,7 @@ impl StviRecord {
 /// verbatim — neither is bounded by the spec other than its 32-bit
 /// width, so the structure preserves whatever the producer wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PdinEntry {
     /// Effective download rate in bytes / second.
     pub rate: u32,
@@ -1351,6 +1360,7 @@ pub struct PdinEntry {
 /// Quantity is zero or one per file (§8.1.3.1); the demuxer collects
 /// the first instance and ignores any subsequent ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PdinRecord {
     /// Pairs in file order, mirroring §8.1.3.2's loop ordering.
     /// A consumer searching by rate should sort if a non-monotonic
@@ -1370,6 +1380,7 @@ pub struct PdinRecord {
 /// atom_index` (which atom of that type to use, typically 1) — twelve
 /// bytes. All integers big-endian.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PnotRecord {
     /// The date the preview was last updated, in Macintosh format
     /// (seconds since 1904-01-01).
@@ -1449,6 +1460,7 @@ pub struct LevaEntry {
 /// copies (a malformed file with two leva boxes is no reason to abort
 /// the parse — the first is the one the spec endorses).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LevaRecord {
     /// Entries in file order, mirroring §8.8.13.2's loop ordering.
     /// The §8.8.13.3 sequence rule on `assignment_type` ordering is
@@ -2117,6 +2129,7 @@ struct SdtpEntry {
 
 /// Parsed `sbgp` (SampleToGroupBox, ISO/IEC 14496-12 §8.9.2).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct SbgpBox {
     /// Four-byte grouping type identifying which `sgpd` (same type) this
     /// box indexes — e.g. `rap `, `roll`, `sync`, `tele`, `alst`.
@@ -2134,6 +2147,7 @@ pub struct SbgpBox {
 
 /// Parsed `sgpd` (SampleGroupDescriptionBox, ISO/IEC 14496-12 §8.9.3).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct SgpdBox {
     /// Four-byte grouping type linking this description table to the
     /// `sbgp` of the same type.
@@ -2153,6 +2167,7 @@ pub struct SgpdBox {
 /// `pattern_length` per-sample `sample_group_description_index` values,
 /// replicated across `sample_count` consecutive groups of that length.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct CsgpPattern {
     /// `sample_count[i]` — number of consecutive groups (each
     /// `pattern_length` samples long) that replay this pattern. The
@@ -2169,6 +2184,7 @@ pub struct CsgpPattern {
 
 /// Parsed `csgp` (CompactSampleToGroupBox, ISO/IEC 14496-12:2020 §8.9.5).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct CsgpBox {
     /// Four-byte grouping type linking this box to the `sgpd` of the
     /// same type — identical role to `sbgp.grouping_type`.
@@ -2204,6 +2220,7 @@ pub struct CsgpBox {
 /// [`CsgpBox::index_msb_indicates_fragment_local_description`] flag is
 /// set: the source-selector MSB has been split off from the index value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CsgpResolvedIndex {
     /// `true` when the field's MSB was set: the index refers to a
     /// description in the **fragment-local** `sgpd` (inside the enclosing
@@ -2340,6 +2357,7 @@ impl CsgpBox {
 /// `subsample_size` field is 16-bit at version 0 and widens to 32-bit at
 /// version 1; we always store as `u32` so callers handle one shape.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubSampleEntry {
     /// §8.7.7.3 — size in bytes of the sub-sample.
     pub subsample_size: u32,
@@ -2360,6 +2378,7 @@ pub struct SubSampleEntry {
 /// sample's sub-sample table together with the sparse delta that
 /// addresses it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubsEntry {
     /// §8.7.7.3 — sample-number delta from the previous entry's sample
     /// (or from sample 0 for the first entry). The decoded absolute
@@ -2385,6 +2404,7 @@ pub struct SubsEntry {
 /// We preserve both as-recorded so codec-specific consumers can pick
 /// the table whose semantics they understand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubsBox {
     /// FullBox version (0 or 1) — determines `subsample_size` width on
     /// disk. We normalise to `u32` in `SubSampleEntry::subsample_size`.
@@ -2419,6 +2439,7 @@ pub struct SubsBox {
 /// permits `sample_count` < total stsz/stz2 count — auxiliary info
 /// supplied for the initial samples only) is preserved verbatim.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SaizBox {
     /// §8.7.8.3 `aux_info_type` — present only when `flags & 1` is set.
     pub aux_info_type: Option<[u8; 4]>,
@@ -2455,6 +2476,7 @@ pub struct SaizBox {
 /// so a producer round-tripping back to disk can re-emit the same
 /// width.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SaioBox {
     /// FullBox version (0 or 1) — selects 32-bit / 64-bit on-disk
     /// offset width. Preserved so a round-trip can match the original
@@ -2553,6 +2575,7 @@ struct HmhdBox {
 /// `int(16) balance`, and a reserved `unsigned int(16)` — twelve payload
 /// bytes after the preamble, sixteen total. All integers big-endian.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GminBox {
     /// The transfer (composition) mode for the base media, selecting the
     /// operation performed when drawing or transferring an image from one
@@ -2581,6 +2604,7 @@ pub struct GminBox {
 /// length byte followed by that many characters). All integers
 /// big-endian.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TcmiBox {
     /// The font id to use for the timecode text. `0` selects the system
     /// font; when `font_name` is a valid name this field is ignored.
@@ -2612,6 +2636,7 @@ pub struct TcmiBox {
 /// as 24 bits alongside an optional source-reference `udta`; this record
 /// captures the fixed numeric fields). All integers big-endian.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TmcdSampleEntry {
     /// Timecode characteristics: Drop-frame (`0x0001`), 24-hour-max
     /// (`0x0002`), Negative-times-OK (`0x0004`), and Counter (`0x0008`).
@@ -2657,6 +2682,7 @@ impl TmcdSampleEntry {
 /// reserved `int(16)`, a 48-bit `foreground_color`, and a Pascal-string
 /// `text_name` (the font name). All integers big-endian.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TextSampleEntry {
     /// Flags describing how the text is drawn (Don't-auto-scale `0x0002`,
     /// Use-movie-background-color `0x0008`, Scroll-in `0x0020`,
@@ -2692,6 +2718,7 @@ pub struct TextSampleEntry {
 /// preload_flags`, `int(32) default_hints` — sixteen bytes. Times are in
 /// the movie's time coordinate system. All integers big-endian.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LoadSettingsBox {
     /// Start time, in the movie timescale, of a track segment to preload.
     pub preload_start_time: i32,
@@ -3688,6 +3715,7 @@ pub struct ItemInfoEntry {
 
 /// Decoded `iinf` (ItemInfoBox, ISO/IEC 14496-12 §8.11.6).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct IinfBox {
     /// One entry per `infe` child, in file order (the spec sorts by
     /// increasing `item_ID`, but the demuxer preserves wire order).
@@ -3725,6 +3753,7 @@ pub struct IrefBox {
 /// [`ItemProperty::Other`] so its index slot and bytes survive a
 /// parse→build round-trip.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ItemProperty {
     /// `ispe` ImageSpatialExtentsProperty (§6.5.3) — the reconstructed
     /// image `(width, height)` in pixels.
@@ -3933,6 +3962,7 @@ impl EntityGroups {
 /// A `meta` box's item infrastructure (ISO/IEC 14496-12 §8.11),
 /// collected together. Any of the four child boxes may be absent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MetaItems {
     /// `pitm` (§8.11.4) — the primary item's ID, if a `pitm` is present.
     pub primary_item_id: Option<u32>,
@@ -3976,6 +4006,7 @@ pub struct MetaItems {
 /// absolute file offset; for `construction_method == 1` (idat) it is an
 /// offset into the `meta` box's `idat` buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ItemByteRange {
     /// Start offset (from the data origin selected by the construction
     /// method). `base_offset + extent_offset`.
@@ -5488,6 +5519,7 @@ pub fn build_grpl_box(g: &EntityGroups) -> Vec<u8> {
 /// same-level `meta` boxes by their `hdlr` handler types and records the
 /// relation between them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MereRelation {
     /// The first related `meta` box's handler type (§8.4.3), verbatim.
     pub first_metabox_handler_type: [u8; 4],
@@ -5507,6 +5539,7 @@ pub struct MereRelation {
 /// infrastructure they carry); a `meco`-resident `meta` is required to
 /// carry a primary item / primary data box (§8.11.7.1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MecoBox {
     /// The additional `meta` boxes, in file order. Each must have a
     /// handler type distinct from the primary `meta` and from each other
@@ -10141,6 +10174,7 @@ fn parse_co64(body: &[u8]) -> Result<Vec<u64>> {
 /// 0-based index into the demuxer's `streams()`; `senc` carries the
 /// payload exactly as parsed.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SencRecord {
     /// `track_idx` of the matching stream in the demuxer's
     /// `streams()` list (0-based).
@@ -10169,6 +10203,7 @@ pub struct SencRecord {
 /// packager) surfaces the 4CC box in `senc_records` and the `uuid` box
 /// here only — no duplicate.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PiffSencRecord {
     /// `track_idx` of the matching stream in the demuxer's
     /// `streams()` list (0-based).
@@ -10252,6 +10287,7 @@ fn parse_aux_info_run(buf: &[u8], sizes: &[usize], iv_size: usize) -> Option<cra
 /// `frag_empty_duration_<n>` metadata and typed via
 /// [`Mp4Demuxer::empty_duration_records`].
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct EmptyDurationRecord {
     /// `track_idx` of the matching stream in the demuxer's
     /// `streams()` list (0-based).
@@ -10275,6 +10311,7 @@ pub struct EmptyDurationRecord {
 /// re-parsing the file. `aux_info_type` semantics determine pairing;
 /// the demuxer does not interpret the bytes the offsets point at.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SaiRecord {
     /// `track_idx` of the matching stream in the demuxer's
     /// `streams()` list (0-based).
@@ -10309,6 +10346,7 @@ pub struct SaiRecord {
 /// difference is that the matching `saio.offset[]` is base_data_offset
 /// relative (per §8.8.14) rather than absolute.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct TrafSaiz {
     /// §8.7.8.3 — `aux_info_type` (present only when `flags & 1`).
     pub aux_info_type: Option<[u8; 4]>,
@@ -10330,6 +10368,7 @@ pub struct TrafSaiz {
 /// established for this traf (or the `moof` start when
 /// `default-base-is-moof` is set, per §8.8.14).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct TrafSaio {
     /// FullBox version.
     pub version: u8,
@@ -10353,6 +10392,7 @@ pub struct TrafSaio {
 /// `pssh` carries the parsed PsshBox; `moof_sequence` is the
 /// `mfhd.sequence_number` of the enclosing `moof`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct MoofPsshRecord {
     /// `mfhd.sequence_number` of the enclosing `moof`. Surfaced so a
     /// decrypting layer can scope SystemID matches to the right
@@ -10381,6 +10421,7 @@ pub struct MoofPsshRecord {
 /// the grouping-type semantics belong to the caller (mirroring the
 /// `stbl`-level surface).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TrafSampleGroupRecord {
     /// `track_idx` of the matching stream in the demuxer's `streams()`
     /// list (0-based).

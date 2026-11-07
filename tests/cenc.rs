@@ -207,21 +207,19 @@ fn protected_mux_demux_decrypt_round_trip() {
     }
 
     let stream = pcm_stream();
-    let options = Mp4MuxerOptions {
-        track_protection: vec![TrackProtection {
-            stream_index: 0,
-            scheme_type: *b"cenc",
-            scheme_version: 0x0001_0000,
-            tenc: tenc.clone(),
-        }],
-        pssh: vec![PsshBox {
+    let options = Mp4MuxerOptions::default()
+        .with_track_protection(vec![TrackProtection::new(
+            0,
+            *b"cenc",
+            0x0001_0000,
+            tenc.clone(),
+        )])
+        .with_pssh(vec![PsshBox {
             version: 1,
             system_id: [0xEE; 16],
             kids: vec![kid],
             data: vec![0xD0, 0xD1, 0xD2],
-        }],
-        ..Mp4MuxerOptions::default()
-    };
+        }]);
     let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-mux-roundtrip.mp4");
     {
         let f = std::fs::File::create(&tmp).unwrap();
@@ -287,22 +285,20 @@ fn protected_mux_demux_decrypt_round_trip() {
 fn protected_fragmented_init_segment_surfaces_protection() {
     let kid: [u8; 16] = [0x33; 16];
     let stream = pcm_stream();
-    let options = Mp4MuxerOptions {
-        fragmented: Some(oxideav_mp4::FragmentedOptions::default()),
-        track_protection: vec![TrackProtection {
-            stream_index: 0,
-            scheme_type: *b"cenc",
-            scheme_version: 0x0001_0000,
-            tenc: cenc_tenc(kid),
-        }],
-        pssh: vec![PsshBox {
+    let options = Mp4MuxerOptions::default()
+        .with_fragmented(Some(oxideav_mp4::FragmentedOptions::default()))
+        .with_track_protection(vec![TrackProtection::new(
+            0,
+            *b"cenc",
+            0x0001_0000,
+            cenc_tenc(kid),
+        )])
+        .with_pssh(vec![PsshBox {
             version: 0,
             system_id: [0xAB; 16],
             kids: Vec::new(),
             data: vec![1, 2, 3, 4],
-        }],
-        ..Mp4MuxerOptions::default()
-    };
+        }]);
     let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-init.mp4");
     {
         let f = std::fs::File::create(&tmp).unwrap();
@@ -346,15 +342,12 @@ fn incoherent_protection_fails_at_open() {
     let stream = pcm_stream();
     // cbcs pins tenc v1 + pattern + constant IV; a v0 per-sample tenc
     // must be rejected.
-    let options = Mp4MuxerOptions {
-        track_protection: vec![TrackProtection {
-            stream_index: 0,
-            scheme_type: *b"cbcs",
-            scheme_version: 0x0001_0000,
-            tenc: cenc_tenc([0; 16]),
-        }],
-        ..Mp4MuxerOptions::default()
-    };
+    let options = Mp4MuxerOptions::default().with_track_protection(vec![TrackProtection::new(
+        0,
+        *b"cbcs",
+        0x0001_0000,
+        cenc_tenc([0; 16]),
+    )]);
     let ws: Box<dyn WriteSeek> = Box::new(std::io::Cursor::new(Vec::new()));
     assert!(
         oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), options).is_err()
@@ -369,15 +362,10 @@ fn incoherent_protection_fails_at_open() {
 fn moof_level_pssh_scopes_to_its_fragment() {
     use oxideav_core::Muxer;
     let stream = pcm_stream();
-    let frag_opts = oxideav_mp4::FragmentedOptions {
-        cadence: oxideav_mp4::FragmentCadence::EveryNPackets(2),
-        emit_random_access_indexes: false,
-        ..oxideav_mp4::FragmentedOptions::default()
-    };
-    let options = Mp4MuxerOptions {
-        fragmented: Some(frag_opts.clone()),
-        ..Mp4MuxerOptions::default()
-    };
+    let frag_opts = oxideav_mp4::FragmentedOptions::default()
+        .with_cadence(oxideav_mp4::FragmentCadence::EveryNPackets(2))
+        .with_emit_random_access_indexes(false);
+    let options = Mp4MuxerOptions::default().with_fragmented(Some(frag_opts.clone()));
     let tmp = std::env::temp_dir().join("oxideav-mp4-moof-pssh.mp4");
     {
         let f = std::fs::File::create(&tmp).unwrap();

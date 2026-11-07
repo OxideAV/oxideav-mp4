@@ -48,6 +48,7 @@ use crate::boxes::*;
 /// §9.1.2.1) plus the verbatim trailing `SchemeTypeBox` +
 /// `SchemeInformationBox` bytes (kept opaque so the box round-trips).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SrppBox {
     /// FullBox version (carried verbatim; the spec leaves it open).
     pub version: u8,
@@ -69,6 +70,7 @@ pub struct SrppBox {
 /// §9.1.2 / §9.4.1.2). The `format` FourCC distinguishes `rtp `, `srtp`,
 /// and `rrtp`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RtpHintSampleEntry {
     /// The sample-entry FourCC: `rtp ` (server), `srtp` (secure), or
     /// `rrtp` (reception).
@@ -258,6 +260,7 @@ pub fn build_rtp_hint_sample_entry(e: &RtpHintSampleEntry) -> Vec<u8> {
 /// packet byte counts and a precomputed-only flag to the common hint
 /// sample-entry preamble.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mpeg2TsHintSampleEntry {
     /// The sample-entry FourCC: `sm2t` (server) or `rm2t` (reception).
     pub format: [u8; 4],
@@ -337,6 +340,7 @@ pub fn build_mpeg2ts_hint_sample_entry(e: &Mpeg2TsHintSampleEntry) -> Vec<u8> {
 /// §9.1.5): the maximum bytes sent in any `period`-millisecond window.
 /// `hinf` may carry several `maxr` boxes for different periods.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MaxRate {
     /// Window length in milliseconds.
     pub period: u32,
@@ -348,6 +352,7 @@ pub struct MaxRate {
 /// A `payt` (payload ID) entry of a `hinf` (§9.1.5): the RTP payload ID
 /// and its `rtpmap` string.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PayloadId {
     /// Payload ID used in the RTP packets.
     pub payload_id: u32,
@@ -363,6 +368,7 @@ pub struct PayloadId {
 /// rtpmap entries). Every field is `None` / empty when its sub-box was
 /// absent — "not all these sub-boxes may be present" (§9.1.5).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HintStatistics {
     /// `trpy` — total bytes sent including 12-byte RTP headers (u64).
     pub bytes_sent_with_rtp_64: Option<u64>,

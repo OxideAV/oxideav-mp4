@@ -64,10 +64,7 @@ fn mux(name: &str, order: &[(u32, bool)], chunking: ChunkPolicy) -> Vec<u8> {
     let path = std::env::temp_dir().join(format!("oxideav-mp4-chunks-{name}.mp4"));
     {
         let out: Box<dyn WriteSeek> = Box::new(std::fs::File::create(&path).unwrap());
-        let options = Mp4MuxerOptions {
-            chunking,
-            ..Mp4MuxerOptions::default()
-        };
+        let options = Mp4MuxerOptions::default().with_chunking(chunking);
         let mut mux = oxideav_mp4::muxer::open_with_options(out, &streams, options).unwrap();
         mux.write_header().unwrap();
         let mut n = [0i64; 2];

@@ -57,36 +57,33 @@ fn make_pcm_packets(n: usize, frames: i64) -> Vec<Packet> {
 }
 
 fn frag_options(emit_indexes: bool, styp: bool) -> (Mp4MuxerOptions, FragmentedOptions) {
-    let frag = FragmentedOptions {
+    let frag = FragmentedOptions::default()
         // One fragment per packet → predictable per-fragment prft.
-        cadence: FragmentCadence::EveryNPackets(1),
-        styp: if styp {
+        .with_cadence(FragmentCadence::EveryNPackets(1))
+        .with_styp(if styp {
             Some(BrandPreset::Custom {
                 major: *b"msdh",
                 compatible: vec![*b"msdh", *b"msix"],
             })
         } else {
             None
-        },
-        emit_random_access_indexes: emit_indexes,
-        levels: Vec::new(),
-        emit_ssix: false,
-        ssix_levels: (1, 2),
-        treps: Vec::new(),
-        write_mehd: false,
-    };
-    let opts = Mp4MuxerOptions {
-        brand: BrandPreset::Custom {
+        })
+        .with_emit_random_access_indexes(emit_indexes)
+        .with_levels(Vec::new())
+        .with_emit_ssix(false)
+        .with_ssix_levels((1, 2))
+        .with_treps(Vec::new())
+        .with_write_mehd(false);
+    let opts = Mp4MuxerOptions::default()
+        .with_brand(BrandPreset::Custom {
             major: *b"iso6",
             compatible: vec![*b"iso6", *b"mp41", *b"dash"],
-        },
-        faststart: false,
-        fragmented: Some(frag.clone()),
-        write_edit_list: true,
-        track_sample_groups: Vec::new(),
-        large_mdat: false,
-        ..Mp4MuxerOptions::default()
-    };
+        })
+        .with_faststart(false)
+        .with_fragmented(Some(frag.clone()))
+        .with_write_edit_list(true)
+        .with_track_sample_groups(Vec::new())
+        .with_large_mdat(false);
     (opts, frag)
 }
 

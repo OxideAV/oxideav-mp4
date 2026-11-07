@@ -160,6 +160,7 @@ fn each_child<F: FnMut([u8; 4], &[u8])>(body: &[u8], mut f: F) {
 /// (§8.13.3.3): `block_count` consecutive source blocks of `block_size`
 /// bytes each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FparEntry {
     /// Number of consecutive source blocks of size `block_size`.
     pub block_count: u16,
@@ -169,6 +170,7 @@ pub struct FparEntry {
 
 /// Decoded `fpar` File Partition Box (ISO/IEC 14496-12 §8.13.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FparBox {
     /// FullBox version (0 ⇒ 16-bit `item_ID`/`entry_count`; 1 ⇒ 32-bit).
     pub version: u8,
@@ -261,6 +263,7 @@ pub fn build_fpar_box(b: &FparBox) -> Vec<u8> {
 /// One `(item_ID, symbol_count)` reservoir entry shared by `fecr` (§8.13.4)
 /// and `fire` (§8.13.7) — both have identical wire layouts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReservoirEntry {
     /// Location of the reservoir item associated with a source block.
     pub item_id: u32,
@@ -271,6 +274,7 @@ pub struct ReservoirEntry {
 /// Decoded `fecr` (FEC Reservoir, §8.13.4) or `fire` (File Reservoir,
 /// §8.13.7) box. Both carry a versioned `(item_ID, symbol_count)` list.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReservoirBox {
     /// FullBox version (0 ⇒ 16-bit `item_ID`/`entry_count`; 1 ⇒ 32-bit).
     pub version: u8,
@@ -315,6 +319,7 @@ pub fn build_reservoir_box(fourcc: &[u8; 4], b: &ReservoirBox) -> Vec<u8> {
 /// Decoded `paen` PartitionEntry (ISO/IEC 14496-12 §8.13.2): one mandatory
 /// `fpar`, an optional `fecr`, and an optional `fire`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PartitionEntry {
     /// `fpar` File Partition Box (mandatory; `None` only for a malformed
     /// entry whose `fpar` was missing or unparseable).
@@ -364,6 +369,7 @@ pub fn build_paen_box(e: &PartitionEntry) -> Vec<u8> {
 /// One session group of a `segr` (§8.13.5.3): the file groups it complies
 /// with plus the FD hint tracks (channels) it spans.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SessionGroup {
     /// File-group IDs the session group complies with.
     pub group_ids: Vec<u32>,
@@ -374,6 +380,7 @@ pub struct SessionGroup {
 
 /// Decoded `segr` FD Session Group Box (ISO/IEC 14496-12 §8.13.5).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SegrBox {
     /// The session groups, in declaration order.
     pub session_groups: Vec<SessionGroup>,
@@ -426,6 +433,7 @@ pub fn build_segr_box(b: &SegrBox) -> Vec<u8> {
 
 /// One `(group_ID, group_name)` mapping of a `gitn` (§8.13.6.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GroupName {
     /// File-group ID.
     pub group_id: u32,
@@ -435,6 +443,7 @@ pub struct GroupName {
 
 /// Decoded `gitn` Group ID to Name Box (ISO/IEC 14496-12 §8.13.6).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GitnBox {
     /// The `(group_ID, group_name)` mappings, in declaration order.
     pub entries: Vec<GroupName>,
@@ -477,6 +486,7 @@ pub fn build_gitn_box(b: &GitnBox) -> Vec<u8> {
 /// Decoded `fiin` FD Item Information Box (ISO/IEC 14496-12 §8.13.2): the
 /// partition entries plus an optional session-group box and group-name box.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FiinBox {
     /// Partition entries (`paen`), implicitly numbered from 1.
     pub partition_entries: Vec<PartitionEntry>,
@@ -537,6 +547,7 @@ pub fn build_fiin_box(b: &FiinBox) -> Vec<u8> {
 /// Box (no version/flags) carried inside an `extr` Extra Data Box of an FD
 /// hint-track sample. Fixed 7-byte body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FeciBox {
     /// FEC encoding scheme ID (RFC 5052 registration).
     pub fec_encoding_id: u8,

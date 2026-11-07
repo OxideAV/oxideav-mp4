@@ -308,10 +308,7 @@ fn post_2040_timestamp_promotes_headers_to_version_1() {
     let t = mp4_secs_from_unix_secs(UNIX_2049).unwrap();
     assert!(t > u32::MAX as u64, "test stamp must exceed the v0 horizon");
     let streams = [pcm_stream_info(0)];
-    let opts = Mp4MuxerOptions {
-        creation_time: Some(t),
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default().with_creation_time(Some(t));
     let file = mux(&streams, opts, "v1");
 
     assert_eq!(header_times(mvhd(&file)), (1, t, t));
@@ -350,11 +347,9 @@ fn post_2040_timestamp_promotes_headers_to_version_1() {
     // 64-bit fields, since the v0 layout can hold neither.
     let c = mp4_secs_from_unix_secs(UNIX_2023).unwrap();
     assert!(c <= u32::MAX as u64);
-    let opts = Mp4MuxerOptions {
-        creation_time: Some(c),
-        modification_time: Some(t),
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default()
+        .with_creation_time(Some(c))
+        .with_modification_time(Some(t));
     let file = mux(&streams, opts, "promote-on-modification");
     assert_eq!(header_times(mvhd(&file)), (1, c, t));
     let headers = track_headers(&file);
@@ -377,11 +372,9 @@ fn version_promotion_is_per_box() {
     let late = mp4_secs_from_unix_secs(UNIX_2049).unwrap();
     assert!(movie <= u32::MAX as u64 && late > u32::MAX as u64);
     let streams = [pcm_stream_info(0), pcm_stream_info(1)];
-    let opts = Mp4MuxerOptions {
-        creation_time: Some(movie),
-        track_header_timestamps: vec![track_time(1, late)],
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default()
+        .with_creation_time(Some(movie))
+        .with_track_header_timestamps(vec![track_time(1, late)]);
     let file = mux(&streams, opts, "mixed-version");
 
     assert_eq!(header_times(mvhd(&file)), (0, movie, movie));
@@ -409,14 +402,9 @@ fn promoted_init_headers_do_not_dislodge_the_mehd_patch() {
     // hardcoded offset would write over eight unrelated bytes instead.
     let t = mp4_secs_from_unix_secs(UNIX_2049).unwrap();
     let streams = [pcm_stream_info(0)];
-    let opts = Mp4MuxerOptions {
-        fragmented: Some(FragmentedOptions {
-            write_mehd: true,
-            ..FragmentedOptions::default()
-        }),
-        creation_time: Some(t),
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default()
+        .with_fragmented(Some(FragmentedOptions::default().with_write_mehd(true)))
+        .with_creation_time(Some(t));
     let file = mux(&streams, opts, "fragmented-mehd-v1");
 
     // The promotion really did happen — otherwise the test proves nothing.
@@ -446,11 +434,9 @@ fn promoted_init_headers_do_not_dislodge_the_mehd_patch() {
 fn faststart_layout_stamps_the_same_values() {
     let t = mp4_secs_from_unix_secs(UNIX_2023).unwrap();
     let streams = [pcm_stream_info(0)];
-    let opts = Mp4MuxerOptions {
-        faststart: true,
-        creation_time: Some(t),
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default()
+        .with_faststart(true)
+        .with_creation_time(Some(t));
     let file = mux(&streams, opts, "faststart");
 
     // Sanity: moov really does precede mdat in this layout.
@@ -470,11 +456,9 @@ fn faststart_layout_stamps_the_same_values() {
     // promotion adds have to settle before the offsets are baked. A
     // clean demux of every packet is what proves they did.
     let late = mp4_secs_from_unix_secs(UNIX_2049).unwrap();
-    let opts = Mp4MuxerOptions {
-        faststart: true,
-        creation_time: Some(late),
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default()
+        .with_faststart(true)
+        .with_creation_time(Some(late));
     let file = mux(&streams, opts, "faststart-v1");
     assert_eq!(header_times(mvhd(&file)), (1, late, late));
 
@@ -498,17 +482,15 @@ fn fragmented_init_segment_stamps_the_headers() {
     let track1 = mp4_secs_from_unix_secs(UNIX_2023 + 3_600).unwrap();
     let media1 = track1 + 7;
     let streams = [pcm_stream_info(0), pcm_stream_info(1)];
-    let opts = Mp4MuxerOptions {
-        fragmented: Some(FragmentedOptions::default()),
-        creation_time: Some(movie),
+    let opts = Mp4MuxerOptions::default()
+        .with_fragmented(Some(FragmentedOptions::default()))
+        .with_creation_time(Some(movie))
         // Track 1 dates its media apart from its track, so the init
         // segment's tkhd and mdhd must come out different — a path
         // that would look identical under the one-value shorthand.
-        track_header_timestamps: vec![
+        .with_track_header_timestamps(vec![
             TrackHeaderTimestamps::new(1, stamped(track1)).with_media(stamped(media1)),
-        ],
-        ..Mp4MuxerOptions::default()
-    };
+        ]);
     let file = mux(&streams, opts, "fragmented");
 
     assert_eq!(header_times(mvhd(&file)), (0, movie, movie));
@@ -530,11 +512,9 @@ fn fragmented_init_segment_stamps_the_headers() {
     // The init segment writes zero durations, so here the timestamp is
     // the only thing that can trigger the version-1 promotion.
     let late = mp4_secs_from_unix_secs(UNIX_2049).unwrap();
-    let opts = Mp4MuxerOptions {
-        fragmented: Some(FragmentedOptions::default()),
-        creation_time: Some(late),
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default()
+        .with_fragmented(Some(FragmentedOptions::default()))
+        .with_creation_time(Some(late));
     let file = mux(&streams, opts, "fragmented-v1");
     assert_eq!(header_times(mvhd(&file)), (1, late, late));
     let headers = track_headers(&file);
@@ -550,10 +530,7 @@ fn fragmented_init_segment_stamps_the_headers() {
 #[test]
 fn out_of_range_track_override_is_rejected_at_open() {
     let streams = [pcm_stream_info(0)];
-    let opts = Mp4MuxerOptions {
-        track_header_timestamps: vec![track_time(3, 1)],
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default().with_track_header_timestamps(vec![track_time(3, 1)]);
     let ws: Box<dyn WriteSeek> = Box::new(std::io::Cursor::new(Vec::new()));
     let err = match oxideav_mp4::muxer::open_with_options(ws, &streams, opts.clone()) {
         Ok(_) => panic!("out-of-range track_header_timestamps accepted"),
@@ -565,10 +542,7 @@ fn out_of_range_track_override_is_rejected_at_open() {
     );
 
     // Same guard on the fragmented entry point.
-    let frag_opts = Mp4MuxerOptions {
-        fragmented: Some(FragmentedOptions::default()),
-        ..opts
-    };
+    let frag_opts = opts.with_fragmented(Some(FragmentedOptions::default()));
     let ws: Box<dyn WriteSeek> = Box::new(std::io::Cursor::new(Vec::new()));
     let err = match oxideav_mp4::muxer::open_with_options(ws, &streams, frag_opts) {
         Ok(_) => panic!("out-of-range track_header_timestamps accepted (fragmented)"),
@@ -597,11 +571,9 @@ fn stamped_file_round_trips_through_the_demuxer() {
     let movie = mp4_secs_from_unix_secs(UNIX_2023).unwrap();
     let track1 = mp4_secs_from_unix_secs(UNIX_2023 + 86_400).unwrap();
     let streams = [pcm_stream_info(0), pcm_stream_info(1)];
-    let opts = Mp4MuxerOptions {
-        creation_time: Some(movie),
-        track_header_timestamps: vec![track_time(1, track1)],
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default()
+        .with_creation_time(Some(movie))
+        .with_track_header_timestamps(vec![track_time(1, track1)]);
     let file = mux(&streams, opts, "roundtrip");
 
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(file));
@@ -714,10 +686,7 @@ fn each_header_field_is_read_from_its_own_bytes() {
             mp4_secs_from_unix_secs(UNIX_2049).unwrap()
         };
         let streams = [pcm_stream_info(0)];
-        let opts = Mp4MuxerOptions {
-            creation_time: Some(base),
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default().with_creation_time(Some(base));
         let mut file = mux(&streams, opts, &format!("distinct-v{version}"));
 
         // Six values, each offset differently from the base so no two
@@ -776,14 +745,12 @@ fn every_readable_field_is_independently_writable() {
     let (tk_c, tk_m) = (base + 3, base + 4);
     let (md_c, md_m) = (base + 5, base + 6);
     let streams = [pcm_stream_info(0)];
-    let opts = Mp4MuxerOptions {
-        creation_time: Some(mv_c),
-        modification_time: Some(mv_m),
-        track_header_timestamps: vec![
+    let opts = Mp4MuxerOptions::default()
+        .with_creation_time(Some(mv_c))
+        .with_modification_time(Some(mv_m))
+        .with_track_header_timestamps(vec![
             TrackHeaderTimestamps::new(0, pair(tk_c, tk_m)).with_media(pair(md_c, md_m)),
-        ],
-        ..Mp4MuxerOptions::default()
-    };
+        ]);
     let file = mux(&streams, opts, "full-parity");
 
     // On the wire.
@@ -817,10 +784,10 @@ fn an_entry_replaces_the_pair_and_media_defaults_to_track() {
         pcm_stream_info(2),
         pcm_stream_info(3),
     ];
-    let opts = Mp4MuxerOptions {
-        creation_time: Some(movie_c),
-        modification_time: Some(movie_m),
-        track_header_timestamps: vec![
+    let opts = Mp4MuxerOptions::default()
+        .with_creation_time(Some(movie_c))
+        .with_modification_time(Some(movie_m))
+        .with_track_header_timestamps(vec![
             // Track 0: one instant in both halves, mdhd mirroring tkhd.
             track_time(0, track_c),
             // Track 2: "created, never modified" — a zero modification
@@ -832,9 +799,7 @@ fn an_entry_replaces_the_pair_and_media_defaults_to_track() {
             // the case a per-field inheritance cascade got wrong by
             // collapsing tkhd's modification time onto its creation.
             TrackHeaderTimestamps::new(3, pair(movie_c, movie_m)).with_media(stamped(media3)),
-        ],
-        ..Mp4MuxerOptions::default()
-    };
+        ]);
     let file = mux(&streams, opts, "entry-shapes");
 
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(file));
@@ -862,10 +827,7 @@ fn modification_time_alone_is_written_without_a_creation_time() {
     // muxer must be able to produce it.
     let m = mp4_secs_from_unix_secs(UNIX_2023).unwrap();
     let streams = [pcm_stream_info(0)];
-    let opts = Mp4MuxerOptions {
-        modification_time: Some(m),
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default().with_modification_time(Some(m));
     let file = mux(&streams, opts, "modification-only");
 
     assert_eq!(header_times(mvhd(&file)), (0, 0, m));

@@ -598,10 +598,7 @@ fn mov_brand_in_ftyp() {
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let opts = Mp4MuxerOptions {
-            brand: BrandPreset::Mov,
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default().with_brand(BrandPreset::Mov);
         let mut mux =
             oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
         mux.write_header().unwrap();
@@ -625,10 +622,7 @@ fn mp4_faststart_has_moov_before_mdat() {
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let opts = Mp4MuxerOptions {
-            faststart: true,
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default().with_faststart(true);
         let mut mux =
             oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
         mux.write_header().unwrap();
@@ -684,10 +678,7 @@ fn faststart_roundtrip_pcm() {
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let opts = Mp4MuxerOptions {
-            faststart: true,
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default().with_faststart(true);
         let mut mux =
             oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
         mux.write_header().unwrap();
@@ -784,10 +775,7 @@ fn faststart_roundtrip_flac() {
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let opts = Mp4MuxerOptions {
-            faststart: true,
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default().with_faststart(true);
         let mut mux =
             oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
         mux.write_header().unwrap();
@@ -884,10 +872,7 @@ fn chunk_offsets_patched_after_faststart() {
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let opts = Mp4MuxerOptions {
-            faststart: true,
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default().with_faststart(true);
         let mut mux =
             oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
         mux.write_header().unwrap();
@@ -1421,10 +1406,7 @@ fn find_box(haystack: &[u8], needle: &[u8; 4]) -> Option<usize> {
 fn mux_pcm_with_start_pts_bytes(start_pts: i64, write_edit_list: bool) -> Vec<u8> {
     let stream = pcm_stream_info();
     let frames_per_packet: i64 = 1024;
-    let opts = Mp4MuxerOptions {
-        write_edit_list,
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default().with_write_edit_list(write_edit_list);
     // Unique per call: two tests mux with the same (start_pts,
     // write_edit_list) args, so a name keyed only on those would let
     // parallel runs truncate each other's file mid-read. Add a

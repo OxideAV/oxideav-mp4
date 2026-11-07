@@ -50,6 +50,7 @@ use crate::sample_entries::sample_entry_for;
 /// (`media_time`), letting a DASH/CMAF client correlate live-edge media
 /// time to absolute time without parsing sample data.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct PrftRequest {
     /// `track_ID` of the reference track this box annotates.
     pub reference_track_id: u32,

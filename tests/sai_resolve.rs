@@ -90,21 +90,14 @@ fn package(tmp_name: &str) -> Packaged {
     }
 
     let stream = pcm_stream();
-    let options = Mp4MuxerOptions {
-        fragmented: Some(FragmentedOptions {
-            cadence: FragmentCadence::EveryNPackets(2),
-            emit_random_access_indexes: false,
-            styp: None,
-            ..FragmentedOptions::default()
-        }),
-        track_protection: vec![TrackProtection {
-            stream_index: 0,
-            scheme_type: *b"cenc",
-            scheme_version: 0x0001_0000,
-            tenc,
-        }],
-        ..Mp4MuxerOptions::default()
-    };
+    let options = Mp4MuxerOptions::default()
+        .with_fragmented(Some(
+            FragmentedOptions::default()
+                .with_cadence(FragmentCadence::EveryNPackets(2))
+                .with_emit_random_access_indexes(false)
+                .with_styp(None),
+        ))
+        .with_track_protection(vec![TrackProtection::new(0, *b"cenc", 0x0001_0000, tenc)]);
     let tmp = std::env::temp_dir().join(tmp_name);
     {
         let frag = options.fragmented.clone().unwrap();

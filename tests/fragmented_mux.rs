@@ -60,30 +60,29 @@ fn make_pcm_packets(n: usize, frames: i64) -> Vec<Packet> {
 }
 
 fn fragmented_options(cadence: FragmentCadence) -> Mp4MuxerOptions {
-    Mp4MuxerOptions {
-        brand: BrandPreset::Custom {
+    Mp4MuxerOptions::default()
+        .with_brand(BrandPreset::Custom {
             major: *b"iso6",
             compatible: vec![*b"iso6", *b"mp41", *b"dash"],
-        },
-        faststart: false,
-        fragmented: Some(FragmentedOptions {
-            cadence,
-            styp: Some(BrandPreset::Custom {
-                major: *b"msdh",
-                compatible: vec![*b"msdh", *b"msix"],
-            }),
-            emit_random_access_indexes: true,
-            levels: Vec::new(),
-            emit_ssix: false,
-            ssix_levels: (1, 2),
-            treps: Vec::new(),
-            write_mehd: false,
-        }),
-        write_edit_list: true,
-        track_sample_groups: Vec::new(),
-        large_mdat: false,
-        ..Mp4MuxerOptions::default()
-    }
+        })
+        .with_faststart(false)
+        .with_fragmented(Some(
+            FragmentedOptions::default()
+                .with_cadence(cadence)
+                .with_styp(Some(BrandPreset::Custom {
+                    major: *b"msdh",
+                    compatible: vec![*b"msdh", *b"msix"],
+                }))
+                .with_emit_random_access_indexes(true)
+                .with_levels(Vec::new())
+                .with_emit_ssix(false)
+                .with_ssix_levels((1, 2))
+                .with_treps(Vec::new())
+                .with_write_mehd(false),
+        ))
+        .with_write_edit_list(true)
+        .with_track_sample_groups(Vec::new())
+        .with_large_mdat(false)
 }
 
 /// Mux to a temp file path; tests then read the file back as bytes.
@@ -221,24 +220,23 @@ fn no_styp_when_disabled() {
     {
         let f = std::fs::File::create(&buf_path).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let opts = Mp4MuxerOptions {
-            brand: BrandPreset::Mp4,
-            faststart: false,
-            fragmented: Some(FragmentedOptions {
-                cadence: FragmentCadence::EveryNPackets(1),
-                styp: None,
-                emit_random_access_indexes: true,
-                levels: Vec::new(),
-                emit_ssix: false,
-                ssix_levels: (1, 2),
-                treps: Vec::new(),
-                write_mehd: false,
-            }),
-            write_edit_list: true,
-            track_sample_groups: Vec::new(),
-            large_mdat: false,
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default()
+            .with_brand(BrandPreset::Mp4)
+            .with_faststart(false)
+            .with_fragmented(Some(
+                FragmentedOptions::default()
+                    .with_cadence(FragmentCadence::EveryNPackets(1))
+                    .with_styp(None)
+                    .with_emit_random_access_indexes(true)
+                    .with_levels(Vec::new())
+                    .with_emit_ssix(false)
+                    .with_ssix_levels((1, 2))
+                    .with_treps(Vec::new())
+                    .with_write_mehd(false),
+            ))
+            .with_write_edit_list(true)
+            .with_track_sample_groups(Vec::new())
+            .with_large_mdat(false);
         let stream = pcm_stream();
         let packets = make_pcm_packets(2, 1024);
         let mut mux = open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
@@ -302,15 +300,13 @@ fn ismv_now_emits_fragmented() {
 #[test]
 fn faststart_and_fragmented_are_mutually_exclusive() {
     let stream = pcm_stream();
-    let opts = Mp4MuxerOptions {
-        brand: BrandPreset::Mp4,
-        faststart: true,
-        fragmented: Some(FragmentedOptions::default()),
-        write_edit_list: true,
-        track_sample_groups: Vec::new(),
-        large_mdat: false,
-        ..Mp4MuxerOptions::default()
-    };
+    let opts = Mp4MuxerOptions::default()
+        .with_brand(BrandPreset::Mp4)
+        .with_faststart(true)
+        .with_fragmented(Some(FragmentedOptions::default()))
+        .with_write_edit_list(true)
+        .with_track_sample_groups(Vec::new())
+        .with_large_mdat(false);
     let cursor: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
     match open_with_options(cursor, std::slice::from_ref(&stream), opts) {
         Err(oxideav_core::Error::InvalidData(_)) => {}
@@ -508,24 +504,23 @@ fn no_sidx_no_mfra_when_disabled() {
     {
         let f = std::fs::File::create(&buf_path).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let opts = Mp4MuxerOptions {
-            brand: BrandPreset::Mp4,
-            faststart: false,
-            fragmented: Some(FragmentedOptions {
-                cadence: FragmentCadence::EveryNPackets(2),
-                styp: None,
-                emit_random_access_indexes: false,
-                levels: Vec::new(),
-                emit_ssix: false,
-                ssix_levels: (1, 2),
-                treps: Vec::new(),
-                write_mehd: false,
-            }),
-            write_edit_list: true,
-            track_sample_groups: Vec::new(),
-            large_mdat: false,
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default()
+            .with_brand(BrandPreset::Mp4)
+            .with_faststart(false)
+            .with_fragmented(Some(
+                FragmentedOptions::default()
+                    .with_cadence(FragmentCadence::EveryNPackets(2))
+                    .with_styp(None)
+                    .with_emit_random_access_indexes(false)
+                    .with_levels(Vec::new())
+                    .with_emit_ssix(false)
+                    .with_ssix_levels((1, 2))
+                    .with_treps(Vec::new())
+                    .with_write_mehd(false),
+            ))
+            .with_write_edit_list(true)
+            .with_track_sample_groups(Vec::new())
+            .with_large_mdat(false);
         let stream = pcm_stream();
         let packets = make_pcm_packets(4, 1024);
         let mut mux = open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
@@ -878,15 +873,16 @@ fn insert_empty_time_rejected_with_edit_lists() {
     let f = std::fs::File::create(&path).unwrap();
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut opts = fragmented_options(FragmentCadence::EveryNPackets(2));
-    opts.track_edit_lists = vec![oxideav_mp4::options::TrackEditList {
-        stream_index: 0,
-        entries: vec![oxideav_mp4::demux::EditListEntry {
-            segment_duration: 0,
-            media_time: 1024,
-            media_rate_integer: 1,
-            media_rate_fraction: 0,
-        }],
-    }];
+    opts.track_edit_lists = vec![
+        oxideav_mp4::options::TrackEditList::default()
+            .with_stream_index(0)
+            .with_entries(vec![oxideav_mp4::demux::EditListEntry {
+                segment_duration: 0,
+                media_time: 1024,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            }]),
+    ];
     let frag_opts = opts.fragmented.clone().unwrap();
     let mut mux = oxideav_mp4::frag::open_fragmented_typed(
         ws,

@@ -40,6 +40,7 @@ pub const EMSG_UNKNOWN_DURATION: u32 = 0xFFFF_FFFF;
 /// *and* meaning change with the FullBox version, so it is carried as
 /// a typed choice rather than two nullable fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EmsgTime {
     /// Version 0 — `presentation_time_delta`: a 32-bit offset, in
     /// `timescale` units, from the earliest presentation time of the

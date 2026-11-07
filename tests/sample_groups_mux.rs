@@ -50,11 +50,9 @@ fn mux_with_sample_groups(stream: &StreamInfo, tsg: TrackSampleGroups) -> Vec<u8
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let opts = Mp4MuxerOptions {
-            track_sample_groups: vec![tsg],
-            large_mdat: false,
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default()
+            .with_track_sample_groups(vec![tsg])
+            .with_large_mdat(false);
         let mut mux =
             oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(stream), opts).unwrap();
         mux.write_header().unwrap();
@@ -88,12 +86,11 @@ fn sgpd_then_sbgp_roundtrip_via_demux() {
         entries: vec![(2, 1), (1, 2), (1, 0)],
     };
     let stream = pcm_stream();
-    let tsg = TrackSampleGroups {
-        stream_index: 0,
-        sbgp: vec![sbgp],
-        sgpd: vec![sgpd],
-        csgp: vec![],
-    };
+    let tsg = TrackSampleGroups::default()
+        .with_stream_index(0)
+        .with_sbgp(vec![sbgp])
+        .with_sgpd(vec![sgpd])
+        .with_csgp(vec![]);
     let bytes = mux_with_sample_groups(&stream, tsg);
 
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
@@ -108,20 +105,19 @@ fn sgpd_then_sbgp_roundtrip_via_demux() {
 #[test]
 fn sbgp_v1_grouping_type_parameter_preserved() {
     let stream = pcm_stream();
-    let tsg = TrackSampleGroups {
-        stream_index: 0,
-        sbgp: vec![SampleToGroup {
+    let tsg = TrackSampleGroups::default()
+        .with_stream_index(0)
+        .with_sbgp(vec![SampleToGroup {
             grouping_type: *b"rap ",
             grouping_type_parameter: Some(42),
             entries: vec![(4, 1)],
-        }],
-        sgpd: vec![SampleGroupDescription {
+        }])
+        .with_sgpd(vec![SampleGroupDescription {
             grouping_type: *b"rap ",
             default_sample_description_index: None,
             entries: vec![vec![0x01]],
-        }],
-        csgp: vec![],
-    };
+        }])
+        .with_csgp(vec![]);
     let bytes = mux_with_sample_groups(&stream, tsg);
 
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
@@ -134,9 +130,9 @@ fn sbgp_v1_grouping_type_parameter_preserved() {
 #[test]
 fn multiple_grouping_types_accumulate_in_order() {
     let stream = pcm_stream();
-    let tsg = TrackSampleGroups {
-        stream_index: 0,
-        sbgp: vec![
+    let tsg = TrackSampleGroups::default()
+        .with_stream_index(0)
+        .with_sbgp(vec![
             SampleToGroup {
                 grouping_type: *b"roll",
                 grouping_type_parameter: None,
@@ -147,8 +143,8 @@ fn multiple_grouping_types_accumulate_in_order() {
                 grouping_type_parameter: None,
                 entries: vec![(1, 1), (3, 0)],
             },
-        ],
-        sgpd: vec![
+        ])
+        .with_sgpd(vec![
             SampleGroupDescription {
                 grouping_type: *b"roll",
                 default_sample_description_index: None,
@@ -159,9 +155,8 @@ fn multiple_grouping_types_accumulate_in_order() {
                 default_sample_description_index: None,
                 entries: vec![vec![0xAA]],
             },
-        ],
-        csgp: vec![],
-    };
+        ])
+        .with_csgp(vec![]);
     let bytes = mux_with_sample_groups(&stream, tsg);
 
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
@@ -177,20 +172,19 @@ fn multiple_grouping_types_accumulate_in_order() {
 fn sgpd_v2_with_default_sample_description_index_roundtrips() {
     // Entries share length → v2 is selected.
     let stream = pcm_stream();
-    let tsg = TrackSampleGroups {
-        stream_index: 0,
-        sbgp: vec![SampleToGroup {
+    let tsg = TrackSampleGroups::default()
+        .with_stream_index(0)
+        .with_sbgp(vec![SampleToGroup {
             grouping_type: *b"alst",
             grouping_type_parameter: None,
             entries: vec![(4, 1)],
-        }],
-        sgpd: vec![SampleGroupDescription {
+        }])
+        .with_sgpd(vec![SampleGroupDescription {
             grouping_type: *b"alst",
             default_sample_description_index: Some(2),
             entries: vec![vec![0xCA, 0xFE], vec![0xBE, 0xEF]],
-        }],
-        csgp: vec![],
-    };
+        }])
+        .with_csgp(vec![]);
     let bytes = mux_with_sample_groups(&stream, tsg);
 
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
@@ -228,12 +222,11 @@ fn csgp_after_sgpd_roundtrip_via_demux() {
         }],
     };
     let stream = pcm_stream();
-    let tsg = TrackSampleGroups {
-        stream_index: 0,
-        sbgp: vec![],
-        sgpd: vec![sgpd],
-        csgp: vec![csgp],
-    };
+    let tsg = TrackSampleGroups::default()
+        .with_stream_index(0)
+        .with_sbgp(vec![])
+        .with_sgpd(vec![sgpd])
+        .with_csgp(vec![csgp]);
     let bytes = mux_with_sample_groups(&stream, tsg);
 
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
@@ -249,15 +242,15 @@ fn csgp_after_sgpd_roundtrip_via_demux() {
 #[test]
 fn csgp_with_grouping_type_parameter_and_multi_pattern_roundtrip() {
     let stream = pcm_stream();
-    let tsg = TrackSampleGroups {
-        stream_index: 0,
-        sbgp: vec![],
-        sgpd: vec![SampleGroupDescription {
+    let tsg = TrackSampleGroups::default()
+        .with_stream_index(0)
+        .with_sbgp(vec![])
+        .with_sgpd(vec![SampleGroupDescription {
             grouping_type: *b"rap ",
             default_sample_description_index: None,
             entries: vec![vec![0x01], vec![0x02]],
-        }],
-        csgp: vec![CompactSampleToGroup {
+        }])
+        .with_csgp(vec![CompactSampleToGroup {
             grouping_type: *b"rap ",
             grouping_type_parameter: Some(42),
             index_msb_indicates_fragment_local_description: false,
@@ -271,8 +264,7 @@ fn csgp_with_grouping_type_parameter_and_multi_pattern_roundtrip() {
                     indices: vec![2],
                 },
             ],
-        }],
-    };
+        }]);
     let bytes = mux_with_sample_groups(&stream, tsg);
 
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
@@ -287,14 +279,14 @@ fn sbgp_and_csgp_distinct_grouping_types_coexist() {
     // §8.9.5 forbids both forms for ONE grouping_type, but distinct
     // grouping_types may each pick their own form on the same track.
     let stream = pcm_stream();
-    let tsg = TrackSampleGroups {
-        stream_index: 0,
-        sbgp: vec![SampleToGroup {
+    let tsg = TrackSampleGroups::default()
+        .with_stream_index(0)
+        .with_sbgp(vec![SampleToGroup {
             grouping_type: *b"sync",
             grouping_type_parameter: None,
             entries: vec![(1, 1), (5, 0)],
-        }],
-        sgpd: vec![
+        }])
+        .with_sgpd(vec![
             SampleGroupDescription {
                 grouping_type: *b"roll",
                 default_sample_description_index: None,
@@ -305,8 +297,8 @@ fn sbgp_and_csgp_distinct_grouping_types_coexist() {
                 default_sample_description_index: None,
                 entries: vec![vec![0xAA]],
             },
-        ],
-        csgp: vec![CompactSampleToGroup {
+        ])
+        .with_csgp(vec![CompactSampleToGroup {
             grouping_type: *b"roll",
             grouping_type_parameter: None,
             index_msb_indicates_fragment_local_description: false,
@@ -314,8 +306,7 @@ fn sbgp_and_csgp_distinct_grouping_types_coexist() {
                 sample_count: 6,
                 indices: vec![1],
             }],
-        }],
-    };
+        }]);
     let bytes = mux_with_sample_groups(&stream, tsg);
 
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
@@ -333,15 +324,15 @@ fn csgp_fragment_local_flag_preserved_in_stbl() {
     // muxer serialises it verbatim if a caller sets it — round-trip the
     // flag bit and the high-bit-set index through the demuxer.
     let stream = pcm_stream();
-    let tsg = TrackSampleGroups {
-        stream_index: 0,
-        sbgp: vec![],
-        sgpd: vec![SampleGroupDescription {
+    let tsg = TrackSampleGroups::default()
+        .with_stream_index(0)
+        .with_sbgp(vec![])
+        .with_sgpd(vec![SampleGroupDescription {
             grouping_type: *b"seig",
             default_sample_description_index: None,
             entries: vec![vec![0x00]],
-        }],
-        csgp: vec![CompactSampleToGroup {
+        }])
+        .with_csgp(vec![CompactSampleToGroup {
             grouping_type: *b"seig",
             grouping_type_parameter: None,
             index_msb_indicates_fragment_local_description: true,
@@ -350,8 +341,7 @@ fn csgp_fragment_local_flag_preserved_in_stbl() {
                 sample_count: 4,
                 indices: vec![0x81],
             }],
-        }],
-    };
+        }]);
     let bytes = mux_with_sample_groups(&stream, tsg);
 
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));

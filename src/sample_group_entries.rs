@@ -38,6 +38,7 @@ use oxideav_core::{Error, Result};
 /// variant; [`decode_sample_group_entry`] routes a `(grouping_type, blob)`
 /// pair to the matching typed parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SampleGroupGroupingType {
     /// `roll` — VisualRollRecoveryEntry / AudioRollRecoveryEntry (§10.1).
     Roll,
@@ -94,6 +95,7 @@ impl SampleGroupGroupingType {
 /// layout is identical); a caller distinguishes recovery-roll from
 /// pre-roll by the grouping type it passed in.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SampleGroupEntry {
     /// `roll` or `prol` (§10.1).
     Roll(RollRecoveryEntry),
@@ -161,6 +163,7 @@ pub fn decode_sample_group_entry(
 /// not the entry shape. Parse with [`parse_roll`], build with
 /// [`build_roll`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RollRecoveryEntry {
     /// `roll_distance` (§10.1.1.3): the number of samples that must be
     /// decoded for a sample to be decoded correctly. Positive = samples
@@ -203,6 +206,7 @@ pub fn build_roll(e: &RollRecoveryEntry) -> Vec<u8> {
 /// in kilobits/second; entries shall be strictly increasing (§10.2.2.3),
 /// though the parser does not enforce monotonicity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RateShareOperationPoint {
     /// `available_bitrate` (§10.2.2.3): the total available bitrate (kbps)
     /// that defines this operation point.
@@ -222,6 +226,7 @@ pub struct RateShareOperationPoint {
 /// target_rate_share)` pair each. Both shapes share the trailing
 /// `maximum_bitrate` / `minimum_bitrate` / `discard_priority` fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RateShareEntry {
     /// The single-point `target_rate_share` when
     /// `operation_point_count == 1`. `Some(_)` selects the single-point
@@ -351,6 +356,7 @@ pub fn build_rash(e: &RateShareEntry) -> Vec<u8> {
 /// the total number of samples (including those not in the alternative
 /// startup sequence) spanned by the piece.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AlstOutputRatePiece {
     /// `num_output_samples[j]` (§10.3.3).
     pub num_output_samples: u16,
@@ -369,6 +375,7 @@ pub struct AlstOutputRatePiece {
 /// pieces from whatever bytes remain after the fixed header + offset
 /// array).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AlternativeStartupEntry {
     /// `first_output_sample` (§10.3.3): the 1-based index of the first
     /// sample intended for output among the samples in the alternative
@@ -467,6 +474,7 @@ pub fn build_alst(e: &AlternativeStartupEntry) -> Vec<u8> {
 /// 7-bit `num_leading_samples` count. Members of this group are random
 /// access points (§10.4.1) — and may, but need not, also be sync samples.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VisualRandomAccessEntry {
     /// `num_leading_samples_known` (§10.4.3): `true` when the number of
     /// leading samples is known for each sample in this group (and given
@@ -513,6 +521,7 @@ pub fn build_rap(e: &VisualRandomAccessEntry) -> Vec<u8> {
 /// description index (§10.5.3); a single byte packs a 1-bit
 /// `level_independently_decodable` flag plus 7 reserved bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TemporalLevelEntry {
     /// `level_independently_decodable` (§10.5.3): `true` (1) indicates all
     /// samples of this level have no coding dependencies on samples of
@@ -553,6 +562,7 @@ pub fn build_tele(e: &TemporalLevelEntry) -> Vec<u8> {
 /// 4-bit `SAP_type`. Identifies samples whose first byte is the position
 /// `ISAU` for a Stream Access Point (Annex I) of the indicated type.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SapEntry {
     /// `dependent_flag` (§10.6.3): `false` (0) for non-layered media.
     /// `true` (1) specifies that the reference layers (if any) for

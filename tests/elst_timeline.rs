@@ -603,13 +603,11 @@ mod mux_explicit {
     #[test]
     fn explicit_list_muxed_and_recovered() {
         let entries = vec![entry(250, -1, 1), entry(64, 0, 1)];
-        let opts = Mp4MuxerOptions {
-            track_edit_lists: vec![TrackEditList {
-                stream_index: 0,
-                entries: entries.clone(),
-            }],
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default().with_track_edit_lists(vec![
+            TrackEditList::default()
+                .with_stream_index(0)
+                .with_entries(entries.clone()),
+        ]);
         let bytes = mux_pcm(0, opts);
         let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.clone()));
         let dmx = oxideav_mp4::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
@@ -630,13 +628,11 @@ mod mux_explicit {
     /// 24_000-tick delay).
     #[test]
     fn explicit_list_overrides_automatic() {
-        let opts = Mp4MuxerOptions {
-            track_edit_lists: vec![TrackEditList {
-                stream_index: 0,
-                entries: vec![entry(64, 0, 1)],
-            }],
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default().with_track_edit_lists(vec![
+            TrackEditList::default()
+                .with_stream_index(0)
+                .with_entries(vec![entry(64, 0, 1)]),
+        ]);
         let got = demux_timing(mux_pcm(24_000, opts));
         assert_eq!(
             got[0].0, 0,
@@ -649,14 +645,13 @@ mod mux_explicit {
     #[test]
     fn explicit_list_ignores_write_edit_list_flag() {
         let entries = vec![entry(250, -1, 1), entry(64, 0, 1)];
-        let opts = Mp4MuxerOptions {
-            write_edit_list: false,
-            track_edit_lists: vec![TrackEditList {
-                stream_index: 0,
-                entries,
-            }],
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default()
+            .with_write_edit_list(false)
+            .with_track_edit_lists(vec![
+                TrackEditList::default()
+                    .with_stream_index(0)
+                    .with_entries(entries),
+            ]);
         let got = demux_timing(mux_pcm(0, opts));
         assert_eq!(got[0].0, 12_000, "explicit list written despite the flag");
     }
@@ -667,44 +662,45 @@ mod mux_explicit {
     fn invalid_explicit_list_fails_at_open() {
         let stream = pcm_stream();
         let open_with = |tel: TrackEditList| {
-            let opts = Mp4MuxerOptions {
-                track_edit_lists: vec![tel],
-                ..Mp4MuxerOptions::default()
-            };
+            let opts = Mp4MuxerOptions::default().with_track_edit_lists(vec![tel]);
             let ws: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
             oxideav_mp4::muxer::open_with_options(ws, std::slice::from_ref(&stream), opts)
                 .map(|_| ())
         };
         // Trailing empty edit (§8.6.6.3).
         assert!(
-            open_with(TrackEditList {
-                stream_index: 0,
-                entries: vec![entry(64, 0, 1), entry(100, -1, 1)],
-            })
+            open_with(
+                TrackEditList::default()
+                    .with_stream_index(0)
+                    .with_entries(vec![entry(64, 0, 1), entry(100, -1, 1)])
+            )
             .is_err()
         );
         // media_rate_integer outside {0, 1}.
         assert!(
-            open_with(TrackEditList {
-                stream_index: 0,
-                entries: vec![entry(64, 0, 2)],
-            })
+            open_with(
+                TrackEditList::default()
+                    .with_stream_index(0)
+                    .with_entries(vec![entry(64, 0, 2)])
+            )
             .is_err()
         );
         // Empty entry list.
         assert!(
-            open_with(TrackEditList {
-                stream_index: 0,
-                entries: vec![],
-            })
+            open_with(
+                TrackEditList::default()
+                    .with_stream_index(0)
+                    .with_entries(vec![])
+            )
             .is_err()
         );
         // Out-of-range stream index.
         assert!(
-            open_with(TrackEditList {
-                stream_index: 3,
-                entries: vec![entry(64, 0, 1)],
-            })
+            open_with(
+                TrackEditList::default()
+                    .with_stream_index(3)
+                    .with_entries(vec![entry(64, 0, 1)])
+            )
             .is_err()
         );
     }
@@ -747,21 +743,20 @@ mod mux_explicit_fragmented {
             media_rate_integer: 1,
             media_rate_fraction: 0,
         }];
-        let opts = Mp4MuxerOptions {
-            fragmented: Some(FragmentedOptions {
-                cadence: FragmentCadence::EveryNPackets(2),
-                styp: Some(BrandPreset::Custom {
-                    major: *b"msdh",
-                    compatible: vec![*b"msdh", *b"msix"],
-                }),
-                ..FragmentedOptions::default()
-            }),
-            track_edit_lists: vec![TrackEditList {
-                stream_index: 0,
-                entries: entries.clone(),
-            }],
-            ..Mp4MuxerOptions::default()
-        };
+        let opts = Mp4MuxerOptions::default()
+            .with_fragmented(Some(
+                FragmentedOptions::default()
+                    .with_cadence(FragmentCadence::EveryNPackets(2))
+                    .with_styp(Some(BrandPreset::Custom {
+                        major: *b"msdh",
+                        compatible: vec![*b"msdh", *b"msix"],
+                    })),
+            ))
+            .with_track_edit_lists(vec![
+                TrackEditList::default()
+                    .with_stream_index(0)
+                    .with_entries(entries.clone()),
+            ]);
         let tmp =
             std::env::temp_dir().join(format!("oxideav-mp4-elst-frag-{}.mp4", std::process::id()));
         {

@@ -50,25 +50,16 @@ fn tenc_cbcs(kid: [u8; 16], constant_iv: Vec<u8>) -> TencBox {
 }
 
 fn frag_opts(n: u32) -> FragmentedOptions {
-    FragmentedOptions {
-        cadence: FragmentCadence::EveryNPackets(n),
-        emit_random_access_indexes: false,
-        styp: None,
-        ..FragmentedOptions::default()
-    }
+    FragmentedOptions::default()
+        .with_cadence(FragmentCadence::EveryNPackets(n))
+        .with_emit_random_access_indexes(false)
+        .with_styp(None)
 }
 
 fn protected_options(scheme: [u8; 4], tenc: TencBox, frag: FragmentedOptions) -> Mp4MuxerOptions {
-    Mp4MuxerOptions {
-        fragmented: Some(frag),
-        track_protection: vec![TrackProtection {
-            stream_index: 0,
-            scheme_type: scheme,
-            scheme_version: 0x0001_0000,
-            tenc,
-        }],
-        ..Mp4MuxerOptions::default()
-    }
+    Mp4MuxerOptions::default()
+        .with_fragmented(Some(frag))
+        .with_track_protection(vec![TrackProtection::new(0, scheme, 0x0001_0000, tenc)])
 }
 
 fn open_typed(
@@ -330,10 +321,7 @@ fn constant_iv_subsample_senc_has_zero_length_ivs() {
 #[test]
 fn protected_write_requires_a_protection_directive() {
     let stream = pcm_stream(0);
-    let options = Mp4MuxerOptions {
-        fragmented: Some(frag_opts(2)),
-        ..Mp4MuxerOptions::default()
-    };
+    let options = Mp4MuxerOptions::default().with_fragmented(Some(frag_opts(2)));
     let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-noprot.mp4");
     let mut mux = open_typed(&tmp, std::slice::from_ref(&stream), options);
     mux.write_header().unwrap();
@@ -660,11 +648,10 @@ fn seig_clear_group_round_trips() {
 #[test]
 fn protected_fragments_with_sidx_styp_and_mfra() {
     let stream = pcm_stream(0);
-    let frag = FragmentedOptions {
-        cadence: FragmentCadence::EveryNPackets(2),
-        emit_random_access_indexes: true,
-        ..FragmentedOptions::default() // default styp(msdh) preset
-    };
+    let frag = FragmentedOptions::default()
+        // default styp(msdh) preset
+        .with_cadence(FragmentCadence::EveryNPackets(2))
+        .with_emit_random_access_indexes(true);
     let options = protected_options(*b"cenc", tenc_iv8([0x31; 16]), frag);
     let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-indexed.mp4");
     {
@@ -721,24 +708,12 @@ fn protected_fragments_with_sidx_styp_and_mfra() {
 fn two_protected_tracks_patch_independent_saio_offsets() {
     let streams = [pcm_stream(0), pcm_stream(1)];
     let frag = frag_opts(2);
-    let options = Mp4MuxerOptions {
-        fragmented: Some(frag),
-        track_protection: vec![
-            TrackProtection {
-                stream_index: 0,
-                scheme_type: *b"cenc",
-                scheme_version: 0x0001_0000,
-                tenc: tenc_iv8([0x0A; 16]),
-            },
-            TrackProtection {
-                stream_index: 1,
-                scheme_type: *b"cenc",
-                scheme_version: 0x0001_0000,
-                tenc: tenc_iv8([0x0B; 16]),
-            },
-        ],
-        ..Mp4MuxerOptions::default()
-    };
+    let options = Mp4MuxerOptions::default()
+        .with_fragmented(Some(frag))
+        .with_track_protection(vec![
+            TrackProtection::new(0, *b"cenc", 0x0001_0000, tenc_iv8([0x0A; 16])),
+            TrackProtection::new(1, *b"cenc", 0x0001_0000, tenc_iv8([0x0B; 16])),
+        ]);
     let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-2track.mp4");
     {
         let mut mux = open_typed(&tmp, &streams, options);
@@ -787,12 +762,10 @@ fn two_protected_tracks_patch_independent_saio_offsets() {
 #[test]
 fn every_keyframe_cadence_keeps_senc_aligned() {
     let stream = pcm_stream(0);
-    let frag = FragmentedOptions {
-        cadence: FragmentCadence::EveryKeyframe,
-        emit_random_access_indexes: false,
-        styp: None,
-        ..FragmentedOptions::default()
-    };
+    let frag = FragmentedOptions::default()
+        .with_cadence(FragmentCadence::EveryKeyframe)
+        .with_emit_random_access_indexes(false)
+        .with_styp(None);
     let options = protected_options(*b"cenc", tenc_iv8([0x44; 16]), frag);
     let tmp = std::env::temp_dir().join("oxideav-mp4-cenc-frag-ekf.mp4");
     {
