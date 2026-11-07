@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Regression test pinning the gapless case reported in #12: a 20000-sample 44.1 kHz M4A from macOS's AAC encoder reports 2112 priming + 20000 valid + 416 remainder (afinfo's numbers) through `gapless_timing`, the flat `gapless_*` options and the `----:com.apple.iTunes:iTunSMPB` metadata item (#12).
 - `TrackProtection::new(stream_index, scheme_type, scheme_version, tenc)`; `with_*` setters for every field of `Mp4MuxerOptions`, `FragmentedOptions`, `TrackSampleGroups`, `TrackEditList` and `TrackProtection`.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.10...v0.0.11) - 2026-10-25

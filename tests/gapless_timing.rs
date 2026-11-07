@@ -51,6 +51,48 @@ fn m4a_itunsmpb() {
 }
 
 #[test]
+fn m4a_itunsmpb_issue_12_case() {
+    // The case reported in #12: 20000 mono samples at 44.1 kHz through
+    // macOS's AAC encoder (`afconvert -f m4af -d aac`); afinfo reports
+    // 20000 valid frames + 2112 priming + 416 remainder = 22528, i.e.
+    // 22 packets of 1024 with no edit list or roll group.
+    let data = include_bytes!("fixtures/apple-aac-20000.m4a");
+    let t = timing(data).unwrap();
+    assert_eq!(
+        t,
+        GaplessTiming::new(2112, 20000, 416, GaplessSource::ITunSmpb)
+    );
+    assert_eq!(t.total(), 22 * 1024);
+    // The freeform item itself reaches metadata() under its
+    // `----:<mean>:<name>` key with the raw value.
+    let ctx = RuntimeContext::new();
+    let d = open_typed(Box::new(std::io::Cursor::new(data.to_vec())), &ctx.codecs).unwrap();
+    let smpb = d
+        .metadata()
+        .iter()
+        .find(|(k, _)| k == "----:com.apple.iTunes:iTunSMPB")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert!(
+        smpb.trim_start()
+            .starts_with("00000000 00000840 000001A0 0000000000004E20"),
+        "{smpb:?}"
+    );
+    let (rate, flat) = rate_and_flat(data);
+    assert_eq!(rate, Some(44_100));
+    assert_eq!(
+        flat,
+        [
+            ("gapless_priming", "2112"),
+            ("gapless_remainder", "416"),
+            ("gapless_source", "iTunSMPB"),
+            ("gapless_valid", "20000"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+    );
+}
+
+#[test]
 fn he_aac_itunsmpb_counts_scale_to_the_reported_rate() {
     // macOS's HE-AAC encoder: 1 s mono at 44.1 kHz, stored with the
     // 22.05 kHz core rate in the `mp4a` entry. afinfo reads the file at
