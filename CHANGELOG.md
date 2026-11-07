@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.11...v0.0.12) - 2026-11-07
+
+### Other
+
+- pin the iTunSMPB gapless case reported in #12 (afinfo 20000 + 2112 + 416)
+- rustfmt the builder chains from the non_exhaustive pass
+- API hygiene: non_exhaustive muxer options, growable enums, read-only box records
+
 ### Changed
 
 - `#[non_exhaustive]`: the muxer option records `Mp4MuxerOptions`, `FragmentedOptions`, `TrackSampleGroups`, `TrackEditList` and `TrackProtection`; the enums `BrandPreset`, `FragmentCadence`, `CencScheme`, `IvSupply`, `ItemProperty`, `ColrRecord`, `EmsgTime`, `SampleGroupGroupingType` and `SampleGroupEntry`; and every parsed box / demuxer record that callers only read (the `sidx` / `tfra` / `prft` / `amve` / `btrt` / `pdin` / `pnot` / `sbgp` / `sgpd` / `csgp` / `subs` / `saiz` / `saio` / `gmin` / `tcmi` / `load` / hint / FD-item / `meta` aggregate records, the `traf` SAI / sample-group / `senc` / `pssh` records, `MetaItems`, `PrftRequest`, `CencSchemeDecision`, `CipherStep` and the sample-group entry payloads). Code outside the crate builds the option records with `Default` plus the `with_*` setters and needs a `_ =>` arm when matching the enums. Box records that callers also build as muxer / packager inputs or test expectations (`TencBox`, `PsshBox`, `SeigEntry`, `SencBox` / `SencSample` / `SubsampleEntry`, the PIFF records, `EditListEntry`, `SampleToGroup`, `SampleGroupDescription`, `CompactSampleToGroup`, the `iloc` / `iinf` / `iref` / `ipma` / `grpl` records, `EmsgBox`, `StviRecord`, the `ssix` / `leva` / `assp` / `trep` / `pasp` / `clap` records), `SampleFlags`, `TrackKey`, `CipherMode` and `CipherStepKind` are unchanged.
