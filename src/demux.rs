@@ -898,14 +898,28 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             })
             .collect()
     };
+    // §10.1 roll distance per track: its own description, else a
+    // movie fragment's.
+    let roll_distances: Vec<Option<i16>> = parsed
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let in_fragments = traf_sample_groups
+                .iter()
+                .filter(move |r| r.track_idx as usize == i)
+                .flat_map(|r| r.sgpd.iter());
+            audio_roll_distance(t, in_fragments)
+        })
+        .collect();
     let gapless = gapless_timings(
         &parsed.tracks,
         &streams,
         &metadata,
         parsed.movie_timescale,
         &media_totals,
+        &roll_distances,
     );
-    let roll_distances: Vec<Option<i16>> = parsed.tracks.iter().map(audio_roll_distance).collect();
     // Flat mirror of the typed accessors, the way the `elst_*` keys
     // mirror `edit_list`.
     for ((s, g), roll) in streams.iter_mut().zip(&gapless).zip(&roll_distances) {
@@ -6881,15 +6895,26 @@ fn scale_count(a: u64, num: u64, den: u64) -> u64 {
 }
 
 /// The `roll_distance` of a track's audio `roll` / `prol` sample group
-/// description (§10.1.1.2), `roll` first.
-fn audio_roll_distance(t: &Track) -> Option<i16> {
+/// description (§10.1.1.2), `roll` first: from the track's own sample
+/// table, else from the first movie fragment of the track that
+/// carries one (`fragment_sgpd`, in file order).
+fn audio_roll_distance<'a>(
+    t: &'a Track,
+    fragment_sgpd: impl Iterator<Item = &'a SgpdBox> + Clone,
+) -> Option<i16> {
     if t.media_type != MediaType::Audio {
         return None;
     }
-    [b"roll", b"prol"].iter().find_map(|ty| {
-        let g = t.sgpd.iter().find(|g| &g.grouping_type == *ty)?;
+    let distance = |g: &SgpdBox| {
         let e = g.entries.first()?;
         Some(i16::from_be_bytes([*e.first()?, *e.get(1)?]))
+    };
+    [b"roll", b"prol"].iter().find_map(|ty| {
+        t.sgpd
+            .iter()
+            .chain(fragment_sgpd.clone())
+            .filter(|g| &g.grouping_type == *ty)
+            .find_map(distance)
     })
 }
 
@@ -6907,6 +6932,7 @@ fn gapless_timings(
     metadata: &[(String, String)],
     movie_timescale: u32,
     media_totals: &[u64],
+    roll_distances: &[Option<i16>],
 ) -> Vec<Option<GaplessTiming>> {
     let smpb = metadata
         .iter()
@@ -6944,7 +6970,7 @@ fn gapless_timings(
                     });
 
             // Carriage: one media edit after any leading empty edits.
-            let signalled = audio_roll_distance(t).is_some();
+            let signalled = roll_distances.get(i).copied().flatten().is_some();
             let media_edits = {
                 let lead = t.elst.iter().take_while(|e| e.media_time == -1).count();
                 &t.elst[lead..]

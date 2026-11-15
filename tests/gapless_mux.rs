@@ -705,3 +705,82 @@ fn pcm_with_a_start_delay_and_a_short_last_packet_is_not_gapless() {
     assert!(d.edit_list(0)[0].is_empty_edit());
     assert_eq!(d.gapless_timing(0), None);
 }
+
+/// `(offset, size)` of the first child box of this type in `data[from..to]`.
+fn child(data: &[u8], from: usize, to: usize, name: &[u8; 4]) -> (usize, usize) {
+    let mut at = from;
+    while at + 8 <= to {
+        let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+        if &data[at + 4..at + 8] == name {
+            return (at, size);
+        }
+        assert!(size >= 8);
+        at += size;
+    }
+    panic!("no {}", String::from_utf8_lossy(name));
+}
+
+#[test]
+fn roll_group_declared_in_a_movie_fragment_signals_the_edit_list() {
+    // A fragmented file whose init segment has the trimming edit but
+    // no sample group description: on its own a plain trim.
+    let plain = mux(fragmented()
+        .with_movie_timescale(RATE)
+        .with_track_edit_lists(vec![edit(PRIMING as i64, VALID)]));
+    let d = open(&plain);
+    assert_eq!(d.audio_roll_distance(0), None);
+    assert_eq!(
+        d.gapless_timing(0).map(|g| g.source),
+        Some(GaplessSource::EditListTrim)
+    );
+
+    // The same file with a `roll` description (distance -1, §10.1)
+    // appended to the first track fragment: the moof and traf grow by
+    // the box, and the trun's data offset (relative to the moof) with
+    // them.
+    let mut sgpd = Vec::new();
+    sgpd.extend_from_slice(&26u32.to_be_bytes());
+    sgpd.extend_from_slice(b"sgpd");
+    sgpd.extend_from_slice(&[1, 0, 0, 0]); // version 1
+    sgpd.extend_from_slice(b"roll");
+    sgpd.extend_from_slice(&2u32.to_be_bytes()); // default_length
+    sgpd.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+    sgpd.extend_from_slice(&(-1i16).to_be_bytes());
+    assert_eq!(sgpd.len(), 26);
+
+    let (moof_at, moof_size) = child(&plain, 0, plain.len(), b"moof");
+    let (traf_at, traf_size) = child(&plain, moof_at + 8, moof_at + moof_size, b"traf");
+    let (trun_at, _) = child(&plain, traf_at + 8, traf_at + traf_size, b"trun");
+    assert_eq!(plain[trun_at + 11] & 1, 1, "trun carries a data offset");
+    let mut grown = plain.clone();
+    let bump = |b: &mut [u8], at: usize| {
+        let v = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) + 26;
+        b[at..at + 4].copy_from_slice(&v.to_be_bytes());
+    };
+    bump(&mut grown, moof_at);
+    bump(&mut grown, traf_at);
+    bump(&mut grown, trun_at + 16); // version/flags, sample_count, data_offset
+    let end_of_traf = traf_at + traf_size;
+    grown.splice(end_of_traf..end_of_traf, sgpd);
+
+    let mut d = open(&grown);
+    assert_eq!(d.audio_roll_distance(0), Some(-1));
+    assert_eq!(
+        d.gapless_timing(0),
+        Some(GaplessTiming::new(
+            PRIMING,
+            VALID,
+            REMAINDER,
+            GaplessSource::EditList
+        ))
+    );
+    // Every payload is still where the tables say.
+    let mut reference = open(&plain);
+    loop {
+        match (d.next_packet(), reference.next_packet()) {
+            (Ok(a), Ok(b)) => assert_eq!(a.data, b.data),
+            (Err(_), Err(_)) => break,
+            _ => panic!("packet counts differ"),
+        }
+    }
+}
