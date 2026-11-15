@@ -260,7 +260,16 @@ fn report(label: &str, streams: &[StreamInfo], pkts: &[Packet], options: Mp4Muxe
 }
 
 fn main() {
+    // `cargo bench` passes `--bench`; anything else that runs this
+    // binary (`cargo test --all-targets`) is only checking that it
+    // builds and starts, and gets a small file.
+    let timed = std::env::args().any(|a| a == "--bench");
     let streams = streams();
+    if !timed {
+        let pkts = packets(&streams, 3000);
+        report("smoke", &streams, &pkts, Mp4MuxerOptions::default());
+        return;
+    }
     let total = env("MP4_BENCH_SAMPLES", 2_000_000);
     let pkts = packets(&streams, total);
     report("progressive", &streams, &pkts, Mp4MuxerOptions::default());
