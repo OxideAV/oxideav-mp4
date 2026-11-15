@@ -287,8 +287,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let mut samples: Vec<SampleRef> = Vec::new();
     for (i, t) in parsed.tracks.iter().enumerate() {
         streams.push(build_stream_info(i as u32, t, codecs));
-        expand_samples(t, i as u32, &mut samples)?;
     }
+    // Every track's samples, merged into file order as they are
+    // expanded.
+    expand_tracks(&parsed.tracks, &mut samples)?;
 
     // Per-track running base_media_decode_time, used when a fragment's
     // `tfdt` box is absent. Initialised from the last DTS+duration of
@@ -12533,33 +12535,173 @@ impl<'a> SyncCursor<'a> {
     }
 }
 
-/// Expand a track's sample tables into one [`SampleRef`] per sample, in
-/// a single pass: the time-to-sample and composition-offset runs
-/// (§8.6.1.2 / §8.6.1.3), the sync table (§8.6.2) and the
-/// sample-to-chunk runs (§8.7.4) are each walked by a cursor, and a
+/// A pull walk over one track's sample tables: one [`SampleRef`] per
+/// sample, in decode order. The time-to-sample and composition-offset
+/// runs (§8.6.1.2 / §8.6.1.3), the sync table (§8.6.2) and the
+/// sample-to-chunk runs (§8.7.4) are each followed by a cursor, and a
 /// sample's file offset is its chunk's offset plus the running size of
 /// the samples before it in that chunk. Nothing is allocated per
-/// sample beyond the output record, and the work is bounded by the
-/// number of sample sizes the file actually backs, whatever counts the
-/// run-length tables claim.
-fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result<()> {
-    let n_samples = t.stsz.len();
-    if n_samples == 0 {
-        return Ok(());
+/// sample, and the work is bounded by the number of sample sizes the
+/// file actually backs, whatever counts the run-length tables claim.
+///
+/// [`Self::peek_offset`] resolves where the next sample lies (so
+/// several tracks can be merged in file order as they are walked);
+/// [`Self::emit`] then produces it.
+struct SampleWalk<'a> {
+    t: &'a Track,
+    track_idx: u32,
+    /// Sample count (the length of the size table), also clamped to
+    /// 32 bits for the `samples_per_chunk` clamp.
+    n: usize,
+    n_u32: u32,
+    stts: RunCursor<'a, u32>,
+    ctts: RunCursor<'a, i32>,
+    sync: SyncCursor<'a>,
+    /// Running decode time (the sum of the deltas so far).
+    media_dts: i64,
+    /// Index of the next sample.
+    i: usize,
+    /// `stsc` entry being walked, and whether `chunk` has been set up
+    /// for it.
+    entry: usize,
+    entered: bool,
+    /// Next chunk number to open within the entry; `chunk_wrapped`
+    /// once it has passed `u32::MAX`.
+    chunk: u32,
+    chunk_wrapped: bool,
+    /// Chunk number carried from one entry to the next.
+    next_chunk: u32,
+    /// Samples left in the open chunk.
+    left: u32,
+    /// File offset and sample description index of the next sample.
+    offset: u64,
+    sdi: u32,
+    /// (chunk, sample_description_index) of the last chunk opened.
+    last_placed: Option<(usize, u32)>,
+    /// Offset every sample the `stsc` runs did not cover is given.
+    leftover_at: Option<u64>,
+}
+
+impl<'a> SampleWalk<'a> {
+    fn new(t: &'a Track, track_idx: u32) -> Self {
+        let n = t.stsz.len();
+        Self {
+            t,
+            track_idx,
+            n,
+            n_u32: u32::try_from(n).unwrap_or(u32::MAX),
+            stts: RunCursor::new(&t.stts),
+            ctts: RunCursor::new(&t.ctts),
+            sync: SyncCursor::new(&t.stss),
+            media_dts: 0,
+            i: 0,
+            entry: 0,
+            entered: false,
+            chunk: 1,
+            chunk_wrapped: false,
+            next_chunk: 1,
+            left: 0,
+            offset: 0,
+            sdi: 1,
+            last_placed: None,
+            leftover_at: None,
+        }
     }
-    out.reserve(n_samples);
 
-    let mut stts = RunCursor::new(&t.stts);
-    let mut ctts = RunCursor::new(&t.ctts);
-    let mut sync = SyncCursor::new(&t.stss);
-    // Running decode time (the sum of the deltas so far).
-    let mut media_dts: i64 = 0;
+    fn chunk_offset(&self, chunk: usize) -> Result<u64> {
+        self.t
+            .chunk_offsets
+            .get(chunk.wrapping_sub(1))
+            .copied()
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "MP4: chunk index {chunk} out of range (track {})",
+                    self.track_idx
+                ))
+            })
+    }
 
-    // One sample, at `offset`, decoding against `sdi`.
-    let mut emit = |i: usize, offset: u64, sdi: u32, out: &mut Vec<SampleRef>| {
+    /// The file offset of the next sample, `None` when the track is
+    /// exhausted, an error when the sample-to-chunk runs name a chunk
+    /// the offset table does not hold.
+    fn peek_offset(&mut self) -> Result<Option<u64>> {
+        if self.i >= self.n {
+            return Ok(None);
+        }
+        if self.left > 0 {
+            return Ok(Some(self.offset));
+        }
+        if let Some(at) = self.leftover_at {
+            self.offset = at;
+            self.left = 1;
+            return Ok(Some(at));
+        }
+        // stsc is run-length: each entry says "starting at
+        // first_chunk, every chunk has `samples_per_chunk` samples"
+        // until the next entry's first_chunk.
+        loop {
+            let Some(&(first_chunk, spc, sdi)) = self.t.stsc.get(self.entry) else {
+                // Samples the stsc runs did not cover (an invalid file
+                // — but don't crash): each is placed at the start of
+                // the last chunk used.
+                let (chunk, sdi) = self.last_placed.unwrap_or((1, 1));
+                let at = self.chunk_offset(chunk)?;
+                self.leftover_at = Some(at);
+                self.sdi = sdi;
+                self.offset = at;
+                self.left = 1;
+                return Ok(Some(at));
+            };
+            let end_chunk = self
+                .t
+                .stsc
+                .get(self.entry + 1)
+                .map_or(self.t.chunk_offsets.len() as u64 + 1, |e| u64::from(e.0));
+            if !self.entered {
+                self.chunk = self.next_chunk.max(first_chunk);
+                self.chunk_wrapped = false;
+                self.entered = true;
+            }
+            // `samples_per_chunk` is clamped to the sample count so a
+            // forged `u32::MAX` cannot overflow the per-chunk count.
+            let spc = spc.min(self.n_u32);
+            if spc == 0 {
+                // A run of empty chunks places nothing: step over it
+                // whole rather than chunk by chunk (the run length is
+                // a forged-able 32-bit difference).
+                let end = u32::try_from(end_chunk).unwrap_or(u32::MAX);
+                self.next_chunk = self.chunk.max(end);
+                self.entry += 1;
+                self.entered = false;
+                continue;
+            }
+            if !self.chunk_wrapped && u64::from(self.chunk) < end_chunk {
+                // Open the chunk: it places at least one sample, so
+                // the walk is bounded by the sample count.
+                let c = self.chunk as usize;
+                self.offset = self.chunk_offset(c)?;
+                self.left = spc;
+                self.sdi = sdi;
+                self.last_placed = Some((c, sdi));
+                match self.chunk.checked_add(1) {
+                    Some(next) => self.chunk = next,
+                    None => self.chunk_wrapped = true,
+                }
+                return Ok(Some(self.offset));
+            }
+            self.next_chunk = self.chunk;
+            self.entry += 1;
+            self.entered = false;
+        }
+    }
+
+    /// Produce the sample [`Self::peek_offset`] just located.
+    fn emit(&mut self, out: &mut Vec<SampleRef>) {
+        let t = self.t;
+        let size = t.stsz[self.i];
         // Past the end of the stts runs the delta is zero.
-        let dur = stts.next().map_or(0, i64::from);
-        let cts_offset = ctts.next().map_or(0, i64::from);
+        let dur = self.stts.next().map_or(0, i64::from);
+        let cts_offset = self.ctts.next().map_or(0, i64::from);
         // CTS = DTS + ctts_offset (§8.6.1.3). Streams without a ctts
         // box take the DTS path unchanged.
         //
@@ -12569,97 +12711,88 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
         // out), and media the list never presents is delivered with
         // the discard flag set. Tracks without an elst take the
         // identity mapping.
-        let media_cts = media_dts.saturating_add(cts_offset);
+        let media_cts = self.media_dts.saturating_add(cts_offset);
         let (elst_delta, presented) = t.elst_timeline.delta_for_span(media_cts, dur);
         out.push(SampleRef {
-            track_idx,
-            offset,
-            size: t.stsz[i],
+            track_idx: self.track_idx,
+            offset: self.offset,
+            size,
             pts: media_cts.saturating_add(elst_delta),
-            dts: media_dts.saturating_add(elst_delta),
+            dts: self.media_dts.saturating_add(elst_delta),
             duration: dur,
             // Per ISO/IEC 14496-12, an absent or empty stss means
             // every sample is a sync frame (the norm for audio and
             // intra-only video).
-            keyframe: sync.is_sync((i as u32).wrapping_add(1)),
+            keyframe: self.sync.is_sync((self.i as u32).wrapping_add(1)),
             discard: !presented,
-            sdi,
-            media_dts,
+            sdi: self.sdi,
+            media_dts: self.media_dts,
             cts_offset,
             seq: out.len() as u64,
         });
-        media_dts = media_dts.saturating_add(dur);
-    };
-
-    let chunk_range_error = |chunk: usize| {
-        Error::invalid(format!(
-            "MP4: chunk index {chunk} out of range (track {track_idx})"
-        ))
-    };
-    // stsc is run-length: each entry says "starting at first_chunk,
-    // every chunk has `samples_per_chunk` samples" until the next
-    // entry's first_chunk. `samples_per_chunk` is clamped to the
-    // sample count so a forged `u32::MAX` cannot spin the inner loop.
-    let n_chunks = t.chunk_offsets.len();
-    let n_samples_u32 = u32::try_from(n_samples).unwrap_or(u32::MAX);
-    let mut i = 0usize;
-    let mut next_chunk = 1u32;
-    // (chunk, sample_description_index) of the last sample placed.
-    let mut last_placed: Option<(usize, u32)> = None;
-    for (entry_i, &(first_chunk, spc, sdi)) in t.stsc.iter().enumerate() {
-        if i >= n_samples {
-            break;
-        }
-        let end_chunk = t
-            .stsc
-            .get(entry_i + 1)
-            .map_or(n_chunks as u64 + 1, |e| u64::from(e.0));
-        let spc = spc.min(n_samples_u32);
-        let mut chunk = next_chunk.max(first_chunk);
-        if spc == 0 {
-            // A run of empty chunks places nothing: step over it
-            // whole rather than chunk by chunk (the run length is a
-            // forged-able 32-bit difference).
-            let end = u32::try_from(end_chunk).unwrap_or(u32::MAX);
-            next_chunk = chunk.max(end);
-            continue;
-        }
-        // Each pass places at least one sample or fails, so the walk
-        // is bounded by the sample count.
-        while u64::from(chunk) < end_chunk && i < n_samples {
-            let c = chunk as usize;
-            let mut offset = *t
-                .chunk_offsets
-                .get(c.wrapping_sub(1))
-                .ok_or_else(|| chunk_range_error(c))?;
-            for _ in 0..spc {
-                if i >= n_samples {
-                    break;
-                }
-                emit(i, offset, sdi, out);
-                offset = offset.saturating_add(u64::from(t.stsz[i]));
-                i += 1;
-            }
-            last_placed = Some((c, sdi));
-            chunk = match chunk.checked_add(1) {
-                Some(c) => c,
-                None => break,
-            };
-        }
-        next_chunk = chunk;
+        self.media_dts = self.media_dts.saturating_add(dur);
+        self.offset = self.offset.saturating_add(u64::from(size));
+        self.left = self.left.saturating_sub(1);
+        self.i += 1;
     }
-    // Samples the stsc runs did not cover (an invalid file — but don't
-    // crash): each is placed at the start of the last chunk used.
-    if i < n_samples {
-        let (chunk, sdi) = last_placed.unwrap_or((1, 1));
-        let offset = *t
-            .chunk_offsets
-            .get(chunk.wrapping_sub(1))
-            .ok_or_else(|| chunk_range_error(chunk))?;
-        while i < n_samples {
-            emit(i, offset, sdi, out);
-            i += 1;
+}
+
+/// Expand one track's sample tables into `out`, in decode order.
+#[cfg(test)]
+fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result<()> {
+    let mut walk = SampleWalk::new(t, track_idx);
+    out.reserve(walk.n);
+    while walk.peek_offset()?.is_some() {
+        walk.emit(out);
+    }
+    Ok(())
+}
+
+/// Expand every track's sample tables into `out` in file order — by
+/// offset, then track, then decode order — merging the tracks as they
+/// are walked, so interleaved tracks need no sort afterwards. A track
+/// whose own offsets go backwards makes a merge impossible; the result
+/// is then sorted into the same order.
+fn expand_tracks(tracks: &[Track], out: &mut Vec<SampleRef>) -> Result<()> {
+    use std::cmp::Reverse;
+    let start = out.len();
+    out.reserve(tracks.iter().map(|t| t.stsz.len()).sum());
+    let mut walks: Vec<SampleWalk> = tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| SampleWalk::new(t, i as u32))
+        .collect();
+    // (offset of the track's next sample, track)
+    let mut heads = std::collections::BinaryHeap::with_capacity(walks.len());
+    for (i, w) in walks.iter_mut().enumerate() {
+        if let Some(offset) = w.peek_offset()? {
+            heads.push(Reverse((offset, i)));
         }
+    }
+    let mut ordered = true;
+    while let Some(Reverse((offset, i))) = heads.pop() {
+        let w = &mut walks[i];
+        // Stay on this track while it remains the lowest: a run of one
+        // track's samples costs no heap traffic.
+        let mut at = offset;
+        loop {
+            w.emit(out);
+            match w.peek_offset()? {
+                None => break,
+                Some(next) => {
+                    ordered &= next >= at;
+                    let stays = heads.peek().is_none_or(|&Reverse(other)| (next, i) < other);
+                    if !stays || next < at {
+                        heads.push(Reverse((next, i)));
+                        break;
+                    }
+                    at = next;
+                }
+            }
+        }
+    }
+    if !ordered {
+        out[start..].sort_by_key(|s| (s.offset, s.track_idx, s.seq));
     }
     Ok(())
 }
@@ -17178,6 +17311,82 @@ mod tests {
         // samples still to place, is an error.
         t.stsc = vec![(1, 2, 1), (5, 3, 2)];
         assert!(super::expand_samples(&t, 3, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn merged_expansion_is_the_stable_offset_sort_of_the_tracks() {
+        // Reference: expand each track on its own, in track order,
+        // then stable-sort by offset.
+        fn reference(tracks: &[super::Track]) -> Vec<(u32, u64, u32, i64)> {
+            let mut all = Vec::new();
+            for (i, t) in tracks.iter().enumerate() {
+                super::expand_samples(t, i as u32, &mut all).unwrap();
+            }
+            all.sort_by_key(|s| s.offset);
+            all.iter()
+                .map(|s| (s.track_idx, s.offset, s.size, s.dts))
+                .collect()
+        }
+        fn merged(tracks: &[super::Track]) -> Vec<(u32, u64, u32, i64)> {
+            let mut all = Vec::new();
+            super::expand_tracks(tracks, &mut all).unwrap();
+            // Decode order within a track survives in `seq`.
+            for t in 0..tracks.len() as u32 {
+                let seqs: Vec<u64> = all
+                    .iter()
+                    .filter(|s| s.track_idx == t)
+                    .map(|s| s.seq)
+                    .collect();
+                let mut by_dts: Vec<(u64, i64)> = all
+                    .iter()
+                    .filter(|s| s.track_idx == t)
+                    .map(|s| (s.seq, s.dts))
+                    .collect();
+                by_dts.sort();
+                assert!(by_dts.windows(2).all(|w| w[0].1 <= w[1].1));
+                let mut unique = seqs.clone();
+                unique.sort();
+                unique.dedup();
+                assert_eq!(unique.len(), seqs.len());
+            }
+            all.iter()
+                .map(|s| (s.track_idx, s.offset, s.size, s.dts))
+                .collect()
+        }
+        let track = |sizes: &[u32], chunks: &[u64], spc: u32| {
+            let mut t = fresh_track();
+            t.stsz = sizes.to_vec();
+            t.chunk_offsets = chunks.to_vec();
+            t.stsc = vec![(1, spc, 1)];
+            t.stts = vec![(sizes.len() as u32, 7)];
+            t
+        };
+        let cases: Vec<Vec<super::Track>> = vec![
+            // Interleaved runs of three tracks.
+            vec![
+                track(&[5, 5, 5, 5], &[100, 140], 2),
+                track(&[10, 10], &[110, 150], 1),
+                track(&[20, 20], &[120, 160], 1),
+            ],
+            // One track after the other (no interleave at all).
+            vec![track(&[1, 2, 3], &[500], 3), track(&[4, 5, 6], &[100], 3)],
+            // Zero-size samples and offsets shared between tracks.
+            vec![
+                track(&[0, 0, 3], &[100], 3),
+                track(&[0, 2], &[100], 2),
+                track(&[1], &[100], 1),
+            ],
+            // A track whose chunks go backwards in the file.
+            vec![
+                track(&[5, 5, 5], &[300, 100, 200], 1),
+                track(&[5, 5], &[150, 250], 1),
+            ],
+            // An empty track among the others.
+            vec![track(&[], &[], 1), track(&[3, 3], &[10], 2)],
+        ];
+        for (n, tracks) in cases.iter().enumerate() {
+            assert_eq!(merged(tracks), reference(tracks), "case {n}");
+        }
     }
 
     #[test]

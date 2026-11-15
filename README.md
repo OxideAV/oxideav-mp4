@@ -1944,10 +1944,10 @@ times each stage. Medians of 3–5 runs on a shared, loaded machine
 
 | Stage | Before | After |
 |---|---|---|
-| `open`, progressive, 2 M samples | 140 ms | 66–80 ms |
+| `open`, progressive, 2 M samples | 140 ms | 25–49 ms |
 | `seek_to`, progressive, per seek | 902 µs | 1.1 µs |
 | `seek_to`, fragmented, per seek | 155 µs | 0.17 µs |
-| open + read every packet, `std::fs::File`, progressive | 2996 ms | 126–169 ms |
+| open + read every packet, `std::fs::File`, progressive | 2996 ms | 111–141 ms |
 | open + read every packet, `std::fs::File`, fragmented | 466 ms | 45–66 ms |
 | `next_packet`, in memory | 43–48 ms (≈ 45 M packets/s) | unchanged |
 | `moov` size, 2 M samples, default options | 15.36 MiB | 10.28 MiB |
@@ -1959,9 +1959,13 @@ Stage breakdown of the 140 ms `open` before the pass: expanding the
 sample tables 97 ms, parsing `moov` 24 ms, sorting into file order
 15 ms, the rest 4 ms. Expansion built four per-sample side tables and
 a hash set of sync samples and re-summed each chunk's sizes per
-sample (quadratic in samples per chunk); it is now one pass of run
-cursors. Parsing copied each box body once per nesting level (six
-copies of a sample table); bodies are now borrowed. Reading through a
+sample (quadratic in samples per chunk); it is now a pull walk of run
+cursors per track, and the tracks are merged into file order as they
+are walked, which removes the sort (a track whose own offsets go
+backwards falls back to sorting). Parsing copied each box body once
+per nesting level (six copies of a sample table); bodies are now
+borrowed. Two smaller per-sample passes run only for the files that
+need them (fragments; a gapless carriage). Reading through a
 file was two system calls per packet; `next_packet` now fills a
 64 KiB read-ahead block (`Mp4Demuxer::set_read_block_size`, `0` =
 off, which also frees the block: the trade is 64 KiB per demuxer).
@@ -2053,7 +2057,9 @@ cargo +nightly fuzz run cenc_roundtrip   # encrypt∘decrypt identity
   public accessor set (CENC / PIFF / `emsg` / HEIF item resolution /
   edit lists / fragment records / `resolve_sai_aux_info` so the
   attacker-controlled `saiz`/`saio` seek + §7.1 cell-parse path is
-  covered), a 256-packet drain, and both seek paths. Asserts
+  covered), gapless reconciliation and roll distances, a 256-packet
+  drain through a read-ahead block of input-chosen size, and seeks on
+  every stream at the extremes and at input-derived times. Asserts
   open-or-error, never a panic / abort / OOM.
 - **`box_parsers`** — hostile bytes through every standalone public
   box parser, asserting a **parse∘build fixed-point** wherever the
@@ -2063,7 +2069,8 @@ cargo +nightly fuzz run cenc_roundtrip   # encrypt∘decrypt identity
   re-demux byte-exactly (payloads + pts) across plain / faststart /
   fragmented (incl. `styp` + `sidx`/`mfra`) layouts, with pts identity
   held exact through the media↔movie timescale rescale and a
-  start-delay `elst`.
+  start-delay `elst`; recipes also switch on track-run chunks, `stz2`
+  sizes and a gapless metadata item, which must read back as written.
 - **`structured_mutate`** — writer-shaped fixtures with fuzz-directed
   byte flips, truncations, and targeted overwrites right after the
   sample-table / fragment / index FourCCs the offset walkers
@@ -2082,8 +2089,10 @@ regression artefacts live under `fuzz/corpus/<target>/`. The fuzz
 crate has its own `[workspace]` and a committed `Cargo.lock` for
 reproducibility; a daily `Fuzz` workflow runs the whole battery. The
 corpus includes muxer-produced fragmented seeds — a sealed-`mehd` file
-with an empty-time gap fragment, and a senc-stripped CENC file
-carrying the `saiz`/`saio` aux-info form.
+with an empty-time gap fragment, a senc-stripped CENC file carrying
+the `saiz`/`saio` aux-info form, and gapless audio files (edit list +
+`roll` group + metadata item; a fragmented one filled in at the
+trailer; one whose carriages contradict each other).
 
 Pinned regressions worth calling out:
 
