@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-mp4/compare/v0.0.11...v0.0.12) - 2026-11-15
+
+### Other
+
+- run the full timed pass only under cargo bench
+- fuzz target coverage, seed corpus and gapless cross-check wording
+- merge tracks into file order while expanding their sample tables
+- skip the per-sample passes a file does not need at open
+- pin sample expansion on irregular tables and the empty-chunk-run walk
+- movie timescale follows the gapless track, M4A brand preset, black-box cross-check
+- audio roll distance from a movie fragment's sample group description
+- fragmented muxer fills the init segment's edit and item at the trailer
+- whole-movie sample budget; size-zero trailing boxes read to end of file
+- drop an unused import in compact_tables
+- compact sample tables — no stss on all-sync tracks, track-run chunks, stz2
+- exact indexed seek, single-pass sample expansion, read-ahead; bound wave nesting
+- Gapless audio: reconcile edit list / roll group / iTunSMPB on read, write them from the muxers
+- pin the iTunSMPB gapless case reported in #12 (afinfo 20000 + 2112 + 416)
+- rustfmt the builder chains from the non_exhaustive pass
+- API hygiene: non_exhaustive muxer options, growable enums, read-only box records
+
 ### Fixed
 
 - Tracks could each claim the same file bytes through a constant-size `stsz`, so a file of many small `trak` boxes described (and made the demuxer expand) far more samples than it had bytes; a movie describing more than two samples per byte of file is now refused at open.
