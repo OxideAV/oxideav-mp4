@@ -1638,10 +1638,10 @@ carries the priming (a zeroed item reads as no item). `Mp4MuxerOptions::movie_ti
 unset it is the sample rate of the first track with a gapless edit
 list (so that edit list is sample-exact on its own) and 1000
 otherwise. `BrandPreset::M4a` writes the `M4A ` major brand: a
-black-box reader (macOS `afinfo`, run by `tests/gapless_mux.rs` when
-present) reports the written priming / valid / remainder for the edit
-list alone, the item alone and both together, and consults the item
-only under that brand. Directives that cannot be written faithfully
+black-box reader (run by `tests/gapless_mux.rs` when installed)
+reports the written priming / valid / remainder for the edit list
+alone, the item alone and both together, and consults the item only
+under that brand. Directives that cannot be written faithfully
 (non-audio stream, two per stream, an explicit `track_edit_lists`
 entry for the same stream, an item for a stream other than the first
 audio one, counts that overrun the track) are refused.
@@ -1940,7 +1940,7 @@ muxes 2 000 001 interleaved packets (one video frame, two audio
 packets, repeated; 24–63 and 16 byte payloads) into a progressive file
 and 300 000 into a fragmented one (4000 one-second fragments), then
 times each stage. Medians of 3–5 runs on a shared, loaded machine
-(Apple silicon; expect ±30 % between runs):
+(an arm64 desktop; expect ±30 % between runs):
 
 | Stage | Before | After |
 |---|---|---|
