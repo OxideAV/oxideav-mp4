@@ -1634,9 +1634,14 @@ first: with the valid length stated both carriages are complete in
 the init segment; without it the edit is written open-ended
 (`segment_duration = 0`) with a zeroed item, and `write_trailer` seeks
 back and fills both in, so a stream cut before its trailer still
-carries the priming (a zeroed item reads as no item). `Mp4MuxerOptions::movie_timescale` (default 1000)
-sets the `mvhd` timescale: at the audio sample rate the edit list on
-its own is sample-exact. Directives that cannot be written faithfully
+carries the priming (a zeroed item reads as no item). `Mp4MuxerOptions::movie_timescale` sets the `mvhd` timescale; left
+unset it is the sample rate of the first track with a gapless edit
+list (so that edit list is sample-exact on its own) and 1000
+otherwise. `BrandPreset::M4a` writes the `M4A ` major brand: a
+black-box reader (macOS `afinfo`, run by `tests/gapless_mux.rs` when
+present) reports the written priming / valid / remainder for the edit
+list alone, the item alone and both together, and consults the item
+only under that brand. Directives that cannot be written faithfully
 (non-audio stream, two per stream, an explicit `track_edit_lists`
 entry for the same stream, an item for a stream other than the first
 audio one, counts that overrun the track) are refused.

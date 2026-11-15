@@ -435,6 +435,7 @@ impl Muxer for FragmentedMuxer {
         // sample duration); rescale media → movie (1000, matching the
         // init mvhd) with u128 intermediates and ceiling division so a
         // sub-tick remainder never truncates the presentation.
+        let movie_timescale = self.movie_timescale();
         if let Some(pos) = self.mehd_patch_pos {
             let mut fragment_duration: u64 = 0;
             for t in &self.tracks {
@@ -442,8 +443,7 @@ impl Muxer for FragmentedMuxer {
                 if ts == 0 {
                     continue;
                 }
-                let scaled =
-                    ((t.next_bmdt as u128) * self.options.movie_timescale as u128).div_ceil(ts);
+                let scaled = ((t.next_bmdt as u128) * movie_timescale as u128).div_ceil(ts);
                 fragment_duration = fragment_duration.max(scaled.min(u64::MAX as u128) as u64);
             }
             let end = self.output.stream_position()?;
@@ -489,6 +489,12 @@ impl GaplessPatch {
 }
 
 impl FragmentedMuxer {
+    /// The `mvhd` timescale of this movie (see
+    /// `Mp4MuxerOptions::movie_timescale`).
+    fn movie_timescale(&self) -> u32 {
+        movie_timescale_for(&self.options, &self.tracks)
+    }
+
     /// Fill in one track's gapless placeholders from its finished
     /// length: the valid length is what remains after priming and
     /// padding. A 32-bit `segment_duration` the value does not fit is
@@ -503,7 +509,7 @@ impl FragmentedMuxer {
         let plan = crate::muxer::GaplessPlan::resolve(g, Some(t.next_bmdt))?;
         let end = self.output.stream_position()?;
         if let Some((pos, v1)) = patch.elst_segment_duration {
-            let entries = plan.edit_list(scale, self.options.movie_timescale);
+            let entries = plan.edit_list(scale, self.movie_timescale());
             let duration = entries[0].segment_duration;
             let bytes: Option<Vec<u8>> = if v1 {
                 Some(duration.to_be_bytes().to_vec())
@@ -1487,6 +1493,10 @@ fn build_styp(brand: &BrandPreset) -> Vec<u8> {
     wrap_box(b"styp", &body)
 }
 
+fn movie_timescale_for(options: &Mp4MuxerOptions, tracks: &[FragTrackState]) -> u32 {
+    options.resolve_movie_timescale(|i| tracks.get(i).map_or(0, |t| t.base.media_time_scale))
+}
+
 fn build_init_moov(
     tracks: &[FragTrackState],
     options: &Mp4MuxerOptions,
@@ -1500,7 +1510,7 @@ fn build_init_moov(
     let movie_times = options.resolve_movie_timestamps();
     // Movie timescale: 1000 unless the caller chose another (matches
     // the non-fragmented path).
-    let movie_timescale: u32 = options.movie_timescale;
+    let movie_timescale: u32 = movie_timescale_for(options, tracks);
     let mut udta: Option<Vec<u8>> = None;
 
     let mut moov_body = Vec::new();

@@ -684,9 +684,10 @@ fn build_moov(tracks: &[TrackState], options: &Mp4MuxerOptions) -> Result<Vec<u8
     let track_sample_groups: &[TrackSampleGroups] = &options.track_sample_groups;
     let pssh = &options.pssh;
     let movie_times = options.resolve_movie_timestamps();
-    // mvhd: the longest track's duration in the movie timescale (1000
-    // unless the caller chose another).
-    let movie_timescale: u32 = options.movie_timescale;
+    // mvhd: the longest track's duration in the movie timescale (the
+    // caller's, a gapless track's sample rate, or 1000).
+    let movie_timescale: u32 =
+        options.resolve_movie_timescale(|i| tracks.get(i).map_or(0, |t| t.media_time_scale));
     // `udta` with the gapless metadata item, when a directive asks.
     let mut udta: Option<Vec<u8>> = None;
     let mut movie_duration: u64 = 0;

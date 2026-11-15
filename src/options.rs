@@ -17,6 +17,7 @@
 /// * [`Mp4`](BrandPreset::Mp4): `mp42` / `isom mp42 mp41 iso2`
 /// * [`Mov`](BrandPreset::Mov): `qt  ` / `qt  `
 /// * [`Ismv`](BrandPreset::Ismv): `iso4` / `iso4 piff iso6 isml`
+/// * [`M4a`](BrandPreset::M4a): `M4A ` / `M4A mp42 isom`
 /// * [`Custom`](BrandPreset::Custom): caller-supplied major + compatible list
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -27,6 +28,10 @@ pub enum BrandPreset {
     Mov,
     /// Microsoft Smooth Streaming / ISMV — `major=iso4`, compatible=`iso4 piff iso6 isml`.
     Ismv,
+    /// MPEG-4 audio file (`.m4a`) — `major=M4A `, compatible=`M4A mp42
+    /// isom`. Some readers consult the `iTunSMPB` gapless item
+    /// ([`TrackGapless`]) only in a file of this major brand.
+    M4a,
     /// Custom brand with an explicit major + compatible list.
     Custom {
         major: [u8; 4],
@@ -41,6 +46,7 @@ impl BrandPreset {
             BrandPreset::Mp4 => *b"mp42",
             BrandPreset::Mov => *b"qt  ",
             BrandPreset::Ismv => *b"iso4",
+            BrandPreset::M4a => *b"M4A ",
             BrandPreset::Custom { major, .. } => *major,
         }
     }
@@ -51,6 +57,7 @@ impl BrandPreset {
             BrandPreset::Mp4 => vec![*b"isom", *b"mp42", *b"mp41", *b"iso2"],
             BrandPreset::Mov => vec![*b"qt  "],
             BrandPreset::Ismv => vec![*b"iso4", *b"piff", *b"iso6", *b"isml"],
+            BrandPreset::M4a => vec![*b"M4A ", *b"mp42", *b"isom"],
             BrandPreset::Custom { compatible, .. } => compatible.clone(),
         }
     }
@@ -397,14 +404,16 @@ impl TrackEditList {
 ///   `segment_duration` = the valid length (ISO/IEC 14496-12 §8.6.6),
 ///   plus a `roll` sample group whose `roll_distance` is
 ///   [`Self::roll_distance`] (§10.1) marking the edit as excluding
-///   encoder delay. `segment_duration` is in the movie timescale, so
-///   it is sample-exact only when
-///   [`Mp4MuxerOptions::movie_timescale`] is the track's sample rate
-///   (or a multiple of it).
+///   encoder delay. `segment_duration` is in the movie timescale,
+///   which [`Mp4MuxerOptions::movie_timescale`] therefore defaults to
+///   this track's sample rate; forcing another value (1000, say)
+///   rounds the valid length down to that resolution.
 /// * **`iTunSMPB` freeform item** ([`Self::write_itunsmpb`], on by
 ///   default): `moov/udta/meta/ilst/----` with the sample-exact
 ///   priming, padding and valid counts. One per file, so only the
-///   first audio stream may carry it.
+///   first audio stream may carry it. Readers that take the item into
+///   account may do so only for an `.m4a`-branded file:
+///   [`BrandPreset::M4a`].
 ///
 /// `priming`, `remainder` and `valid` are in the track's media
 /// timescale, which this muxer sets to the stream's sample rate — i.e.
@@ -847,11 +856,14 @@ pub struct Mp4MuxerOptions {
     /// See [`TrackGapless`].
     pub track_gapless: Vec<TrackGapless>,
     /// The `mvhd` timescale (§8.2.2), which is also the unit of `tkhd`
-    /// durations and of every `elst` `segment_duration`. `1000` by
-    /// default. Set it to an audio track's sample rate to make that
-    /// track's edit-list durations sample-exact. Zero is rejected at
+    /// durations and of every `elst` `segment_duration`.
+    ///
+    /// `None` (the default) picks it: the media timescale — the sample
+    /// rate — of the first track with a [`TrackGapless`] edit list, so
+    /// that edit list is sample-exact, and `1000` otherwise (the
+    /// historical value). `Some(n)` fixes it; zero is rejected at
     /// `open`.
-    pub movie_timescale: u32,
+    pub movie_timescale: Option<u32>,
 }
 
 impl Mp4MuxerOptions {
@@ -950,7 +962,7 @@ impl Mp4MuxerOptions {
 
     /// Set `movie_timescale`.
     pub fn with_movie_timescale(mut self, movie_timescale: u32) -> Self {
-        self.movie_timescale = movie_timescale;
+        self.movie_timescale = Some(movie_timescale);
         self
     }
 }
@@ -973,7 +985,7 @@ impl Default for Mp4MuxerOptions {
             chunking: ChunkPolicy::default(),
             compact_sample_sizes: false,
             track_gapless: Vec::new(),
-            movie_timescale: 1000,
+            movie_timescale: None,
         }
     }
 }
@@ -1024,6 +1036,21 @@ impl Mp4MuxerOptions {
             .find(|c| c.stream_index == stream_index)
     }
 
+    /// The movie timescale to write: the caller's, else the media
+    /// timescale of the first track with a gapless edit list
+    /// (`media_time_scale` maps a stream index to it), else 1000.
+    pub(crate) fn resolve_movie_timescale(&self, media_time_scale: impl Fn(usize) -> u32) -> u32 {
+        self.movie_timescale
+            .or_else(|| {
+                self.track_gapless
+                    .iter()
+                    .find(|g| g.write_edit_list)
+                    .map(|g| media_time_scale(g.stream_index))
+                    .filter(|&scale| scale != 0)
+            })
+            .unwrap_or(1000)
+    }
+
     /// The [`TrackGapless`] directive targeting `stream_index`, if any.
     pub(crate) fn gapless_for(&self, stream_index: usize) -> Option<&TrackGapless> {
         self.track_gapless
@@ -1043,7 +1070,7 @@ impl Mp4MuxerOptions {
         streams: &[oxideav_core::StreamInfo],
     ) -> oxideav_core::Result<()> {
         use oxideav_core::{Error, MediaType};
-        if self.movie_timescale == 0 {
+        if self.movie_timescale == Some(0) {
             return Err(Error::invalid(
                 "mp4 muxer: movie_timescale must be non-zero",
             ));

@@ -113,12 +113,29 @@ fn option(d: &Mp4Demuxer, key: &str) -> Option<String> {
 
 #[test]
 fn both_carriages_report_the_exact_counts() {
+    // Forced to a millisecond movie timescale, the edit list alone is
+    // exact only to a millisecond; it agrees with the item within
+    // that tick, so the item's sample-exact numbers are the result.
+    let bytes = mux(Mp4MuxerOptions::default()
+        .with_movie_timescale(1000)
+        .with_track_gapless(vec![TrackGapless::new(0, PRIMING, REMAINDER)]));
+    assert_eq!(open(&bytes).edit_list(0)[0].segment_duration, 172);
+    assert_eq!(
+        open(&bytes).gapless_timing(0),
+        Some(GaplessTiming::new(
+            PRIMING,
+            VALID,
+            REMAINDER,
+            GaplessSource::ITunSmpb
+        ))
+    );
+    // Left alone, the movie timescale follows the gapless track's
+    // sample rate and the edit list is exact as well.
     let bytes = mux(Mp4MuxerOptions::default()
         .with_track_gapless(vec![TrackGapless::new(0, PRIMING, REMAINDER)]));
     let mut d = open(&bytes);
-    // The edit list alone is exact only to a millisecond (movie
-    // timescale 1000); it agrees with the item within that tick, so
-    // the item's sample-exact numbers are the result.
+    assert_eq!(d.movie_header().timescale, RATE);
+    assert_eq!(d.edit_list(0)[0].segment_duration, VALID);
     assert_eq!(
         d.gapless_timing(0),
         Some(GaplessTiming::new(
@@ -199,10 +216,12 @@ fn edit_list_only_is_exact_at_a_sample_rate_movie_timescale() {
 }
 
 #[test]
-fn edit_list_only_at_the_default_movie_timescale_rounds_to_a_tick() {
-    let bytes = mux(Mp4MuxerOptions::default().with_track_gapless(vec![
-        TrackGapless::new(0, PRIMING, REMAINDER).with_write_itunsmpb(false),
-    ]));
+fn edit_list_only_at_a_millisecond_movie_timescale_rounds_to_a_tick() {
+    let bytes = mux(Mp4MuxerOptions::default()
+        .with_movie_timescale(1000)
+        .with_track_gapless(vec![
+            TrackGapless::new(0, PRIMING, REMAINDER).with_write_itunsmpb(false),
+        ]));
     let g = open(&bytes).gapless_timing(0).unwrap();
     // 7628 samples = 172.97 ms: the segment is written as 172 ms
     // (rounded down so it never reaches into the padding), which reads
@@ -781,6 +800,62 @@ fn roll_group_declared_in_a_movie_fragment_signals_the_edit_list() {
             (Ok(a), Ok(b)) => assert_eq!(a.data, b.data),
             (Err(_), Err(_)) => break,
             _ => panic!("packet counts differ"),
+        }
+    }
+}
+
+#[test]
+fn m4a_brand_preset() {
+    let bytes = mux(Mp4MuxerOptions::default().with_brand(oxideav_mp4::BrandPreset::M4a));
+    assert_eq!(&bytes[4..8], b"ftyp");
+    assert_eq!(&bytes[8..12], b"M4A ");
+    assert_eq!(&bytes[16..28], b"M4A mp42isom");
+    assert_eq!(open(&bytes).major_brand(), Some(*b"M4A "));
+}
+
+/// `(valid, priming, remainder)` as the `afinfo` tool reports them for
+/// `bytes`, or `None` when the tool is not installed (it ships with
+/// macOS only).
+fn afinfo_counts(name: &str, bytes: &[u8]) -> Option<(u64, u64, u64)> {
+    let path = std::env::temp_dir().join(format!(
+        "oxideav-mp4-gapless-{}-{name}.m4a",
+        std::process::id()
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    let out = std::process::Command::new("afinfo").arg(&path).output();
+    let _ = std::fs::remove_file(&path);
+    let out = String::from_utf8_lossy(&out.ok()?.stdout).into_owned();
+    // "audio 7628 valid frames + 2112 priming + 500 remainder = 10240"
+    let line = out.lines().find(|l| l.contains("valid frames"))?;
+    let n: Vec<u64> = line
+        .split_ascii_whitespace()
+        .filter_map(|w| w.parse().ok())
+        .collect();
+    (n.len() >= 3).then(|| (n[0], n[1], n[2]))
+}
+
+#[test]
+fn black_box_reader_reports_the_written_counts() {
+    // Each carriage on its own, and both together, in an `.m4a`-branded
+    // file: an independent reader recovers the same three numbers.
+    let m4a = || Mp4MuxerOptions::default().with_brand(oxideav_mp4::BrandPreset::M4a);
+    let directive = || TrackGapless::new(0, PRIMING, REMAINDER);
+    let cases = [
+        ("both", directive()),
+        ("elst", directive().with_write_itunsmpb(false)),
+        ("item", directive().with_write_edit_list(false)),
+    ];
+    for (name, g) in cases {
+        let bytes = mux(m4a().with_track_gapless(vec![g]));
+        let ours = open(&bytes).gapless_timing(0).unwrap();
+        assert_eq!(
+            (ours.valid, ours.priming, ours.remainder),
+            (VALID, PRIMING, REMAINDER),
+            "{name}"
+        );
+        match afinfo_counts(name, &bytes) {
+            Some(theirs) => assert_eq!(theirs, (VALID, PRIMING, REMAINDER), "{name}"),
+            None => eprintln!("afinfo not available: {name} checked against this crate only"),
         }
     }
 }
