@@ -294,11 +294,14 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // `tfdt` box is absent. Initialised from the last DTS+duration of
     // the moov-derived samples for that track (zero if none).
     let mut next_dts: Vec<i64> = vec![0; parsed.tracks.len()];
-    for s in &samples {
-        let idx = s.track_idx as usize;
-        let end = s.dts.saturating_add(s.duration);
-        if end > next_dts[idx] {
-            next_dts[idx] = end;
+    // (Only fragments consume it: a file without them skips the pass.)
+    if !moofs.is_empty() {
+        for s in &samples {
+            let idx = s.track_idx as usize;
+            let end = s.dts.saturating_add(s.duration);
+            if end > next_dts[idx] {
+                next_dts[idx] = end;
+            }
         }
     }
 
@@ -873,7 +876,16 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let media_totals: Vec<u64> = {
         // (count, first duration, sum, samples differing from first, last duration)
         let mut acc = vec![(0u64, 0u64, 0u64, 0u64, 0u64); parsed.tracks.len()];
-        for s in &samples {
+        // Only a file with a gapless carriage needs the pass: an audio
+        // track with an edit list, or the metadata item.
+        let carriage = metadata
+            .iter()
+            .any(|(k, _)| k == "----:com.apple.iTunes:iTunSMPB")
+            || parsed
+                .tracks
+                .iter()
+                .any(|t| t.media_type == MediaType::Audio && !t.elst.is_empty());
+        for s in samples.iter().filter(|_| carriage) {
             if let Some(a) = acc.get_mut(s.track_idx as usize) {
                 let d = s.duration.max(0) as u64;
                 if a.0 == 0 {
