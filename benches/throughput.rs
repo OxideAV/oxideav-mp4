@@ -178,7 +178,7 @@ fn report(label: &str, streams: &[StreamInfo], pkts: &[Packet], options: Mp4Muxe
     let path = std::env::temp_dir().join(format!(
         "oxideav-mp4-bench-{}-{}.mp4",
         std::process::id(),
-        label.split(' ').next().unwrap_or("x")
+        label.len()
     ));
     std::fs::write(&path, &bytes).unwrap();
     let mut file_t = Vec::new();
@@ -264,6 +264,14 @@ fn main() {
     let total = env("MP4_BENCH_SAMPLES", 2_000_000);
     let pkts = packets(&streams, total);
     report("progressive", &streams, &pkts, Mp4MuxerOptions::default());
+    report(
+        "progressive, compact tables (track-run chunks + stz2)",
+        &streams,
+        &pkts,
+        Mp4MuxerOptions::default()
+            .with_chunking(oxideav_mp4::ChunkPolicy::TrackRuns)
+            .with_compact_sample_sizes(true),
+    );
     report(
         "faststart",
         &streams,

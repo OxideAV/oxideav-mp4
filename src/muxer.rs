@@ -114,6 +114,9 @@ pub(crate) struct TrackState {
     /// resolution, but a `TrackHeaderTimestamps::media` override can date
     /// the media apart from the track that carries it.
     pub(crate) mdhd_timestamps: crate::demux::HeaderTimestamps,
+    /// Write the sample sizes as an `stz2` when they fit
+    /// (`Mp4MuxerOptions::compact_sample_sizes`).
+    pub(crate) compact_sample_sizes: bool,
 }
 
 impl TrackState {
@@ -149,6 +152,7 @@ impl TrackState {
             aac_asc_synthesised: false,
             tkhd_timestamps: crate::demux::HeaderTimestamps::default(),
             mdhd_timestamps: crate::demux::HeaderTimestamps::default(),
+            compact_sample_sizes: false,
         }
     }
 
@@ -267,6 +271,7 @@ pub fn open_with_options(
         // per-track override targets this stream.
         track.tkhd_timestamps = options.resolve_track_timestamps(i);
         track.mdhd_timestamps = options.resolve_media_timestamps(i);
+        track.compact_sample_sizes = options.compact_sample_sizes;
         tracks.push(track);
     }
     // ISO/IEC 14496-12 §8.6.6: validate explicit edit lists up front so
@@ -507,6 +512,7 @@ impl Muxer for Mp4Muxer {
         let chunk_ends = match self.options.chunking {
             ChunkPolicy::SampleCount => t.current_chunk_samples >= t.samples_per_chunk_target,
             ChunkPolicy::PacketBoundaries => packet.flags.unit_boundary,
+            ChunkPolicy::TrackRuns => t.current_chunk_samples >= TRACK_RUN_MAX_SAMPLES,
         };
         if chunk_ends {
             t.close_current_chunk();
@@ -1343,11 +1349,18 @@ fn build_stbl_with_sample_groups(
             body.extend_from_slice(&cslg);
         }
     }
-    if !t.keyframes.is_empty() {
+    // §8.6.2.1: "If the sync sample box is not present, every sample
+    // is a sync sample" — so a track whose samples are all sync
+    // samples (audio, intra-only video) carries no table rather than
+    // one listing every sample number.
+    if !t.keyframes.is_empty() && t.keyframes.len() != t.sample_sizes.len() {
         body.extend_from_slice(&build_stss(&t.keyframes));
     }
     body.extend_from_slice(&build_stsc(&t.stsc));
-    body.extend_from_slice(&build_stsz(&t.sample_sizes));
+    body.extend_from_slice(&build_sample_size_box(
+        &t.sample_sizes,
+        t.compact_sample_sizes,
+    ));
     body.extend_from_slice(&build_chunk_offset_box(&t.chunk_offsets));
     // ISO/IEC 14496-12 §8.9: sample groups. `sgpd` first (description
     // table), then `sbgp` (per-sample index into the description), then
@@ -1475,6 +1488,44 @@ fn build_stsc(runs: &[(u32, u32, u32)]) -> Vec<u8> {
         body.extend_from_slice(&sdi.to_be_bytes());
     }
     wrap_box(b"stsc", &body)
+}
+
+/// Most samples one chunk holds under [`ChunkPolicy::TrackRuns`].
+pub(crate) const TRACK_RUN_MAX_SAMPLES: u32 = 1024;
+
+/// The sample-size table: `stsz` (§8.7.3.2), or — when `compact` is
+/// set, the sizes are not all equal (the constant form of `stsz` is
+/// already 20 bytes) and every size fits 16 bits — the compact `stz2`
+/// (§8.7.3.3) at the narrowest of its 4-, 8- and 16-bit field widths.
+fn build_sample_size_box(sizes: &[u32], compact: bool) -> Vec<u8> {
+    let max = sizes.iter().copied().max().unwrap_or(0);
+    let uniform = sizes
+        .first()
+        .is_some_and(|&f| sizes.iter().all(|&s| s == f));
+    if !compact || uniform || sizes.is_empty() || max > u32::from(u16::MAX) {
+        return build_stsz(sizes);
+    }
+    let field_size: u8 = match max {
+        0..=0xF => 4,
+        0x10..=0xFF => 8,
+        _ => 16,
+    };
+    let mut body = Vec::with_capacity(12 + sizes.len() * usize::from(field_size) / 8 + 1);
+    body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+    body.extend_from_slice(&[0, 0, 0, field_size]); // reserved(24) + field_size
+    body.extend_from_slice(&(sizes.len() as u32).to_be_bytes());
+    match field_size {
+        // Two sizes a byte, the first in the high nibble; an odd
+        // count leaves the last low nibble zero (§8.7.3.3.2).
+        4 => body.extend(
+            sizes
+                .chunks(2)
+                .map(|pair| ((pair[0] as u8) << 4) | pair.get(1).map_or(0, |&s| s as u8)),
+        ),
+        8 => body.extend(sizes.iter().map(|&s| s as u8)),
+        _ => body.extend(sizes.iter().flat_map(|&s| (s as u16).to_be_bytes())),
+    }
+    wrap_box(b"stz2", &body)
 }
 
 fn build_stsz(sizes: &[u32]) -> Vec<u8> {

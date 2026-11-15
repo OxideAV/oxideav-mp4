@@ -150,6 +150,9 @@ pub struct Built {
     /// When `false`, only payload identity is asserted (empty-time
     /// inserts legitimately shift downstream timestamps).
     pub check_pts: bool,
+    /// `(priming, decoded length)` in frames when the plan wrote a
+    /// gapless metadata item for track 0.
+    pub gapless: Option<(u64, u64)>,
 }
 
 enum TrackKind {
@@ -181,6 +184,8 @@ pub struct MuxPlan {
     options: Mp4MuxerOptions,
     frag: Option<FragPlan>,
     check_pts: bool,
+    /// Priming of the gapless metadata item written for track 0.
+    gapless_priming: Option<u64>,
 }
 
 /// Tracks carry timestamps that rescale *exactly* through the muxer's
@@ -351,17 +356,39 @@ impl MuxPlan {
             None
         };
 
-        let options = Mp4MuxerOptions::default()
+        let mut options = Mp4MuxerOptions::default()
             // fragmented goes through open_fragmented_typed
             .with_brand(brand)
             .with_faststart(layout == 1)
             .with_fragmented(None);
+
+        // Table-shape and gapless switches, read last so earlier
+        // recipe bytes keep their meaning. None of them moves a
+        // timestamp: track-run chunks and `stz2` only reshape the
+        // sample tables, and the gapless directive is written as the
+        // metadata item alone (no edit list). Track 0 is PCM audio —
+        // the first audio stream — and holds at least one frame, so a
+        // priming of 0 or 1 frames always fits.
+        let tail = r.u8();
+        if tail & 1 == 1 {
+            options = options.with_chunking(oxideav_mp4::ChunkPolicy::TrackRuns);
+        }
+        if tail & 2 == 2 {
+            options = options.with_compact_sample_sizes(true);
+        }
+        let gapless_priming = (!fragmented && tail & 4 == 4).then_some(u64::from(tail >> 3) % 2);
+        if let Some(priming) = gapless_priming {
+            options = options.with_track_gapless(vec![
+                oxideav_mp4::TrackGapless::new(0, priming, 0).with_write_edit_list(false),
+            ]);
+        }
 
         MuxPlan {
             tracks,
             options,
             frag,
             check_pts,
+            gapless_priming,
         }
     }
 
@@ -437,6 +464,14 @@ impl MuxPlan {
             bytes,
             tracks,
             check_pts: self.check_pts,
+            gapless: self.gapless_priming.map(|priming| {
+                let total: i64 = self.tracks[0]
+                    .packets
+                    .iter()
+                    .map(|p| p.duration.unwrap_or(0))
+                    .sum();
+                (priming, total as u64)
+            }),
         }
     }
 
@@ -527,7 +562,20 @@ pub fn exercise_demux(data: &[u8]) {
     // CENC aux-info carriage (saiz/saio) — seeks + bounded allocations.
     let _ = dmx.resolve_sai_aux_info();
 
-    // Bounded drain.
+    // Gapless reconciliation + roll distance, per stream.
+    for i in 0..n_streams as u32 {
+        let _ = dmx.gapless_timing(i).map(|g| g.total());
+        let _ = dmx.audio_roll_distance(i);
+    }
+    let _ = (dmx.sidxes().len(), dmx.tfras().len());
+
+    // Bounded drain, through a read-ahead block whose size the input
+    // picks: off, a few bytes, or the default.
+    match data.len() % 3 {
+        0 => dmx.set_read_block_size(0),
+        1 => dmx.set_read_block_size(1 + data.len() % 61),
+        _ => {}
+    }
     for _ in 0..MAX_PACKETS_PER_INPUT {
         if dmx.next_packet().is_err() {
             break;
@@ -542,6 +590,18 @@ pub fn exercise_demux(data: &[u8]) {
     for _ in 0..8 {
         if dmx.next_packet().is_err() {
             break;
+        }
+    }
+    // Every stream, at the extremes and at input-derived times: the
+    // indexed lookup and the roll back-up must hold on any table.
+    let pick = data
+        .iter()
+        .fold(0i64, |a, &b| a.wrapping_mul(31).wrapping_add(i64::from(b)));
+    for i in 0..n_streams as u32 {
+        for target in [i64::MIN, -1, pick % 100_000, pick, i64::MAX] {
+            if dmx.seek_to(i, target).is_ok() {
+                let _ = dmx.next_packet();
+            }
         }
     }
 }

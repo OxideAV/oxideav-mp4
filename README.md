@@ -1925,6 +1925,54 @@ for the progressive, faststart and fragmented layouts (indexed and
 not, fragments that start off a sync sample), with composition
 offsets, start delays, trimming edit lists and audio roll distances.
 
+### Throughput
+
+`benches/throughput.rs` (`cargo bench --bench throughput`, no harness)
+muxes 2 000 001 interleaved packets (one video frame, two audio
+packets, repeated; 24–63 and 16 byte payloads) into a progressive file
+and 300 000 into a fragmented one (4000 one-second fragments), then
+times each stage. Medians of 3–5 runs on a shared, loaded machine
+(Apple silicon; expect ±30 % between runs):
+
+| Stage | Before | After |
+|---|---|---|
+| `open`, progressive, 2 M samples | 140 ms | 66–80 ms |
+| `seek_to`, progressive, per seek | 902 µs | 1.1 µs |
+| `seek_to`, fragmented, per seek | 155 µs | 0.17 µs |
+| open + read every packet, `std::fs::File`, progressive | 2996 ms | 126–169 ms |
+| open + read every packet, `std::fs::File`, fragmented | 466 ms | 45–66 ms |
+| `next_packet`, in memory | 43–48 ms (≈ 45 M packets/s) | unchanged |
+| `moov` size, 2 M samples, default options | 15.36 MiB | 10.28 MiB |
+| `moov` size, `TrackRuns` + `compact_sample_sizes` | — | 5.82 MiB |
+| `write_trailer`, progressive | 14–16 ms | 14–16 ms (7 ms compact) |
+| `write_packet` | ≈ 30 M packets/s progressive, ≈ 11 M fragmented | unchanged |
+
+Stage breakdown of the 140 ms `open` before the pass: expanding the
+sample tables 97 ms, parsing `moov` 24 ms, sorting into file order
+15 ms, the rest 4 ms. Expansion built four per-sample side tables and
+a hash set of sync samples and re-summed each chunk's sizes per
+sample (quadratic in samples per chunk); it is now one pass of run
+cursors. Parsing copied each box body once per nesting level (six
+copies of a sample table); bodies are now borrowed. Reading through a
+file was two system calls per packet; `next_packet` now fills a
+64 KiB read-ahead block (`Mp4Demuxer::set_read_block_size`, `0` =
+off, which also frees the block: the trade is 64 KiB per demuxer).
+Seeking scanned every sample; it is a binary search over a lazily
+built index (16 bytes per sync sample of the streams seeked).
+
+On the write side the sync-sample table of an all-sync track is no
+longer written (§8.6.2.1: absent means every sample is a sync sample)
+— a third of the `moov` above. Two opt-in table shapes shrink it
+further: `ChunkPolicy::TrackRuns` (a chunk is a whole run of one
+track's consecutive samples, capped at 1024, so `stco` / `stsc`
+describe the interleave and nothing finer) and
+`Mp4MuxerOptions::compact_sample_sizes` (`stz2`, §8.7.3.3: 4, 8 or 16
+bits a sample when the sizes fit). Both are off by default: one chunk
+per video sample and `stsz` are the shapes every reader handles.
+
+A demuxer holds one 72-byte record per sample, so a file's sample
+count — not its size — sets the memory an open takes.
+
 ### Not (yet) supported
 
 - In-pipeline CENC decryption — the AES-128 CTR / CBC driver

@@ -107,6 +107,24 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
+    // Gapless: the item written for track 0 reads back as given, with
+    // the valid length the muxer derived from the finished track.
+    if let Some((priming, total)) = built.gapless {
+        let g = dmx
+            .gapless_timing(0)
+            .expect("gapless item written but not read back");
+        assert_eq!(
+            (g.priming, g.valid, g.remainder, g.conflict),
+            (priming, total - priming, 0, false),
+            "gapless timing differs on round-trip"
+        );
+    } else {
+        assert!(
+            dmx.gapless_timing(0).is_none(),
+            "gapless timing reported for a plan that wrote none"
+        );
+    }
+
     // Seek back to the start and re-read the first packet of stream 0:
     // the sync-sample landing must reproduce the same leading payload.
     if dmx.seek_to(0, 0).is_ok() {

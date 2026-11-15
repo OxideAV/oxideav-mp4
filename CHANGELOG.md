@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The non-fragmented muxer no longer writes a sync-sample table for a track whose samples are all sync samples (ISO/IEC 14496-12 §8.6.2.1: an absent table means exactly that); the `moov` of an audio track shrinks by four bytes a sample.
 - `seek_to` is a binary search over a per-stream sync-sample index built on first use (was a scan of every sample), and for an audio stream with a `roll` / `prol` group lands the roll distance before the target packet.
 - Opening a file expands each sample table in one pass with no per-sample side tables, borrows nested box bodies instead of copying them at every nesting level, and skips the file-order sort when the samples are already ordered.
 - `next_packet` reads through a 64 KiB read-ahead block (`Mp4Demuxer::set_read_block_size`, `0` to turn it off) instead of one seek and one read per packet.
@@ -25,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `Mp4Demuxer::sidxes()` / `tfras()`: the parsed segment-index and random-access tables.
+- `ChunkPolicy::TrackRuns` (one chunk per run of a track's consecutive samples, capped at 1024) and `Mp4MuxerOptions::compact_sample_sizes` (`stz2` at 4 / 8 / 16 bits a sample): opt-in compact sample tables for the non-fragmented muxer.
 - `benches/throughput.rs`: timed mux / finalisation / open / read / seek run on large self-muxed progressive and fragmented files.
 - `tests/seek_exact.rs`: exhaustive seek checks on small self-muxed files.
 - Gapless audio, read side: `gapless_timing` reconciles every carriage a file holds — an edit list on a track with a `roll` / `prol` sample group, the `iTunSMPB` item, and a plain trimming edit list (new `GaplessSource::EditListTrim`) — under a documented precedence, checks them against the track's decoded length, and flags contradictions (`GaplessTiming::conflict`, `gapless_conflict` option). Leading empty edits, open-ended (`segment_duration == 0`) edits of fragmented files and `prol` groups are understood. `Mp4Demuxer::audio_roll_distance` / the `audio_roll_distance` option expose the group's roll distance.

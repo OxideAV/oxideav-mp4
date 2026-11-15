@@ -702,6 +702,12 @@ pub enum ChunkPolicy {
     /// A chunk ends after each packet whose `flags.unit_boundary` is set,
     /// so the caller decides the interleave and the chunk sizes.
     PacketBoundaries,
+    /// A chunk is a whole run of one track's consecutive samples — it
+    /// ends only when another track's sample follows, or after 1024
+    /// samples. The chunk tables then describe the interleave the
+    /// caller wrote and nothing finer, which is the smallest `stco` /
+    /// `stsc` a given `mdat` layout allows.
+    TrackRuns,
 }
 
 /// Runtime options controlling how the MP4 muxer shapes its output.
@@ -826,6 +832,13 @@ pub struct Mp4MuxerOptions {
     pub pssh: Vec<crate::cenc::PsshBox>,
     /// How samples are grouped into chunks (non-fragmented output).
     pub chunking: ChunkPolicy,
+    /// Write each track's sample sizes as the compact `stz2` table
+    /// (§8.7.3.3: 4, 8 or 16 bits a sample) instead of `stsz` (32 bits
+    /// a sample) when every size fits 16 bits and they are not all
+    /// equal. `false` by default: `stsz` is the form every reader
+    /// knows. Non-fragmented output only (a fragmented `moov` holds no
+    /// samples).
+    pub compact_sample_sizes: bool,
     /// Gapless audio timing per track: encoder priming and end padding
     /// written as an edit list with a `roll` group and/or the
     /// `iTunSMPB` metadata item. Empty by default (nothing written).
@@ -921,6 +934,12 @@ impl Mp4MuxerOptions {
         self
     }
 
+    /// Set `compact_sample_sizes`.
+    pub fn with_compact_sample_sizes(mut self, compact_sample_sizes: bool) -> Self {
+        self.compact_sample_sizes = compact_sample_sizes;
+        self
+    }
+
     /// Set `track_gapless`.
     pub fn with_track_gapless(mut self, track_gapless: Vec<TrackGapless>) -> Self {
         self.track_gapless = track_gapless;
@@ -950,6 +969,7 @@ impl Default for Mp4MuxerOptions {
             track_header_timestamps: Vec::new(),
             pssh: Vec::new(),
             chunking: ChunkPolicy::default(),
+            compact_sample_sizes: false,
             track_gapless: Vec::new(),
             movie_timescale: 1000,
         }
