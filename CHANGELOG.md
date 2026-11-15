@@ -9,15 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `wave` atoms nested inside one another were followed without bound: a sample entry made of `wave` headers (eight bytes a level) overflowed the stack. Nesting is now followed four levels deep.
+- A sample-to-chunk run of empty chunks (`samples_per_chunk == 0`) spanning a forged 32-bit chunk range was walked chunk by chunk; it is now stepped over whole.
+- `seek_to` on a fragmented file with a `tfra` or `sidx` landed on the first sync sample of the indexed fragment even when a later one in that fragment was at or before the target, and compared media-timeline index times with presentation-timeline targets (wrong under an edit list). Seeks are now answered from the samples themselves.
 - A packet that an edit list cuts into (it starts before the first presented media time but ends after it) is no longer flagged `discard`: with AAC priming of 2112 samples the third 1024-sample packet holds the first 960 presented samples.
 - The remainder of an edit-list gapless result on a fragmented file with an open-ended edit is no longer the whole track.
 
 ### Changed
 
+- `seek_to` is a binary search over a per-stream sync-sample index built on first use (was a scan of every sample), and for an audio stream with a `roll` / `prol` group lands the roll distance before the target packet.
+- Opening a file expands each sample table in one pass with no per-sample side tables, borrows nested box bodies instead of copying them at every nesting level, and skips the file-order sort when the samples are already ordered.
+- `next_packet` reads through a 64 KiB read-ahead block (`Mp4Demuxer::set_read_block_size`, `0` to turn it off) instead of one seek and one read per packet.
 - `#[non_exhaustive]`: the muxer option records `Mp4MuxerOptions`, `FragmentedOptions`, `TrackSampleGroups`, `TrackEditList` and `TrackProtection`; the enums `BrandPreset`, `FragmentCadence`, `CencScheme`, `IvSupply`, `ItemProperty`, `ColrRecord`, `EmsgTime`, `SampleGroupGroupingType` and `SampleGroupEntry`; and every parsed box / demuxer record that callers only read (the `sidx` / `tfra` / `prft` / `amve` / `btrt` / `pdin` / `pnot` / `sbgp` / `sgpd` / `csgp` / `subs` / `saiz` / `saio` / `gmin` / `tcmi` / `load` / hint / FD-item / `meta` aggregate records, the `traf` SAI / sample-group / `senc` / `pssh` records, `MetaItems`, `PrftRequest`, `CencSchemeDecision`, `CipherStep` and the sample-group entry payloads). Code outside the crate builds the option records with `Default` plus the `with_*` setters and needs a `_ =>` arm when matching the enums. Box records that callers also build as muxer / packager inputs or test expectations (`TencBox`, `PsshBox`, `SeigEntry`, `SencBox` / `SencSample` / `SubsampleEntry`, the PIFF records, `EditListEntry`, `SampleToGroup`, `SampleGroupDescription`, `CompactSampleToGroup`, the `iloc` / `iinf` / `iref` / `ipma` / `grpl` records, `EmsgBox`, `StviRecord`, the `ssix` / `leva` / `assp` / `trep` / `pasp` / `clap` records), `SampleFlags`, `TrackKey`, `CipherMode` and `CipherStepKind` are unchanged.
 
 ### Added
 
+- `Mp4Demuxer::sidxes()` / `tfras()`: the parsed segment-index and random-access tables.
+- `benches/throughput.rs`: timed mux / finalisation / open / read / seek run on large self-muxed progressive and fragmented files.
+- `tests/seek_exact.rs`: exhaustive seek checks on small self-muxed files.
 - Gapless audio, read side: `gapless_timing` reconciles every carriage a file holds — an edit list on a track with a `roll` / `prol` sample group, the `iTunSMPB` item, and a plain trimming edit list (new `GaplessSource::EditListTrim`) — under a documented precedence, checks them against the track's decoded length, and flags contradictions (`GaplessTiming::conflict`, `gapless_conflict` option). Leading empty edits, open-ended (`segment_duration == 0`) edits of fragmented files and `prol` groups are understood. `Mp4Demuxer::audio_roll_distance` / the `audio_roll_distance` option expose the group's roll distance.
 - Gapless audio, write side: `Mp4MuxerOptions::track_gapless` (`TrackGapless`) writes encoder priming and end padding as an edit list plus `roll` group and/or the `iTunSMPB` freeform item, in the progressive, faststart and fragmented muxers. `Mp4MuxerOptions::movie_timescale` selects the `mvhd` timescale so an edit list can be sample-exact. `demux::format_itunsmpb` builds the item value.
 - Regression test pinning the gapless case reported in #12: a 20000-sample 44.1 kHz M4A from macOS's AAC encoder reports 2112 priming + 20000 valid + 416 remainder (afinfo's numbers) through `gapless_timing`, the flat `gapless_*` options and the `----:com.apple.iTunes:iTunSMPB` metadata item (#12).

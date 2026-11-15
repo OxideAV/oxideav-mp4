@@ -369,7 +369,11 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         moof_earliest.push(best);
     }
 
-    samples.sort_by_key(|s| s.offset);
+    // File order. A single-track file is already there; the stable
+    // sort keeps equal offsets in expansion order otherwise.
+    if !samples.is_sorted_by_key(|s| s.offset) {
+        samples.sort_by_key(|s| s.offset);
+    }
 
     // Movie duration from mvhd (§8.2.2), with §8.8.2 `mehd`
     // (MovieExtendsHeaderBox) as fall-back for fragmented files. When
@@ -922,6 +926,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         streams,
         samples,
         cursor: 0,
+        sync_indexes: Vec::new(),
+        read_block: Vec::new(),
+        read_block_start: 0,
+        read_block_size: DEFAULT_READ_BLOCK_SIZE,
         metadata,
         duration_micros,
         sidxes,
@@ -959,8 +967,6 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             volume: parsed.movie_volume,
             matrix: parsed.movie_matrix,
         },
-        track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
-        track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
         gapless,
         roll_distances,
         fragmented: parsed.fragmented,
@@ -3179,28 +3185,28 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         match hdr.fourcc {
             TRAK => {
-                let body = read_bytes_vec(&mut cur, psz)?;
-                if let Some(t) = parse_trak(&body, file_size)? {
+                let body = take_slice(&mut cur, psz)?;
+                if let Some(t) = parse_trak(body, file_size)? {
                     out.tracks.push(t);
                 }
             }
             MVHD => {
-                let body = read_bytes_vec(&mut cur, psz)?;
-                parse_mvhd(&body, &mut out)?;
+                let body = take_slice(&mut cur, psz)?;
+                parse_mvhd(body, &mut out)?;
             }
             UDTA => {
-                let body = read_bytes_vec(&mut cur, psz)?;
-                parse_udta(&body, &mut out.metadata);
+                let body = take_slice(&mut cur, psz)?;
+                parse_udta(body, &mut out.metadata);
             }
             META => {
-                let body = read_bytes_vec(&mut cur, psz)?;
-                parse_meta(&body, &mut out.metadata);
+                let body = take_slice(&mut cur, psz)?;
+                parse_meta(body, &mut out.metadata);
             }
             MVEX => {
-                let body = read_bytes_vec(&mut cur, psz)?;
+                let body = take_slice(&mut cur, psz)?;
                 out.fragmented = true;
                 parse_mvex(
-                    &body,
+                    body,
                     &mut out.tracks,
                     &mut out.mehd_fragment_duration,
                     &mut out.leva,
@@ -3217,8 +3223,8 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
                 // file parseable (DRM-free playback may still be
                 // intended, and an opaque DRM box should not brick the
                 // demuxer).
-                let body = read_bytes_vec(&mut cur, psz)?;
-                if let Ok(p) = parse_pssh(&body) {
+                let body = take_slice(&mut cur, psz)?;
+                if let Ok(p) = parse_pssh(body) {
                     out.psshes.push(p);
                 }
             }
@@ -3229,7 +3235,7 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
             // recovery policy as the 4CC form: a malformed instance is
             // dropped, not fatal. Unknown usertypes are skipped.
             UUID => {
-                let body = read_bytes_vec(&mut cur, psz)?;
+                let body = take_slice(&mut cur, psz)?;
                 if body.len() >= 16
                     && body[..16] == PIFF_PSSH_USERTYPE
                     && let Ok(p) = parse_piff_pssh(&body[16..])
@@ -3268,8 +3274,8 @@ fn parse_mvex(
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         match hdr.fourcc {
             TREX => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                parse_trex(&b, tracks)?;
+                let b = take_slice(&mut cur, psz)?;
+                parse_trex(b, tracks)?;
             }
             // §8.8.2 — `mehd` MovieExtendsHeaderBox. Optional FullBox
             // (`Quantity: Zero or one`). v0 → 32-bit fragment_duration;
@@ -3279,8 +3285,8 @@ fn parse_mvex(
             // is non-fatal: we drop it but keep the file parseable
             // (the demuxer falls back to mvhd.duration in that case).
             MEHD => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                if let Ok(d) = parse_mehd(&b) {
+                let b = take_slice(&mut cur, psz)?;
+                if let Ok(d) = parse_mehd(b) {
                     // Spec allows only one per mvex; if a second
                     // mehd appears we keep the first (defensive — the
                     // file is malformed and the rest of our parser
@@ -3302,9 +3308,9 @@ fn parse_mvex(
             // / `leva_<n>` metadata channel. A malformed leva is
             // non-fatal: dropped, file remains parseable.
             LEVA => {
-                let b = read_bytes_vec(&mut cur, psz)?;
+                let b = take_slice(&mut cur, psz)?;
                 if leva.is_none()
-                    && let Ok(r) = parse_leva(&b)
+                    && let Ok(r) = parse_leva(b)
                 {
                     *leva = Some(r);
                 }
@@ -3319,8 +3325,8 @@ fn parse_mvex(
             // the flat `trep_<n>` metadata channel. A malformed trep is
             // non-fatal: dropped, file remains parseable.
             TREP => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                if let Ok(r) = parse_trep(&b) {
+                let b = take_slice(&mut cur, psz)?;
+                if let Ok(r) = parse_trep(b) {
                     treps.push(r);
                 }
             }
@@ -5760,38 +5766,38 @@ fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         match hdr.fourcc {
             TKHD => {
-                let sub = read_bytes_vec(&mut cur, psz)?;
-                parse_tkhd(&sub, &mut t)?;
+                let sub = take_slice(&mut cur, psz)?;
+                parse_tkhd(sub, &mut t)?;
             }
             MDIA => {
-                let sub = read_bytes_vec(&mut cur, psz)?;
-                parse_mdia(&sub, &mut t, file_size)?;
+                let sub = take_slice(&mut cur, psz)?;
+                parse_mdia(sub, &mut t, file_size)?;
                 has_media = true;
             }
             EDTS => {
-                let sub = read_bytes_vec(&mut cur, psz)?;
-                parse_edts(&sub, &mut t)?;
+                let sub = take_slice(&mut cur, psz)?;
+                parse_edts(sub, &mut t)?;
             }
             TREF => {
-                let sub = read_bytes_vec(&mut cur, psz)?;
-                parse_tref(&sub, &mut t)?;
+                let sub = take_slice(&mut cur, psz)?;
+                parse_tref(sub, &mut t)?;
             }
             TRGR => {
-                let sub = read_bytes_vec(&mut cur, psz)?;
-                parse_trgr(&sub, &mut t)?;
+                let sub = take_slice(&mut cur, psz)?;
+                parse_trgr(sub, &mut t)?;
             }
             LOAD => {
                 // QuickTime Track Load Settings Atom: keep the first
                 // parseable instance; a malformed one is dropped
                 // (informational) so the trak walk never aborts.
-                let sub = read_bytes_vec(&mut cur, psz)?;
+                let sub = take_slice(&mut cur, psz)?;
                 if t.load_settings.is_none() {
-                    t.load_settings = parse_load_settings(&sub);
+                    t.load_settings = parse_load_settings(sub);
                 }
             }
             UDTA => {
-                let sub = read_bytes_vec(&mut cur, psz)?;
-                parse_track_udta(&sub, &mut t);
+                let sub = take_slice(&mut cur, psz)?;
+                parse_track_udta(sub, &mut t);
             }
             _ => {
                 skip_cursor_bytes(&mut cur, psz);
@@ -6425,7 +6431,7 @@ fn parse_tref(body: &[u8], t: &mut Track) -> Result<()> {
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
-        let child = read_bytes_vec(&mut cur, psz)?;
+        let child = take_slice(&mut cur, psz)?;
         // §8.3.3.2 — child body is "unsigned int(32) track_IDs[]"; size
         // not stored, derived from box length. Reject malformed
         // sub-boxes whose body isn't a whole number of u32s — that's a
@@ -6529,7 +6535,7 @@ fn parse_trgr(body: &[u8], t: &mut Track) -> Result<()> {
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
-        let child = read_bytes_vec(&mut cur, psz)?;
+        let child = take_slice(&mut cur, psz)?;
         // FullBox preamble (4) + track_group_id (4) = 8 bytes minimum.
         if child.len() < 8 {
             return Err(Error::invalid(
@@ -6584,8 +6590,8 @@ fn parse_edts(body: &[u8], t: &mut Track) -> Result<()> {
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         match hdr.fourcc {
             ELST => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                parse_elst(&b, t)?;
+                let b = take_slice(&mut cur, psz)?;
+                parse_elst(b, t)?;
             }
             _ => skip_cursor_bytes(&mut cur, psz),
         }
@@ -7195,20 +7201,20 @@ fn parse_mdia(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         match hdr.fourcc {
             MDHD => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                parse_mdhd(&b, t)?;
+                let b = take_slice(&mut cur, psz)?;
+                parse_mdhd(b, t)?;
             }
             ELNG => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                parse_elng(&b, t);
+                let b = take_slice(&mut cur, psz)?;
+                parse_elng(b, t);
             }
             HDLR => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                parse_hdlr(&b, t)?;
+                let b = take_slice(&mut cur, psz)?;
+                parse_hdlr(b, t)?;
             }
             MINF => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                parse_minf(&b, t, file_size)?;
+                let b = take_slice(&mut cur, psz)?;
+                parse_minf(b, t, file_size)?;
             }
             _ => skip_cursor_bytes(&mut cur, psz),
         }
@@ -7311,27 +7317,27 @@ fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         match hdr.fourcc {
             STBL => {
-                let sub = read_bytes_vec(&mut cur, psz)?;
-                parse_stbl(&sub, t, file_size)?;
+                let sub = take_slice(&mut cur, psz)?;
+                parse_stbl(sub, t, file_size)?;
             }
             VMHD => {
-                let sub = read_bytes_vec(&mut cur, psz)?;
+                let sub = take_slice(&mut cur, psz)?;
                 // §12.1.2 fixes the quantity at exactly one; keep the
                 // first instance seen and ignore any stray duplicates.
                 if t.vmhd.is_none()
-                    && let Ok(v) = parse_vmhd(&sub)
+                    && let Ok(v) = parse_vmhd(sub)
                 {
                     t.vmhd = Some(v);
                 }
             }
             HMHD => {
-                let sub = read_bytes_vec(&mut cur, psz)?;
+                let sub = take_slice(&mut cur, psz)?;
                 // §12.4.2 marks exactly one media header mandatory inside
                 // `minf`; keep the first parseable `hmhd` and ignore stray
                 // duplicates. A malformed one is dropped (informational —
                 // the track still demuxes), so the walk never aborts.
                 if t.hmhd.is_none()
-                    && let Ok(h) = parse_hmhd(&sub)
+                    && let Ok(h) = parse_hmhd(sub)
                 {
                     t.hmhd = Some(h);
                 }
@@ -7345,8 +7351,8 @@ fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
                 // first parseable instance of each; a malformed child is
                 // dropped (informational — the track still demuxes) so the
                 // walk never aborts.
-                let sub = read_bytes_vec(&mut cur, psz)?;
-                parse_gmhd(&sub, t);
+                let sub = take_slice(&mut cur, psz)?;
+                parse_gmhd(sub, t);
             }
             DINF => {
                 // §8.7.1: DataInformationBox is a plain container whose
@@ -7356,9 +7362,9 @@ fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
                 // malformed `dref` is dropped (informational — the file
                 // still demuxes against the single-source default), so the
                 // dinf walk never aborts the surrounding `minf` parse.
-                let sub = read_bytes_vec(&mut cur, psz)?;
+                let sub = take_slice(&mut cur, psz)?;
                 if t.dref.is_none()
-                    && let Some(d) = parse_dinf(&sub)
+                    && let Some(d) = parse_dinf(sub)
                 {
                     t.dref = Some(d);
                 }
@@ -7986,28 +7992,28 @@ fn parse_stbl(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
-        let b = read_bytes_vec(&mut cur, psz)?;
+        let b = take_slice(&mut cur, psz)?;
         match hdr.fourcc {
-            STSD => parse_stsd(&b, t)?,
-            STTS => t.stts = parse_stts(&b)?,
-            STSC => t.stsc = parse_stsc(&b)?,
-            STSZ => t.stsz = parse_stsz(&b, file_size)?,
-            STZ2 => t.stsz = parse_stz2(&b)?,
-            STCO => t.chunk_offsets = parse_stco(&b)?,
-            CO64 => t.chunk_offsets = parse_co64(&b)?,
-            STSS => t.stss = parse_stss(&b)?,
-            STSH => t.stsh = parse_stsh(&b)?,
-            SDTP => t.sdtp = parse_sdtp(&b)?,
-            STDP => t.stdp = parse_stdp(&b)?,
-            PADB => t.padb = parse_padb(&b)?,
-            CTTS => t.ctts = parse_ctts(&b)?,
-            CSLG => t.cslg = Some(parse_cslg(&b)?),
-            SBGP => t.sbgp.push(parse_sbgp(&b)?),
-            SGPD => t.sgpd.push(parse_sgpd(&b)?),
-            CSGP => t.csgp.push(parse_csgp(&b)?),
-            SUBS => t.subs.push(parse_subs(&b)?),
-            SAIZ => t.saiz.push(parse_saiz(&b)?),
-            SAIO => t.saio.push(parse_saio(&b)?),
+            STSD => parse_stsd(b, t)?,
+            STTS => t.stts = parse_stts(b)?,
+            STSC => t.stsc = parse_stsc(b)?,
+            STSZ => t.stsz = parse_stsz(b, file_size)?,
+            STZ2 => t.stsz = parse_stz2(b)?,
+            STCO => t.chunk_offsets = parse_stco(b)?,
+            CO64 => t.chunk_offsets = parse_co64(b)?,
+            STSS => t.stss = parse_stss(b)?,
+            STSH => t.stsh = parse_stsh(b)?,
+            SDTP => t.sdtp = parse_sdtp(b)?,
+            STDP => t.stdp = parse_stdp(b)?,
+            PADB => t.padb = parse_padb(b)?,
+            CTTS => t.ctts = parse_ctts(b)?,
+            CSLG => t.cslg = Some(parse_cslg(b)?),
+            SBGP => t.sbgp.push(parse_sbgp(b)?),
+            SGPD => t.sgpd.push(parse_sgpd(b)?),
+            CSGP => t.csgp.push(parse_csgp(b)?),
+            SUBS => t.subs.push(parse_subs(b)?),
+            SAIZ => t.saiz.push(parse_saiz(b)?),
+            SAIO => t.saio.push(parse_saio(b)?),
             _ => {}
         }
     }
@@ -8054,7 +8060,7 @@ fn parse_stsd(body: &[u8], t: &mut Track) -> Result<()> {
             }
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
-        let entry = read_bytes_vec(&mut cur, psz)?;
+        let entry = take_slice(&mut cur, psz)?;
         // §8.5.2.2 preamble: 6 reserved bytes then a 16-bit
         // data_reference_index. Entries shorter than 8 bytes are
         // malformed; record a zero index rather than failing the whole
@@ -8067,10 +8073,10 @@ fn parse_stsd(body: &[u8], t: &mut Track) -> Result<()> {
         t.stsd_entries.push(StsdEntry {
             format: hdr.fourcc,
             data_reference_index,
-            payload: entry.clone(),
+            payload: entry.to_vec(),
         });
         if i == 0 {
-            first_entry = Some((hdr, entry));
+            first_entry = Some((hdr, entry.to_vec()));
         }
     }
     let (hdr, entry) = match first_entry {
@@ -8175,9 +8181,9 @@ fn parse_sinf_for_original_format(entry: &[u8], media_type: MediaType) -> Result
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
-        let body = read_bytes_vec(&mut cur, psz)?;
+        let body = take_slice(&mut cur, psz)?;
         if hdr.fourcc == SINF {
-            return parse_sinf_body(&body);
+            return parse_sinf_body(body);
         }
     }
     Ok(SinfUnwrap::empty())
@@ -8199,7 +8205,7 @@ fn parse_sinf_body(body: &[u8]) -> Result<SinfUnwrap> {
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
-        let inner = read_bytes_vec(&mut cur, psz)?;
+        let inner = take_slice(&mut cur, psz)?;
         match hdr.fourcc {
             FRMA if inner.len() >= 4 => {
                 out.original_format = Some([inner[0], inner[1], inner[2], inner[3]]);
@@ -8218,7 +8224,7 @@ fn parse_sinf_body(body: &[u8]) -> Result<SinfUnwrap> {
                 // schi should not abort sinf parsing (it still has
                 // structural meaning via frma + schm), so each is
                 // swallowed independently and left `None` on error.
-                let children = walk_schi(&inner);
+                let children = walk_schi(inner);
                 out.tenc = children.tenc;
                 out.piff_tenc = children.piff_tenc;
                 out.stvi = children.stvi;
@@ -8467,7 +8473,7 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
         _ => {}
     }
 
-    parse_audio_children(&entry[children_at..], t, &mut hints)?;
+    parse_audio_children(&entry[children_at..], t, &mut hints, 0)?;
     t.pcm = PcmLayout::for_entry(&t.codec_id_fourcc, t.sample_size_bits, &hints);
     Ok(())
 }
@@ -8500,7 +8506,7 @@ struct PcmHints {
 
 /// Walk an audio sample entry's child boxes (and the boxes nested in a
 /// QuickTime `wave` decompression-parameters atom).
-fn parse_audio_children(buf: &[u8], t: &mut Track, hints: &mut PcmHints) -> Result<()> {
+fn parse_audio_children(buf: &[u8], t: &mut Track, hints: &mut PcmHints, depth: u32) -> Result<()> {
     let mut cur = std::io::Cursor::new(buf);
     let end = buf.len() as u64;
     while cur.position() + 8 <= end {
@@ -8513,7 +8519,7 @@ fn parse_audio_children(buf: &[u8], t: &mut Track, hints: &mut PcmHints) -> Resu
             break;
         }
         let psz = hdr.payload_size().unwrap_or(0) as usize;
-        let body = read_bytes_vec(&mut cur, psz)?;
+        let body = take_slice(&mut cur, psz)?;
         match &hdr.fourcc {
             // ISO/IEC 23003-5 PCMConfig: FullBox + format_flags (bit 0
             // set = little-endian) + PCM_sample_size (bits).
@@ -8531,7 +8537,12 @@ fn parse_audio_children(buf: &[u8], t: &mut Track, hints: &mut PcmHints) -> Resu
             }
             // QuickTime `wave` (siDecompressionParam): nested atoms —
             // `frma`, `enda`, `esds`, … — then a terminator.
-            b"wave" => parse_audio_children(&body, t, hints)?,
+            //
+            // A `wave` holds leaf atoms; one found inside another is
+            // followed a few levels and then ignored, so a file made
+            // of `wave` headers nested to its full length (eight bytes
+            // a level) cannot run the stack out.
+            b"wave" if depth < MAX_WAVE_DEPTH => parse_audio_children(body, t, hints, depth + 1)?,
             // QuickTime `enda`: 16-bit flag, non-zero = little-endian
             // samples (for `in24` / `in32` / `fl32` / `fl64`).
             b"enda" if body.len() >= 2 => {
@@ -8547,7 +8558,7 @@ fn parse_audio_children(buf: &[u8], t: &mut Track, hints: &mut PcmHints) -> Resu
             b"dOps" if body.len() >= 11 => {
                 let mut oh = Vec::with_capacity(body.len() + 8);
                 oh.extend_from_slice(b"OpusHead");
-                oh.extend_from_slice(&body);
+                oh.extend_from_slice(body);
                 t.extradata = oh;
             }
             // ES Descriptor box for MPEG-4 audio (mp4a): strip the nested
@@ -8576,12 +8587,12 @@ fn parse_audio_children(buf: &[u8], t: &mut Track, hints: &mut PcmHints) -> Resu
             // care about `fscod`/`bsid`/`acmod`/`lfeon`/etc. can parse
             // it themselves. For decoders that don't need it the bytes
             // are harmless extra context.
-            b"dac3" | b"dec3" => t.extradata = body,
+            b"dac3" | b"dec3" => t.extradata = body.to_vec(),
             // BitRateBox (ISO/IEC 14496-12 §8.5.2) — optional, at the end
             // of any sample entry including audio. First wins; short body
             // dropped (informational).
             b"btrt" if t.btrt.is_none() => {
-                if let Some(rec) = parse_btrt(&body) {
+                if let Some(rec) = parse_btrt(body) {
                     t.btrt = Some(rec);
                 }
             }
@@ -8879,21 +8890,21 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
-        let body = read_bytes_vec(&mut cur, psz)?;
+        let body = take_slice(&mut cur, psz)?;
         match &hdr.fourcc {
             // AVCConfigurationRecord (ISO/IEC 14496-15 §5.3.3) — for
             // h264, our decoder consumes this verbatim.
-            b"avcC" => t.extradata = body,
+            b"avcC" => t.extradata = body.to_vec(),
             // HEVCDecoderConfigurationRecord (ISO/IEC 14496-15 §8.3.3).
-            b"hvcC" => t.extradata = body,
+            b"hvcC" => t.extradata = body.to_vec(),
             // AV1CodecConfigurationRecord — av1C box per the AV1 ISOBMFF spec.
-            b"av1C" => t.extradata = body,
+            b"av1C" => t.extradata = body.to_vec(),
             // VPCodecConfigurationRecord — vpcC box for VP8 / VP9.
-            b"vpcC" => t.extradata = body,
+            b"vpcC" => t.extradata = body.to_vec(),
             // H.263 decoder configuration (`d263`, the 3GPP MP4 packaging's
             // config child inside an `s263` entry). Kept verbatim as opaque
             // extradata — the muxer's `h263_entry` re-emits it byte-exact.
-            b"d263" => t.extradata = body,
+            b"d263" => t.extradata = body.to_vec(),
             // esds for `mp4v` sample entries. Same shape as the audio variant.
             // We keep the DSI (MPEG-4 VOL header for Part 2, etc.) as
             // extradata and remember the OTI so `from_sample_entry_with_oti`
@@ -8913,7 +8924,7 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             // wins; a malformed (short) body is dropped (informational —
             // it never aborts the open).
             b"amve" if t.amve.is_none() => {
-                if let Some(rec) = parse_amve(&body) {
+                if let Some(rec) = parse_amve(body) {
                     t.amve = Some(rec);
                 }
             }
@@ -8923,7 +8934,7 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             // First one on the active entry wins; a short body is dropped
             // (informational — it never aborts the open).
             b"btrt" if t.btrt.is_none() => {
-                if let Some(rec) = parse_btrt(&body) {
+                if let Some(rec) = parse_btrt(body) {
                     t.btrt = Some(rec);
                 }
             }
@@ -8931,21 +8942,21 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             // preamble), 8-byte body (hSpacing / vSpacing). First one on
             // the active entry wins; a short body is dropped.
             b"pasp" if t.pasp.is_none() => {
-                if let Some(rec) = parse_pasp(&body) {
+                if let Some(rec) = parse_pasp(body) {
                     t.pasp = Some(rec);
                 }
             }
             // CleanApertureBox (§12.1.4) — a plain Box, 32-byte body of
             // four (N, D) fractions. First one wins; short body dropped.
             b"clap" if t.clap.is_none() => {
-                if let Some(rec) = parse_clap(&body) {
+                if let Some(rec) = parse_clap(body) {
                     t.clap = Some(rec);
                 }
             }
             // ColourInformationBox (§12.1.5) — a plain Box; the spec
             // allows several (most-accurate first), the first wins here.
             b"colr" if t.colr.is_none() => {
-                if let Some(rec) = parse_colr(&body) {
+                if let Some(rec) = parse_colr(body) {
                     t.colr = Some(rec);
                 }
             }
@@ -8959,7 +8970,7 @@ fn parse_video_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             // (handled before `parse_sample_entry`) already populated
             // `t.stvi` for protected entries — first one wins.
             b"sinf" if t.stvi.is_none() => {
-                if let Ok(unwrap) = parse_sinf_body(&body) {
+                if let Ok(unwrap) = parse_sinf_body(body) {
                     t.stvi = unwrap.stvi;
                 }
             }
@@ -10741,7 +10752,7 @@ fn parse_moof(
                 // moov-level recovery policy and matches the spec's
                 // opaque-SystemID treatment.
                 let body = read_bytes_vec(&mut cur, psz)?;
-                pending_pssh_bodies.push(body);
+                pending_pssh_bodies.push(body.to_vec());
             }
             // PIFF legacy `uuid` boxes at moof level: the pre-CENC
             // ProtectionSystemSpecificHeaderBox (PIFF places it in
@@ -10751,7 +10762,7 @@ fn parse_moof(
             UUID => {
                 let body = read_bytes_vec(&mut cur, psz)?;
                 if body.len() >= 16 && body[..16] == PIFF_PSSH_USERTYPE {
-                    pending_piff_pssh_bodies.push(body);
+                    pending_piff_pssh_bodies.push(body.to_vec());
                 }
             }
             _ => skip_cursor_bytes(&mut cur, psz),
@@ -11013,19 +11024,19 @@ fn parse_traf(
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         match hdr.fourcc {
             TFHD => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                parse_tfhd(&b, moof_start, tracks, &mut state)?;
+                let b = take_slice(&mut cur, psz)?;
+                parse_tfhd(b, moof_start, tracks, &mut state)?;
                 tfhd_seen = true;
             }
             TFDT => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                state.base_media_decode_time = Some(parse_tfdt(&b)?);
+                let b = take_slice(&mut cur, psz)?;
+                state.base_media_decode_time = Some(parse_tfdt(b)?);
             }
             // §7.2 senc — keep the bytes; we need the track's tenc
             // first (via state.track_idx, populated by tfhd) before we
             // can interpret the per-sample IV width.
             SENC => {
-                senc_body = Some(read_bytes_vec(&mut cur, psz)?);
+                senc_body = Some(take_slice(&mut cur, psz)?.to_vec());
             }
             // PIFF legacy `uuid` boxes inside `traf`: the pre-CENC
             // SampleEncryptionBox is the only encryption usertype
@@ -11033,7 +11044,7 @@ fn parse_traf(
             // post-tfhd parse; unknown usertypes (e.g. the Smooth
             // Streaming tfxd/tfrf fragment-timing boxes) are skipped.
             UUID => {
-                let b = read_bytes_vec(&mut cur, psz)?;
+                let b = take_slice(&mut cur, psz)?;
                 if b.len() >= 16 && b[..16] == PIFF_SENC_USERTYPE {
                     piff_senc_body = Some(b[16..].to_vec());
                 }
@@ -11046,8 +11057,8 @@ fn parse_traf(
             // `senc` alternative (per §8.8.14: in a `traf`, `saio`
             // offsets are relative to `tfhd.base_data_offset`).
             SAIZ => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                let sb = parse_saiz(&b)?;
+                let b = take_slice(&mut cur, psz)?;
+                let sb = parse_saiz(b)?;
                 frag_saiz.push(TrafSaiz {
                     aux_info_type: sb.aux_info_type,
                     aux_info_type_parameter: sb.aux_info_type_parameter,
@@ -11057,8 +11068,8 @@ fn parse_traf(
                 });
             }
             SAIO => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                let sb = parse_saio(&b)?;
+                let b = take_slice(&mut cur, psz)?;
+                let sb = parse_saio(b)?;
                 frag_saio.push(TrafSaio {
                     version: sb.version,
                     aux_info_type: sb.aux_info_type,
@@ -11070,20 +11081,20 @@ fn parse_traf(
             // boxes. A malformed box is dropped (the fragment's samples
             // are still usable); a well-formed one is preserved verbatim.
             SGPD => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                if let Ok(g) = parse_sgpd(&b) {
+                let b = take_slice(&mut cur, psz)?;
+                if let Ok(g) = parse_sgpd(b) {
                     frag_sgpd.push(g);
                 }
             }
             SBGP => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                if let Ok(g) = parse_sbgp(&b) {
+                let b = take_slice(&mut cur, psz)?;
+                if let Ok(g) = parse_sbgp(b) {
                     frag_sbgp.push(g);
                 }
             }
             CSGP => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                if let Ok(g) = parse_csgp(&b) {
+                let b = take_slice(&mut cur, psz)?;
+                if let Ok(g) = parse_csgp(b) {
                     frag_csgp.push(g);
                 }
             }
@@ -11236,8 +11247,8 @@ fn parse_traf(
             skip_cursor_bytes(&mut cur, psz);
             continue;
         }
-        let b = read_bytes_vec(&mut cur, psz)?;
-        let parsed = parse_trun(&b, sample_budget)?;
+        let b = take_slice(&mut cur, psz)?;
+        let parsed = parse_trun(b, sample_budget)?;
 
         // Resolve the run's starting data offset:
         // * explicit data_offset present → relative to base_data_offset
@@ -12225,8 +12236,8 @@ fn parse_mfra(body: &[u8], out: &mut Vec<TfraRecord>, mfro_size: &mut Option<u32
         let psz = hdr.payload_size().unwrap_or(0) as usize;
         match hdr.fourcc {
             TFRA => {
-                let b = read_bytes_vec(&mut cur, psz)?;
-                if let Some(r) = parse_tfra(&b)? {
+                let b = take_slice(&mut cur, psz)?;
+                if let Some(r) = parse_tfra(b)? {
                     out.push(r);
                 }
             }
@@ -12237,7 +12248,7 @@ fn parse_mfra(body: &[u8], out: &mut Vec<TfraRecord>, mfro_size: &mut Option<u32
                 // player locating the mfra from the last 16 bytes of
                 // the file depends on it being right — capture the
                 // declared value so it can be surfaced and checked.
-                let b = read_bytes_vec(&mut cur, psz)?;
+                let b = take_slice(&mut cur, psz)?;
                 if b.len() >= 8 && mfro_size.is_none() {
                     *mfro_size = Some(u32::from_be_bytes([b[4], b[5], b[6], b[7]]));
                 }
@@ -12388,136 +12399,107 @@ struct SampleRef {
     seq: u64,
 }
 
+/// How deep `wave` atoms nested in one another are followed.
+const MAX_WAVE_DEPTH: u32 = 4;
+
+/// A cursor over a run-length table (`stts` / `ctts`): yields one value
+/// per sample, and `None` once the runs are exhausted.
+struct RunCursor<'a, T: Copy> {
+    runs: std::slice::Iter<'a, (u32, T)>,
+    left: u32,
+    value: Option<T>,
+}
+
+impl<'a, T: Copy> RunCursor<'a, T> {
+    fn new(runs: &'a [(u32, T)]) -> Self {
+        Self {
+            runs: runs.iter(),
+            left: 0,
+            value: None,
+        }
+    }
+
+    fn next(&mut self) -> Option<T> {
+        while self.left == 0 {
+            let &(count, value) = self.runs.next()?;
+            self.left = count;
+            self.value = Some(value);
+        }
+        self.left -= 1;
+        self.value
+    }
+}
+
+/// Membership test for the 1-based sync-sample numbers of an `stss`,
+/// queried with ascending sample numbers. A table in ascending order
+/// (§8.6.2.2 requires it) is walked with a cursor; any other order
+/// falls back to a hash set.
+enum SyncCursor<'a> {
+    /// No `stss`: every sample is a sync sample.
+    All,
+    Ascending(std::slice::Iter<'a, u32>, Option<u32>),
+    Set(std::collections::HashSet<u32>),
+}
+
+impl<'a> SyncCursor<'a> {
+    fn new(stss: &'a [u32]) -> Self {
+        if stss.is_empty() {
+            SyncCursor::All
+        } else if stss.is_sorted() {
+            let mut it = stss.iter();
+            let head = it.next().copied();
+            SyncCursor::Ascending(it, head)
+        } else {
+            SyncCursor::Set(stss.iter().copied().collect())
+        }
+    }
+
+    fn is_sync(&mut self, one_based: u32) -> bool {
+        match self {
+            SyncCursor::All => true,
+            SyncCursor::Set(set) => set.contains(&one_based),
+            SyncCursor::Ascending(it, head) => {
+                while let Some(h) = *head {
+                    if h >= one_based {
+                        return h == one_based;
+                    }
+                    *head = it.next().copied();
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Expand a track's sample tables into one [`SampleRef`] per sample, in
+/// a single pass: the time-to-sample and composition-offset runs
+/// (§8.6.1.2 / §8.6.1.3), the sync table (§8.6.2) and the
+/// sample-to-chunk runs (§8.7.4) are each walked by a cursor, and a
+/// sample's file offset is its chunk's offset plus the running size of
+/// the samples before it in that chunk. Nothing is allocated per
+/// sample beyond the output record, and the work is bounded by the
+/// number of sample sizes the file actually backs, whatever counts the
+/// run-length tables claim.
 fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result<()> {
-    if t.stsz.is_empty() {
+    let n_samples = t.stsz.len();
+    if n_samples == 0 {
         return Ok(());
     }
-    let n_samples = t.stsz.len();
+    out.reserve(n_samples);
 
-    // Build per-sample DTS by scanning stts (cumulative).
-    // ISO/IEC 14496-12 §8.6.1.2 — stts maps decoding-order index to
-    // a per-sample delta in the media timescale, so the running sum
-    // is the sample's DTS.
-    let mut pts = Vec::with_capacity(n_samples);
-    {
-        let mut i = 0;
-        let mut t_accum: i64 = 0;
-        for &(count, delta) in &t.stts {
-            for _ in 0..count {
-                if i >= n_samples {
-                    break;
-                }
-                pts.push((t_accum, delta as i64));
-                t_accum += delta as i64;
-                i += 1;
-            }
-        }
-        while pts.len() < n_samples {
-            pts.push((t_accum, 0));
-        }
-    }
+    let mut stts = RunCursor::new(&t.stts);
+    let mut ctts = RunCursor::new(&t.ctts);
+    let mut sync = SyncCursor::new(&t.stss);
+    // Running decode time (the sum of the deltas so far).
+    let mut media_dts: i64 = 0;
 
-    // Apply ctts (§8.6.1.3) to convert DTS → CTS. Without this the
-    // packets we hand the codec carry DTS as `pts`, and any codec
-    // that reorders for display (B-frames in H.264 / H.265 / AV1)
-    // emits frames in display order with decode-time pts attached
-    // — i.e. monotonic-decreasing pts at every B-frame boundary.
-    // The CTS is what downstream pacing wants.
-    let mut cts_offsets: Vec<i64> = vec![0; n_samples];
-    if !t.ctts.is_empty() {
-        let mut i = 0usize;
-        for &(count, off) in &t.ctts {
-            for _ in 0..count {
-                if i >= n_samples {
-                    break;
-                }
-                cts_offsets[i] = off as i64;
-                i += 1;
-            }
-        }
-    }
-
-    // Determine which chunk each sample belongs to using stsc.
-    // stsc is run-length: each entry says "starting at first_chunk, every
-    // chunk has `samples_per_chunk` samples" until the next entry's first_chunk.
-    // We need to know, for each sample, (chunk_index, index_within_chunk).
-    //
-    // Defensive: clamp `samples_per_chunk` to `n_samples` per entry so a
-    // malicious file claiming `spc = u32::MAX` doesn't burn CPU spinning
-    // an inner `for 0..spc` loop that the `sample_i >= n_samples` break
-    // inside it would otherwise terminate only after ~4 billion iterations.
-    // With the clamp the inner loop walks at most `n_samples` iterations
-    // per stsc entry, matching what any well-formed file already does.
-    let mut chunk_of_sample = Vec::with_capacity(n_samples);
-    let mut sample_within_chunk = Vec::with_capacity(n_samples);
-    // §8.7.4: each stsc run also names the 1-based stsd entry its
-    // samples decode against; carried per sample so callers can detect
-    // a mid-stream sample-description switch.
-    let mut sdi_of_sample: Vec<u32> = Vec::with_capacity(n_samples);
-    {
-        let mut sample_i = 0;
-        let mut chunk_i = 1u32;
-        let n_samples_u32 = u32::try_from(n_samples).unwrap_or(u32::MAX);
-        for entry_i in 0..t.stsc.len() {
-            let (fc, spc, sdi) = t.stsc[entry_i];
-            let next_fc = t
-                .stsc
-                .get(entry_i + 1)
-                .map(|e| e.0)
-                .unwrap_or(t.chunk_offsets.len() as u32 + 1);
-            let spc_clamped = spc.min(n_samples_u32);
-            // `next_fc - fc` runs of `spc` samples each.
-            let mut ch = chunk_i.max(fc);
-            while ch < next_fc && sample_i < n_samples {
-                for s_in_ch in 0..spc_clamped {
-                    if sample_i >= n_samples {
-                        break;
-                    }
-                    chunk_of_sample.push(ch);
-                    sample_within_chunk.push(s_in_ch);
-                    sdi_of_sample.push(sdi);
-                    sample_i += 1;
-                }
-                ch += 1;
-            }
-            chunk_i = ch;
-        }
-        // Fallback: if stsc didn't cover all samples, place the remainder in
-        // the last chunk. (Invalid files — but don't crash.)
-        while sample_within_chunk.len() < n_samples {
-            chunk_of_sample.push(*chunk_of_sample.last().unwrap_or(&1));
-            sample_within_chunk.push(0);
-            sdi_of_sample.push(*sdi_of_sample.last().unwrap_or(&1));
-        }
-    }
-
-    // Per-sample keyframe flags. Per ISO/IEC 14496-12, an absent or empty
-    // stss means every sample is a sync frame (this is the norm for audio
-    // and intra-only video). Otherwise only the 1-based indices listed in
-    // stss are sync frames.
-    let stss_all_keyframes = t.stss.is_empty();
-    let stss_set: std::collections::HashSet<u32> = t.stss.iter().copied().collect();
-
-    // Compute each sample's absolute offset.
-    for i in 0..n_samples {
-        let chunk = chunk_of_sample[i] as usize;
-        if chunk == 0 || chunk > t.chunk_offsets.len() {
-            return Err(Error::invalid(format!(
-                "MP4: chunk index {chunk} out of range (track {track_idx})"
-            )));
-        }
-        let chunk_off = t.chunk_offsets[chunk - 1];
-        // Sum sizes of preceding samples in this chunk.
-        let chunk_start_sample = i - sample_within_chunk[i] as usize;
-        let mut preceding: u64 = 0;
-        for j in chunk_start_sample..i {
-            preceding += t.stsz[j] as u64;
-        }
-        let size = t.stsz[i];
-        let (dts_v, dur) = pts[i];
+    // One sample, at `offset`, decoding against `sdi`.
+    let mut emit = |i: usize, offset: u64, sdi: u32, out: &mut Vec<SampleRef>| {
+        // Past the end of the stts runs the delta is zero.
+        let dur = stts.next().map_or(0, i64::from);
+        let cts_offset = ctts.next().map_or(0, i64::from);
         // CTS = DTS + ctts_offset (§8.6.1.3). Streams without a ctts
-        // box leave `cts_offsets` zero-filled, so audio + intra-only
-        // video continue to take the DTS path unchanged.
+        // box take the DTS path unchanged.
         //
         // The edit list (§8.6.6) maps the media composition time onto
         // the presentation timeline: each edit segment contributes a
@@ -12525,26 +12507,97 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
         // out), and media the list never presents is delivered with
         // the discard flag set. Tracks without an elst take the
         // identity mapping.
-        let media_cts = dts_v.saturating_add(cts_offsets[i]);
+        let media_cts = media_dts.saturating_add(cts_offset);
         let (elst_delta, presented) = t.elst_timeline.delta_for_span(media_cts, dur);
-        let cts_v = media_cts.saturating_add(elst_delta);
-        let dts_v_shifted = dts_v.saturating_add(elst_delta);
-        let one_based = (i as u32) + 1;
-        let keyframe = stss_all_keyframes || stss_set.contains(&one_based);
         out.push(SampleRef {
             track_idx,
-            offset: chunk_off + preceding,
-            size,
-            pts: cts_v,
-            dts: dts_v_shifted,
+            offset,
+            size: t.stsz[i],
+            pts: media_cts.saturating_add(elst_delta),
+            dts: media_dts.saturating_add(elst_delta),
             duration: dur,
-            keyframe,
+            // Per ISO/IEC 14496-12, an absent or empty stss means
+            // every sample is a sync frame (the norm for audio and
+            // intra-only video).
+            keyframe: sync.is_sync((i as u32).wrapping_add(1)),
             discard: !presented,
-            sdi: sdi_of_sample[i],
-            media_dts: dts_v,
-            cts_offset: cts_offsets[i],
+            sdi,
+            media_dts,
+            cts_offset,
             seq: out.len() as u64,
         });
+        media_dts = media_dts.saturating_add(dur);
+    };
+
+    let chunk_range_error = |chunk: usize| {
+        Error::invalid(format!(
+            "MP4: chunk index {chunk} out of range (track {track_idx})"
+        ))
+    };
+    // stsc is run-length: each entry says "starting at first_chunk,
+    // every chunk has `samples_per_chunk` samples" until the next
+    // entry's first_chunk. `samples_per_chunk` is clamped to the
+    // sample count so a forged `u32::MAX` cannot spin the inner loop.
+    let n_chunks = t.chunk_offsets.len();
+    let n_samples_u32 = u32::try_from(n_samples).unwrap_or(u32::MAX);
+    let mut i = 0usize;
+    let mut next_chunk = 1u32;
+    // (chunk, sample_description_index) of the last sample placed.
+    let mut last_placed: Option<(usize, u32)> = None;
+    for (entry_i, &(first_chunk, spc, sdi)) in t.stsc.iter().enumerate() {
+        if i >= n_samples {
+            break;
+        }
+        let end_chunk = t
+            .stsc
+            .get(entry_i + 1)
+            .map_or(n_chunks as u64 + 1, |e| u64::from(e.0));
+        let spc = spc.min(n_samples_u32);
+        let mut chunk = next_chunk.max(first_chunk);
+        if spc == 0 {
+            // A run of empty chunks places nothing: step over it
+            // whole rather than chunk by chunk (the run length is a
+            // forged-able 32-bit difference).
+            let end = u32::try_from(end_chunk).unwrap_or(u32::MAX);
+            next_chunk = chunk.max(end);
+            continue;
+        }
+        // Each pass places at least one sample or fails, so the walk
+        // is bounded by the sample count.
+        while u64::from(chunk) < end_chunk && i < n_samples {
+            let c = chunk as usize;
+            let mut offset = *t
+                .chunk_offsets
+                .get(c.wrapping_sub(1))
+                .ok_or_else(|| chunk_range_error(c))?;
+            for _ in 0..spc {
+                if i >= n_samples {
+                    break;
+                }
+                emit(i, offset, sdi, out);
+                offset = offset.saturating_add(u64::from(t.stsz[i]));
+                i += 1;
+            }
+            last_placed = Some((c, sdi));
+            chunk = match chunk.checked_add(1) {
+                Some(c) => c,
+                None => break,
+            };
+        }
+        next_chunk = chunk;
+    }
+    // Samples the stsc runs did not cover (an invalid file — but don't
+    // crash): each is placed at the start of the last chunk used.
+    if i < n_samples {
+        let (chunk, sdi) = last_placed.unwrap_or((1, 1));
+        let offset = *t
+            .chunk_offsets
+            .get(chunk.wrapping_sub(1))
+            .ok_or_else(|| chunk_range_error(chunk))?;
+        while i < n_samples {
+            emit(i, offset, sdi, out);
+            i += 1;
+        }
     }
     Ok(())
 }
@@ -14102,6 +14155,13 @@ pub struct Mp4Demuxer {
     streams: Vec<StreamInfo>,
     samples: Vec<SampleRef>,
     cursor: usize,
+    /// Per-stream sync-sample index, built on the stream's first seek.
+    sync_indexes: Vec<Option<SyncIndex>>,
+    /// Read-ahead block: `read_block` holds the input bytes starting at
+    /// `read_block_start`; refilled `read_block_size` bytes at a time.
+    read_block: Vec<u8>,
+    read_block_start: u64,
+    read_block_size: usize,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
     /// Parsed `sidx` SegmentIndexBoxes; one per top-level sidx encountered.
@@ -14271,15 +14331,9 @@ pub struct Mp4Demuxer {
     /// channel as `meco_*` keys.
     #[allow(dead_code)]
     meco: MecoBox,
-    /// Per-track media timescale (1-based parallel to `track_ids`),
-    /// needed to translate `tfra.time` (track timescale) to the seek-to
-    /// caller's pts (also track timescale, but this lets us add unit
-    /// asserts later if they diverge).
     #[allow(dead_code)]
     movie_timescale: u32,
     movie_header: MovieHeader,
-    track_timescales: Vec<u32>,
-    track_ids: Vec<u32>,
     /// Per-stream §8.6.6 edit lists in typed form (empty Vec = no
     /// `edts`/`elst` on that track). The demuxer has already applied
     /// the timeline mapping to packet timestamps; this surface is for
@@ -14411,6 +14465,21 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn treps(&self) -> &[TrepRecord] {
         &self.treps
+    }
+
+    /// ISO/IEC 14496-12 §8.16.3 — every top-level `sidx`
+    /// SegmentIndexBox, in file order. `seek_to` does not consult them
+    /// (it has every fragment's samples in hand); they are surfaced for
+    /// tooling that plans byte-range fetches.
+    pub fn sidxes(&self) -> &[SidxRecord] {
+        &self.sidxes
+    }
+
+    /// ISO/IEC 14496-12 §8.8.11 — the `tfra` random-access tables of a
+    /// trailing `mfra`, one per indexed track. Like [`Self::sidxes`],
+    /// informational: `seek_to` works from the samples themselves.
+    pub fn tfras(&self) -> &[TfraRecord] {
+        &self.tfras
     }
 
     /// ISO/IEC 14496-12 §8.16.4 — all `ssix` SubsegmentIndexBoxes
@@ -14937,9 +15006,7 @@ impl Demuxer for Mp4Demuxer {
                 )));
             }
         }
-        self.input.seek(SeekFrom::Start(s.offset))?;
-        let mut data = vec![0u8; s.size as usize];
-        self.input.read_exact(&mut data)?;
+        let mut data = self.read_sample(s.offset, s.size as usize)?;
         if let Some(&width) = self.pcm_swap.get(s.track_idx as usize) {
             swap_sample_bytes(&mut data, width);
         }
@@ -14959,100 +15026,74 @@ impl Demuxer for Mp4Demuxer {
         Ok(pkt)
     }
 
+    /// Position the demuxer so that decoding from the next packet
+    /// yields correct output at `pts` (the stream's time base, on the
+    /// presentation timeline — after the edit list, in composition
+    /// time), and return the presentation time of the packet landed
+    /// on.
+    ///
+    /// The landing packet is the stream's last sync sample whose
+    /// presentation time is at or before `pts` (the first sync sample
+    /// when `pts` precedes them all). Its timestamp already carries
+    /// the composition offset (§8.6.1.3) and the edit-list mapping
+    /// (§8.6.6), so the lookup is the same for a sample-table file and
+    /// for a fragmented one, with or without `sidx` / `mfra` — those
+    /// indexes exist so a reader can find a fragment without having
+    /// read it, and this demuxer has every fragment's samples in hand.
+    /// For an audio stream with a `roll` / `prol` group (§10.1) the
+    /// landing packet is moved back by the roll distance, so the
+    /// decoder has its pre-roll before the target.
+    ///
+    /// The lookup is a binary search over a per-stream index of sync
+    /// samples, built on the stream's first seek.
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         if stream_index as usize >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "MP4: stream index {stream_index} out of range"
             )));
         }
-
-        // Optional fast-path: if we have a `tfra` random-access index
-        // for this track, use it to locate the moof byte offset of the
-        // last keyframe at-or-before `pts`. We then convert the
-        // `moof_offset` back to a sample index by looking up the first
-        // sample of this track whose `offset >= moof_offset`. This is
-        // O(log N) on the tfra (binary search by time) + O(N) on the
-        // sample list (linear scan from the moof boundary), where the
-        // sample list scan is bounded by one fragment's worth of
-        // samples — far better than the full O(N) walk below.
-        //
-        // The tfra entries' `time` field is in this track's media
-        // timescale, same as the caller's `pts`.
-        if let Some(target) = self.tfra_seek_target(stream_index, pts) {
-            // Find the cursor: first sample of this track whose offset
-            // matches the moof's first sample. The moof's samples land
-            // in mdat, which starts after the moof box; the first one
-            // belongs to this track (single-track sidx) or the first
-            // traf for this track.
-            for (i, s) in self.samples.iter().enumerate() {
-                if s.track_idx != stream_index {
-                    continue;
-                }
-                if s.offset >= target.moof_offset && s.keyframe {
-                    self.cursor = i;
-                    return Ok(s.pts);
-                }
-            }
-            // Fall through to the linear scan if the tfra entry didn't
-            // resolve cleanly (e.g. mdat layout the file lied about).
-        }
-
-        // Secondary fast-path: if `tfra` didn't apply (no mfra in the
-        // file, or none of the file's tfras index this track), but the
-        // file carries a `sidx` (typical for DASH on-demand profile,
-        // §8.16.3), use it to find the subsegment whose decode-time
-        // range contains `pts` and snap to the first keyframe at or
-        // after that subsegment's byte offset. The sample-list scan is
-        // bounded by one subsegment's samples.
-        if let Some(target_offset) = self.sidx_seek_target(stream_index, pts) {
-            for (i, s) in self.samples.iter().enumerate() {
-                if s.track_idx != stream_index {
-                    continue;
-                }
-                if s.offset >= target_offset && s.keyframe {
-                    self.cursor = i;
-                    return Ok(s.pts);
-                }
-            }
-            // Fall through to the linear scan if no keyframe lands at
-            // or after the sidx-pointed offset (corrupt sidx, etc.).
-        }
-
-        // Default linear scan: find the last keyframe of this stream
-        // with pts <= target.
-        let mut best_cursor: Option<usize> = None;
-        let mut best_pts: i64 = 0;
-        for (i, s) in self.samples.iter().enumerate() {
-            if s.track_idx != stream_index || !s.keyframe {
-                continue;
-            }
-            if s.pts <= pts {
-                if best_cursor.is_none() || s.pts >= best_pts {
-                    best_cursor = Some(i);
-                    best_pts = s.pts;
-                }
-            } else {
-                break;
-            }
-        }
-        // If no keyframe at-or-before target but there is any keyframe,
-        // fall back to the first keyframe of this stream (pts 0).
-        if best_cursor.is_none() {
-            for (i, s) in self.samples.iter().enumerate() {
-                if s.track_idx == stream_index && s.keyframe {
-                    best_cursor = Some(i);
-                    best_pts = s.pts;
-                    break;
-                }
-            }
-        }
-        let cursor = best_cursor.ok_or_else(|| {
-            Error::unsupported(format!(
+        let index = self.sync_index(stream_index);
+        let Some(&first) = index.by_position.first() else {
+            return Err(Error::unsupported(format!(
                 "MP4: no keyframes in stream {stream_index} to seek to"
-            ))
-        })?;
+            )));
+        };
+        // Last sync sample at or before the target; equal presentation
+        // times resolve to the later sample.
+        let k = index.by_pts.partition_point(|&(p, _)| p <= pts);
+        let mut cursor = match k.checked_sub(1) {
+            Some(k) => index.by_pts[k].1,
+            None => first,
+        };
+        // §10.1: back up by the audio roll distance (a negative count
+        // of samples), then — when not every sample is a sync sample
+        // (`prol`) — to the sync sample at or before that position.
+        let roll = self
+            .roll_distances
+            .get(stream_index as usize)
+            .copied()
+            .flatten()
+            .filter(|&d| d < 0);
+        if let Some(distance) = roll {
+            let mut steps = distance.unsigned_abs();
+            let mut at = cursor;
+            let mut i = cursor;
+            while steps > 0 && i > 0 {
+                i -= 1;
+                if self.samples[i].track_idx == stream_index {
+                    at = i;
+                    steps -= 1;
+                }
+            }
+            if !self.samples[at].keyframe {
+                let index = self.sync_index(stream_index);
+                let k = index.by_position.partition_point(|&p| p <= at);
+                at = k.checked_sub(1).map_or(cursor, |k| index.by_position[k]);
+            }
+            cursor = at;
+        }
         self.cursor = cursor;
-        Ok(best_pts)
+        Ok(self.samples[cursor].pts)
     }
 
     fn metadata(&self) -> &[(String, String)] {
@@ -15068,116 +15109,113 @@ impl Demuxer for Mp4Demuxer {
     }
 }
 
+/// Default size of the demuxer's read-ahead block
+/// ([`Mp4Demuxer::set_read_block_size`]).
+pub const DEFAULT_READ_BLOCK_SIZE: usize = 64 * 1024;
+
 impl Mp4Demuxer {
-    /// Look up the latest tfra entry for `stream_index` whose `time`
-    /// is `<= pts`. Returns the `TfraEntry` or `None` when no tfra
-    /// covers this track or no entry is at-or-before `pts`.
-    fn tfra_seek_target(&self, stream_index: u32, pts: i64) -> Option<TfraEntry> {
-        if self.tfras.is_empty() {
-            return None;
-        }
-        let track_id = self.track_ids.get(stream_index as usize)?;
-        let tfra = self.tfras.iter().find(|t| t.track_id == *track_id)?;
-        if tfra.entries.is_empty() {
-            return None;
-        }
-        let _ts = self.track_timescales.get(stream_index as usize)?;
-        // tfra entries are sorted by `time` per spec. Binary search for
-        // the largest `time <= pts`. We treat negative pts as "before
-        // any keyframe" → return the first entry.
-        if pts < 0 {
-            return Some(tfra.entries[0]);
-        }
-        let target = pts as u64;
-        match tfra.entries.binary_search_by_key(&target, |e| e.time) {
-            Ok(i) => Some(tfra.entries[i]),
-            Err(i) => {
-                if i == 0 {
-                    Some(tfra.entries[0])
-                } else {
-                    Some(tfra.entries[i - 1])
-                }
-            }
-        }
+    /// Set the size of the read-ahead block `next_packet` fills from
+    /// the input: one seek and one read bring in `bytes` of the file,
+    /// and the samples inside are handed out from memory, so a file of
+    /// small interleaved samples costs a system call per block rather
+    /// than two per packet. Samples at least as large as the block are
+    /// read directly. The default is [`DEFAULT_READ_BLOCK_SIZE`]; `0`
+    /// turns read-ahead off (every packet is one seek and one exact
+    /// read, and the demuxer holds no buffer).
+    pub fn set_read_block_size(&mut self, bytes: usize) {
+        self.read_block_size = bytes;
+        self.read_block = Vec::new();
+        self.read_block_start = 0;
     }
 
-    /// Look up the byte offset of the subsegment that covers `pts` for
-    /// this track, using parsed `sidx` (ISO/IEC 14496-12 §8.16.3) records.
-    ///
-    /// Two on-the-wire shapes are handled, both spec-conformant:
-    ///
-    /// 1. **Single `sidx` indexing N subsegments** (DASH on-demand
-    ///    profile). One sidx record at the start of the file lists
-    ///    every fragment's `(EPT, duration, size)`. We binary-search
-    ///    that table by decode time.
-    ///
-    /// 2. **One `sidx` per fragment, each indexing one subsegment**
-    ///    (DASH live profile / our own muxer's output). Each sidx
-    ///    immediately precedes a `(styp? + moof + mdat)` and reports
-    ///    `EPT` = that fragment's `tfdt`. We pick the latest sidx
-    ///    whose EPT ≤ `pts`.
-    ///
-    /// Both shapes converge on the same return: a byte offset the
-    /// `seek_to` caller can match against `SampleRef::offset` to find
-    /// the first keyframe at-or-after that fragment's first byte. The
-    /// sample-list scan that follows is bounded by one subsegment.
-    ///
-    /// Hierarchical (nested) sidx references are skipped — we keep
-    /// walking media references only. Returns `None` when no sidx
-    /// covers this track, or no reference is at or before `pts`.
-    fn sidx_seek_target(&self, stream_index: u32, pts: i64) -> Option<u64> {
-        if self.sidxes.is_empty() {
-            return None;
+    /// The payload of the sample at `offset`. The caller has checked
+    /// that `offset + size` lies within the input.
+    fn read_sample(&mut self, offset: u64, size: usize) -> Result<Vec<u8>> {
+        let block_size = self.read_block_size;
+        if size >= block_size {
+            self.input.seek(SeekFrom::Start(offset))?;
+            let mut data = vec![0u8; size];
+            self.input.read_exact(&mut data)?;
+            return Ok(data);
         }
-        let track_id = *self.track_ids.get(stream_index as usize)?;
-        let track_ts = *self.track_timescales.get(stream_index as usize)? as u64;
-        if track_ts == 0 {
-            return None;
-        }
-        let pts_u = if pts < 0 { 0u64 } else { pts as u64 };
+        let held = offset
+            .checked_sub(self.read_block_start)
+            .and_then(|rel| usize::try_from(rel).ok())
+            .filter(|&rel| {
+                rel.checked_add(size)
+                    .is_some_and(|end| end <= self.read_block.len())
+            });
+        let rel = match held {
+            Some(rel) => rel,
+            None => {
+                // Refill from this sample onwards, no further than the
+                // input goes.
+                let want = usize::try_from(self.input_len.saturating_sub(offset))
+                    .unwrap_or(usize::MAX)
+                    .min(block_size);
+                self.read_block.clear();
+                self.read_block.resize(want, 0);
+                self.input.seek(SeekFrom::Start(offset))?;
+                let mut got = 0usize;
+                while got < want {
+                    match self.input.read(&mut self.read_block[got..]) {
+                        Ok(0) => break,
+                        Ok(n) => got += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            self.read_block.clear();
+                            return Err(e.into());
+                        }
+                    }
+                }
+                self.read_block.truncate(got);
+                self.read_block_start = offset;
+                if got < size {
+                    self.read_block.clear();
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                }
+                0
+            }
+        };
+        Ok(self.read_block[rel..rel + size].to_vec())
+    }
+}
 
-        // Walk every sidx whose reference_id matches the track. For
-        // each one, expand its reference list into virtual
-        // `(time_in_sidx_scale, byte_offset)` anchors and remember the
-        // latest anchor whose time ≤ pts (translated into sidx scale).
-        let mut best: Option<u64> = None;
-        let mut first_media_offset: Option<u64> = None;
-        for sidx in self.sidxes.iter().filter(|s| s.reference_id == track_id) {
-            if sidx.references.is_empty() || sidx.timescale == 0 {
-                continue;
-            }
-            let target_sidx_time = if track_ts == sidx.timescale as u64 {
-                pts_u
-            } else {
-                // Multiply with u128 to avoid overflow on long durations.
-                ((pts_u as u128) * (sidx.timescale as u128) / (track_ts as u128)) as u64
-            };
-            let mut cur_time = sidx.earliest_presentation_time;
-            let mut cur_offset = sidx.first_byte_offset;
-            for r in &sidx.references {
-                if r.is_sidx {
-                    // Hierarchical sidx: consumes byte range, no
-                    // media-time anchor to land on.
-                    cur_offset = cur_offset.saturating_add(r.referenced_size as u64);
-                    continue;
-                }
-                if first_media_offset.is_none() {
-                    first_media_offset = Some(cur_offset);
-                }
-                if cur_time <= target_sidx_time {
-                    // Later anchors override earlier ones (we're picking
-                    // the LAST subsegment whose start ≤ pts).
-                    best = Some(cur_offset);
-                }
-                cur_time = cur_time.saturating_add(r.subsegment_duration as u64);
-                cur_offset = cur_offset.saturating_add(r.referenced_size as u64);
-            }
+/// A stream's sync samples, for [`Mp4Demuxer::seek_to`]: positions
+/// into the demuxer's file-ordered sample list.
+#[derive(Default)]
+struct SyncIndex {
+    /// `(presentation time, position)`, ascending.
+    by_pts: Vec<(i64, usize)>,
+    /// Positions, ascending (decode order).
+    by_position: Vec<usize>,
+}
+
+impl Mp4Demuxer {
+    /// The sync-sample index of `stream_index`, built on first use.
+    fn sync_index(&mut self, stream_index: u32) -> &SyncIndex {
+        let slot = stream_index as usize;
+        if self.sync_indexes.len() <= slot {
+            self.sync_indexes.resize_with(slot + 1, || None);
         }
-        // If pts predates every sidx-indexed subsegment, snap to the
-        // first media reference's offset so the caller still lands on
-        // a keyframe boundary rather than falling through to the slow
-        // path.
-        best.or(first_media_offset)
+        let samples = &self.samples;
+        self.sync_indexes[slot].get_or_insert_with(|| {
+            let by_position: Vec<usize> = samples
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.track_idx == stream_index && s.keyframe)
+                .map(|(i, _)| i)
+                .collect();
+            let mut by_pts: Vec<(i64, usize)> =
+                by_position.iter().map(|&i| (samples[i].pts, i)).collect();
+            if !by_pts.is_sorted() {
+                by_pts.sort_unstable();
+            }
+            SyncIndex {
+                by_pts,
+                by_position,
+            }
+        })
     }
 }
 
@@ -15788,6 +15826,24 @@ pub fn build_stvi_box(record: &StviRecord) -> Result<Vec<u8>> {
 }
 
 use std::io::Read;
+
+/// Borrow the next `n` bytes of an in-memory box body and advance past
+/// them — the copy-free form of [`read_bytes_vec`] for the nested box
+/// walkers, which would otherwise duplicate a sample table once per
+/// nesting level. `n` derives from an attacker-controlled size field:
+/// anything the buffer cannot back is a truncation error.
+fn take_slice<'a>(cur: &mut std::io::Cursor<&'a [u8]>, n: usize) -> Result<&'a [u8]> {
+    let buf: &'a [u8] = cur.get_ref();
+    let start = usize::try_from(cur.position())
+        .unwrap_or(usize::MAX)
+        .min(buf.len());
+    let end = start
+        .checked_add(n)
+        .filter(|&e| e <= buf.len())
+        .ok_or_else(|| Error::invalid("MP4: truncated box payload"))?;
+    cur.set_position(end as u64);
+    Ok(&buf[start..end])
+}
 
 fn read_bytes_vec<R: Read + ?Sized>(r: &mut R, n: usize) -> Result<Vec<u8>> {
     // `n` derives from a box size field that is attacker-controlled
@@ -16995,6 +17051,31 @@ mod tests {
 
     /// §8.3.3.3 — `track_ID` is never zero; we silently drop zeros from
     /// the array rather than rejecting the file.
+    #[test]
+    fn nested_wave_atoms_do_not_recurse_without_bound() {
+        // 200 000 `wave` atoms, each the sole child of the one before
+        // (1.6 MB): followed level by level this is a stack overflow.
+        let levels = 200_000usize;
+        let mut buf = Vec::with_capacity(levels * 8);
+        for i in 0..levels {
+            buf.extend_from_slice(&(((levels - i) * 8) as u32).to_be_bytes());
+            buf.extend_from_slice(b"wave");
+        }
+        let mut t = fresh_track();
+        let mut hints = super::PcmHints::default();
+        super::parse_audio_children(&buf, &mut t, &mut hints, 0).unwrap();
+        // A `wave` at a legitimate depth is still read.
+        let mut enda = 10u32.to_be_bytes().to_vec();
+        enda.extend_from_slice(b"enda");
+        enda.extend_from_slice(&1u16.to_be_bytes());
+        let mut wave = ((8 + enda.len()) as u32).to_be_bytes().to_vec();
+        wave.extend_from_slice(b"wave");
+        wave.extend_from_slice(&enda);
+        let mut hints = super::PcmHints::default();
+        super::parse_audio_children(&wave, &mut t, &mut hints, 0).unwrap();
+        assert_eq!(hints.little_endian, Some(true));
+    }
+
     #[test]
     fn parse_tref_drops_zero_track_ids() {
         let mut payload = Vec::new();

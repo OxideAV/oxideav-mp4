@@ -26,3 +26,7 @@ ctr = "0.9"
 oxideav-basic = "0.0"
 oxideav-flac = "0.0"
 oxideav-mjpeg = "0.1"
+
+[[bench]]
+name = "throughput"
+harness = false

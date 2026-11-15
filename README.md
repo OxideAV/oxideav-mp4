@@ -1889,36 +1889,41 @@ it.
 
 ### Seek strategy
 
-`seek_to(stream, pts)` tries three strategies in order, picking the
-first that applies:
+`seek_to(stream, pts)` positions the demuxer so that decoding from the
+next packet gives correct output at `pts`, and returns the
+presentation time of the packet it landed on:
 
-1. **`tfra` fast-path (ISO/IEC 14496-12 §8.8.11).** If the file has
-   a trailing `mfra` whose `tfra` indexes the requested track, the
-   demuxer binary-searches the `tfra` time table for the largest
-   `time ≤ pts`, translates the result to a `moof_offset`, and
-   snaps to the first keyframe at-or-after that offset. O(log N) on
-   `tfra` + a one-fragment-bounded sample-list scan.
-2. **`sidx` fast-path (ISO/IEC 14496-12 §8.16.3).** If no `tfra`
-   covers the track but the file carries one or more `sidx` boxes
-   whose `reference_id` matches the track's `track_ID`, the demuxer
-   walks every matching `sidx`, expands its references into virtual
-   `(EPT, byte_offset)` anchors, and picks the latest anchor whose
-   decode-time start is at-or-before `pts` (translated from the
-   track's media timescale into the sidx timescale per §8.16.3).
-   Both on-the-wire shapes are handled: a single `sidx` indexing
-   every subsegment (DASH on-demand profile) and one `sidx` per
-   subsegment (DASH live profile / what our own muxer emits).
-   Hierarchical (nested) sidx references are walked for byte-range
-   accounting only — they don't carry a media-time anchor we can
-   land on. Timescale conversion uses `u128` arithmetic so the
-   multiply doesn't overflow for long-duration tracks even when the
-   track's media timescale and the sidx's timescale differ (per the
-   spec-permitted but DASH-IF-deprecated case).
-3. **Linear scan fallback.** Walks the sample table picking the
-   last keyframe at-or-before `pts`. This is the unconditional
-   safety net — when neither index applies, or when the indexed
-   offset doesn't resolve cleanly (corrupt index, mdat layout the
-   file lied about), `seek_to` still returns a correct cursor.
+- `pts` is on the **presentation timeline**: the composition time
+  (ISO/IEC 14496-12 §8.6.1.3, decode time plus `ctts` / `trun`
+  offset) after the edit list (§8.6.6) — the same timeline packet
+  `pts` values are on. A start-delay empty edit, a trimming edit and
+  B-frame reordering are therefore already accounted for.
+- The landing packet is the stream's **last sync sample whose
+  presentation time is at or before `pts`**, or the first sync sample
+  when `pts` precedes them all. Under a trimming edit list, target 0
+  lands on the sync sample the first presented picture depends on,
+  which sits before the edit and carries a negative timestamp.
+- For an **audio stream with a `roll` / `prol` sample group** (§10.1)
+  the landing point is moved back by the roll distance (one packet for
+  AAC's `-1`), then — for `prol`, where not every sample is a sync
+  sample — to the sync sample at or before it, so the decoder has its
+  pre-roll before the target.
+- The lookup is the same for sample-table files and fragmented ones,
+  with or without `sidx` / `mfra`: those indexes let a reader locate a
+  fragment it has not read, and this demuxer has every fragment's
+  samples in hand (they remain available through `sidxes()` /
+  `tfras()` / `ssixes()` for byte-range planning). Their times are
+  also media times, not presentation times, so answering from the
+  samples is what keeps a seek exact under an edit list.
+
+The lookup is a binary search over a per-stream index of sync samples
+(presentation time → position), built on the stream's first seek: 16
+bytes per sync sample of the streams actually seeked, nothing for a
+demuxer that never seeks. `tests/seek_exact.rs` checks every target
+time across small self-muxed files against a scan of the packet list,
+for the progressive, faststart and fragmented layouts (indexed and
+not, fragments that start off a sync sample), with composition
+offsets, start delays, trimming edit lists and audio roll distances.
 
 ### Not (yet) supported
 
