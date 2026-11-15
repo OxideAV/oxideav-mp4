@@ -295,6 +295,7 @@ pub fn open_fragmented_typed(
         pending_moof_pssh: Vec::new(),
         pending_emsg: Vec::new(),
         mehd_patch_pos: None,
+        gapless_patches: Vec::new(),
     })
 }
 
@@ -346,6 +347,9 @@ pub struct FragmentedMuxer {
     /// sealed §8.8.2.3 duration in place. `None` when no `mehd` was
     /// requested.
     mehd_patch_pos: Option<u64>,
+    /// Gapless fields of the init segment to fill in at `write_trailer`,
+    /// once the tracks' lengths are known.
+    gapless_patches: Vec<GaplessPatch>,
 }
 
 impl Muxer for FragmentedMuxer {
@@ -369,7 +373,7 @@ impl Muxer for FragmentedMuxer {
         // tables). trex defaults are zero until the first packet locks
         // them; this is legal — the per-sample fields in `trun` then
         // override the zeroes.
-        let (moov, mehd_off) = build_init_moov(
+        let (moov, mehd_off, gapless_patches) = build_init_moov(
             &self.tracks,
             &self.options,
             &self.frag_options.levels,
@@ -380,6 +384,14 @@ impl Muxer for FragmentedMuxer {
         // bytes landed in the file (ftyp precedes the moov) so
         // write_trailer can seal the overall presentation duration.
         self.mehd_patch_pos = mehd_off.map(|o| ftyp.len() as u64 + o as u64);
+        // Likewise the gapless placeholders (moov-relative → absolute).
+        self.gapless_patches = gapless_patches
+            .into_iter()
+            .map(|mut p| {
+                p.shift(ftyp.len() as u64);
+                p
+            })
+            .collect();
         self.output.write_all(&moov)?;
 
         self.header_written = true;
@@ -439,13 +451,80 @@ impl Muxer for FragmentedMuxer {
             self.output.write_all(&fragment_duration.to_be_bytes())?;
             self.output.seek(std::io::SeekFrom::Start(end))?;
         }
+        // Gapless timing left open in the init segment (no valid length
+        // was stated): the tracks are finished, so bound the edit and
+        // fill in the metadata item.
+        let patches = std::mem::take(&mut self.gapless_patches);
+        for patch in &patches {
+            self.apply_gapless_patch(patch)?;
+        }
         self.output.flush()?;
         self.trailer_written = true;
         Ok(())
     }
 }
 
+/// Where the init segment holds a track's gapless placeholders
+/// (absolute file offsets once shifted past `ftyp`).
+#[derive(Clone, Copy, Debug)]
+struct GaplessPatch {
+    /// Index into the muxer's tracks.
+    track: usize,
+    /// The `elst` entry's `segment_duration` and whether the box is
+    /// version 1 (64-bit field).
+    elst_segment_duration: Option<(u64, bool)>,
+    /// The `iTunSMPB` value string.
+    item_value: Option<u64>,
+}
+
+impl GaplessPatch {
+    fn shift(&mut self, by: u64) {
+        if let Some((pos, _)) = self.elst_segment_duration.as_mut() {
+            *pos += by;
+        }
+        if let Some(pos) = self.item_value.as_mut() {
+            *pos += by;
+        }
+    }
+}
+
 impl FragmentedMuxer {
+    /// Fill in one track's gapless placeholders from its finished
+    /// length: the valid length is what remains after priming and
+    /// padding. A 32-bit `segment_duration` the value does not fit is
+    /// left at zero (open-ended, §8.6.6.1 — still a correct edit).
+    fn apply_gapless_patch(&mut self, patch: &GaplessPatch) -> Result<()> {
+        let Some(g) = self.options.gapless_for(patch.track) else {
+            return Ok(());
+        };
+        let t = &self.tracks[patch.track];
+        let scale = t.base.media_time_scale;
+        let rate = t.base.stream.params.sample_rate;
+        let plan = crate::muxer::GaplessPlan::resolve(g, Some(t.next_bmdt))?;
+        let end = self.output.stream_position()?;
+        if let Some((pos, v1)) = patch.elst_segment_duration {
+            let entries = plan.edit_list(scale, self.options.movie_timescale);
+            let duration = entries[0].segment_duration;
+            let bytes: Option<Vec<u8>> = if v1 {
+                Some(duration.to_be_bytes().to_vec())
+            } else {
+                u32::try_from(duration)
+                    .ok()
+                    .map(|d| d.to_be_bytes().to_vec())
+            };
+            if let Some(bytes) = bytes {
+                self.output.seek(SeekFrom::Start(pos))?;
+                self.output.write_all(&bytes)?;
+            }
+        }
+        if let (Some(pos), Some(value)) = (patch.item_value, plan.itunsmpb_value(scale, rate)?) {
+            self.output.seek(SeekFrom::Start(pos))?;
+            self.output.write_all(value.as_bytes())?;
+        }
+        self.output.seek(SeekFrom::Start(end))?;
+        Ok(())
+    }
+
     /// Write one **protected** sample: the packet's (already-encrypted)
     /// payload plus its ISO/IEC 23001-7 §7.1 sample auxiliary
     /// information — the per-sample `InitializationVector` and optional
@@ -1414,8 +1493,9 @@ fn build_init_moov(
     levels: &[crate::demux::LevaEntry],
     treps: &[crate::demux::TrepRecord],
     write_mehd: bool,
-) -> Result<(Vec<u8>, Option<usize>)> {
+) -> Result<(Vec<u8>, Option<usize>, Vec<GaplessPatch>)> {
     let track_edit_lists = &options.track_edit_lists;
+    let mut patches: Vec<GaplessPatch> = Vec::new();
     let pssh = &options.pssh;
     let movie_times = options.resolve_movie_timestamps();
     // Movie timescale: 1000 unless the caller chose another (matches
@@ -1437,31 +1517,51 @@ fn build_init_moov(
             .iter()
             .find(|e| e.stream_index as u32 + 1 == t.track_id)
             .map(|e| e.entries.as_slice());
-        // Gapless timing: the init segment precedes every sample, so
-        // the edit is bounded (and the metadata item written) only
-        // when the directive states the valid length; the `roll`
+        // Gapless timing: the init segment precedes every sample. With
+        // a stated valid length the edit is bounded and the metadata
+        // item written here and now; without one the edit is written
+        // open-ended and the item zeroed, and both are filled in at
+        // `write_trailer` from the finished track. The `roll`
         // description names its entry as the default for all the
         // fragment samples to come.
         let gapless_elst: Vec<crate::demux::EditListEntry>;
         let mut roll_sgpd = None;
+        let mut patch: Option<GaplessPatch> = None;
         if let Some(g) = options.gapless_for(t.track_id as usize - 1) {
             let scale = t.base.media_time_scale;
             let plan = crate::muxer::GaplessPlan::resolve(g, None)?;
+            let deferred = g.valid.is_none();
+            if deferred {
+                patch = Some(GaplessPatch {
+                    track: t.track_id as usize - 1,
+                    elst_segment_duration: None,
+                    item_value: None,
+                });
+            }
             if g.write_edit_list {
                 gapless_elst = plan.edit_list(scale, movie_timescale);
                 explicit_elst = Some(&gapless_elst);
                 roll_sgpd = plan.roll_group(g.roll_distance, None).map(|(sgpd, _)| sgpd);
             }
             if g.write_itunsmpb {
-                udta = plan.itunsmpb_udta(scale, t.base.stream.params.sample_rate)?;
+                udta = plan.itunsmpb_udta(scale, t.base.stream.params.sample_rate, deferred)?;
             }
         }
-        moov_body.extend_from_slice(&build_trak_init(
-            t.track_id,
-            &t.base,
-            explicit_elst,
-            roll_sgpd.as_ref(),
-        )?);
+        let trak_at = 8 + moov_body.len();
+        let (trak, elst_at) =
+            build_trak_init(t.track_id, &t.base, explicit_elst, roll_sgpd.as_ref())?;
+        if let (Some(p), Some(elst_at)) = (patch.as_mut(), elst_at)
+            && options
+                .gapless_for(p.track)
+                .is_some_and(|g| g.write_edit_list)
+        {
+            // elst: header (8), version + flags (4), entry_count (4),
+            // then the first entry's segment_duration.
+            let v1 = trak[elst_at + 8] == 1;
+            p.elst_segment_duration = Some(((trak_at + elst_at + 16) as u64, v1));
+        }
+        moov_body.extend_from_slice(&trak);
+        patches.extend(patch);
     }
     let mvex_off_in_body = moov_body.len();
     let (mvex, mehd_off_in_mvex) = build_mvex(tracks, levels, treps, write_mehd)?;
@@ -1473,12 +1573,23 @@ fn build_init_moov(
     }
     if let Some(udta) = udta {
         moov_body.extend_from_slice(&udta);
+        // The item value is the tail of the `udta`, which is the tail
+        // of the `moov`.
+        let value_at = 8 + moov_body.len() - crate::muxer::ITUNSMPB_VALUE_LEN;
+        for p in &mut patches {
+            if options
+                .gapless_for(p.track)
+                .is_some_and(|g| g.write_itunsmpb)
+            {
+                p.item_value = Some(value_at as u64);
+            }
+        }
     }
     // Translate the mehd fragment_duration offset from mvex-relative
     // to moov-box-relative: 8 bytes of moov header + everything ahead
     // of the mvex within the moov body.
     let mehd_off_in_moov = mehd_off_in_mvex.map(|o| 8 + mvex_off_in_body + o);
-    Ok((wrap_box(b"moov", &moov_body), mehd_off_in_moov))
+    Ok((wrap_box(b"moov", &moov_body), mehd_off_in_moov, patches))
 }
 
 fn build_trak_init(
@@ -1486,8 +1597,10 @@ fn build_trak_init(
     t: &TrackState,
     explicit_elst: Option<&[crate::demux::EditListEntry]>,
     sgpd: Option<&crate::sample_groups::SampleGroupDescription>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Option<usize>)> {
     let mut body = Vec::new();
+    // Offset of the `elst` box within the returned `trak`, if any.
+    let mut elst_at = None;
     // Duration is unknown at init time — use 0 so players read tfhd/trun
     // for actual timing. Per §8.2.2 a zero duration means "indefinite".
     body.extend_from_slice(&build_tkhd(track_id, 0, &t.stream, t.tkhd_timestamps));
@@ -1496,6 +1609,8 @@ fn build_trak_init(
     // fragmented presentation ("from media_time onwards").
     if let Some(entries) = explicit_elst {
         let elst = crate::demux::build_elst_box(entries)?;
+        // trak header (8) + what precedes the edts + edts header (8).
+        elst_at = Some(8 + body.len() + 8);
         body.extend_from_slice(&wrap_box(b"edts", &elst));
     }
     // mdia uses the same builder as the non-fragmented path; sample
@@ -1507,7 +1622,7 @@ fn build_trak_init(
         &sgpd,
         &[],
     )?);
-    Ok(wrap_box(b"trak", &body))
+    Ok((wrap_box(b"trak", &body), elst_at))
 }
 
 /// `mvex` (§8.8.1) container holding `trex` per track + an optional

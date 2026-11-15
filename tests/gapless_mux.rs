@@ -534,24 +534,93 @@ fn fragmented_with_a_stated_valid_length() {
 }
 
 #[test]
-fn fragmented_without_a_valid_length_is_open_ended() {
+fn fragmented_without_a_valid_length_is_filled_in_at_the_trailer() {
     // The init segment precedes every sample: with no stated length
-    // the edit is the §8.6.6.1 open-ended form, no item is written,
-    // and the valid length runs to the end of the fragments.
-    let bytes =
-        mux(fragmented().with_track_gapless(vec![TrackGapless::new(0, PRIMING, REMAINDER)]));
-    let d = open(&bytes);
+    // the edit is written open-ended and the item zeroed, and
+    // `write_trailer` fills both in from the finished track.
+    for movie_timescale in [1000, RATE] {
+        let bytes = mux(fragmented()
+            .with_movie_timescale(movie_timescale)
+            .with_track_gapless(vec![TrackGapless::new(0, PRIMING, REMAINDER)]));
+        let mut d = open(&bytes);
+        assert!(d.is_fragmented());
+        assert_eq!(
+            d.edit_list(0)[0].segment_duration,
+            VALID * u64::from(movie_timescale) / u64::from(RATE)
+        );
+        assert_eq!(
+            d.gapless_timing(0),
+            Some(GaplessTiming::new(
+                PRIMING,
+                VALID,
+                REMAINDER,
+                GaplessSource::ITunSmpb
+            ))
+        );
+        assert_eq!(timeline(&mut d).len(), PACKETS as usize);
+    }
+    // The edit list on its own is filled in the same way.
+    let bytes = mux(fragmented()
+        .with_movie_timescale(RATE)
+        .with_track_gapless(vec![
+            TrackGapless::new(0, PRIMING, REMAINDER).with_write_itunsmpb(false),
+        ]));
+    assert_eq!(
+        open(&bytes).gapless_timing(0),
+        Some(GaplessTiming::new(
+            PRIMING,
+            VALID,
+            REMAINDER,
+            GaplessSource::EditList
+        ))
+    );
+}
+
+#[test]
+fn fragmented_stream_cut_before_the_trailer_stays_open_ended() {
+    // A recording that never reaches `write_trailer`: the edit is the
+    // §8.6.6.1 open-ended form, the zeroed item is not a carriage, and
+    // the valid length runs to the end of the fragments written.
+    let stream = aac_stream();
+    let sink = Sink::default();
+    let mut m = oxideav_mp4::muxer::open_with_options(
+        Box::new(sink.clone()),
+        std::slice::from_ref(&stream),
+        fragmented().with_track_gapless(vec![TrackGapless::new(0, PRIMING, REMAINDER)]),
+    )
+    .unwrap();
+    m.write_header().unwrap();
+    for i in 0..PACKETS {
+        let pts = (i * FRAME) as i64;
+        let p = Packet::new(0, stream.time_base, vec![i as u8; 40])
+            .with_pts(pts)
+            .with_dts(pts)
+            .with_duration(FRAME as i64)
+            .with_keyframe(true);
+        m.write_packet(&p).unwrap();
+    }
+    drop(m);
+    let bytes = sink.0.lock().unwrap().get_ref().clone();
+    let mut d = open(&bytes);
+    // Three whole fragments of three packets made it out.
+    let written = timeline(&mut d).len() as u64;
+    assert_eq!(written, 9);
     assert_eq!(d.edit_list(0)[0].segment_duration, 0);
     assert_eq!(
         d.gapless_timing(0),
         Some(GaplessTiming::new(
             PRIMING,
-            PACKETS * FRAME - PRIMING,
+            written * FRAME - PRIMING,
             0,
             GaplessSource::EditList
         ))
     );
-    assert!(d.metadata().iter().all(|(k, _)| !k.contains("iTunSMPB")));
+}
+
+#[test]
+fn fragmented_track_shorter_than_its_priming_fails_at_the_trailer() {
+    let options = fragmented().with_track_gapless(vec![TrackGapless::new(0, PACKETS * FRAME, 1)]);
+    assert!(try_mux(options).is_err());
 }
 
 #[test]
@@ -593,4 +662,46 @@ fn movie_timescale_reaches_every_duration_field() {
     assert_eq!(d.movie_header().timescale, RATE);
     assert_eq!(d.movie_header().duration, PACKETS * FRAME);
     assert_eq!(d.duration_micros(), Some(232_199));
+}
+
+#[test]
+fn pcm_with_a_start_delay_and_a_short_last_packet_is_not_gapless() {
+    // Found by the mux_roundtrip fuzz target: uncompressed audio has
+    // no frames to pad, so a shorter final packet is just a shorter
+    // packet — the whole-track edit behind the start delay trims
+    // nothing and no timing is reported.
+    let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+    params.sample_rate = Some(8000);
+    params.channels = Some(1);
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 8000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+    let sink = Sink::default();
+    let mut m = oxideav_mp4::muxer::open_with_options(
+        Box::new(sink.clone()),
+        std::slice::from_ref(&stream),
+        Mp4MuxerOptions::default(),
+    )
+    .unwrap();
+    m.write_header().unwrap();
+    let mut pts = 80;
+    for frames in [50i64, 10] {
+        let p = Packet::new(0, stream.time_base, vec![0x5A; frames as usize * 2])
+            .with_pts(pts)
+            .with_dts(pts)
+            .with_duration(frames)
+            .with_keyframe(true);
+        m.write_packet(&p).unwrap();
+        pts += frames;
+    }
+    m.write_trailer().unwrap();
+    drop(m);
+    let bytes = sink.0.lock().unwrap().get_ref().clone();
+    let d = open(&bytes);
+    assert!(d.edit_list(0)[0].is_empty_edit());
+    assert_eq!(d.gapless_timing(0), None);
 }

@@ -743,7 +743,8 @@ fn build_moov(tracks: &[TrackState], options: &Mp4MuxerOptions) -> Result<Vec<u8
                 }
             }
             if g.write_itunsmpb {
-                udta = plan.itunsmpb_udta(t.media_time_scale, t.stream.params.sample_rate)?;
+                udta =
+                    plan.itunsmpb_udta(t.media_time_scale, t.stream.params.sample_rate, false)?;
             }
         }
         moov_body.extend_from_slice(&build_trak(
@@ -865,15 +866,15 @@ impl GaplessPlan {
         Some((sgpd, sbgp))
     }
 
-    /// `udta/meta/ilst/----` carrying the `iTunSMPB` item, or `None`
-    /// when the valid length is unknown. Counts are sample counts at
-    /// the sample entry's rate: media ticks rescaled when the media
-    /// timescale is not that rate.
-    pub(crate) fn itunsmpb_udta(
+    /// The `iTunSMPB` value for this plan, or `None` when the valid
+    /// length is unknown. Counts are sample counts at the sample
+    /// entry's rate: media ticks rescaled when the media timescale is
+    /// not that rate.
+    pub(crate) fn itunsmpb_value(
         &self,
         media_time_scale: u32,
         sample_rate: Option<u32>,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<String>> {
         let Some(valid) = self.valid else {
             return Ok(None);
         };
@@ -889,6 +890,25 @@ impl GaplessPlan {
             narrow(self.remainder)?,
             conv(valid),
         );
+        debug_assert_eq!(value.len(), ITUNSMPB_VALUE_LEN);
+        Ok(Some(value))
+    }
+
+    /// `udta/meta/ilst/----` carrying the `iTunSMPB` item. With the
+    /// valid length unknown there is no item — unless `placeholder`
+    /// asks for an all-zero one of the same size, to be overwritten
+    /// when the length is known (an all-zero item reads as no item).
+    pub(crate) fn itunsmpb_udta(
+        &self,
+        media_time_scale: u32,
+        sample_rate: Option<u32>,
+        placeholder: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let value = match self.itunsmpb_value(media_time_scale, sample_rate)? {
+            Some(v) => v,
+            None if placeholder => crate::demux::format_itunsmpb(0, 0, 0),
+            None => return Ok(None),
+        };
         Ok(Some(build_freeform_udta(
             "com.apple.iTunes",
             "iTunSMPB",
@@ -896,6 +916,10 @@ impl GaplessPlan {
         )))
     }
 }
+
+/// Length of an `iTunSMPB` value: a space and eight hex digits for
+/// each of eleven fields, a space and sixteen for the valid count.
+pub(crate) const ITUNSMPB_VALUE_LEN: usize = 11 * 9 + 17;
 
 /// `udta` holding one freeform metadata item: `meta` (FullBox) with an
 /// `mdir` handler and an `ilst` whose single `----` item carries the

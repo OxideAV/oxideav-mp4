@@ -410,11 +410,13 @@ impl TrackEditList {
 /// timescale, which this muxer sets to the stream's sample rate — i.e.
 /// they are sample counts at the rate the sample entry declares. When
 /// `valid` is `None` it is derived at finalisation as the track's
-/// total duration minus `priming` and `remainder`; a fragmented
-/// output writes its `moov` before any sample, so there `valid` must
-/// be given for the item to be written and for the edit to be bounded
-/// (otherwise the §8.6.6.1 open-ended `segment_duration = 0` form is
-/// used and the item is omitted).
+/// total duration minus `priming` and `remainder`. A fragmented
+/// output writes its `moov` before any sample: with `valid` given
+/// both carriages are complete in the init segment; without it the
+/// edit is first written in the §8.6.6.1 open-ended form
+/// (`segment_duration = 0`) with a zeroed item, and `write_trailer`
+/// seeks back and fills both in — so a stream cut before the trailer,
+/// or an init segment copied away early, still carries the priming.
 ///
 /// Packets are written as they are: the first packet sits at media
 /// time zero whatever its timestamp, and the edit list alone moves the

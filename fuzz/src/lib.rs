@@ -376,7 +376,11 @@ impl MuxPlan {
         if tail & 2 == 2 {
             options = options.with_compact_sample_sizes(true);
         }
-        let gapless_priming = (!fragmented && tail & 4 == 4).then_some(u64::from(tail >> 3) % 2);
+        // Fragmented plans take it too (the muxer fills the item in at
+        // the trailer) unless an empty-time gap stretches the track's
+        // timeline past its samples.
+        let gapless_ok = frag.as_ref().is_none_or(|f| f.empty_time.is_empty());
+        let gapless_priming = (gapless_ok && tail & 4 == 4).then_some(u64::from(tail >> 3) % 2);
         if let Some(priming) = gapless_priming {
             options = options.with_track_gapless(vec![
                 oxideav_mp4::TrackGapless::new(0, priming, 0).with_write_edit_list(false),

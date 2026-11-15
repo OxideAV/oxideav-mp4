@@ -1613,7 +1613,7 @@ the core rate in its `mp4a` entry keeps its counts in core-rate
 frames; they are scaled by the SBR factor to match the reported
 output rate. The track's decoded length is the sum of its sample
 durations, a shortened final duration of an otherwise constant-frame
-track counting as a whole frame. The values are mirrored on the
+compressed track counting as a whole frame. The values are mirrored on the
 stream's options as `gapless_priming` / `gapless_valid` /
 `gapless_remainder` / `gapless_source` (plus `gapless_conflict = 1`),
 and the roll group's `roll_distance` is available as
@@ -1629,9 +1629,12 @@ an `elst` entry plus a `roll` group (`with_write_edit_list`, default
 on; `with_roll_distance`, default `-1`) and the `iTunSMPB` item under
 `moov/udta/meta/ilst` (`with_write_itunsmpb`, default on). The valid
 length is the finished track's duration minus priming and remainder,
-or `with_valid(Some(n))`; a fragmented output writes its `moov` first,
-so there the edit is open-ended and the item omitted unless the valid
-length is stated. `Mp4MuxerOptions::movie_timescale` (default 1000)
+or `with_valid(Some(n))`. A fragmented output writes its `moov`
+first: with the valid length stated both carriages are complete in
+the init segment; without it the edit is written open-ended
+(`segment_duration = 0`) with a zeroed item, and `write_trailer` seeks
+back and fills both in, so a stream cut before its trailer still
+carries the priming (a zeroed item reads as no item). `Mp4MuxerOptions::movie_timescale` (default 1000)
 sets the `mvhd` timescale: at the audio sample rate the edit list on
 its own is sample-exact. Directives that cannot be written faithfully
 (non-audio stream, two per stream, an explicit `track_edit_lists`

@@ -866,9 +866,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // Decoded length of each track on its media timeline — the
     // yardstick the gapless carriages are checked against. It is the
     // sum of the sample durations (sample table and fragments alike),
-    // except that a track of constant-duration frames whose final
-    // sample declares a shorter one (a writer trimming the padding in
-    // the time-to-sample table) still decodes a whole last frame.
+    // except that a compressed track of constant-duration frames whose
+    // final sample declares a shorter one (a writer trimming the
+    // padding in the time-to-sample table) still decodes a whole last
+    // frame.
     let media_totals: Vec<u64> = {
         // (count, first duration, sum, samples differing from first, last duration)
         let mut acc = vec![(0u64, 0u64, 0u64, 0u64, 0u64); parsed.tracks.len()];
@@ -885,8 +886,11 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             }
         }
         acc.iter()
-            .map(|&(count, first, sum, differing, last)| {
-                if differing == 1 && last < first {
+            .zip(&parsed.tracks)
+            .map(|(&(count, first, sum, differing, last), t)| {
+                // Uncompressed audio has no frames to pad: a sample's
+                // duration is its length.
+                if differing == 1 && last < first && t.pcm.is_none() {
                     count.saturating_mul(first)
                 } else {
                     sum
@@ -6850,7 +6854,9 @@ fn parse_itunsmpb(value: &str) -> Option<(u64, u64, u64)> {
         .take(4)
         .map(|w| u64::from_str_radix(w, 16).ok())
         .collect::<Option<_>>()?;
-    (f.len() == 4).then(|| (f[1], f[2], f[3]))
+    // An item with no valid length says nothing (a writer's
+    // placeholder that was never filled in).
+    (f.len() == 4 && f[3] != 0).then(|| (f[1], f[2], f[3]))
 }
 
 /// The `iTunSMPB` value for the given counts, in the twelve-field

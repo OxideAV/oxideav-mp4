@@ -109,7 +109,9 @@ fuzz_target!(|data: &[u8]| {
 
     // Gapless: the item written for track 0 reads back as given, with
     // the valid length the muxer derived from the finished track.
-    if let Some((priming, total)) = built.gapless {
+    // (An item whose valid length is zero — a one-frame track that is
+    // all priming — says nothing and reads back as no timing.)
+    if let Some((priming, total)) = built.gapless.filter(|&(p, t)| t > p) {
         let g = dmx
             .gapless_timing(0)
             .expect("gapless item written but not read back");
