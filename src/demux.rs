@@ -17102,6 +17102,73 @@ mod tests {
     /// §8.3.3.3 — `track_ID` is never zero; we silently drop zeros from
     /// the array rather than rejecting the file.
     #[test]
+    fn empty_chunk_run_is_stepped_over_whole() {
+        // An stsc run of empty chunks reaching to a forged first_chunk
+        // of u32::MAX: walked chunk by chunk this is four billion
+        // iterations. The one sample falls back to the first chunk.
+        let mut t = fresh_track();
+        t.stsz = vec![10];
+        t.chunk_offsets = vec![100];
+        t.stsc = vec![(1, 0, 1), (u32::MAX, 1, 1)];
+        t.stts = vec![(1, 5)];
+        let mut out = Vec::new();
+        super::expand_samples(&t, 0, &mut out).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].offset, out[0].size, out[0].duration), (100, 10, 5));
+    }
+
+    #[test]
+    fn sample_expansion_walks_irregular_tables() {
+        // Three chunks: two samples, two samples, then three; a second
+        // sample description from the third chunk on; stts and ctts
+        // runs that end before the samples do; an unsorted stss.
+        let mut t = fresh_track();
+        t.stsz = vec![1, 2, 3, 4, 5, 6, 7];
+        t.chunk_offsets = vec![1000, 2000, 3000];
+        t.stsc = vec![(1, 2, 1), (3, 3, 2)];
+        t.stts = vec![(2, 10), (3, 20)];
+        t.ctts = vec![(1, 5), (2, 0)];
+        t.stss = vec![5, 1];
+        let mut out = Vec::new();
+        super::expand_samples(&t, 3, &mut out).unwrap();
+        let got: Vec<(u64, u32, i64, i64, i64, bool, u32)> = out
+            .iter()
+            .map(|s| {
+                (
+                    s.offset, s.size, s.dts, s.pts, s.duration, s.keyframe, s.sdi,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1000, 1, 0, 5, 10, true, 1),
+                (1001, 2, 10, 10, 10, false, 1),
+                (2000, 3, 20, 20, 20, false, 1),
+                (2003, 4, 40, 40, 20, false, 1),
+                (3000, 5, 60, 60, 20, true, 2),
+                (3005, 6, 80, 80, 0, false, 2),
+                (3011, 7, 80, 80, 0, false, 2),
+            ]
+        );
+        assert!(out.iter().all(|s| s.track_idx == 3));
+        // The last run stops at the chunks the offsets table holds;
+        // samples it leaves over sit at the start of the last chunk
+        // used.
+        t.chunk_offsets.truncate(2);
+        let mut out = Vec::new();
+        super::expand_samples(&t, 3, &mut out).unwrap();
+        assert_eq!(
+            out.iter().map(|s| s.offset).collect::<Vec<_>>(),
+            [1000, 1001, 2000, 2003, 2000, 2000, 2000]
+        );
+        // A run that reaches a chunk the table does not hold, with
+        // samples still to place, is an error.
+        t.stsc = vec![(1, 2, 1), (5, 3, 2)];
+        assert!(super::expand_samples(&t, 3, &mut Vec::new()).is_err());
+    }
+
+    #[test]
     fn nested_wave_atoms_do_not_recurse_without_bound() {
         // 200 000 `wave` atoms, each the sole child of the one before
         // (1.6 MB): followed level by level this is a stack overflow.
