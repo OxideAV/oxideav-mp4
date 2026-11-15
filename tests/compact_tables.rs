@@ -8,7 +8,7 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 use oxideav_core::{
-    CodecId, CodecParameters, Demuxer, Muxer, NullCodecResolver, Packet, StreamInfo, TimeBase,
+    CodecId, CodecParameters, Muxer, NullCodecResolver, Packet, StreamInfo, TimeBase,
 };
 use oxideav_mp4::{ChunkPolicy, Mp4MuxerOptions};
 
