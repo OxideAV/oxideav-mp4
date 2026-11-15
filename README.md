@@ -1586,20 +1586,57 @@ subsequent movie fragments") — e.g. a `media_time = 1024, duration =
 across every fragment.
 
 Gapless audio timing: `Mp4Demuxer::gapless_timing(stream)` returns a
-`demux::GaplessTiming` — encoder `priming`, `valid` and `remainder`
-sample counts, plus the `GaplessSource` they came from — for an audio
-track that carries them: the iTunes `iTunSMPB` freeform item (M4A;
-fields two to four of its hex string, applied to the first audio
-track), else a single-entry `elst` on a track with an AAC `roll`
-sample group (`priming = media_time`, `valid = segment_duration`,
-`remainder` = the last frame's unused tail), and `None` otherwise —
-the "assume 2112 for AAC" fallback is reader policy and stays with the
-caller. Counts are in samples at the stream's reported `sample_rate`:
-an HE-AAC file that stores the core rate in its `mp4a` entry keeps its
-counts in core-rate frames, and they are scaled by the SBR factor to
-match the reported output rate. The same four values appear on the
+`demux::GaplessTiming` — encoder `priming` (the start skip), `valid`
+(the exact length of the original signal) and `remainder` (the end
+trim) in samples at the stream's reported `sample_rate`, the
+`GaplessSource` they came from, and a `conflict` flag. Three carriages
+are read and reconciled:
+
+| Carriage | Read as | Exactness |
+|---|---|---|
+| One media edit (after any leading empty edits) on a track with a `roll` / `prol` sample group (§8.6.6, §10.1; QuickTime File Format appendix G) | `priming = media_time`, `valid = segment_duration`, remainder = rest of the track; source `elst` | one movie-timescale tick |
+| `iTunSMPB` freeform item (first audio track) | priming / padding / original length fields; source `iTunSMPB` | sample-exact |
+| The same single media edit with no roll group, when it trims anything | as above; source `elst-trim` | one movie-timescale tick |
+
+Precedence when two are present: an item and an edit list that agree
+(equal priming, valid lengths within one movie tick, or an open-ended
+`segment_duration == 0` edit) yield the item's sample-exact numbers.
+A *signalled* edit list that disagrees with the item wins — it is the
+normative timeline and what the packet timestamps and `discard` flags
+already reflect — unless it describes more samples than the track
+holds while the item does not. A *plain* edit list that disagrees
+loses to the item (without the roll group an edit list says nothing
+about encoder delay). Either disagreement sets `conflict`. With no
+carriage the result is `None` — the "assume 2112 for AAC" fallback is
+reader policy and stays with the caller. An HE-AAC file that stores
+the core rate in its `mp4a` entry keeps its counts in core-rate
+frames; they are scaled by the SBR factor to match the reported
+output rate. The track's decoded length is the sum of its sample
+durations, a shortened final duration of an otherwise constant-frame
+track counting as a whole frame. The values are mirrored on the
 stream's options as `gapless_priming` / `gapless_valid` /
-`gapless_remainder` / `gapless_source` (`"iTunSMPB"` or `"elst"`).
+`gapless_remainder` / `gapless_source` (plus `gapless_conflict = 1`),
+and the roll group's `roll_distance` is available as
+`Mp4Demuxer::audio_roll_distance(stream)` / the `audio_roll_distance`
+option. A packet the edit list cuts into (it starts before the edit
+but ends inside it) is delivered as presented, not `discard`: part of
+its output is on the timeline and the cut inside it is the consumer's.
+
+The muxers write the same carriages from
+`Mp4MuxerOptions::track_gapless`, a list of
+`TrackGapless::new(stream_index, priming, remainder)` directives:
+an `elst` entry plus a `roll` group (`with_write_edit_list`, default
+on; `with_roll_distance`, default `-1`) and the `iTunSMPB` item under
+`moov/udta/meta/ilst` (`with_write_itunsmpb`, default on). The valid
+length is the finished track's duration minus priming and remainder,
+or `with_valid(Some(n))`; a fragmented output writes its `moov` first,
+so there the edit is open-ended and the item omitted unless the valid
+length is stated. `Mp4MuxerOptions::movie_timescale` (default 1000)
+sets the `mvhd` timescale: at the audio sample rate the edit list on
+its own is sample-exact. Directives that cannot be written faithfully
+(non-audio stream, two per stream, an explicit `track_edit_lists`
+entry for the same stream, an item for a stream other than the first
+audio one, counts that overrun the track) are refused.
 iTunes freeform `----` items (`mean` / `name` / `data`) reach
 `metadata()` as `----:<mean>:<name>` with their trimmed string value.
 

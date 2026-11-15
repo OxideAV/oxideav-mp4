@@ -33,8 +33,8 @@ pub mod styp;
 
 pub use options::{
     BrandPreset, ChunkPolicy, FragmentCadence, FragmentedOptions, MP4_EPOCH_OFFSET_SECS,
-    Mp4MuxerOptions, TrackEditList, TrackHeaderTimestamps, TrackProtection, TrackSampleGroups,
-    mp4_secs_from_system_time, mp4_secs_from_unix_secs, unix_secs_from_mp4_secs,
+    Mp4MuxerOptions, TrackEditList, TrackGapless, TrackHeaderTimestamps, TrackProtection,
+    TrackSampleGroups, mp4_secs_from_system_time, mp4_secs_from_unix_secs, unix_secs_from_mp4_secs,
 };
 // The header-timestamp pair is written through `Mp4MuxerOptions` and
 // read back off `Mp4Demuxer`, so it belongs at the root alongside the

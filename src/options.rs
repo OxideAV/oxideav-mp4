@@ -385,6 +385,100 @@ impl TrackEditList {
     }
 }
 
+/// Gapless audio timing for one track, written by the muxer.
+///
+/// An audio encoder puts `priming` samples of delay ahead of the
+/// signal and pads the last frame with `remainder` samples. This
+/// directive records both so a reader can cut the decoded audio to
+/// the original length, in up to two carriages:
+///
+/// * **Edit list + roll group** ([`Self::write_edit_list`], on by
+///   default): one `elst` entry with `media_time = priming` and
+///   `segment_duration` = the valid length (ISO/IEC 14496-12 §8.6.6),
+///   plus a `roll` sample group whose `roll_distance` is
+///   [`Self::roll_distance`] (§10.1) marking the edit as excluding
+///   encoder delay. `segment_duration` is in the movie timescale, so
+///   it is sample-exact only when
+///   [`Mp4MuxerOptions::movie_timescale`] is the track's sample rate
+///   (or a multiple of it).
+/// * **`iTunSMPB` freeform item** ([`Self::write_itunsmpb`], on by
+///   default): `moov/udta/meta/ilst/----` with the sample-exact
+///   priming, padding and valid counts. One per file, so only the
+///   first audio stream may carry it.
+///
+/// `priming`, `remainder` and `valid` are in the track's media
+/// timescale, which this muxer sets to the stream's sample rate — i.e.
+/// they are sample counts at the rate the sample entry declares. When
+/// `valid` is `None` it is derived at finalisation as the track's
+/// total duration minus `priming` and `remainder`; a fragmented
+/// output writes its `moov` before any sample, so there `valid` must
+/// be given for the item to be written and for the edit to be bounded
+/// (otherwise the §8.6.6.1 open-ended `segment_duration = 0` form is
+/// used and the item is omitted).
+///
+/// Packets are written as they are: the first packet sits at media
+/// time zero whatever its timestamp, and the edit list alone moves the
+/// presentation start. The demux dual is `Mp4Demuxer::gapless_timing`.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct TrackGapless {
+    /// Index into the muxer's `streams` slice. Must be an audio stream.
+    pub stream_index: usize,
+    /// Encoder delay: samples to drop before the first valid one.
+    pub priming: u64,
+    /// Padding after the last valid sample.
+    pub remainder: u64,
+    /// Valid sample count; `None` derives it from the track duration.
+    pub valid: Option<u64>,
+    /// Write the `elst` entry and the `roll` sample group.
+    pub write_edit_list: bool,
+    /// Write the `iTunSMPB` freeform metadata item.
+    pub write_itunsmpb: bool,
+    /// `roll_distance` of the `roll` group (§10.1.1.3): `-1` — one
+    /// packet of decoder pre-roll — unless set otherwise. `0` is not a
+    /// legal distance and omits the group.
+    pub roll_distance: i16,
+}
+
+impl TrackGapless {
+    /// Gapless timing for `stream_index` with both carriages enabled.
+    pub fn new(stream_index: usize, priming: u64, remainder: u64) -> Self {
+        Self {
+            stream_index,
+            priming,
+            remainder,
+            valid: None,
+            write_edit_list: true,
+            write_itunsmpb: true,
+            roll_distance: -1,
+        }
+    }
+
+    /// Set `valid`.
+    pub fn with_valid(mut self, valid: Option<u64>) -> Self {
+        self.valid = valid;
+        self
+    }
+
+    /// Set `write_edit_list`.
+    pub fn with_write_edit_list(mut self, write_edit_list: bool) -> Self {
+        self.write_edit_list = write_edit_list;
+        self
+    }
+
+    /// Set `write_itunsmpb`.
+    pub fn with_write_itunsmpb(mut self, write_itunsmpb: bool) -> Self {
+        self.write_itunsmpb = write_itunsmpb;
+        self
+    }
+
+    /// Set `roll_distance`.
+    pub fn with_roll_distance(mut self, roll_distance: i16) -> Self {
+        self.roll_distance = roll_distance;
+        self
+    }
+}
+
 /// Per-track CENC protection signalling for the muxer (ISO/IEC
 /// 14496-12 §8.12 envelope + ISO/IEC 23001-7 §4.1 carriage).
 ///
@@ -732,6 +826,17 @@ pub struct Mp4MuxerOptions {
     pub pssh: Vec<crate::cenc::PsshBox>,
     /// How samples are grouped into chunks (non-fragmented output).
     pub chunking: ChunkPolicy,
+    /// Gapless audio timing per track: encoder priming and end padding
+    /// written as an edit list with a `roll` group and/or the
+    /// `iTunSMPB` metadata item. Empty by default (nothing written).
+    /// See [`TrackGapless`].
+    pub track_gapless: Vec<TrackGapless>,
+    /// The `mvhd` timescale (§8.2.2), which is also the unit of `tkhd`
+    /// durations and of every `elst` `segment_duration`. `1000` by
+    /// default. Set it to an audio track's sample rate to make that
+    /// track's edit-list durations sample-exact. Zero is rejected at
+    /// `open`.
+    pub movie_timescale: u32,
 }
 
 impl Mp4MuxerOptions {
@@ -815,6 +920,18 @@ impl Mp4MuxerOptions {
         self.chunking = chunking;
         self
     }
+
+    /// Set `track_gapless`.
+    pub fn with_track_gapless(mut self, track_gapless: Vec<TrackGapless>) -> Self {
+        self.track_gapless = track_gapless;
+        self
+    }
+
+    /// Set `movie_timescale`.
+    pub fn with_movie_timescale(mut self, movie_timescale: u32) -> Self {
+        self.movie_timescale = movie_timescale;
+        self
+    }
 }
 
 impl Default for Mp4MuxerOptions {
@@ -833,6 +950,8 @@ impl Default for Mp4MuxerOptions {
             track_header_timestamps: Vec::new(),
             pssh: Vec::new(),
             chunking: ChunkPolicy::default(),
+            track_gapless: Vec::new(),
+            movie_timescale: 1000,
         }
     }
 }
@@ -881,6 +1000,74 @@ impl Mp4MuxerOptions {
         self.track_header_timestamps
             .iter()
             .find(|c| c.stream_index == stream_index)
+    }
+
+    /// The [`TrackGapless`] directive targeting `stream_index`, if any.
+    pub(crate) fn gapless_for(&self, stream_index: usize) -> Option<&TrackGapless> {
+        self.track_gapless
+            .iter()
+            .find(|g| g.stream_index == stream_index)
+    }
+
+    /// Reject, at `open`, a zero movie timescale and [`TrackGapless`]
+    /// directives that could not be written faithfully: a stream slot
+    /// that does not exist or is not audio, two directives for one
+    /// stream, an edit list requested next to an explicit
+    /// [`TrackEditList`] for the same stream, and an `iTunSMPB` item
+    /// (one per file, read back against the first audio track) on any
+    /// other stream or with counts past its 32-bit fields.
+    pub(crate) fn validate_track_gapless(
+        &self,
+        streams: &[oxideav_core::StreamInfo],
+    ) -> oxideav_core::Result<()> {
+        use oxideav_core::{Error, MediaType};
+        if self.movie_timescale == 0 {
+            return Err(Error::invalid(
+                "mp4 muxer: movie_timescale must be non-zero",
+            ));
+        }
+        let first_audio = streams
+            .iter()
+            .position(|s| s.params.media_type == MediaType::Audio);
+        for (n, g) in self.track_gapless.iter().enumerate() {
+            let i = g.stream_index;
+            let Some(s) = streams.get(i) else {
+                return Err(Error::invalid(format!(
+                    "mp4 muxer: track_gapless stream_index {i} out of range ({} streams)",
+                    streams.len()
+                )));
+            };
+            if s.params.media_type != MediaType::Audio {
+                return Err(Error::invalid(format!(
+                    "mp4 muxer: track_gapless stream {i} is not an audio stream"
+                )));
+            }
+            if self.track_gapless[..n].iter().any(|o| o.stream_index == i) {
+                return Err(Error::invalid(format!(
+                    "mp4 muxer: two track_gapless directives for stream {i}"
+                )));
+            }
+            if g.write_edit_list && self.track_edit_lists.iter().any(|e| e.stream_index == i) {
+                return Err(Error::invalid(format!(
+                    "mp4 muxer: stream {i} has both an explicit track_edit_lists entry \
+                     and a track_gapless edit list"
+                )));
+            }
+            if g.write_itunsmpb {
+                if Some(i) != first_audio {
+                    return Err(Error::invalid(format!(
+                        "mp4 muxer: the iTunSMPB item describes the first audio stream; \
+                         stream {i} is not it (clear write_itunsmpb)"
+                    )));
+                }
+                if g.priming > u64::from(u32::MAX) || g.remainder > u64::from(u32::MAX) {
+                    return Err(Error::invalid(
+                        "mp4 muxer: iTunSMPB priming / remainder exceed 32 bits",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reject [`TrackHeaderTimestamps`] entries that name a stream slot

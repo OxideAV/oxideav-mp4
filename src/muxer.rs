@@ -235,6 +235,7 @@ pub fn open_with_options(
         return crate::frag::open_fragmented(output, streams, options, frag_opts);
     }
     options.validate_track_header_timestamps(streams.len())?;
+    options.validate_track_gapless(streams)?;
     let mut tracks = Vec::with_capacity(streams.len());
     for (i, s) in streams.iter().enumerate() {
         // AAC without extradata: synthesise the AudioSpecificConfig the
@@ -583,14 +584,7 @@ impl Mp4Muxer {
         }
 
         // Write moov at the end.
-        let moov = build_moov(
-            &self.tracks,
-            self.options.write_edit_list,
-            &self.options.track_edit_lists,
-            &self.options.track_sample_groups,
-            &self.options.pssh,
-            self.options.resolve_movie_timestamps(),
-        )?;
+        let moov = build_moov(&self.tracks, &self.options)?;
         self.output.write_all(&moov)?;
         Ok(())
     }
@@ -641,14 +635,7 @@ impl Mp4Muxer {
             for (t, orig) in self.tracks.iter_mut().zip(orig_offsets.iter()) {
                 t.chunk_offsets = orig.iter().map(|o| *o + base).collect();
             }
-            let candidate = build_moov(
-                &self.tracks,
-                self.options.write_edit_list,
-                &self.options.track_edit_lists,
-                &self.options.track_sample_groups,
-                &self.options.pssh,
-                self.options.resolve_movie_timestamps(),
-            )?;
+            let candidate = build_moov(&self.tracks, &self.options)?;
             let candidate_size = candidate.len() as u64;
             let converged = candidate_size == moov_size;
             moov_size = candidate_size;
@@ -685,17 +672,17 @@ impl Mp4Muxer {
 
 // --- Moov builders --------------------------------------------------------
 
-fn build_moov(
-    tracks: &[TrackState],
-    write_edit_list: bool,
-    track_edit_lists: &[TrackEditList],
-    track_sample_groups: &[TrackSampleGroups],
-    pssh: &[crate::cenc::PsshBox],
-    movie_times: crate::demux::HeaderTimestamps,
-) -> Result<Vec<u8>> {
-    // mvhd: use the largest media-time-scale duration as a rough movie
-    // duration at timescale 1000.
-    let movie_timescale: u32 = 1000;
+fn build_moov(tracks: &[TrackState], options: &Mp4MuxerOptions) -> Result<Vec<u8>> {
+    let write_edit_list = options.write_edit_list;
+    let track_edit_lists: &[TrackEditList] = &options.track_edit_lists;
+    let track_sample_groups: &[TrackSampleGroups] = &options.track_sample_groups;
+    let pssh = &options.pssh;
+    let movie_times = options.resolve_movie_timestamps();
+    // mvhd: the longest track's duration in the movie timescale (1000
+    // unless the caller chose another).
+    let movie_timescale: u32 = options.movie_timescale;
+    // `udta` with the gapless metadata item, when a directive asks.
+    let mut udta: Option<Vec<u8>> = None;
     let mut movie_duration: u64 = 0;
     for (i, t) in tracks.iter().enumerate() {
         let track_duration_movie =
@@ -730,10 +717,29 @@ fn build_moov(
         }
         // §8.6.6: an explicit edit list targeting this stream overrides
         // the automatic start-delay emission (first match wins).
-        let explicit_elst = track_edit_lists
+        let mut explicit_elst = track_edit_lists
             .iter()
             .find(|e| e.stream_index == i)
             .map(|e| e.entries.as_slice());
+        // Gapless timing: the edit list + `roll` group, and the
+        // `iTunSMPB` item, from the finished track's duration.
+        let gapless_elst: Vec<crate::demux::EditListEntry>;
+        let gapless_groups;
+        if let Some(g) = options.gapless_for(i) {
+            let plan = GaplessPlan::resolve(g, Some(t.cumulative_duration))?;
+            if g.write_edit_list {
+                gapless_elst = plan.edit_list(t.media_time_scale, movie_timescale);
+                explicit_elst = Some(&gapless_elst);
+                gapless_groups = plan.roll_group(g.roll_distance, Some(t.sample_sizes.len()));
+                if let Some((sgpd, sbgp)) = &gapless_groups {
+                    track_sgpd.push(sgpd);
+                    track_sbgp.extend(sbgp.iter());
+                }
+            }
+            if g.write_itunsmpb {
+                udta = plan.itunsmpb_udta(t.media_time_scale, t.stream.params.sample_rate)?;
+            }
+        }
         moov_body.extend_from_slice(&build_trak(
             i as u32 + 1,
             t,
@@ -750,7 +756,170 @@ fn build_moov(
     for record in pssh {
         moov_body.extend_from_slice(&crate::cenc::build_pssh_box(record)?);
     }
+    if let Some(udta) = udta {
+        moov_body.extend_from_slice(&udta);
+    }
     Ok(wrap_box(b"moov", &moov_body))
+}
+
+/// A [`crate::options::TrackGapless`] directive resolved against a
+/// track: priming and valid length in media-timescale ticks, the valid
+/// length unknown (`None`) when neither the directive nor a finished
+/// track supplies it.
+pub(crate) struct GaplessPlan {
+    priming: u64,
+    remainder: u64,
+    valid: Option<u64>,
+}
+
+impl GaplessPlan {
+    /// Resolve `g` for a track of `total` media ticks (`None` while the
+    /// track is still open — the fragmented init segment). An explicit
+    /// or derived valid length that overruns the track is an error: an
+    /// edit must not reach into the samples that are not there.
+    pub(crate) fn resolve(g: &crate::options::TrackGapless, total: Option<u64>) -> Result<Self> {
+        let lead = g.priming.checked_add(g.remainder);
+        let valid = match (g.valid, total, lead) {
+            (Some(v), _, _) => Some(v),
+            (None, Some(total), Some(lead)) => Some(total.checked_sub(lead).ok_or_else(|| {
+                Error::invalid(format!(
+                    "mp4 muxer: gapless priming {} + remainder {} exceed the track's {} samples",
+                    g.priming, g.remainder, total
+                ))
+            })?),
+            (None, Some(_), None) => {
+                return Err(Error::invalid(
+                    "mp4 muxer: gapless priming + remainder overflow",
+                ));
+            }
+            (None, None, _) => None,
+        };
+        if let (Some(v), Some(total)) = (valid, total)
+            && g.priming.checked_add(v).is_none_or(|end| end > total)
+        {
+            return Err(Error::invalid(format!(
+                "mp4 muxer: gapless priming {} + valid {} exceed the track's {} samples",
+                g.priming, v, total
+            )));
+        }
+        if i64::try_from(g.priming).is_err() {
+            return Err(Error::invalid("mp4 muxer: gapless priming out of range"));
+        }
+        Ok(Self {
+            priming: g.priming,
+            remainder: g.remainder,
+            valid,
+        })
+    }
+
+    /// The single media edit (§8.6.6): from `priming`, for the valid
+    /// length in the movie timescale (rounded down, so the edit never
+    /// reaches into the padding) — or open-ended (`segment_duration ==
+    /// 0`, §8.6.6.1) when the valid length is unknown.
+    pub(crate) fn edit_list(
+        &self,
+        media_time_scale: u32,
+        movie_timescale: u32,
+    ) -> Vec<crate::demux::EditListEntry> {
+        vec![crate::demux::EditListEntry {
+            segment_duration: self
+                .valid
+                .map_or(0, |v| rescale_u64(v, media_time_scale, movie_timescale)),
+            media_time: self.priming as i64,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        }]
+    }
+
+    /// The `roll` sample group (§10.1) that marks the edit list as
+    /// excluding encoder delay: its description, and — for a finished
+    /// track of `sample_count` samples — the `sbgp` mapping every
+    /// sample to it. An open track (`None`) names the entry as the
+    /// description's default instead, which covers every fragment
+    /// sample. A zero `roll_distance` is not a legal distance: no
+    /// group.
+    pub(crate) fn roll_group(
+        &self,
+        roll_distance: i16,
+        sample_count: Option<usize>,
+    ) -> Option<(SampleGroupDescription, Option<SampleToGroup>)> {
+        if roll_distance == 0 {
+            return None;
+        }
+        let sgpd = SampleGroupDescription {
+            grouping_type: *b"roll",
+            default_sample_description_index: sample_count.is_none().then_some(1),
+            entries: vec![roll_distance.to_be_bytes().to_vec()],
+        };
+        let sbgp = sample_count.map(|n| SampleToGroup {
+            grouping_type: *b"roll",
+            grouping_type_parameter: None,
+            entries: vec![(u32::try_from(n).unwrap_or(u32::MAX), 1)],
+        });
+        Some((sgpd, sbgp))
+    }
+
+    /// `udta/meta/ilst/----` carrying the `iTunSMPB` item, or `None`
+    /// when the valid length is unknown. Counts are sample counts at
+    /// the sample entry's rate: media ticks rescaled when the media
+    /// timescale is not that rate.
+    pub(crate) fn itunsmpb_udta(
+        &self,
+        media_time_scale: u32,
+        sample_rate: Option<u32>,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(valid) = self.valid else {
+            return Ok(None);
+        };
+        let rate = sample_rate.unwrap_or(media_time_scale);
+        let conv = |v: u64| rescale_u64(v, media_time_scale, rate);
+        let narrow = |v: u64| {
+            u32::try_from(conv(v)).map_err(|_| {
+                Error::invalid("mp4 muxer: iTunSMPB priming / remainder exceed 32 bits")
+            })
+        };
+        let value = crate::demux::format_itunsmpb(
+            narrow(self.priming)?,
+            narrow(self.remainder)?,
+            conv(valid),
+        );
+        Ok(Some(build_freeform_udta(
+            "com.apple.iTunes",
+            "iTunSMPB",
+            &value,
+        )))
+    }
+}
+
+/// `udta` holding one freeform metadata item: `meta` (FullBox) with an
+/// `mdir` handler and an `ilst` whose single `----` item carries the
+/// `mean` (namespace) and `name` FullBoxes and a UTF-8 `data` value
+/// (type indicator 1, locale 0).
+fn build_freeform_udta(mean: &str, name: &str, value: &str) -> Vec<u8> {
+    let full = |fourcc: &[u8; 4], text: &str| {
+        let mut b = vec![0u8; 4];
+        b.extend_from_slice(text.as_bytes());
+        wrap_box(fourcc, &b)
+    };
+    let mut data = Vec::with_capacity(8 + value.len());
+    data.extend_from_slice(&1u32.to_be_bytes()); // type indicator: UTF-8
+    data.extend_from_slice(&0u32.to_be_bytes()); // locale
+    data.extend_from_slice(value.as_bytes());
+    let mut item = full(b"mean", mean);
+    item.extend_from_slice(&full(b"name", name));
+    item.extend_from_slice(&wrap_box(b"data", &data));
+    let ilst = wrap_box(b"ilst", &wrap_box(b"----", &item));
+    // hdlr (§8.4.3): version/flags, pre_defined, handler_type `mdir`,
+    // three reserved words (the first holding the manufacturer code
+    // found in such files), empty name.
+    let mut hdlr = vec![0u8; 8];
+    hdlr.extend_from_slice(b"mdir");
+    hdlr.extend_from_slice(b"appl");
+    hdlr.extend_from_slice(&[0u8; 9]);
+    let mut meta = vec![0u8; 4];
+    meta.extend_from_slice(&wrap_box(b"hdlr", &hdlr));
+    meta.extend_from_slice(&ilst);
+    wrap_box(b"udta", &wrap_box(b"meta", &meta))
 }
 
 /// `true` when either half of a header-timestamp pair overflows the
@@ -1001,11 +1170,7 @@ pub(crate) fn build_tkhd(
     wrap_box(b"tkhd", &body)
 }
 
-pub(crate) fn build_mdia(t: &TrackState) -> Result<Vec<u8>> {
-    build_mdia_with_sample_groups(t, &[], &[], &[])
-}
-
-fn build_mdia_with_sample_groups(
+pub(crate) fn build_mdia_with_sample_groups(
     t: &TrackState,
     sbgp: &[&SampleToGroup],
     sgpd: &[&SampleGroupDescription],

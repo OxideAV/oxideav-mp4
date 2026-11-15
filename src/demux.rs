@@ -859,16 +859,60 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     }
 
     fill_params_from_samples(&mut streams, &parsed.tracks, &samples, &mut *input)?;
-    let gapless = gapless_timings(&parsed.tracks, &streams, &metadata, parsed.movie_timescale);
-    // Flat mirror of the typed accessor, the way the `elst_*` keys
+    // Decoded length of each track on its media timeline — the
+    // yardstick the gapless carriages are checked against. It is the
+    // sum of the sample durations (sample table and fragments alike),
+    // except that a track of constant-duration frames whose final
+    // sample declares a shorter one (a writer trimming the padding in
+    // the time-to-sample table) still decodes a whole last frame.
+    let media_totals: Vec<u64> = {
+        // (count, first duration, sum, samples differing from first, last duration)
+        let mut acc = vec![(0u64, 0u64, 0u64, 0u64, 0u64); parsed.tracks.len()];
+        for s in &samples {
+            if let Some(a) = acc.get_mut(s.track_idx as usize) {
+                let d = s.duration.max(0) as u64;
+                if a.0 == 0 {
+                    a.1 = d;
+                }
+                a.0 += 1;
+                a.2 = a.2.saturating_add(d);
+                a.3 += u64::from(d != a.1);
+                a.4 = d;
+            }
+        }
+        acc.iter()
+            .map(|&(count, first, sum, differing, last)| {
+                if differing == 1 && last < first {
+                    count.saturating_mul(first)
+                } else {
+                    sum
+                }
+            })
+            .collect()
+    };
+    let gapless = gapless_timings(
+        &parsed.tracks,
+        &streams,
+        &metadata,
+        parsed.movie_timescale,
+        &media_totals,
+    );
+    let roll_distances: Vec<Option<i16>> = parsed.tracks.iter().map(audio_roll_distance).collect();
+    // Flat mirror of the typed accessors, the way the `elst_*` keys
     // mirror `edit_list`.
-    for (s, g) in streams.iter_mut().zip(&gapless) {
+    for ((s, g), roll) in streams.iter_mut().zip(&gapless).zip(&roll_distances) {
+        let o = &mut s.params.options;
         if let Some(g) = g {
-            let o = &mut s.params.options;
             o.insert("gapless_priming".to_string(), g.priming.to_string());
             o.insert("gapless_valid".to_string(), g.valid.to_string());
             o.insert("gapless_remainder".to_string(), g.remainder.to_string());
             o.insert("gapless_source".to_string(), g.source.as_str().to_string());
+            if g.conflict {
+                o.insert("gapless_conflict".to_string(), "1".to_string());
+            }
+        }
+        if let Some(r) = roll {
+            o.insert("audio_roll_distance".to_string(), r.to_string());
         }
     }
     Ok(Mp4Demuxer {
@@ -918,6 +962,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         track_timescales: parsed.tracks.iter().map(|t| t.timescale).collect(),
         track_ids: parsed.tracks.iter().map(|t| t.track_id).collect(),
         gapless,
+        roll_distances,
         fragmented: parsed.fragmented,
         major_brand,
         track_headers: parsed.tracks.iter().map(|t| t.header).collect(),
@@ -2988,18 +3033,30 @@ struct ElstTimeline {
 }
 
 impl ElstTimeline {
-    /// Map a sample's media composition time to `(delta, presented)`:
-    /// `delta` is added to the sample's CTS and DTS to land it on the
-    /// presentation timeline, and `presented` is false when the edit
-    /// list never presents this composition time (decode pre-roll
-    /// before the first segment, or media excised between segments) —
-    /// surfaced as the packet `discard` flag.
+    /// Map a sample's media composition time to `(delta, presented)`
+    /// treating it as an instant; see [`Self::delta_for_span`].
+    #[cfg(test)]
     fn delta_for_cts(&self, cts: i64) -> (i64, bool) {
+        self.delta_for_span(cts, 0)
+    }
+
+    /// Map a sample occupying `[cts, cts + duration)` on the media
+    /// composition timeline to `(delta, presented)`: `delta` is added
+    /// to the sample's CTS and DTS to land it on the presentation
+    /// timeline, and `presented` is false when the edit list presents
+    /// no part of the sample (decode pre-roll that ends at or before
+    /// the first segment, or media excised between segments) —
+    /// surfaced as the packet `discard` flag. A sample that straddles
+    /// a segment start is presented: part of its output (the tail of
+    /// an audio frame the edit cuts into, §8.6.6) is on the timeline,
+    /// and trimming inside it is the consumer's job.
+    fn delta_for_span(&self, cts: i64, duration: i64) -> (i64, bool) {
         if !self.mapped || self.segments.is_empty() {
             // Legacy single-shift behaviour: subtract the first
             // non-empty edit's media_time.
             return (self.leading_shift.saturating_neg(), true);
         }
+        let end = cts.saturating_add(duration.max(0));
         let first = &self.segments[0];
         if cts < first.media_start {
             // Decode pre-roll: media before the first mapped
@@ -3007,18 +3064,17 @@ impl ElstTimeline {
             // samples ahead of an initial trim). Extrapolate the first
             // segment's delta so pre-roll timestamps stay ordered
             // (they land before the segment's presentation start).
-            return (first.pres_start.saturating_sub(first.media_start), false);
+            return (
+                first.pres_start.saturating_sub(first.media_start),
+                end > first.media_start,
+            );
         }
         // Last segment whose media_start <= cts (media-monotonic list,
         // so this is the innermost candidate).
-        let mut chosen = 0usize;
-        for (i, s) in self.segments.iter().enumerate() {
-            if s.media_start <= cts {
-                chosen = i;
-            } else {
-                break;
-            }
-        }
+        let chosen = self
+            .segments
+            .partition_point(|s| s.media_start <= cts)
+            .saturating_sub(1);
         let s = &self.segments[chosen];
         let delta = s.pres_start.saturating_sub(s.media_start);
         let in_range = s.dur == 0 || cts < s.media_start.saturating_add(s.dur);
@@ -3026,12 +3082,16 @@ impl ElstTimeline {
             (delta, true)
         } else {
             // Past the declared end of the chosen segment. Between two
-            // segments the media is excised (not presented); past the
-            // *last* segment we keep presenting — real files routinely
+            // segments the media is excised (not presented) unless the
+            // sample reaches into the next one; past the *last*
+            // segment we keep presenting — real files routinely
             // declare an elst duration a frame or two short of the
             // track, and §8.6.6.3 models the tail as an implicit empty
             // edit on the *movie* timeline, not a sample drop.
-            (delta, chosen == self.segments.len() - 1)
+            match self.segments.get(chosen + 1) {
+                Some(next) => (delta, end > next.media_start),
+                None => (delta, true),
+            }
         }
     }
 }
@@ -6636,9 +6696,10 @@ fn elst_leading_media_time(elst: &[ElstEntry]) -> i64 {
 }
 
 /// Gapless timing of an audio track ([`Mp4Demuxer::gapless_timing`]):
-/// encoder priming before the first valid sample, the valid samples,
-/// and the padding (remainder) after them, so a consumer can trim the
-/// decoded PCM to the original length.
+/// encoder priming before the first valid sample (the start skip), the
+/// valid samples (the exact length of the original signal), and the
+/// padding after them (the end trim), so a consumer can cut the decoded
+/// PCM to the original length.
 ///
 /// All three counts are in samples at the stream's reported
 /// `params.sample_rate` — the rate the decoder emits. An HE-AAC file
@@ -6647,8 +6708,46 @@ fn elst_leading_media_time(elst: &[ElstEntry]) -> i64 {
 /// they are scaled by the SBR factor here so they line up with the
 /// reported rate.
 ///
+/// # Carriages and precedence
+///
+/// Three carriages are read:
+///
+/// 1. **Signalled edit list** — one media edit (after any leading
+///    empty edits) on a track that has a `roll` or `prol` sample group
+///    description (ISO/IEC 14496-12 §10.1; QuickTime File Format
+///    appendix G): `priming = media_time`, `valid = segment_duration`.
+///    The group is what says the edit excludes encoder delay.
+/// 2. **`iTunSMPB`** — the freeform metadata item, applied to the first
+///    audio track: sample-exact priming, padding and original length.
+/// 3. **Plain trimming edit list** — the same single media edit on a
+///    track *without* a roll group, reported only when it trims
+///    something (§8.6.6: the presentation starts at `media_time`).
+///
+/// `segment_duration` is in the movie timescale, so an edit list's
+/// `valid` is exact only to one movie tick; `iTunSMPB` is exact.
+/// Reconciliation:
+///
+/// * `iTunSMPB` and an edit list **agree** when their priming is equal
+///   and their valid counts differ by no more than one movie-timescale
+///   tick (or the edit is open-ended, `segment_duration == 0`): the
+///   sample-exact `iTunSMPB` numbers are reported.
+/// * `iTunSMPB` against a **signalled** edit list that disagrees: the
+///   edit list wins — it is the normative timeline, and it is what the
+///   packet timestamps and `discard` flags already reflect — unless it
+///   describes more samples than the track holds while `iTunSMPB` does
+///   not. [`GaplessTiming::conflict`] is set.
+/// * `iTunSMPB` against a **plain** edit list that disagrees:
+///   `iTunSMPB` wins (without the roll group an edit list is not a
+///   statement about encoder delay); `conflict` is set when the edit
+///   list trims at all.
+///
+/// The remainder of an edit-list result is the rest of the track:
+/// its decoded length (the sum of its sample durations) minus priming
+/// and valid.
+///
 /// Mirrored on the stream's `params.options` as `gapless_priming` /
-/// `gapless_valid` / `gapless_remainder` / `gapless_source`.
+/// `gapless_valid` / `gapless_remainder` / `gapless_source`, plus
+/// `gapless_conflict = 1` when the carriages contradict each other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GaplessTiming {
@@ -6662,22 +6761,35 @@ pub struct GaplessTiming {
     pub remainder: u64,
     /// Which carrier the numbers came from.
     pub source: GaplessSource,
+    /// True when the file holds two carriages that contradict each
+    /// other; the numbers are the ones the documented precedence
+    /// picked.
+    pub conflict: bool,
 }
 
 impl GaplessTiming {
-    /// A timing record with every field given.
+    /// A timing record with every count given and no conflict.
     pub fn new(priming: u64, valid: u64, remainder: u64, source: GaplessSource) -> Self {
         Self {
             priming,
             valid,
             remainder,
             source,
+            conflict: false,
         }
+    }
+
+    /// Set [`Self::conflict`].
+    pub fn with_conflict(mut self, conflict: bool) -> Self {
+        self.conflict = conflict;
+        self
     }
 
     /// `priming + valid + remainder`: the decoded length of the track.
     pub fn total(&self) -> u64 {
-        self.priming + self.valid + self.remainder
+        self.priming
+            .saturating_add(self.valid)
+            .saturating_add(self.remainder)
     }
 }
 
@@ -6687,16 +6799,21 @@ impl GaplessTiming {
 pub enum GaplessSource {
     /// The iTunes `iTunSMPB` freeform item (M4A).
     ITunSmpb,
-    /// A single-entry `elst` on a track with an AAC `roll` sample group.
+    /// A single media edit on a track with a `roll` / `prol` sample
+    /// group.
     EditList,
+    /// A single media edit that trims the track, with no roll group.
+    EditListTrim,
 }
 
 impl GaplessSource {
-    /// The `gapless_source` option value: `"iTunSMPB"` or `"elst"`.
+    /// The `gapless_source` option value: `"iTunSMPB"`, `"elst"` or
+    /// `"elst-trim"`.
     pub fn as_str(&self) -> &'static str {
         match self {
             GaplessSource::ITunSmpb => "iTunSMPB",
             GaplessSource::EditList => "elst",
+            GaplessSource::EditListTrim => "elst-trim",
         }
     }
 }
@@ -6712,16 +6829,54 @@ fn parse_itunsmpb(value: &str) -> Option<(u64, u64, u64)> {
     (f.len() == 4).then(|| (f[1], f[2], f[3]))
 }
 
+/// The `iTunSMPB` value for the given counts, in the twelve-field
+/// layout the item is found in: a zero field, priming and padding as
+/// eight hex digits, the valid count as sixteen, then eight zero
+/// fields, each preceded by a space.
+pub fn format_itunsmpb(priming: u32, remainder: u32, valid: u64) -> String {
+    let mut s = format!(" 00000000 {priming:08X} {remainder:08X} {valid:016X}");
+    for _ in 0..8 {
+        s.push_str(" 00000000");
+    }
+    s
+}
+
+/// `a * num / den` without intermediate overflow, saturating; a zero
+/// `den` yields zero.
+fn scale_count(a: u64, num: u64, den: u64) -> u64 {
+    if den == 0 {
+        return 0;
+    }
+    u64::try_from(u128::from(a) * u128::from(num) / u128::from(den)).unwrap_or(u64::MAX)
+}
+
+/// The `roll_distance` of a track's audio `roll` / `prol` sample group
+/// description (§10.1.1.2), `roll` first.
+fn audio_roll_distance(t: &Track) -> Option<i16> {
+    if t.media_type != MediaType::Audio {
+        return None;
+    }
+    [b"roll", b"prol"].iter().find_map(|ty| {
+        let g = t.sgpd.iter().find(|g| &g.grouping_type == *ty)?;
+        let e = g.entries.first()?;
+        Some(i16::from_be_bytes([*e.first()?, *e.get(1)?]))
+    })
+}
+
 /// Per-track gapless timing, in samples at each stream's reported
-/// `sample_rate` (`streams` is parallel to `tracks`). `iTunSMPB` counts
-/// frames at the `mp4a` entry's rate; when the stream reports a higher
-/// rate (HE-AAC with the core rate in the entry) the counts are scaled
-/// by that integer factor so they describe the decoder's output.
+/// `sample_rate` (`streams` and `media_totals` are parallel to
+/// `tracks`; a total is the track's decoded length in media ticks).
+/// `iTunSMPB` counts frames at the `mp4a` entry's rate; when the stream
+/// reports a higher rate (HE-AAC with the core rate in the entry) the
+/// counts are scaled by that integer factor so they describe the
+/// decoder's output. The precedence between carriages is documented on
+/// [`GaplessTiming`].
 fn gapless_timings(
     tracks: &[Track],
     streams: &[StreamInfo],
     metadata: &[(String, String)],
     movie_timescale: u32,
+    media_totals: &[u64],
 ) -> Vec<Option<GaplessTiming>> {
     let smpb = metadata
         .iter()
@@ -6738,41 +6893,88 @@ fn gapless_timings(
             }
             let entry_rate = t.sample_rate?;
             let rate = s.params.sample_rate.unwrap_or(entry_rate);
-            if let (Some((priming, remainder, valid)), true) = (smpb, Some(i) == first_audio) {
-                let factor = match (entry_rate, rate) {
-                    (e, o) if e > 0 && o > e && o.is_multiple_of(e) => u64::from(o / e),
-                    _ => 1,
-                };
-                return Some(GaplessTiming {
-                    priming: priming * factor,
-                    valid: valid * factor,
-                    remainder: remainder * factor,
-                    source: GaplessSource::ITunSmpb,
-                });
-            }
+            let factor = match (entry_rate, rate) {
+                (e, o) if e > 0 && o > e && o.is_multiple_of(e) => u64::from(o / e),
+                _ => 1,
+            };
             let rate = u64::from(rate);
             let scale = u64::from(t.timescale).max(1);
-            let roll = t.sgpd.iter().any(|g| &g.grouping_type == b"roll");
-            match t.elst.as_slice() {
-                [e] if roll && e.media_time >= 0 && movie_timescale > 0 => {
-                    let priming = e.media_time as u64 * rate / scale;
-                    let valid = e.segment_duration * rate / u64::from(movie_timescale);
-                    // Every packet holds a full frame: the last one's
-                    // unused tail is the remainder too.
-                    let packets: u64 = t.stts.iter().map(|&(n, _)| u64::from(n)).sum();
-                    let total = match t.stts.first() {
-                        Some(&(_, frame)) => packets * u64::from(frame),
-                        None => t.duration?,
-                    } * rate
-                        / scale;
-                    Some(GaplessTiming {
-                        priming,
-                        valid,
-                        remainder: total.saturating_sub(priming + valid),
-                        source: GaplessSource::EditList,
-                    })
+            let total = scale_count(media_totals.get(i).copied().unwrap_or(0), rate, scale);
+
+            // Carriage: iTunSMPB (first audio track only).
+            let from_item =
+                smpb.filter(|_| Some(i) == first_audio)
+                    .map(|(priming, remainder, valid)| {
+                        GaplessTiming::new(
+                            priming.saturating_mul(factor),
+                            valid.saturating_mul(factor),
+                            remainder.saturating_mul(factor),
+                            GaplessSource::ITunSmpb,
+                        )
+                    });
+
+            // Carriage: one media edit after any leading empty edits.
+            let signalled = audio_roll_distance(t).is_some();
+            let media_edits = {
+                let lead = t.elst.iter().take_while(|e| e.media_time == -1).count();
+                &t.elst[lead..]
+            };
+            // One movie-timescale tick, in output samples: the
+            // resolution of `segment_duration`.
+            let tick = if movie_timescale > 0 {
+                rate.div_ceil(u64::from(movie_timescale))
+            } else {
+                0
+            };
+            // (timing, open-ended)
+            let from_edit = match media_edits {
+                [e] if e.media_time >= 0 && (e.media_rate >> 16) == 1 && movie_timescale > 0 => {
+                    let priming = scale_count(e.media_time as u64, rate, scale);
+                    let open = e.segment_duration == 0;
+                    let valid = if open {
+                        total.saturating_sub(priming)
+                    } else {
+                        scale_count(e.segment_duration, rate, u64::from(movie_timescale))
+                    };
+                    let source = if signalled {
+                        GaplessSource::EditList
+                    } else {
+                        GaplessSource::EditListTrim
+                    };
+                    let remainder = total.saturating_sub(priming.saturating_add(valid));
+                    Some((GaplessTiming::new(priming, valid, remainder, source), open))
                 }
                 _ => None,
+            };
+            // A plain edit list is a carriage only when it trims.
+            let edit_trims = |e: &GaplessTiming| e.priming > 0 || e.remainder > tick;
+
+            match (from_item, from_edit) {
+                (None, None) => None,
+                (Some(item), None) => Some(item),
+                (None, Some((edit, _))) => (signalled || edit_trims(&edit)).then_some(edit),
+                (Some(item), Some((edit, open))) => {
+                    let agree = item.priming == edit.priming
+                        && (open || item.valid.abs_diff(edit.valid) <= tick);
+                    if agree {
+                        Some(item)
+                    } else if !signalled {
+                        Some(item.with_conflict(edit_trims(&edit)))
+                    } else {
+                        // Signalled edit list against a disagreeing
+                        // item: the edit list, unless only it overruns
+                        // the samples the track holds.
+                        let fits = |g: &GaplessTiming, slack: u64| {
+                            g.priming.saturating_add(g.valid) <= total.saturating_add(slack)
+                        };
+                        let pick = if !fits(&edit, tick) && fits(&item, 0) {
+                            item
+                        } else {
+                            edit
+                        };
+                        Some(pick.with_conflict(true))
+                    }
+                }
             }
         })
         .collect()
@@ -11076,7 +11278,7 @@ fn parse_traf(
             // discard semantics as the moov sample-table path (the
             // elst lives in the moov and spans the fragments).
             let media_cts = frag_dts.saturating_add(cts_off);
-            let (elst_delta, presented) = track.elst_timeline.delta_for_cts(media_cts);
+            let (elst_delta, presented) = track.elst_timeline.delta_for_span(media_cts, dur);
             let dts_v = frag_dts.saturating_add(elst_delta);
             let cts_v = media_cts.saturating_add(elst_delta);
 
@@ -12324,7 +12526,7 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
         // the discard flag set. Tracks without an elst take the
         // identity mapping.
         let media_cts = dts_v.saturating_add(cts_offsets[i]);
-        let (elst_delta, presented) = t.elst_timeline.delta_for_cts(media_cts);
+        let (elst_delta, presented) = t.elst_timeline.delta_for_span(media_cts, dur);
         let cts_v = media_cts.saturating_add(elst_delta);
         let dts_v_shifted = dts_v.saturating_add(elst_delta);
         let one_based = (i as u32) + 1;
@@ -14093,6 +14295,8 @@ pub struct Mp4Demuxer {
     mdhd_timestamps: Vec<HeaderTimestamps>,
     /// Per-stream gapless audio timing ([`Self::gapless_timing`]).
     gapless: Vec<Option<GaplessTiming>>,
+    /// Per-stream audio roll distance ([`Self::audio_roll_distance`]).
+    roll_distances: Vec<Option<i16>>,
     /// The moov carries an `mvex` ([`Self::is_fragmented`]).
     fragmented: bool,
     /// The first `ftyp`'s major brand ([`Self::major_brand`]).
@@ -14586,13 +14790,28 @@ impl Mp4Demuxer {
         self.mdhd_timestamps.get(stream_index as usize).copied()
     }
 
-    /// The gapless timing of `stream_index`'s audio track: from the
-    /// M4A `iTunSMPB` item, else from a single-entry edit list on a
-    /// track with an AAC `roll` sample group; `None` otherwise (or for
-    /// a non-audio stream). Counts are in samples at the stream's
-    /// reported `sample_rate`; see [`GaplessTiming`].
+    /// The gapless timing of `stream_index`'s audio track, reconciled
+    /// from every carriage the file holds — the `iTunSMPB` freeform
+    /// item, an edit list on a track with a `roll` / `prol` sample
+    /// group, a plain trimming edit list — under the precedence
+    /// documented on [`GaplessTiming`]; `None` when the track carries
+    /// none of them. Counts are in samples at the stream's reported
+    /// `sample_rate`.
     pub fn gapless_timing(&self, stream_index: u32) -> Option<GaplessTiming> {
         self.gapless.get(stream_index as usize).copied().flatten()
+    }
+
+    /// The `roll_distance` of `stream_index`'s audio `roll` (§10.1
+    /// AudioRollRecoveryEntry) or `prol` (AudioPreRollEntry) sample
+    /// group description: how many packets before a seek target must
+    /// be decoded for its output to be correct (negative: `-1` is one
+    /// packet of pre-roll). `None` for a track without such a group.
+    /// Mirrored on the stream's options as `audio_roll_distance`.
+    pub fn audio_roll_distance(&self, stream_index: u32) -> Option<i16> {
+        self.roll_distances
+            .get(stream_index as usize)
+            .copied()
+            .flatten()
     }
 
     /// `mvhd`'s timescale: the unit of the edit lists' segment durations.

@@ -34,8 +34,7 @@ use std::io::{Seek, SeekFrom, Write};
 use oxideav_core::{Error, Muxer, Packet, Result, StreamInfo, WriteSeek};
 
 use crate::muxer::{
-    TrackState, build_mdia, build_mvhd, build_tkhd, default_samples_per_chunk, rescale_to_media_ts,
-    wrap_box,
+    TrackState, build_mvhd, build_tkhd, default_samples_per_chunk, rescale_to_media_ts, wrap_box,
 };
 use crate::options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
 use crate::sample_entries::sample_entry_for;
@@ -226,6 +225,7 @@ pub fn open_fragmented_typed(
         return Err(Error::invalid("mp4 muxer: need at least one stream"));
     }
     options.validate_track_header_timestamps(streams.len())?;
+    options.validate_track_gapless(streams)?;
     let mut tracks = Vec::with_capacity(streams.len());
     for (i, s) in streams.iter().enumerate() {
         // AAC without extradata: the init segment is written before any
@@ -371,12 +371,10 @@ impl Muxer for FragmentedMuxer {
         // override the zeroes.
         let (moov, mehd_off) = build_init_moov(
             &self.tracks,
-            &self.options.track_edit_lists,
+            &self.options,
             &self.frag_options.levels,
             &self.frag_options.treps,
-            &self.options.pssh,
             self.frag_options.write_mehd,
-            self.options.resolve_movie_timestamps(),
         )?;
         // §8.8.2 — remember where the reserved mehd fragment_duration
         // bytes landed in the file (ftyp precedes the moov) so
@@ -432,7 +430,8 @@ impl Muxer for FragmentedMuxer {
                 if ts == 0 {
                     continue;
                 }
-                let scaled = ((t.next_bmdt as u128) * 1000).div_ceil(ts);
+                let scaled =
+                    ((t.next_bmdt as u128) * self.options.movie_timescale as u128).div_ceil(ts);
                 fragment_duration = fragment_duration.max(scaled.min(u64::MAX as u128) as u64);
             }
             let end = self.output.stream_position()?;
@@ -948,13 +947,15 @@ impl FragmentedMuxer {
                 self.tracks.len()
             )));
         }
-        if !self.options.track_edit_lists.is_empty() {
+        if !self.options.track_edit_lists.is_empty()
+            || self.options.track_gapless.iter().any(|g| g.write_edit_list)
+        {
             // §8.8.7.1: "It is an error to make a presentation that has
             // both edit lists in the Movie Box, and empty-duration
             // fragments."
             return Err(Error::invalid(
                 "mp4 muxer: §8.8.7.1 forbids combining empty-duration fragments \
-                 with edit lists in the Movie Box (track_edit_lists is set)",
+                 with edit lists in the Movie Box (track_edit_lists / track_gapless is set)",
             ));
         }
         if duration == 0 {
@@ -1409,15 +1410,18 @@ fn build_styp(brand: &BrandPreset) -> Vec<u8> {
 
 fn build_init_moov(
     tracks: &[FragTrackState],
-    track_edit_lists: &[crate::options::TrackEditList],
+    options: &Mp4MuxerOptions,
     levels: &[crate::demux::LevaEntry],
     treps: &[crate::demux::TrepRecord],
-    pssh: &[crate::cenc::PsshBox],
     write_mehd: bool,
-    movie_times: crate::demux::HeaderTimestamps,
 ) -> Result<(Vec<u8>, Option<usize>)> {
-    // Movie timescale: pick 1000 (matches the non-fragmented path).
-    let movie_timescale: u32 = 1000;
+    let track_edit_lists = &options.track_edit_lists;
+    let pssh = &options.pssh;
+    let movie_times = options.resolve_movie_timestamps();
+    // Movie timescale: 1000 unless the caller chose another (matches
+    // the non-fragmented path).
+    let movie_timescale: u32 = options.movie_timescale;
+    let mut udta: Option<Vec<u8>> = None;
 
     let mut moov_body = Vec::new();
     moov_body.extend_from_slice(&build_mvhd(
@@ -1429,15 +1433,34 @@ fn build_init_moov(
     for t in tracks {
         // §8.6.6: explicit edit list for this track (stream index is
         // track_id - 1 — track IDs are assigned 1-based in open order).
-        let explicit_elst = track_edit_lists
+        let mut explicit_elst = track_edit_lists
             .iter()
             .find(|e| e.stream_index as u32 + 1 == t.track_id)
             .map(|e| e.entries.as_slice());
+        // Gapless timing: the init segment precedes every sample, so
+        // the edit is bounded (and the metadata item written) only
+        // when the directive states the valid length; the `roll`
+        // description names its entry as the default for all the
+        // fragment samples to come.
+        let gapless_elst: Vec<crate::demux::EditListEntry>;
+        let mut roll_sgpd = None;
+        if let Some(g) = options.gapless_for(t.track_id as usize - 1) {
+            let scale = t.base.media_time_scale;
+            let plan = crate::muxer::GaplessPlan::resolve(g, None)?;
+            if g.write_edit_list {
+                gapless_elst = plan.edit_list(scale, movie_timescale);
+                explicit_elst = Some(&gapless_elst);
+                roll_sgpd = plan.roll_group(g.roll_distance, None).map(|(sgpd, _)| sgpd);
+            }
+            if g.write_itunsmpb {
+                udta = plan.itunsmpb_udta(scale, t.base.stream.params.sample_rate)?;
+            }
+        }
         moov_body.extend_from_slice(&build_trak_init(
             t.track_id,
             &t.base,
-            movie_timescale,
             explicit_elst,
+            roll_sgpd.as_ref(),
         )?);
     }
     let mvex_off_in_body = moov_body.len();
@@ -1447,6 +1470,9 @@ fn build_init_moov(
     // after the trak boxes + mvex.
     for record in pssh {
         moov_body.extend_from_slice(&crate::cenc::build_pssh_box(record)?);
+    }
+    if let Some(udta) = udta {
+        moov_body.extend_from_slice(&udta);
     }
     // Translate the mehd fragment_duration offset from mvex-relative
     // to moov-box-relative: 8 bytes of moov header + everything ahead
@@ -1458,8 +1484,8 @@ fn build_init_moov(
 fn build_trak_init(
     track_id: u32,
     t: &TrackState,
-    movie_timescale: u32,
     explicit_elst: Option<&[crate::demux::EditListEntry]>,
+    sgpd: Option<&crate::sample_groups::SampleGroupDescription>,
 ) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     // Duration is unknown at init time — use 0 so players read tfhd/trun
@@ -1474,8 +1500,13 @@ fn build_trak_init(
     }
     // mdia uses the same builder as the non-fragmented path; sample
     // tables will be empty (the moov has no samples).
-    body.extend_from_slice(&build_mdia(t)?);
-    let _ = movie_timescale;
+    let sgpd: Vec<&crate::sample_groups::SampleGroupDescription> = sgpd.into_iter().collect();
+    body.extend_from_slice(&crate::muxer::build_mdia_with_sample_groups(
+        t,
+        &[],
+        &sgpd,
+        &[],
+    )?);
     Ok(wrap_box(b"trak", &body))
 }
 
