@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Tracks could each claim the same file bytes through a constant-size `stsz`, so a file of many small `trak` boxes described (and made the demuxer expand) far more samples than it had bytes; a movie describing more than two samples per byte of file is now refused at open.
+- A trailing `moov` (or `meta`, `mfra`, …) whose size field is zero — the ISO/IEC 14496-12 §4.2 "extends to the end of the file" form — failed to open; `boxes::read_box_body` now reads such a box to the end of the input.
 - `wave` atoms nested inside one another were followed without bound: a sample entry made of `wave` headers (eight bytes a level) overflowed the stack. Nesting is now followed four levels deep.
 - A sample-to-chunk run of empty chunks (`samples_per_chunk == 0`) spanning a forged 32-bit chunk range was walked chunk by chunk; it is now stepped over whole.
 - `seek_to` on a fragmented file with a `tfra` or `sidx` landed on the first sync sample of the indexed fragment even when a later one in that fragment was at or before the target, and compared media-timeline index times with presentation-timeline targets (wrong under an edit list). Seeks are now answered from the samples themselves.

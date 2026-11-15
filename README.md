@@ -1973,6 +1973,17 @@ per video sample and `stsz` are the shapes every reader handles.
 A demuxer holds one 72-byte record per sample, so a file's sample
 count — not its size — sets the memory an open takes.
 
+Bounds on hostile input (audited by reading, and fuzzed): every box
+body is read with the declared size as a limit, never as an
+allocation; table reservations are capped by the bytes that back the
+table; a constant-size `stsz` may not describe more bytes than the
+file has, and all tracks together may not describe more than two
+samples per byte of file; fragment runs draw on a whole-file sample
+budget; a 64-bit `largesize` and a size-zero trailing box (to end of
+file) are accepted at the top level; the one recursive walker
+(`wave` atoms) is depth-limited; run-length tables are walked by
+cursors bounded by the sample count, whatever counts they claim.
+
 ### Not (yet) supported
 
 - In-pipeline CENC decryption — the AES-128 CTR / CBC driver

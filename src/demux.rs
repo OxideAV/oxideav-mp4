@@ -3176,6 +3176,8 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
     let mut out = ParsedMoov::default();
     let mut cur = std::io::Cursor::new(moov);
     let end = moov.len() as u64;
+    // Samples described so far, across tracks.
+    let mut sample_total: u64 = 0;
     // First pass: collect tracks + mvhd + metadata.
     while cur.position() < end {
         let hdr = match read_box_header(&mut cur)? {
@@ -3187,6 +3189,22 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
             TRAK => {
                 let body = take_slice(&mut cur, psz)?;
                 if let Some(t) = parse_trak(body, file_size)? {
+                    // Whole-movie sample budget. Each track's tables
+                    // are individually bounded by the bytes that back
+                    // them, but a constant-size `stsz` backs its count
+                    // with file bytes any number of tracks can claim
+                    // again — a few hundred bytes of `trak` each. No
+                    // movie describes more than two samples per byte
+                    // of file (the densest table, 4-bit `stz2`, is two
+                    // a byte), so past that the file is forged and
+                    // would only buy a per-sample record 70 times its
+                    // size.
+                    sample_total = sample_total.saturating_add(t.stsz.len() as u64);
+                    if sample_total > file_size.max(4096).saturating_mul(2) {
+                        return Err(Error::invalid(
+                            "MP4: sample tables describe more samples than the file can back",
+                        ));
+                    }
                     out.tracks.push(t);
                 }
             }

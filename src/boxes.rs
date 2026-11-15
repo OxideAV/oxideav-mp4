@@ -108,8 +108,10 @@ pub fn read_box_header<R: Read + Seek + ?Sized>(r: &mut R) -> Result<Option<BoxH
     }))
 }
 
-/// Read the full payload of a box as bytes. Fails if the box size is
-/// unknown OR if the input ends before the declared payload size.
+/// Read the full payload of a box as bytes. Fails if the input ends
+/// before the declared payload size. A box whose size field is zero
+/// (ISO/IEC 14496-12 §4.2: the last box of the file, its payload
+/// extending to the end) is read to the end of the input.
 ///
 /// The size field is attacker-controlled (a 4 GiB+ `size32` field
 /// fits in 32 bits), so we must not pre-allocate the declared length
@@ -119,13 +121,17 @@ pub fn read_box_header<R: Read + Seek + ?Sized>(r: &mut R) -> Result<Option<BoxH
 /// usize` length check and we return `Error::invalid` instead of
 /// `read_exact`'s `UnexpectedEof`.
 pub fn read_box_body<R: Read + ?Sized>(r: &mut R, h: &BoxHeader) -> Result<Vec<u8>> {
-    let payload = h
-        .payload_size()
-        .ok_or_else(|| Error::invalid("MP4: cannot read open-ended box body"))?;
     let mut buf = Vec::new();
-    r.take(payload).read_to_end(&mut buf)?;
-    if buf.len() as u64 != payload {
-        return Err(Error::invalid("MP4: truncated box body"));
+    match h.payload_size() {
+        Some(payload) => {
+            r.take(payload).read_to_end(&mut buf)?;
+            if buf.len() as u64 != payload {
+                return Err(Error::invalid("MP4: truncated box body"));
+            }
+        }
+        None => {
+            r.read_to_end(&mut buf)?;
+        }
     }
     Ok(buf)
 }
