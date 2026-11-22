@@ -249,8 +249,9 @@ fn mjpeg_track(r: &mut Recipe, index: usize, start_delay_ms: i64) -> TrackPlan {
 
     let n_pkts = 1 + (r.u8() % 6) as usize;
     let mut packets = Vec::with_capacity(n_pkts);
-    // Video media is written at timescale 1000, so keep every 1/90000
-    // timestamp a whole multiple of 90 ticks (= 1 ms) for exactness.
+    // Video media is written at the stream's own 1/90000 clock; the
+    // timestamps stay whole multiples of 90 ticks (= 1 ms) so a start
+    // delay is exact in a millisecond movie timescale too.
     let mut pts = start_delay_ms * 90;
     for i in 0..n_pkts {
         let len = 1 + (r.u16() % 1024) as usize;

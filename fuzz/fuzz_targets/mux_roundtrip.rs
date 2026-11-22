@@ -44,11 +44,10 @@ fuzz_target!(|data: &[u8]| {
     );
 
     // The demuxer surfaces each stream at its written mdhd media
-    // timescale (audio: the sample rate — identical to the recipe time
-    // base; video: 1000, while the recipe feeds 1/90000 ticks). The
-    // recipe only generates timestamps that rescale exactly (whole
-    // multiples of 90 ticks / 10 ms), so the identity stays exact
-    // after conversion.
+    // timescale: the sample rate for audio and the stream's own clock
+    // for video, both identical to the recipe time base, so the
+    // conversion below is the identity (kept for a muxer that picks
+    // another scale).
     let out_tb: Vec<(i64, i64)> = dmx
         .streams()
         .iter()
@@ -84,7 +83,41 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
+    // Uncompressed audio written one frame a packet comes back with
+    // the frames of a chunk concatenated (the demuxer delivers one-tick
+    // PCM frames up to 1024 to a packet): the byte stream and the time
+    // of every delivered packet are the identity there, not the packet
+    // boundaries.
+    let frame_bytes: Vec<usize> = dmx
+        .streams()
+        .iter()
+        .map(|s| {
+            let p = &s.params;
+            if p.codec_id.as_str().starts_with("pcm_") {
+                usize::from(p.channels.unwrap_or(1).max(1)) * 2
+            } else {
+                0
+            }
+        })
+        .collect();
+
     for (si, expect) in built.tracks.iter().enumerate() {
+        let regrouped = frame_bytes[si] > 0 && got_payloads[si].len() != expect.payloads.len();
+        if regrouped {
+            assert_eq!(
+                got_payloads[si].concat(),
+                expect.payloads.concat(),
+                "payload byte mismatch on stream {si}"
+            );
+            if built.check_pts {
+                let mut at = rescale(expect.pts[0], expect.tb_den, si);
+                for (k, data) in got_payloads[si].iter().enumerate() {
+                    assert_eq!(got_pts[si][k], at, "pts mismatch on stream {si} packet {k}");
+                    at += (data.len() / frame_bytes[si]) as i64;
+                }
+            }
+            continue;
+        }
         assert_eq!(
             got_payloads[si].len(),
             expect.payloads.len(),
@@ -132,8 +165,8 @@ fuzz_target!(|data: &[u8]| {
     if dmx.seek_to(0, 0).is_ok() {
         if let Ok(p) = dmx.next_packet() {
             if p.stream_index == 0 && built.check_pts {
-                assert_eq!(
-                    &p.data, &built.tracks[0].payloads[0],
+                assert!(
+                    built.tracks[0].payloads.concat().starts_with(&p.data),
                     "post-seek first packet of stream 0 differs"
                 );
             }
