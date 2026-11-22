@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use oxideav_core::{Demuxer, RuntimeContext};
+use oxideav_core::RuntimeContext;
 
 fn main() {
     let Some(path) = std::env::args().nth(1) else {
