@@ -299,7 +299,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     if !moofs.is_empty() {
         for s in &samples {
             let idx = s.track_idx as usize;
-            let end = s.dts.saturating_add(s.duration);
+            let end = s.dts().saturating_add(s.duration());
             if end > next_dts[idx] {
                 next_dts[idx] = end;
             }
@@ -359,11 +359,11 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
                 continue;
             }
             best = match best {
-                None => Some((s.pts, ts)),
+                None => Some((s.pts(), ts)),
                 // `a/at < b/bt` ⇔ `a·bt < b·at` (timescales positive).
                 Some((b_pts, b_ts)) => {
-                    if (s.pts as i128) * (b_ts as i128) < (b_pts as i128) * (ts as i128) {
-                        Some((s.pts, ts))
+                    if (s.pts() as i128) * (b_ts as i128) < (b_pts as i128) * (ts as i128) {
+                        Some((s.pts(), ts))
                     } else {
                         Some((b_pts, b_ts))
                     }
@@ -390,9 +390,9 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         let mut media_end: Vec<i64> = vec![0; streams.len()];
         for s in &samples {
             let i = s.track_idx as usize;
-            media_end[i] = media_end[i].max(s.media_dts.saturating_add(s.duration));
-            if !s.discard && first_pts[i].is_none_or(|p| s.pts < p) {
-                first_pts[i] = Some(s.pts);
+            media_end[i] = media_end[i].max(s.media_dts.saturating_add(s.duration()));
+            if !s.discard && first_pts[i].is_none_or(|p| s.pts() < p) {
+                first_pts[i] = Some(s.pts());
             }
         }
         for (i, st) in streams.iter_mut().enumerate() {
@@ -929,7 +929,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
                 .any(|t| t.media_type == MediaType::Audio && !t.elst.is_empty());
         for s in samples.iter().filter(|_| carriage) {
             if let Some(a) = acc.get_mut(s.track_idx as usize) {
-                let d = s.duration.max(0) as u64;
+                let d = u64::from(s.duration);
                 if a.0 == 0 {
                     a.1 = d;
                 }
@@ -11513,21 +11513,19 @@ fn parse_traf(
             // elst lives in the moov and spans the fragments).
             let media_cts = frag_dts.saturating_add(cts_off);
             let (elst_delta, presented) = track.elst_timeline.delta_for_span(media_cts, dur);
-            let dts_v = frag_dts.saturating_add(elst_delta);
-            let cts_v = media_cts.saturating_add(elst_delta);
 
             samples.push(SampleRef {
                 track_idx: state.track_idx as u32,
                 offset: sample_off,
                 size,
-                pts: cts_v,
-                dts: dts_v,
-                duration: dur,
+                edit_shift: elst_delta,
+                // Both come from 32-bit `trun` / `tfhd` / `trex` fields.
+                duration: dur as u32,
                 keyframe,
                 discard: !presented,
                 sdi: state.sample_description_index,
                 media_dts: frag_dts,
-                cts_offset: cts_off,
+                cts_offset: cts_off as i32,
                 seq: samples.len() as u64,
             });
 
@@ -12639,20 +12637,34 @@ impl SampleSizes {
     }
 }
 
+/// One sample (or, for uncompressed audio, one packet of audio frames)
+/// of the movie: 56 bytes. Presentation times are derived — the decode
+/// time on the media timeline plus the constant the covering edit
+/// contributes (§8.6.6), plus the composition offset (§8.6.1.3).
 #[derive(Clone, Copy, Debug)]
 struct SampleRef {
-    track_idx: u32,
     offset: u64,
+    /// Decoding time on the media timeline, before the edit list
+    /// (§8.6.1.2).
+    media_dts: i64,
+    /// What the edit list adds to this sample's media times to place
+    /// them on the presentation timeline.
+    edit_shift: i64,
+    /// Order of expansion: a track's samples in decode order (the
+    /// sample table, then its fragments in file order).
+    seq: u64,
     size: u32,
-    /// Composition-time stamp (CTS), media timescale. Equals DTS for
-    /// streams without a `ctts` box (e.g. audio, intra-only video);
-    /// otherwise CTS = DTS + ctts_offset, see ISO/IEC 14496-12 §8.6.1.3.
-    pts: i64,
-    /// Decoding-time stamp, media timescale. Carried separately so the
-    /// packet can advertise both — the codec consumes the buffer in
-    /// decode order (`dts`) and the player paces presentation by `pts`.
-    dts: i64,
-    duration: i64,
+    /// Sample delta (`stts` / `trun` fields are 32 bits).
+    duration: u32,
+    /// Composition offset (`ctts` / `trun`, 32 bits signed).
+    cts_offset: i32,
+    /// 1-based `sample_description_index` naming the `stsd` entry this
+    /// sample decodes against — from the covering `stsc` entry
+    /// (§8.7.4) for moov-resident samples, or `tfhd` / `trex`
+    /// (§8.8.7) for fragment samples. Decode always uses entry [0];
+    /// this is surfaced so callers can detect a mid-stream switch.
+    sdi: u32,
+    track_idx: u32,
     keyframe: bool,
     /// True when the §8.6.6 edit list never presents this sample's
     /// composition time (decode pre-roll before the first edit
@@ -12661,20 +12673,26 @@ struct SampleRef {
     /// be a reference frame / priming input) but its output is not
     /// shown.
     discard: bool,
-    /// 1-based `sample_description_index` naming the `stsd` entry this
-    /// sample decodes against — from the covering `stsc` entry
-    /// (§8.7.4) for moov-resident samples, or `tfhd` / `trex`
-    /// (§8.8.7) for fragment samples. Decode always uses entry [0];
-    /// this is surfaced so callers can detect a mid-stream switch.
-    sdi: u32,
-    /// Decoding time and composition offset on the media timeline,
-    /// before the edit list (§8.6.1.2 / §8.6.1.3), for
-    /// [`Mp4Demuxer::samples`].
-    media_dts: i64,
-    cts_offset: i64,
-    /// Order of expansion: a track's samples in decode order (the
-    /// sample table, then its fragments in file order).
-    seq: u64,
+}
+
+impl SampleRef {
+    /// Decoding time stamp on the presentation timeline.
+    fn dts(&self) -> i64 {
+        self.media_dts.saturating_add(self.edit_shift)
+    }
+
+    /// Composition time stamp on the presentation timeline: equal to
+    /// the DTS for streams without composition offsets (audio,
+    /// intra-only video), else DTS + offset (§8.6.1.3).
+    fn pts(&self) -> i64 {
+        self.media_dts
+            .saturating_add(i64::from(self.cts_offset))
+            .saturating_add(self.edit_shift)
+    }
+
+    fn duration(&self) -> i64 {
+        i64::from(self.duration)
+    }
 }
 
 /// How deep `wave` atoms nested in one another are followed.
@@ -12992,9 +13010,9 @@ impl<'a> SampleWalk<'a> {
             track_idx: self.track_idx,
             offset: self.offset,
             size,
-            pts: media_cts.saturating_add(elst_delta),
-            dts: self.media_dts.saturating_add(elst_delta),
-            duration: dur,
+            edit_shift: elst_delta,
+            // A 32-bit `stts` delta, or up to 1024 one-tick frames.
+            duration: dur as u32,
             // Per ISO/IEC 14496-12, an absent or empty stss means
             // every sample is a sync frame (the norm for audio and
             // intra-only video).
@@ -13002,7 +13020,8 @@ impl<'a> SampleWalk<'a> {
             discard: !presented,
             sdi: self.sdi,
             media_dts: self.media_dts,
-            cts_offset,
+            // A 32-bit `ctts` offset.
+            cts_offset: cts_offset as i32,
             seq: out.len() as u64,
         });
         self.media_dts = self.media_dts.saturating_add(dur);
@@ -13122,10 +13141,10 @@ fn fill_params_from_samples(
         let mut first: Option<&SampleRef> = None;
         let mut last: Option<&SampleRef> = None;
         for s in samples.iter().filter(|s| s.track_idx as usize == i) {
-            if first.is_none_or(|f| s.dts < f.dts) {
+            if first.is_none_or(|f| s.dts() < f.dts()) {
                 first = Some(s);
             }
-            if last.is_none_or(|l| s.dts >= l.dts) {
+            if last.is_none_or(|l| s.dts() >= l.dts()) {
                 last = Some(s);
             }
         }
@@ -13140,8 +13159,8 @@ fn fill_params_from_samples(
                     continue;
                 }
                 match delta {
-                    None => delta = Some(s.duration),
-                    Some(d) if d == s.duration => {}
+                    None => delta = Some(s.duration()),
+                    Some(d) if d == s.duration() => {}
                     Some(_) => {
                         constant = false;
                         break;
@@ -15455,8 +15474,8 @@ impl Mp4Demuxer {
                 offset: s.offset,
                 size: s.size,
                 decode_time: s.media_dts,
-                composition_time: s.media_dts.saturating_add(s.cts_offset),
-                duration: s.duration,
+                composition_time: s.media_dts.saturating_add(i64::from(s.cts_offset)),
+                duration: s.duration(),
                 sync: s.keyframe,
                 sample_description_index: s.sdi,
             })
@@ -15524,9 +15543,9 @@ impl Demuxer for Mp4Demuxer {
         // CTS for `pts` (display order), DTS for `dts` (decode order).
         // For tracks without a ctts box `pts == dts` because the
         // demuxer fills `cts_offsets[i]` with zero (§8.6.1.3).
-        pkt.pts = Some(s.pts);
-        pkt.dts = Some(s.dts);
-        pkt.duration = Some(s.duration);
+        pkt.pts = Some(s.pts());
+        pkt.dts = Some(s.dts());
+        pkt.duration = Some(s.duration());
         pkt.flags.keyframe = s.keyframe;
         // §8.6.6: media the edit list never presents (decode pre-roll
         // / excised ranges) is delivered for decoding but flagged so a
@@ -15602,7 +15621,7 @@ impl Demuxer for Mp4Demuxer {
             cursor = at;
         }
         self.cursor = cursor;
-        Ok(self.samples[cursor].pts)
+        Ok(self.samples[cursor].pts())
     }
 
     fn metadata(&self) -> &[(String, String)] {
@@ -15661,7 +15680,7 @@ fn read_chapter_list(
         .filter(|s| s.track_idx as usize == list && !s.discard)
         .take(MAX_CHAPTERS)
         .collect();
-    own.sort_by_key(|s| s.pts);
+    own.sort_by_key(|s| s.pts());
     let mut out = Vec::with_capacity(own.len());
     for s in own {
         let size = s.size.min(MAX_CHAPTER_TITLE);
@@ -15676,8 +15695,8 @@ fn read_chapter_list(
         let title = decode_utf8_or_utf16(&data[2..2 + len]);
         out.push(Chapter {
             id: out.len() as u64,
-            start: Timestamp::new(s.pts, base),
-            end: Timestamp::new(s.pts.saturating_add(s.duration), base),
+            start: Timestamp::new(s.pts(), base),
+            end: Timestamp::new(s.pts().saturating_add(s.duration()), base),
             title: (!title.is_empty()).then_some(title),
             language: None,
         });
@@ -15783,7 +15802,7 @@ impl Mp4Demuxer {
                 .map(|(i, _)| i)
                 .collect();
             let mut by_pts: Vec<(i64, usize)> =
-                by_position.iter().map(|&i| (samples[i].pts, i)).collect();
+                by_position.iter().map(|&i| (samples[i].pts(), i)).collect();
             if !by_pts.is_sorted() {
                 by_pts.sort_unstable();
             }
@@ -17662,7 +17681,13 @@ mod tests {
             .iter()
             .map(|s| {
                 (
-                    s.offset, s.size, s.dts, s.pts, s.duration, s.keyframe, s.sdi,
+                    s.offset,
+                    s.size,
+                    s.dts(),
+                    s.pts(),
+                    s.duration(),
+                    s.keyframe,
+                    s.sdi,
                 )
             })
             .collect();
@@ -17706,7 +17731,7 @@ mod tests {
             }
             all.sort_by_key(|s| s.offset);
             all.iter()
-                .map(|s| (s.track_idx, s.offset, s.size, s.dts))
+                .map(|s| (s.track_idx, s.offset, s.size, s.dts()))
                 .collect()
         }
         fn merged(tracks: &[super::Track]) -> Vec<(u32, u64, u32, i64)> {
@@ -17722,7 +17747,7 @@ mod tests {
                 let mut by_dts: Vec<(u64, i64)> = all
                     .iter()
                     .filter(|s| s.track_idx == t)
-                    .map(|s| (s.seq, s.dts))
+                    .map(|s| (s.seq, s.dts()))
                     .collect();
                 by_dts.sort();
                 assert!(by_dts.windows(2).all(|w| w[0].1 <= w[1].1));
@@ -17732,7 +17757,7 @@ mod tests {
                 assert_eq!(unique.len(), seqs.len());
             }
             all.iter()
-                .map(|s| (s.track_idx, s.offset, s.size, s.dts))
+                .map(|s| (s.track_idx, s.offset, s.size, s.dts()))
                 .collect()
         }
         let track = |sizes: &[u32], chunks: &[u64], spc: u32| {

@@ -33,7 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Uncompressed audio (one table sample per audio frame) is delivered up to 1024 frames to a packet instead of one packet a frame, and a constant-size `stsz` is no longer expanded into a size per sample: an hour of 48 kHz PCM is 170 000 packets rather than 173 million.
+- Uncompressed audio (one table sample per audio frame) is delivered up to 1024 frames to a packet instead of one packet a frame, and a constant-size `stsz` is no longer expanded into a size per sample: an hour of 48 kHz PCM is 170 000 packets rather than 173 million. A 10-minute PCM `.mov` opens in 0.47 ms (was 354 ms) with a 5 MiB peak resident set (was 2751 MiB).
+- The demuxer's per-sample record is 56 bytes (was 72): 246 MiB instead of 290 MiB at the peak for a 2.88-million-sample file.
+- The muxer writes a track at the stream's own clock (see Fixed) and, when an audio track gets an automatic edit list — in a fragmented file, whenever there is an audio track — the movie timescale is that track's sample rate instead of 1000. `Mp4MuxerOptions::movie_timescale` still overrides it.
+- The fragmented muxer's init segment holds a 64-byte `free` box per `trak` (the place of the automatic edit list) unless `write_edit_list` is off or the track has an explicit edit list.
 - The non-fragmented muxer no longer writes a sync-sample table for a track whose samples are all sync samples (ISO/IEC 14496-12 §8.6.2.1: an absent table means exactly that); the `moov` of an audio track shrinks by four bytes a sample.
 - `seek_to` is a binary search over a per-stream sync-sample index built on first use (was a scan of every sample), and for an audio stream with a `roll` / `prol` group lands the roll distance before the target packet.
 - Opening a file walks each sample table with run cursors (no per-sample side tables, no per-sample rescan of the chunk), merges the tracks into file order as it goes instead of sorting afterwards, borrows nested box bodies instead of copying them at every nesting level, and skips the per-sample passes a file does not need: 140 ms → 25–49 ms on a two-million-sample file.
@@ -48,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Demuxer::chapters()`: the chapter list — the text track a `chap` track reference names (QuickTime File Format, "Chapter Lists"), one chapter a sample.
 - QuickTime compression types in the static codec table: `cvid`, `rle `, `png `, `gif `, `tiff`, `SVQ1`, `SVQ3`, `dvc ` / `dvcp`, `ima4`, `.mp3`, the `ms` ACM codes 0x55 / 0x02 / 0x11; `NONE` and an all-zero format as `raw ` / `twos` by sample size.
 - `tests/blackbox_matrix.rs`: the live matrix against a black-box muxer and reader — every codec the muxer writes into `mp4` / `mov` / `3gp` / `m4a` / `ismv`, every `-movflags` layout and their combinations, rate × channel and size × pixel format × GOP sweeps, subtitles, chapters, cover art, protected files; skipped when the tools are absent.
+- `examples/mp4time.rs`: times open / read / seek on a file.
 - `examples/mp4dump.rs`: prints the streams, options and packets (timestamps, flags, Adler-32) the demuxer reports for a file.
 - `tests/blackbox_pins.rs` with `tests/fixtures/blackbox/`: demuxer behaviours pinned on small files from a black-box muxer.
 - `Mp4Demuxer::sidxes()` / `tfras()`: the parsed segment-index and random-access tables.

@@ -2095,8 +2095,35 @@ describe the interleave and nothing finer) and
 bits a sample when the sizes fit). Both are off by default: one chunk
 per video sample and `stsz` are the shapes every reader handles.
 
-A demuxer holds one 72-byte record per sample, so a file's sample
-count — not its size — sets the memory an open takes.
+A demuxer holds one 56-byte record per packet it will deliver, so a
+file's packet count — not its size — sets the memory an open takes.
+The sample tables are expanded at `open`, not walked lazily; what is
+no longer expanded is a constant-size table of uncompressed audio (one
+table sample per audio frame), which is delivered 1024 frames a
+packet.
+
+Large foreign files (`examples/mp4time.rs` under `/usr/bin/time -l`,
+medians of three runs on the same shared machine, files in the page
+cache, written by a black-box muxer):
+
+| File | Stage | Before | After |
+|---|---|---|---|
+| 10 min PCM s16 stereo 48 kHz, `.mov`, 110 MiB (28.8 M table samples) | `open` | 354 ms | 0.47 ms |
+| | read every packet | 427 ms (28.8 M packets) | 10.3 ms (28 125 packets, 10.6 GiB/s) |
+| | `seek_to` | 85 µs | 0.07 µs |
+| | peak resident set | 2751 MiB | 5 MiB |
+| 60 min PCM s24 stereo 48 kHz, `.mov`, 989 MiB (172.8 M table samples) | `open` / read / peak | not run (≈ 16 GiB of records) | 2.8 ms / 134 ms / 18 MiB |
+| 2 h Opus in 2.5 ms packets, 38.5 MiB (2.88 M samples) | `open` | 33.7 ms | 33.6 ms |
+| | read every packet | 37.6 ms | 36.5 ms (79 M packets/s) |
+| | peak resident set (with the seek index) | 290 MiB | 246 MiB |
+| 20 min 720p H.264 + AAC, 585 MiB, progressive | `open` / read | 2.0 ms / 58 ms | 2.1 ms / 57 ms (10 GiB/s) |
+| the same, fragmented at every key frame | `open` / read | 4.6 ms / 54 ms | 4.6 ms / 55 ms |
+
+The per-sample record went from 72 to 56 bytes (presentation times are
+derived from the media decode time, the composition offset and the
+edit's shift instead of being stored twice). The muxer's throughput is
+unchanged by this round (`benches/throughput.rs`: 38 M packets/s
+progressive, 15 M fragmented).
 
 Bounds on hostile input (audited by reading, and fuzzed): every box
 body is read with the declared size as a limit, never as an
