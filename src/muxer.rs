@@ -1648,6 +1648,12 @@ fn compute_delta(
             return v as u32;
         }
     }
+    // A stated duration of zero is written as zero: the empty sample
+    // that ends a text track lasts no time (§8.6.1.2.1 allows a zero
+    // delta for the last sample).
+    if packet.duration == Some(0) {
+        return 0;
+    }
     // Otherwise: diff against the previous packet's DTS — decode order,
     // so reordered (B-frame) PTS cannot produce a bogus delta — or its
     // PTS when the packets carry no DTS.

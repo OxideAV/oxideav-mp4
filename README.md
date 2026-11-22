@@ -1558,9 +1558,10 @@ else on purpose the test states the rule:
   metadata block header; ALAC extradata is the cookie without its box.
 
 `tests/blackbox_mux.rs` (ours → foreign, and foreign → ours →
-foreign): 46 source clips × 10 writer modes (progressive, faststart,
-`mov` and `ismv` brands, 64-bit `mdat`, track-run chunks + `stz2`,
-four fragmented shapes) = **440 files, 0 differences**. The reader must
+foreign): 48 source clips (two of them demuxed only) × 10 writer modes
+(progressive, faststart, `mov` and `ismv` brands, 64-bit `mdat`,
+track-run chunks + `stz2`, four fragmented shapes) = **460 files, 0
+differences**. The reader must
 report for each rewritten file the packets and stream parameters of
 the original, print nothing, decode it to the same output (sample-table
 files; a fragmented one must decode cleanly), and its own copy of the
@@ -1572,12 +1573,13 @@ right codec id and configuration, (b) written back:
 
 | | (a) and (b) | (a) only | neither |
 |---|---|---|---|
-| video | H.264 (`avc1` / `avc3`), HEVC (`hvc1` / `hev1`), AV1, VP9, VP8, MPEG-4 Part 2, MPEG-1 / MPEG-2 (`mp4v`), MJPEG, H.263, JPEG 2000 (`mp4v`) | ProRes, PNG (`png `), QuickTime Animation, SVQ1, DV; MPEG-1 / -2 and JPEG 2000 under their QuickTime types (`m1v ` / `m2v1` / `mjp2` → `mp4:<fourcc>`) | DNxHD, CineForm, FFV1, Dirac, v210, H.261 (`mp4:<fourcc>`) |
+| video | H.264 (`avc1` / `avc3` in, `avc1` out), HEVC (`hvc1` / `hev1` in, `hvc1` out), AV1, VP9, MPEG-4 Part 2, MPEG-1 / MPEG-2 (`mp4v`), MJPEG, H.263, JPEG 2000 (`mp4v`) | ProRes, PNG (`png `), QuickTime Animation, SVQ1, DV | DNxHD, CineForm, FFV1, Dirac, v210, H.261, and MPEG-1 / -2 / JPEG 2000 under the tool's QuickTime types `m1v ` / `m2v1` / `mjp2` (all `mp4:<fourcc>`); PNG as `mp4v` (`mp4v:0x6d`) |
 | audio | AAC LC / HE / HEv2, MP3, MP2 (as `mp3`), AC-3, E-AC-3, Opus, FLAC, ALAC, PCM s8 / s16 / s24 / s32 / f32 / f64 (either byte order in, little-endian out), G.711 A-law / µ-law | DTS, IMA ADPCM (`ima4`), PCM u8 | TrueHD (`mlpa`), iLBC |
-| other | `mov_text` / `tx3g`, TTML (`stpp`) | QuickTime `text`, timecode (`tmcd`), RTP hint tracks | — |
+| other | `mov_text` / `tx3g` | TTML (`stpp`), QuickTime `text`, timecode (`tmcd`), RTP hint tracks | — |
 
-Never checked against an outside stream: `webvtt` / `sbtt` / `stxt`
-tracks, `cbcs` / `cbc1` / `cens` protection (the tool writes `cenc`
+Never checked against an outside stream: VP8 (the tool does not write
+it into these containers), `webvtt` / `sbtt` / `stxt` tracks, the
+writer's `ttml` entry, `cbcs` / `cbc1` / `cens` protection (the tool writes `cenc`
 only), this crate's own CENC writer, `stz2` and `co64` *input*, the
 `meta` item boxes.
 

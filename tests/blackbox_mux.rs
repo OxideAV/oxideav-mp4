@@ -41,9 +41,22 @@ fn tool_major(tool: &str) -> Option<u32> {
 const V: &str = "-f lavfi -i testsrc2=s=64x48:r=25:d=1";
 const A: &str = "-f lavfi -i sine=f=440:d=1";
 
-/// `(name, container, arguments)` of the source clips.
-fn sources() -> Vec<(String, &'static str, String)> {
+/// `(name, container, arguments)` of the source clips. `dir` receives
+/// the subtitle input.
+fn sources(dir: &Path) -> Vec<(String, &'static str, String)> {
     let mut out = Vec::new();
+    let srt = dir.join("in.srt");
+    std::fs::write(
+        &srt,
+        "1\n00:00:00,100 --> 00:00:00,400\nHello\n\n\
+         2\n00:00:00,600 --> 00:00:00,900\nWorld <b>bold</b>\n",
+    )
+    .unwrap();
+    out.push((
+        "sub_text".into(),
+        "mp4",
+        format!("{V} -i {} -c:v libx264 -c:s mov_text", srt.display()),
+    ));
     let video = [
         ("h264", "-c:v libx264 -bf 2 -g 10"),
         ("h264_nob", "-c:v libx264 -bf 0 -g 10"),
@@ -67,6 +80,7 @@ fn sources() -> Vec<(String, &'static str, String)> {
     let audio = [
         ("aac", "-c:a aac"),
         ("aac_he", "-c:a aac_at -profile:a 4 -ac 2"),
+        ("aac_hev2", "-c:a aac_at -profile:a 28 -ac 2"),
         ("aac_6ch_96k", "-ar 96000 -ac 6 -c:a aac"),
         ("mp3", "-c:a libmp3lame"),
         ("mp2", "-c:a mp2"),
@@ -299,6 +313,15 @@ fn ffprobe(path: &Path) -> Option<Report> {
             list.push(rest.trim_end_matches(',').to_string());
         }
     }
+    // A text track ends in an empty sample (a zero length word) that
+    // lasts no time. The reader shows it or not depending on whether an
+    // edit list ends where it starts; it is not compared.
+    for (line, list) in streams.iter().zip(&mut packets) {
+        let empty = |p: &String| p.split(',').nth(3) == Some("2");
+        if line.contains(",mov_text,") && list.last().is_some_and(empty) {
+            list.pop();
+        }
+    }
     Some(Report {
         streams,
         packets,
@@ -311,7 +334,8 @@ fn decoded_hash(path: &Path) -> Option<(String, String)> {
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
-        .args(["-map", "0", "-f", "hash", "-hash", "md5", "-"])
+        .args(["-map", "0:v?", "-map", "0:a?"])
+        .args(["-f", "hash", "-hash", "md5", "-"])
         .output()
         .ok()?;
     Some((
@@ -648,7 +672,7 @@ fn files_written_here_read_like_the_originals() {
     std::fs::create_dir_all(&scratch.0).unwrap();
     let dir = scratch.0.as_path();
     let filter = std::env::var("OXIDEAV_MP4_MATRIX").unwrap_or_default();
-    let mut all = sources();
+    let mut all = sources(dir);
     all.retain(|s| s.0.contains(&filter));
 
     let next = AtomicUsize::new(0);
@@ -690,6 +714,9 @@ fn files_written_here_read_like_the_originals() {
          {skipped} sources the tool did not write",
         results.len() - skipped
     );
+    if filter.is_empty() && major >= VALIDATED_MAJOR {
+        assert!(files >= 400, "only {files} files were written");
+    }
     if major < VALIDATED_MAJOR {
         eprintln!(
             "tool version {major} is older than the validated {VALIDATED_MAJOR}: not asserted"

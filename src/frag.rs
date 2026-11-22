@@ -831,7 +831,15 @@ impl FragmentedMuxer {
         let media_ts = self.tracks[idx].base.media_time_scale;
         let dur = if let Some(d) = packet.duration {
             let v = rescale_to_media_ts(d, packet.time_base, media_ts);
-            if v > 0 { v as u32 } else { 1 }
+            // A stated zero stays zero (the empty sample that ends a
+            // text track); a positive duration never rounds to it.
+            if v > 0 {
+                v as u32
+            } else if d == 0 {
+                0
+            } else {
+                1
+            }
         } else if let (Some(prev), Some(cur)) = (
             self.tracks[idx].base.prev_pts_in_ts,
             packet

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The muxer wrote every video (and subtitle) track at a media timescale of 1000: timestamps were rounded to the millisecond (a 25 fps stream on a 1/12800 clock came back at 40-tick frames, 30000/1001 fps drifted). The media timescale is now the stream's own clock.
 - The automatic edit list of a stream with B-frames ignored where the first *presented* frame sits: a video track delayed by 0.7 s came back 80 ms early and a black-box reader warned about a missing key frame. The edit now runs from the smallest presentation time.
 - The fragmented muxer wrote no edit list: audio encoder priming and the decode delay of a stream with B-frames shifted the whole track (the first AAC packet at 0 instead of −1024, the first video frame one frame late), and a start delay was lost. Space is reserved in each `trak` of the init segment and the edit list written when the track's first fragment is flushed.
+- A packet with a stated duration of zero (the empty sample that ends a text track) was written with a duration of one tick.
 - An automatic audio edit list was expressed in a 1 ms movie timescale and cut up to a millisecond of audio off the end of the track; the movie timescale now follows the audio track's sample rate.
 
 - In a movie fragment whose track fragments have neither an explicit base data offset nor `default-base-is-moof`, the second and later track fragments read their samples from the wrong place: every `traf` was anchored at the start of the `moof`. Each one now starts where the data of the one before it ends (ISO/IEC 14496-12 §8.8.7.1).
@@ -42,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Muxer: `mpeg4video`, `mpeg1video`, `mpeg2video` and `jpeg2000` as `mp4v` sample entries with an `esds` (ISO/IEC 14496-14 §5.6, object types of ISO/IEC 14496-1 Table 5).
-- `tests/blackbox_mux.rs`: 46 clips from a black-box muxer rewritten by every writer mode (440 files) and held to the black-box reader's report of the originals, its decode of them, its own copy and a player run.
+- `tests/blackbox_mux.rs`: 48 clips from a black-box muxer rewritten by every writer mode (460 files) and held to the black-box reader's report of the originals, its decode of them, its own copy and a player run.
 - `Demuxer::attached_pictures()`: the JPEG / PNG / BMP images of the movie's metadata item list (cover art).
 - `Demuxer::chapters()`: the chapter list — the text track a `chap` track reference names (QuickTime File Format, "Chapter Lists"), one chapter a sample.
 - QuickTime compression types in the static codec table: `cvid`, `rle `, `png `, `gif `, `tiff`, `SVQ1`, `SVQ3`, `dvc ` / `dvcp`, `ima4`, `.mp3`, the `ms` ACM codes 0x55 / 0x02 / 0x11; `NONE` and an all-zero format as `raw ` / `twos` by sample size.
