@@ -1455,7 +1455,9 @@ fn edit_list_emitted_for_positive_start_pts() {
     let mt1 = i32::from_be_bytes([e1[4], e1[5], e1[6], e1[7]]);
     assert_eq!(mt1, -1, "leading entry is an empty edit");
     // 0.5 s at the movie timescale (1000) = 500 ticks.
-    assert_eq!(seg1, 500, "start delay in movie timescale");
+    // An audio track with an automatic edit list sets the movie
+    // timescale to its sample rate, so the edit is exact to the frame.
+    assert_eq!(seg1, 24_000, "start delay in the movie timescale");
     // Entry 2: normal edit at media_time 0.
     let e2 = &body[20..32];
     let mt2 = i32::from_be_bytes([e2[4], e2[5], e2[6], e2[7]]);

@@ -1038,8 +1038,14 @@ impl Mp4MuxerOptions {
 
     /// The movie timescale to write: the caller's, else the media
     /// timescale of the first track with a gapless edit list
-    /// (`media_time_scale` maps a stream index to it), else 1000.
-    pub(crate) fn resolve_movie_timescale(&self, media_time_scale: impl Fn(usize) -> u32) -> u32 {
+    /// (`media_time_scale` maps a stream index to it), else
+    /// `automatic` — the media timescale of an audio track whose
+    /// automatic edit list should be sample-exact — else 1000.
+    pub(crate) fn resolve_movie_timescale(
+        &self,
+        media_time_scale: impl Fn(usize) -> u32,
+        automatic: Option<u32>,
+    ) -> u32 {
         self.movie_timescale
             .or_else(|| {
                 self.track_gapless
@@ -1048,6 +1054,7 @@ impl Mp4MuxerOptions {
                     .map(|g| media_time_scale(g.stream_index))
                     .filter(|&scale| scale != 0)
             })
+            .or(automatic.filter(|&scale| scale != 0))
             .unwrap_or(1000)
     }
 

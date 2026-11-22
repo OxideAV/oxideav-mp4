@@ -74,7 +74,7 @@ fn non_negative_offsets_write_version_0_without_cslg() {
     let file = mux("positive", &[(0, 20), (20, 80), (40, 40), (60, 60)]);
     let ctts = stbl_box(&file, "ctts").expect("ctts");
     assert_eq!(ctts[0], 0, "version 0");
-    // (1, 20) (1, 60) (2, 0) at media time scale 1000
+    // The media time scale is the stream's 1/600 s clock.
     let entries: Vec<(u32, i32)> = ctts[8..]
         .chunks(8)
         .map(|c| {
@@ -84,7 +84,7 @@ fn non_negative_offsets_write_version_0_without_cslg() {
             )
         })
         .collect();
-    assert_eq!(entries, vec![(1, 33), (1, 100), (2, 0)]);
+    assert_eq!(entries, vec![(1, 20), (1, 60), (2, 0)]);
     assert!(stbl_box(&file, "cslg").is_none());
 }
 
@@ -98,8 +98,8 @@ fn negative_offsets_write_version_1_and_cslg() {
         .chunks(4)
         .map(|c| i32::from_be_bytes(c.try_into().unwrap()))
         .collect();
-    // shift, least, greatest, composition start, composition end (ms)
-    assert_eq!(f, vec![34, -34, 67, 0, 133]);
+    // shift, least, greatest, composition start, composition end
+    assert_eq!(f, vec![20, -20, 40, 0, 80]);
 }
 
 #[test]
@@ -117,9 +117,9 @@ fn negative_first_dts_maps_presentation_zero_through_the_edit_list() {
     use oxideav_core::{Error, NullCodecResolver, ReadSeek};
     let file = mux("origin", &[(-20, 0), (0, 60), (20, 20), (40, 40)]);
     let elst = find(&file, &["moov", "trak", "edts", "elst"]).expect("elst");
-    // version 0, one entry: segment_duration, media_time (33 ms = 20/600 s)
+    // version 0, one entry: segment_duration, media_time (20/600 s)
     assert_eq!(u32::from_be_bytes(elst[4..8].try_into().unwrap()), 1);
-    assert_eq!(i32::from_be_bytes(elst[12..16].try_into().unwrap()), 33);
+    assert_eq!(i32::from_be_bytes(elst[12..16].try_into().unwrap()), 20);
 
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(file));
     let mut d = oxideav_mp4::demux::open(rs, &NullCodecResolver).unwrap();
@@ -131,9 +131,9 @@ fn negative_first_dts_maps_presentation_zero_through_the_edit_list() {
             Err(e) => panic!("{e}"),
         }
     }
-    // Presentation order restored, starting at 0 (1/1000 s; DTS and PTS
-    // round to the media time scale separately).
-    assert_eq!(pts, vec![0, 100, 33, 66]);
+    // Presentation order restored, starting at 0, in the stream's own
+    // 1/600 s ticks.
+    assert_eq!(pts, vec![0, 60, 20, 40]);
 }
 
 /// Without packet durations the decode deltas come from the DTS
@@ -168,10 +168,6 @@ fn decode_deltas_follow_dts_without_durations() {
         })
         .collect();
     // The first sample has no predecessor (1-tick fallback); every later
-    // delta is the 33 ms DTS step, never the PTS jump back from 133 to 67.
-    assert_eq!(runs.iter().map(|r| r.0).sum::<u32>(), 4);
-    assert!(
-        runs[1..].iter().all(|&(_, d)| d == 33 || d == 34),
-        "{runs:?}"
-    );
+    // delta is the 20-tick DTS step, never the PTS jump back from 80 to 40.
+    assert_eq!(runs, vec![(1, 1), (3, 20)]);
 }

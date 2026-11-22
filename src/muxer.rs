@@ -88,6 +88,8 @@ pub(crate) struct TrackState {
     pub(crate) prev_pts_in_ts: Option<i64>,
     /// First PTS in media time scale (for duration calculation + elst).
     pub(crate) first_pts_in_ts: Option<i64>,
+    /// Smallest PTS in media time scale: the first presented time.
+    pub(crate) min_pts_in_ts: Option<i64>,
     /// First DTS in media time scale. With composition offsets (`ctts`)
     /// the media timeline starts at the first sample's *decode* time, so
     /// this — not the first PTS — is where presentation time 0 sits on
@@ -121,11 +123,16 @@ pub(crate) struct TrackState {
 
 impl TrackState {
     pub(crate) fn new(stream: StreamInfo, sample_entry: SampleEntry) -> Self {
-        // Media time scale: for audio prefer sample_rate, for video use a
-        // reasonable default of 1000 (so video durations are in ms).
+        // Media time scale (§8.4.2.3): the sample rate for audio, so a
+        // tick is an audio frame; otherwise the stream's own clock, so
+        // every timestamp it hands over is kept exactly.
         let media_time_scale = match stream.params.media_type {
-            MediaType::Audio => stream.params.sample_rate.unwrap_or(1000),
-            _ => 1000,
+            MediaType::Audio => stream
+                .params
+                .sample_rate
+                .filter(|&r| r > 0)
+                .unwrap_or_else(|| time_scale_for(stream.time_base)),
+            _ => time_scale_for(stream.time_base),
         };
         Self {
             stream,
@@ -146,6 +153,7 @@ impl TrackState {
             cumulative_duration: 0,
             prev_pts_in_ts: None,
             first_pts_in_ts: None,
+            min_pts_in_ts: None,
             first_dts_in_ts: None,
             prev_dts_in_ts: None,
             presentation_end_in_ts: None,
@@ -522,6 +530,7 @@ impl Muxer for Mp4Muxer {
             if t.first_pts_in_ts.is_none() {
                 t.first_pts_in_ts = Some(p);
             }
+            t.min_pts_in_ts = Some(t.min_pts_in_ts.map_or(p, |m| m.min(p)));
             t.prev_pts_in_ts = Some(p);
             let end = p + i64::from(delta);
             t.presentation_end_in_ts = Some(t.presentation_end_in_ts.map_or(end, |e| e.max(end)));
@@ -684,10 +693,27 @@ fn build_moov(tracks: &[TrackState], options: &Mp4MuxerOptions) -> Result<Vec<u8
     let track_sample_groups: &[TrackSampleGroups] = &options.track_sample_groups;
     let pssh = &options.pssh;
     let movie_times = options.resolve_movie_timestamps();
+    // An audio track that gets an automatic edit list (encoder priming
+    // to skip, padding to trim): at its sample rate the edit is exact
+    // to the audio frame, where milliseconds would cut up to a
+    // millisecond of audio off the end.
+    let exact_audio = tracks
+        .iter()
+        .enumerate()
+        .find(|(i, t)| {
+            write_edit_list
+                && t.stream.params.media_type == MediaType::Audio
+                && !track_edit_lists.iter().any(|e| e.stream_index == *i)
+                && build_edts(t, t.media_time_scale, 0).is_some()
+        })
+        .map(|(_, t)| t.media_time_scale);
     // mvhd: the longest track's duration in the movie timescale (the
-    // caller's, a gapless track's sample rate, or 1000).
-    let movie_timescale: u32 =
-        options.resolve_movie_timescale(|i| tracks.get(i).map_or(0, |t| t.media_time_scale));
+    // caller's, a gapless track's sample rate, such an audio track's,
+    // or 1000).
+    let movie_timescale: u32 = options.resolve_movie_timescale(
+        |i| tracks.get(i).map_or(0, |t| t.media_time_scale),
+        exact_audio,
+    );
     // `udta` with the gapless metadata item, when a directive asks.
     let mut udta: Option<Vec<u8>> = None;
     let mut movie_duration: u64 = 0;
@@ -1040,87 +1066,67 @@ fn build_trak(
     Ok(wrap_box(b"trak", &body))
 }
 
-/// Build an `edts/elst` (EditBox containing an EditListBox) for a track whose
-/// first presented sample has a positive PTS, per ISO/IEC 14496-12 §8.6.5–6.
+/// Build the `edts/elst` that puts a track's samples back at the times
+/// their packets carried (ISO/IEC 14496-12 §8.6.5–6).
 ///
-/// "An empty edit is used to offset the start time of a track" (§8.6.5.1). We
-/// therefore emit a two-entry list:
+/// Media time 0 is the first sample's decode time (§8.6.1.2), so a
+/// packet time `T` sits at media composition time `T - first_dts`. The
+/// presentation shows packet time `T` at movie time `T`, from the first
+/// presented time on — the smallest PTS (§8.6.1.4: "the first edit
+/// begins at the smallest CTS"), or 0 when the track opens with
+/// pre-roll at negative times (AAC priming, B-frame decode delay):
 ///
-/// 1. an **empty edit** (`media_time = -1`) whose `segment_duration` is the
-///    start delay expressed in the movie timescale, and
-/// 2. a normal edit (`media_time = 0`, `media_rate = 1.0`) covering the rest
-///    of the track's media duration,
+/// 1. an **empty edit** (`media_time = -1`, "used to offset the start
+///    time of a track", §8.6.5.1) when the first presented time is
+///    after 0;
+/// 2. a normal edit from the media time of the first presented time to
+///    the end of the presented range (`max(pts + duration)`), which
+///    also trims trailing padding a shortened final packet declares.
 ///
-/// so a player holds the timeline blank for the delay and then plays the
-/// track from its first media sample. Returns `None` when the first PTS is
-/// zero/absent or the rescaled delay is zero (no offset needed → implicit
-/// 1:1 mapping applies and no box is written).
+/// Nothing is written when both would be the identity. This is the
+/// mapping the demuxer's edit-list timeline inverts: pre-roll comes
+/// back at negative, `discard`-flagged timestamps and a delayed track
+/// at its delay.
 ///
 /// `version` is chosen per §8.6.6.2: version 1 (64-bit fields) when any
-/// duration exceeds the 32-bit range, else version 0.
+/// field exceeds the 32-bit range, else version 0.
 fn build_edts(t: &TrackState, movie_timescale: u32, track_duration_movie: u64) -> Option<Vec<u8>> {
-    // Media time 0 is the first sample's decode time. Without composition
-    // offsets that is its PTS; with them (§8.6.1.3) the first DTS is the
-    // origin, so the edit starts where input time 0 lands on the
-    // composition timeline (§8.6.1.4 recommends the first edit begin at
-    // the smallest CTS).
-    let first_pts = if t.ctts.iter().any(|&(_, o)| o != 0) {
-        t.first_dts_in_ts.or(t.first_pts_in_ts)?
-    } else {
-        t.first_pts_in_ts?
+    let first_pts = t.first_pts_in_ts?;
+    let origin = t.first_dts_in_ts.unwrap_or(first_pts);
+    let start = t.min_pts_in_ts.unwrap_or(first_pts).max(0);
+    let media_time = start.checked_sub(origin)?.max(0);
+    let delay_movie = rescale_u64(start as u64, t.media_time_scale, movie_timescale);
+    if delay_movie == 0 && media_time == 0 {
+        return None;
+    }
+    // The presented range, or (packets without timestamps) the media
+    // that is left.
+    let segment_movie = match t.presentation_end_in_ts {
+        Some(end) => rescale_u64(
+            end.saturating_sub(start).max(0) as u64,
+            t.media_time_scale,
+            movie_timescale,
+        ),
+        None => track_duration_movie.saturating_sub(rescale_u64(
+            media_time as u64,
+            t.media_time_scale,
+            movie_timescale,
+        )),
     };
-    if first_pts < 0 {
-        return build_preroll_edts(t, first_pts, movie_timescale);
-    }
-    if first_pts == 0 {
-        return None;
-    }
-    // Start delay in the movie timescale (elst segment_duration units).
-    let delay_movie = rescale_u64(first_pts as u64, t.media_time_scale, movie_timescale);
-    if delay_movie == 0 {
-        return None;
-    }
-
-    // version 1 if any field needs more than 32 bits.
-    let use_v1 = delay_movie > u32::MAX as u64 || track_duration_movie > u32::MAX as u64;
+    let use_v1 = delay_movie > u32::MAX as u64
+        || segment_movie > u32::MAX as u64
+        || media_time > i64::from(i32::MAX);
     let media_rate: u32 = 0x0001_0000; // 1.0 in 16.16 (rate_integer=1, frac=0).
 
     let mut body = Vec::new();
     body.push(if use_v1 { 1 } else { 0 }); // version
     body.extend_from_slice(&[0, 0, 0]); // flags
-    body.extend_from_slice(&2u32.to_be_bytes()); // entry_count
+    body.extend_from_slice(&(if delay_movie > 0 { 2u32 } else { 1 }).to_be_bytes());
+    if delay_movie > 0 {
+        push_elst_entry(&mut body, use_v1, delay_movie, -1, media_rate);
+    }
+    push_elst_entry(&mut body, use_v1, segment_movie, media_time, media_rate);
 
-    // Entry 1: empty edit (media_time = -1) for the start delay.
-    push_elst_entry(&mut body, use_v1, delay_movie, -1, media_rate);
-    // Entry 2: normal edit (media_time = 0) covering the track media duration.
-    push_elst_entry(&mut body, use_v1, track_duration_movie, 0, media_rate);
-
-    let elst = wrap_box(b"elst", &body);
-    Some(wrap_box(b"edts", &elst))
-}
-
-/// Build the `edts/elst` for a track whose first sample is decode
-/// pre-roll — it carries a **negative** PTS, e.g. the AAC encoder-delay
-/// ("priming") access unit whose output is never presented.
-///
-/// The first sample sits at media composition time 0, so presentation
-/// time 0 is media time `-first_pts`. One normal edit (§8.6.6.3) starts
-/// there (`media_time = -first_pts`) and runs to the end of the
-/// presented range (`max(pts + duration)`), which also trims any
-/// trailing padding a shortened final packet duration declares. This is
-/// exactly the mapping the demuxer's edit-list timeline inverts back
-/// into negative, `discard`-flagged pre-roll timestamps.
-fn build_preroll_edts(t: &TrackState, first_pts: i64, movie_timescale: u32) -> Option<Vec<u8>> {
-    let media_time = first_pts.checked_neg()?;
-    let end = t.presentation_end_in_ts.unwrap_or(0).max(0);
-    let seg_movie = rescale_u64(end as u64, t.media_time_scale, movie_timescale);
-    let use_v1 = seg_movie > u32::MAX as u64 || media_time > i64::from(i32::MAX);
-    let media_rate: u32 = 0x0001_0000;
-    let mut body = Vec::new();
-    body.push(if use_v1 { 1 } else { 0 });
-    body.extend_from_slice(&[0, 0, 0]);
-    body.extend_from_slice(&1u32.to_be_bytes());
-    push_elst_entry(&mut body, use_v1, seg_movie, media_time, media_rate);
     let elst = wrap_box(b"elst", &body);
     Some(wrap_box(b"edts", &elst))
 }
@@ -1662,6 +1668,30 @@ fn compute_delta(
     // Fallback: a sensible default based on codec. For audio, use 1 sample
     // (1 tick at sample_rate time scale, which is wrong but better than 0).
     1
+}
+
+/// The media time scale that holds a stream's timestamps exactly: for
+/// a time base of `num / den` seconds, ticks of `1 / den` (a stream
+/// tick is `num` of them). A clock finer than 10 MHz would overflow the
+/// 32-bit sample durations of `stts` / `trun` within minutes, and an
+/// unusable time base has no clock at all: both get the 90 kHz one.
+fn time_scale_for(tb: oxideav_core::TimeBase) -> u32 {
+    const FINEST: i64 = 10_000_000;
+    const FALLBACK: u32 = 90_000;
+    let r = tb.as_rational();
+    if r.num <= 0 || r.den <= 0 {
+        return FALLBACK;
+    }
+    let den = r.den / gcd(r.num, r.den);
+    if den > FINEST { FALLBACK } else { den as u32 }
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
 }
 
 pub(crate) fn rescale_to_media_ts(value: i64, from_tb: oxideav_core::TimeBase, to_ts: u32) -> i64 {

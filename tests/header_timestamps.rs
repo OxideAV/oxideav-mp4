@@ -415,13 +415,13 @@ fn promoted_init_headers_do_not_dislodge_the_mehd_patch() {
 
     // The sealed duration landed in the mehd's own field, walked
     // structurally rather than by fourcc search: 3 × 1024 media ticks
-    // @ 48 kHz = 64 movie ticks at timescale 1000.
+    // @ 48 kHz, which is the movie timescale too.
     let moov = child(&file, b"moov").expect("moov");
     let mvex = child(moov, b"mvex").expect("mvex");
     let mehd = child(mvex, b"mehd").expect("mehd");
     assert_eq!(mehd[0], 1, "version 1 (64-bit fragment_duration)");
     let dur = u64::from_be_bytes(mehd[4..12].try_into().unwrap());
-    assert_eq!(dur, 64, "sealed fragment_duration in movie timescale");
+    assert_eq!(dur, 3072, "sealed fragment_duration in movie timescale");
 
     // And the demuxer agrees, which it would not if the patch had
     // clipped the surrounding boxes.

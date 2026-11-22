@@ -1505,6 +1505,11 @@ parentheses):
 - `h263` → `s263`, with a `d263` config child when extradata is present
   (opaque symmetric carriage; the demuxer surfaces the `d263` body)
 - `mjpeg` → `jpeg`
+- `mpeg4video` → `mp4v` with `esds` `objectTypeIndication = 0x20`
+  (extradata, the headers down to the VOL, as DecoderSpecificInfo)
+- `mpeg1video` / `mpeg2video` / `jpeg2000` → `mp4v` with `esds`
+  `objectTypeIndication` 0x6A / 0x61 / 0x6E (ISO/IEC 14496-1 Table 5;
+  no DecoderSpecificInfo)
 - `mov_text` → `tx3g` (3GPP TS 26.245 timed text) — `text` handler + `nmhd`
 - `webvtt` → `wvtt` (BMFF §12.6.3.2 XMLSubtitleSampleEntry sibling) — `subt` handler + `sthd`
 - `ttml` → `stpp` (BMFF §12.6.3.2 XMLSubtitleSampleEntry) — `subt` + `sthd`
@@ -1517,7 +1522,64 @@ For the subtitle codecs the muxer accepts the demuxer's surfaced
 strings), so a demux → mux round-trip preserves the inner config.
 
 Other codec ids fail with `Error::Unsupported` at `open`, never at
-`write_packet` time.
+`write_packet` time. Demuxed but not written back: `prores` (the
+sample entry type is the profile, which the stream parameters do not
+state), `dts` (needs the `ddts` record), `vorbis`, and every
+`mp4:<fourcc>` format.
+
+#### Black-box matrix
+
+Two tests run against `ffmpeg` / `ffprobe` (and `mpv` when present)
+and skip without them; nothing they generate is committed.
+
+`tests/blackbox_matrix.rs` (foreign → ours): **827 files, 827 agree**
+(ffmpeg 9.0.1; 197 more combinations the tool declines to write). Every
+codec the tool muxes into `mp4` / `mov` / `3gp` / `m4a` / `ismv`, every
+`-movflags` layout and their combinations (fragmented by key frame /
+duration / size / every frame, `empty_moov`, `default_base_moof`,
+`separate_moof`, `omit_tfhd_offset`, `dash`, `cmaf`, `global_sidx`,
+`negative_cts_offsets`, `frag_discont`, `delay_moov`, `isml`, hybrid),
+rate × channel-count and size × pixel-format × GOP sweeps, start
+offsets, VFR, one-sample and two-minute files, subtitles, chapters,
+cover art, `cenc` protection. Compared per track with what the reader
+reports: packet count, payload hash, pts / dts / duration, key-frame
+and discard flags, codec id, time base, dimensions, rate, channels,
+configuration record, start time. Where this crate reports something
+else on purpose the test states the rule:
+
+- signed composition offsets — CT = DT + offset (§8.6.1.3), where the
+  reader moves the stream's pts or dts by a constant;
+- QuickTime partial sync samples (`stps`) are not key frames;
+- with a global `sidx` the `trun` sample flags, not the index, say
+  which samples are sync samples;
+- an attached picture is an `attached_pictures()` entry, not a stream;
+  timecode, hint and chapter text tracks stay streams;
+- big-endian PCM is delivered little-endian; FLAC extradata keeps the
+  metadata block header; ALAC extradata is the cookie without its box.
+
+`tests/blackbox_mux.rs` (ours → foreign, and foreign → ours →
+foreign): 46 source clips × 10 writer modes (progressive, faststart,
+`mov` and `ismv` brands, 64-bit `mdat`, track-run chunks + `stz2`,
+four fragmented shapes) = **440 files, 0 differences**. The reader must
+report for each rewritten file the packets and stream parameters of
+the original, print nothing, decode it to the same output (sample-table
+files; a fragmented one must decode cleanly), and its own copy of the
+file must match its copy of the original; this crate must read its own
+file back to the packets it was given; `mpv` must play it to the end.
+
+Per codec the tool writes into these containers — (a) demuxed with the
+right codec id and configuration, (b) written back:
+
+| | (a) and (b) | (a) only | neither |
+|---|---|---|---|
+| video | H.264 (`avc1` / `avc3`), HEVC (`hvc1` / `hev1`), AV1, VP9, VP8, MPEG-4 Part 2, MPEG-1 / MPEG-2 (`mp4v`), MJPEG, H.263, JPEG 2000 (`mp4v`) | ProRes, PNG (`png `), QuickTime Animation, SVQ1, DV; MPEG-1 / -2 and JPEG 2000 under their QuickTime types (`m1v ` / `m2v1` / `mjp2` → `mp4:<fourcc>`) | DNxHD, CineForm, FFV1, Dirac, v210, H.261 (`mp4:<fourcc>`) |
+| audio | AAC LC / HE / HEv2, MP3, MP2 (as `mp3`), AC-3, E-AC-3, Opus, FLAC, ALAC, PCM s8 / s16 / s24 / s32 / f32 / f64 (either byte order in, little-endian out), G.711 A-law / µ-law | DTS, IMA ADPCM (`ima4`), PCM u8 | TrueHD (`mlpa`), iLBC |
+| other | `mov_text` / `tx3g`, TTML (`stpp`) | QuickTime `text`, timecode (`tmcd`), RTP hint tracks | — |
+
+Never checked against an outside stream: `webvtt` / `sbtt` / `stxt`
+tracks, `cbcs` / `cbc1` / `cens` protection (the tool writes `cenc`
+only), this crate's own CENC writer, `stz2` and `co64` *input*, the
+`meta` item boxes.
 
 #### CENC protected-track muxing
 
@@ -1587,15 +1649,29 @@ plaintext, for every §10 scheme (`cenc` / `cbc1` / `cens` / `cbcs`,
 full-sample + subsample + pattern + constant-IV shapes) and across
 key-rotation boundaries.
 
-Edit lists (`edts`/`elst`, ISO/IEC 14496-12 §8.6.5–6) are emitted
-per-track when the first packet has a positive presentation timestamp:
-a leading empty edit (`media_time = -1`) of the start delay (in the
-movie timescale) followed by a `media_time = 0` segment for the track
-duration, so a player offsets the track start instead of beginning at
-presentation time 0. Version 0 (32-bit) by default, auto-promoting to
-version 1 (64-bit) for over-32-bit durations. Tracks starting at PTS 0
-get no `edts`. Controlled by `Mp4MuxerOptions::write_edit_list`
-(default `true`).
+Timestamps are kept as the packets carry them. A track's media
+timescale is the sample rate for audio and the stream's own clock for
+everything else (a `1/12800` stream is written at 12800; a clock finer
+than 10 MHz, or an unusable time base, falls back to 90 kHz), so no
+timestamp is rounded. Media time 0 is the first sample's decode time,
+and an automatic edit list (`edts`/`elst`, ISO/IEC 14496-12 §8.6.5–6)
+puts the samples back where the packets said: an empty edit
+(`media_time = -1`) when the first presented time is after 0, then one
+edit from the media time of the first presented time — which skips
+decode pre-roll at negative times (audio encoder priming, the decode
+delay of a stream with B-frames) — to the end of the presented range.
+Nothing is written when that mapping is the identity. Version 0
+(32-bit) by default, version 1 for larger values. Controlled by
+`Mp4MuxerOptions::write_edit_list` (default `true`). When an audio
+track gets such an edit list the movie timescale is that track's
+sample rate, so the edit is exact to the audio frame.
+
+The fragmented muxer writes its init segment before the first packet:
+it reserves 64 bytes (a `free` box) in each `trak` and, when a track's
+first fragment is flushed, replaces them by the edit list — open-ended
+(`segment_duration = 0`, §8.6.6.1) — if one is needed. The movie
+timescale of a fragmented file with an audio track is the first audio
+track's sample rate.
 
 Explicit per-track edit lists: `Mp4MuxerOptions::track_edit_lists` (a
 list of `TrackEditList` records, each a `stream_index` plus
@@ -1609,8 +1685,9 @@ governs only the automatic behaviour). Serialised through
 out-of-range stream indices fail at `open`, never at `write_trailer`.
 This is the write-side dual of `Mp4Demuxer::edit_list`: a remuxer
 carries a source's elst across by feeding the demuxed slice straight
-back in (mind the §8.6.6.3 unit split — `segment_duration` is movie
-timescale, which this muxer writes as 1000). The same option drives
+back in (mind the §8.6.6.3 unit split — `segment_duration` is in the
+movie timescale; set `Mp4MuxerOptions::movie_timescale` to the
+source's). The same option drives
 the fragmented muxer's init segment: the list is written into the
 init-`moov` trak, where the §8.6.6.1 zero-`segment_duration` form is
 the idiomatic choice ("the edit provides the offset for the movie and
@@ -1669,8 +1746,9 @@ the init segment; without it the edit is written open-ended
 back and fills both in, so a stream cut before its trailer still
 carries the priming (a zeroed item reads as no item). `Mp4MuxerOptions::movie_timescale` sets the `mvhd` timescale; left
 unset it is the sample rate of the first track with a gapless edit
-list (so that edit list is sample-exact on its own) and 1000
-otherwise. `BrandPreset::M4a` writes the `M4A ` major brand: a
+list (so that edit list is sample-exact on its own), else that of an
+audio track with an automatic edit list (in a fragmented file: of the
+first audio track), and 1000 otherwise. `BrandPreset::M4a` writes the `M4A ` major brand: a
 black-box reader (run by `tests/gapless_mux.rs` when installed)
 reports the written priming / valid / remainder for the edit list
 alone, the item alone and both together, and consults the item only

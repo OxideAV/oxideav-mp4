@@ -41,6 +41,17 @@ pub(crate) fn sample_entry_for(params: &CodecParameters) -> Result<SampleEntry> 
         "aac" => aac_entry(params),
         "h264" => h264_entry(params),
         "mjpeg" => mjpeg_entry(params),
+        // MPEG-4 Systems visual streams: an `mp4v` entry whose `esds`
+        // names the format by objectTypeIndication (ISO/IEC 14496-1
+        // Table 5). MPEG-4 Visual carries its configuration (the
+        // headers down to the VOL) as DecoderSpecificInfo; MPEG-1 / -2
+        // video and JPEG 2000 repeat theirs in the stream. 0x61 is
+        // MPEG-2 Main Profile, the entry for a stream whose profile the
+        // parameters do not state.
+        "mpeg4video" => mp4v_entry(params, 0x20, true),
+        "mpeg1video" => mp4v_entry(params, 0x6A, false),
+        "mpeg2video" => mp4v_entry(params, 0x61, false),
+        "jpeg2000" => mp4v_entry(params, 0x6E, false),
         // Video codecs whose sample entry is the shared VisualSampleEntry
         // preamble plus one mandatory configuration-record child box.
         // The extradata is the config-record bytes exactly as this
@@ -136,6 +147,36 @@ fn mjpeg_entry(params: &CodecParameters) -> Result<SampleEntry> {
         body,
     })
 }
+
+/// `mp4v` sample entry (ISO/IEC 14496-14 §5.6): the VisualSampleEntry
+/// preamble and an `esds` whose DecoderConfigDescriptor has the visual
+/// stream type and the given objectTypeIndication. `with_config` puts
+/// the stream's extradata in as DecoderSpecificInfo.
+fn mp4v_entry(params: &CodecParameters, oti: u8, with_config: bool) -> Result<SampleEntry> {
+    let codec = params.codec_id.as_str();
+    if params.media_type != MediaType::Video {
+        return Err(Error::invalid(format!("mp4 muxer: {codec} must be video")));
+    }
+    let (Some(width), Some(height)) = (params.width, params.height) else {
+        return Err(Error::invalid(format!(
+            "mp4 muxer: {codec} requires width and height"
+        )));
+    };
+    let config: &[u8] = if with_config { &params.extradata } else { &[] };
+    let mut body = visual_preamble(width, height).to_vec();
+    body.extend_from_slice(&write_simple_box(
+        b"esds",
+        &build_esds_body(STREAM_TYPE_VISUAL, oti, config),
+    ));
+    Ok(SampleEntry {
+        fourcc: *b"mp4v",
+        body,
+    })
+}
+
+/// ISO/IEC 14496-1 Table 6 streamType values.
+const STREAM_TYPE_VISUAL: u8 = 0x04;
+const STREAM_TYPE_AUDIO: u8 = 0x05;
 
 /// 28-byte AudioSampleEntryV0 preamble.
 fn audio_preamble(channels: u16, sample_size: u16, sample_rate: u32) -> [u8; 28] {
@@ -309,7 +350,7 @@ fn aac_entry(params: &CodecParameters) -> Result<SampleEntry> {
     // ObjectTypeIndication = 0x40 (AAC). See ISO/IEC 14496-1 §7.2.6.
     body.extend_from_slice(&write_simple_box(
         b"esds",
-        &build_esds_body(0x40, &params.extradata),
+        &build_esds_body(STREAM_TYPE_AUDIO, 0x40, &params.extradata),
     ));
 
     Ok(SampleEntry {
@@ -584,7 +625,10 @@ fn mp3_entry(params: &CodecParameters) -> Result<SampleEntry> {
         .sample_rate
         .ok_or_else(|| Error::invalid("mp4 muxer: mp3 requires sample_rate"))?;
     let mut body = audio_preamble(channels, 16, sample_rate).to_vec();
-    body.extend_from_slice(&write_simple_box(b"esds", &build_esds_body(0x6B, &[])));
+    body.extend_from_slice(&write_simple_box(
+        b"esds",
+        &build_esds_body(STREAM_TYPE_AUDIO, 0x6B, &[]),
+    ));
     Ok(SampleEntry {
         fourcc: *b"mp4a",
         body,
@@ -610,9 +654,8 @@ fn g711_entry(params: &CodecParameters, fourcc: [u8; 4]) -> Result<SampleEntry> 
 /// Build an `esds` FullBox body: 4 bytes version/flags then the
 /// ES_Descriptor wrapping a DecoderConfigDescriptor (with the given
 /// `objectTypeIndication` and optional DecoderSpecificInfo bytes) and an
-/// SLConfigDescriptor (predefined = 2). ISO/IEC 14496-1 §7.2.6; streamType
-/// is always audio (0x05) here.
-fn build_esds_body(oti: u8, dsi_bytes: &[u8]) -> Vec<u8> {
+/// SLConfigDescriptor (predefined = 2). ISO/IEC 14496-1 §7.2.6.
+fn build_esds_body(stream_type: u8, oti: u8, dsi_bytes: &[u8]) -> Vec<u8> {
     // DecoderSpecificInfo (tag 0x05) — omitted entirely when empty.
     let mut dsi = Vec::new();
     if !dsi_bytes.is_empty() {
@@ -626,7 +669,7 @@ fn build_esds_body(oti: u8, dsi_bytes: &[u8]) -> Vec<u8> {
     dcd.push(0x04);
     append_ber_length(&mut dcd, 13 + dsi.len() as u32);
     dcd.push(oti);
-    dcd.push((0x05 << 2) | 0x01); // streamType audio | upstream=0 | reserved=1
+    dcd.push((stream_type << 2) | 0x01); // streamType | upstream=0 | reserved=1
     dcd.extend_from_slice(&[0, 0, 0]); // bufferSizeDB (u24) = 0
     dcd.extend_from_slice(&[0, 0, 0, 0]); // maxBitrate = 0
     dcd.extend_from_slice(&[0, 0, 0, 0]); // avgBitrate = 0

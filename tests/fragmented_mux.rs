@@ -688,8 +688,9 @@ fn every_keyframe_cadence_keeps_the_final_sample() {
 #[test]
 fn write_mehd_seals_overall_duration() {
     let stream = pcm_stream();
-    // 6 × 1024 = 6144 media ticks @ 48 kHz → exactly 128 movie ticks
-    // (timescale 1000): 6144 · 1000 / 48000 = 128.
+    // 6 × 1024 = 6144 media ticks @ 48 kHz; the movie timescale of a
+    // fragmented file with an audio track is that track's sample rate,
+    // so 6144 movie ticks as well.
     let packets = make_pcm_packets(6, 1024);
 
     let path = std::env::temp_dir().join("oxideav-mp4-frag-mehd.mp4");
@@ -726,7 +727,7 @@ fn write_mehd_seals_overall_duration() {
     );
     assert_eq!(bytes[pos + 4], 1, "version 1 (64-bit duration)");
     let dur = u64::from_be_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
-    assert_eq!(dur, 128, "sealed fragment_duration in movie timescale");
+    assert_eq!(dur, 6144, "sealed fragment_duration in movie timescale");
     let mvex_pos = bytes
         .windows(4)
         .position(|w| w == b"mvex")
@@ -740,7 +741,7 @@ fn write_mehd_seals_overall_duration() {
     assert_eq!(
         dmx.duration_micros(),
         Some(128_000),
-        "128 movie ticks @ 1000 = 128 ms"
+        "6144 movie ticks @ 48000 = 128 ms"
     );
     let raw = dmx
         .metadata()
@@ -748,7 +749,7 @@ fn write_mehd_seals_overall_duration() {
         .find(|(k, _)| k == "mehd_fragment_duration")
         .map(|(_, v)| v.clone())
         .expect("mehd_fragment_duration key");
-    assert_eq!(raw, "128");
+    assert_eq!(raw, "6144");
 }
 
 /// Without `write_mehd` (the default) no `mehd` is emitted and the

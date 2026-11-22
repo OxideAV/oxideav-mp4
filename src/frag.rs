@@ -128,7 +128,19 @@ struct FragTrackState {
     /// sync sample. All `*_number` fields are 1-based per ISO/IEC 14496-12
     /// §8.8.11.
     tfra_entries: Vec<TfraEmitEntry>,
+    /// File offset of the space reserved in this track's `trak` for the
+    /// automatic edit list, until it has been decided.
+    edit_slot: Option<u64>,
+    /// Packet time of media time 0 (the first packet's DTS, else its
+    /// PTS) and the smallest PTS seen before the edit list was decided.
+    edit_origin: Option<i64>,
+    edit_min_pts: Option<i64>,
 }
+
+/// Bytes reserved in a `trak` of the init segment for the automatic
+/// edit list: an `edts` holding a version-1 `elst` of two entries.
+/// Written as a `free` box, which stays when no edit is needed.
+const EDIT_SLOT_LEN: usize = 8 + 8 + 4 + 4 + 2 * 20;
 
 /// One row of an emitted `tfra` table — recorded per fragment as the
 /// muxer walks tracks, used at `write_trailer` to build the mfra.
@@ -161,7 +173,45 @@ impl FragTrackState {
             next_bmdt: 0,
             packets_total: 0,
             tfra_entries: Vec::new(),
+            edit_slot: None,
+            edit_origin: None,
+            edit_min_pts: None,
         }
+    }
+
+    /// The bytes that replace the reserved slot: the edit list that
+    /// puts this track's samples back at the times their packets
+    /// carried (see `muxer::build_edts`), open-ended (§8.6.6.1: a zero
+    /// `segment_duration` in the initial movie of a fragmented file
+    /// means "from `media_time` onwards"). `None` when the mapping is
+    /// the identity.
+    fn edit_slot_bytes(&self, movie_timescale: u32) -> Option<Vec<u8>> {
+        let origin = self.edit_origin?;
+        let start = self.edit_min_pts.unwrap_or(origin).max(0);
+        let media_time = start.checked_sub(origin)?.max(0);
+        let delay =
+            crate::muxer::rescale_u64(start as u64, self.base.media_time_scale, movie_timescale);
+        if delay == 0 && media_time == 0 {
+            return None;
+        }
+        let rate: u32 = 0x0001_0000;
+        let mut elst = vec![1, 0, 0, 0];
+        elst.extend_from_slice(&(if delay > 0 { 2u32 } else { 1 }).to_be_bytes());
+        if delay > 0 {
+            elst.extend_from_slice(&delay.to_be_bytes());
+            elst.extend_from_slice(&(-1i64).to_be_bytes());
+            elst.extend_from_slice(&rate.to_be_bytes());
+        }
+        elst.extend_from_slice(&0u64.to_be_bytes());
+        elst.extend_from_slice(&media_time.to_be_bytes());
+        elst.extend_from_slice(&rate.to_be_bytes());
+        let mut out = wrap_box(b"edts", &wrap_box(b"elst", &elst));
+        // A one-entry list leaves room for exactly one more entry: keep
+        // it as a `free` box.
+        if out.len() < EDIT_SLOT_LEN {
+            out.extend_from_slice(&wrap_box(b"free", &vec![0; EDIT_SLOT_LEN - out.len() - 8]));
+        }
+        Some(out)
     }
 
     /// Lock in the trex defaults from the first packet seen on this track.
@@ -373,13 +423,16 @@ impl Muxer for FragmentedMuxer {
         // tables). trex defaults are zero until the first packet locks
         // them; this is legal — the per-sample fields in `trun` then
         // override the zeroes.
-        let (moov, mehd_off, gapless_patches) = build_init_moov(
+        let (moov, mehd_off, gapless_patches, edit_slots) = build_init_moov(
             &self.tracks,
             &self.options,
             &self.frag_options.levels,
             &self.frag_options.treps,
             self.frag_options.write_mehd,
         )?;
+        for (t, slot) in self.tracks.iter_mut().zip(edit_slots) {
+            t.edit_slot = slot.map(|o| ftyp.len() as u64 + o as u64);
+        }
         // §8.8.2 — remember where the reserved mehd fragment_duration
         // bytes landed in the file (ftyp precedes the moov) so
         // write_trailer can seal the overall presentation duration.
@@ -489,6 +542,32 @@ impl GaplessPatch {
 }
 
 impl FragmentedMuxer {
+    /// Write the automatic edit list of every track whose first
+    /// samples are queued.
+    fn settle_edit_lists(&mut self) -> Result<()> {
+        let movie_timescale = self.movie_timescale();
+        let mut end = None;
+        for t in &mut self.tracks {
+            if t.pending.is_empty() {
+                continue;
+            }
+            let Some(slot) = t.edit_slot.take() else {
+                continue;
+            };
+            if let Some(bytes) = t.edit_slot_bytes(movie_timescale) {
+                if end.is_none() {
+                    end = Some(self.output.stream_position()?);
+                }
+                self.output.seek(SeekFrom::Start(slot))?;
+                self.output.write_all(&bytes)?;
+            }
+        }
+        if let Some(end) = end {
+            self.output.seek(SeekFrom::Start(end))?;
+        }
+        Ok(())
+    }
+
     /// The `mvhd` timescale of this movie (see
     /// `Mp4MuxerOptions::movie_timescale`).
     fn movie_timescale(&self) -> u32 {
@@ -809,6 +888,17 @@ impl FragmentedMuxer {
         let pts_in_ts = packet
             .pts
             .map(|v| rescale_to_media_ts(v, packet.time_base, media_ts));
+        if track.edit_slot.is_some() {
+            let dts_in_ts = packet
+                .dts
+                .map(|v| rescale_to_media_ts(v, packet.time_base, media_ts));
+            if track.edit_origin.is_none() {
+                track.edit_origin = dts_in_ts.or(pts_in_ts);
+            }
+            if let Some(p) = pts_in_ts {
+                track.edit_min_pts = Some(track.edit_min_pts.map_or(p, |m| m.min(p)));
+            }
+        }
         if let Some(p) = pts_in_ts {
             if track.base.first_pts_in_ts.is_none() {
                 track.base.first_pts_in_ts = Some(p);
@@ -1210,6 +1300,10 @@ impl FragmentedMuxer {
             return Ok(());
         }
 
+        // A track's first samples are about to be written: its edit
+        // list is decided now, into the space the init segment holds.
+        self.settle_edit_lists()?;
+
         self.sequence_number += 1;
         let seq = self.sequence_number;
 
@@ -1494,8 +1588,35 @@ fn build_styp(brand: &BrandPreset) -> Vec<u8> {
 }
 
 fn movie_timescale_for(options: &Mp4MuxerOptions, tracks: &[FragTrackState]) -> u32 {
-    options.resolve_movie_timescale(|i| tracks.get(i).map_or(0, |t| t.base.media_time_scale))
+    // The init segment is written before any packet: whether an audio
+    // track will need an edit list (encoder priming, a start delay) is
+    // not known yet, so the movie timescale is the first audio track's
+    // sample rate whenever automatic edit lists are on — an edit is
+    // then exact to the audio frame.
+    let exact_audio = options
+        .write_edit_list
+        .then(|| {
+            tracks
+                .iter()
+                .find(|t| t.base.stream.params.media_type == oxideav_core::MediaType::Audio)
+                .map(|t| t.base.media_time_scale)
+        })
+        .flatten();
+    options.resolve_movie_timescale(
+        |i| tracks.get(i).map_or(0, |t| t.base.media_time_scale),
+        exact_audio,
+    )
 }
+
+/// The init segment's `moov`, the offset in it of the `mehd` duration,
+/// the gapless placeholders and, per track, the offset of the space
+/// reserved for its automatic edit list.
+type InitMoov = (
+    Vec<u8>,
+    Option<usize>,
+    Vec<GaplessPatch>,
+    Vec<Option<usize>>,
+);
 
 fn build_init_moov(
     tracks: &[FragTrackState],
@@ -1503,9 +1624,12 @@ fn build_init_moov(
     levels: &[crate::demux::LevaEntry],
     treps: &[crate::demux::TrepRecord],
     write_mehd: bool,
-) -> Result<(Vec<u8>, Option<usize>, Vec<GaplessPatch>)> {
+) -> Result<InitMoov> {
     let track_edit_lists = &options.track_edit_lists;
     let mut patches: Vec<GaplessPatch> = Vec::new();
+    // Per track: where (in the moov) the space for its automatic edit
+    // list is.
+    let mut edit_slots: Vec<Option<usize>> = Vec::with_capacity(tracks.len());
     let pssh = &options.pssh;
     let movie_times = options.resolve_movie_timestamps();
     // Movie timescale: 1000 unless the caller chose another (matches
@@ -1558,8 +1682,15 @@ fn build_init_moov(
             }
         }
         let trak_at = 8 + moov_body.len();
-        let (trak, elst_at) =
-            build_trak_init(t.track_id, &t.base, explicit_elst, roll_sgpd.as_ref())?;
+        let reserve = options.write_edit_list && explicit_elst.is_none();
+        let (trak, elst_at, slot_at) = build_trak_init(
+            t.track_id,
+            &t.base,
+            explicit_elst,
+            roll_sgpd.as_ref(),
+            reserve,
+        )?;
+        edit_slots.push(slot_at.map(|o| trak_at + o));
         if let (Some(p), Some(elst_at)) = (patch.as_mut(), elst_at)
             && options
                 .gapless_for(p.track)
@@ -1599,7 +1730,12 @@ fn build_init_moov(
     // to moov-box-relative: 8 bytes of moov header + everything ahead
     // of the mvex within the moov body.
     let mehd_off_in_moov = mehd_off_in_mvex.map(|o| 8 + mvex_off_in_body + o);
-    Ok((wrap_box(b"moov", &moov_body), mehd_off_in_moov, patches))
+    Ok((
+        wrap_box(b"moov", &moov_body),
+        mehd_off_in_moov,
+        patches,
+        edit_slots,
+    ))
 }
 
 fn build_trak_init(
@@ -1607,10 +1743,13 @@ fn build_trak_init(
     t: &TrackState,
     explicit_elst: Option<&[crate::demux::EditListEntry]>,
     sgpd: Option<&crate::sample_groups::SampleGroupDescription>,
-) -> Result<(Vec<u8>, Option<usize>)> {
+    reserve_edit_slot: bool,
+) -> Result<(Vec<u8>, Option<usize>, Option<usize>)> {
     let mut body = Vec::new();
-    // Offset of the `elst` box within the returned `trak`, if any.
+    // Offset of the `elst` box within the returned `trak`, if any, and
+    // of the space reserved for an automatic one.
     let mut elst_at = None;
+    let mut slot_at = None;
     // Duration is unknown at init time — use 0 so players read tfhd/trun
     // for actual timing. Per §8.2.2 a zero duration means "indefinite".
     body.extend_from_slice(&build_tkhd(track_id, 0, &t.stream, t.tkhd_timestamps));
@@ -1622,6 +1761,11 @@ fn build_trak_init(
         // trak header (8) + what precedes the edts + edts header (8).
         elst_at = Some(8 + body.len() + 8);
         body.extend_from_slice(&wrap_box(b"edts", &elst));
+    } else if reserve_edit_slot {
+        // The first packet times are not known yet: hold the place of
+        // the edit list they may call for.
+        slot_at = Some(8 + body.len());
+        body.extend_from_slice(&wrap_box(b"free", &[0; EDIT_SLOT_LEN - 8]));
     }
     // mdia uses the same builder as the non-fragmented path; sample
     // tables will be empty (the moov has no samples).
@@ -1632,7 +1776,7 @@ fn build_trak_init(
         &sgpd,
         &[],
     )?);
-    Ok((wrap_box(b"trak", &body), elst_at))
+    Ok((wrap_box(b"trak", &body), elst_at, slot_at))
 }
 
 /// `mvex` (§8.8.1) container holding `trex` per track + an optional
