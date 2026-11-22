@@ -408,12 +408,55 @@ fn h263_entry(params: &CodecParameters) -> Result<SampleEntry> {
     })
 }
 
-/// Opus sample entry (`Opus` + `dOps`). This crate's demuxer surfaces the
-/// dOps body with an 8-byte `OpusHead` magic prepended so downstream code
-/// treats Ogg- and MP4-sourced Opus uniformly; the write side strips that
-/// magic back off when present and emits the remaining bytes verbatim as
-/// the `dOps` body — the byte-exact inverse. Extradata without the magic is
-/// taken to already be the dOps body.
+/// Rebuild the RFC 7845 §5.1 identification header from an
+/// OpusSpecificBox (`dOps`) body.
+///
+/// The box holds the same fields as the header — channel count,
+/// pre-skip, input sample rate, output gain, mapping family and, for a
+/// non-zero family, the stream counts and channel mapping — without the
+/// `OpusHead` magic, with a version byte of 0 and with the multi-byte
+/// fields in big-endian order; the header has version 1 and
+/// little-endian fields. `None` when the body is shorter than the fixed
+/// fields.
+pub(crate) fn opus_head_from_dops(dops: &[u8]) -> Option<Vec<u8>> {
+    if dops.len() < 11 {
+        return None;
+    }
+    let mut head = Vec::with_capacity(8 + dops.len());
+    head.extend_from_slice(b"OpusHead");
+    head.push(1);
+    head.push(dops[1]);
+    head.extend_from_slice(&[dops[3], dops[2]]);
+    head.extend_from_slice(&[dops[7], dops[6], dops[5], dops[4]]);
+    head.extend_from_slice(&[dops[9], dops[8]]);
+    head.extend_from_slice(&dops[10..]);
+    Some(head)
+}
+
+/// The inverse of [`opus_head_from_dops`]: the `dOps` body for an
+/// identification header (`OpusHead` magic included).
+fn dops_from_opus_head(head: &[u8]) -> Option<Vec<u8>> {
+    let h = head.strip_prefix(b"OpusHead")?;
+    if h.len() < 11 {
+        return None;
+    }
+    let mut dops = Vec::with_capacity(h.len());
+    dops.push(0);
+    dops.push(h[1]);
+    dops.extend_from_slice(&[h[3], h[2]]);
+    dops.extend_from_slice(&[h[7], h[6], h[5], h[4]]);
+    dops.extend_from_slice(&[h[9], h[8]]);
+    dops.extend_from_slice(&h[10..]);
+    Some(dops)
+}
+
+/// Opus sample entry (`Opus` + `dOps`). The stream's extradata is the
+/// RFC 7845 §5.1 identification header (`OpusHead`…), which is what the
+/// demuxer reports and what an Ogg source hands over; it is rewritten
+/// into the box's big-endian layout. Extradata without the magic — or
+/// with the magic in front of a version-0 body, the form earlier
+/// releases of this crate reported — is taken to be the `dOps` body
+/// already.
 fn opus_entry(params: &CodecParameters) -> Result<SampleEntry> {
     if params.media_type != MediaType::Audio {
         return Err(Error::invalid("mp4 muxer: opus must be audio"));
@@ -429,8 +472,14 @@ fn opus_entry(params: &CodecParameters) -> Result<SampleEntry> {
             "mp4 muxer: opus stream missing extradata (OpusHead / dOps config)",
         ));
     }
+    let converted;
     let dops_body = match params.extradata.strip_prefix(b"OpusHead") {
-        Some(rest) => rest,
+        Some(rest) if rest.first() == Some(&0) => rest,
+        Some(_) => {
+            converted = dops_from_opus_head(&params.extradata)
+                .ok_or_else(|| Error::invalid("mp4 muxer: opus identification header too short"))?;
+            &converted[..]
+        }
         None => &params.extradata[..],
     };
     if dops_body.len() < 11 {
@@ -818,20 +867,40 @@ mod tests {
     }
 
     #[test]
-    fn opus_entry_strips_opushead_magic() {
-        // 11-byte dOps-shaped payload behind the OpusHead magic.
-        let dops = [1u8, 2, 0x01, 0x38, 0, 0, 0xBB, 0x80, 0, 0, 0];
+    fn opus_entry_rewrites_the_identification_header() {
+        // RFC 7845 §5.1 header: version 1, 2 channels, pre-skip 312,
+        // 48 kHz, gain -2, mapping family 0 — little-endian fields.
+        let head = [1u8, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0xFE, 0xFF, 0];
+        // The box: version 0 and the same fields big-endian.
+        let dops = [0u8, 2, 0x01, 0x38, 0, 0, 0xBB, 0x80, 0xFF, 0xFE, 0];
         let mut extradata = b"OpusHead".to_vec();
-        extradata.extend_from_slice(&dops);
+        extradata.extend_from_slice(&head);
         let e = sample_entry_for(&audio_params("opus", &extradata)).unwrap();
         assert_eq!(&e.fourcc, b"Opus");
         assert_eq!(e.body.len(), 28 + 8 + dops.len());
         assert_eq!(&e.body[32..36], b"dOps");
-        assert_eq!(&e.body[36..], &dops, "dOps body must lose the magic");
+        assert_eq!(&e.body[36..], &dops);
+        assert_eq!(opus_head_from_dops(&dops).unwrap(), extradata);
 
-        // Extradata already without the magic is taken verbatim.
+        // A mapping table (family 1: stream count, coupled count, one
+        // byte a channel) is carried across unchanged.
+        let mut surround = b"OpusHead".to_vec();
+        surround.extend_from_slice(&[1, 6, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 1]);
+        surround.extend_from_slice(&[4, 2, 0, 4, 1, 2, 3, 5]);
+        let mut p = audio_params("opus", &surround);
+        p.channels = Some(6);
+        let e = sample_entry_for(&p).unwrap();
+        assert_eq!(&e.body[36 + 10..], &[1, 4, 2, 0, 4, 1, 2, 3, 5]);
+        assert_eq!(opus_head_from_dops(&e.body[36..]).unwrap(), surround);
+
+        // Extradata without the magic, or with the magic in front of a
+        // version-0 body, is the box body already.
         let e2 = sample_entry_for(&audio_params("opus", &dops)).unwrap();
         assert_eq!(&e2.body[36..], &dops);
+        let mut legacy = b"OpusHead".to_vec();
+        legacy.extend_from_slice(&dops);
+        let e3 = sample_entry_for(&audio_params("opus", &legacy)).unwrap();
+        assert_eq!(&e3.body[36..], &dops);
 
         // Too-short config is rejected.
         assert!(sample_entry_for(&audio_params("opus", b"OpusHead\x01")).is_err());

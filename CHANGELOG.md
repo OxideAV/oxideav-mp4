@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- In a movie fragment whose track fragments have neither an explicit base data offset nor `default-base-is-moof`, the second and later track fragments read their samples from the wrong place: every `traf` was anchored at the start of the `moof`. Each one now starts where the data of the one before it ends (ISO/IEC 14496-12 §8.8.7.1).
+- Opus: `extradata` was the `dOps` box body behind an `OpusHead` magic — version 0 and big-endian pre-skip / sample rate / gain where the RFC 7845 §5.1 header has version 1 and little-endian fields — and the muxer wrote an identification header's bytes into `dOps` unchanged. The demuxer now reports the real identification header and the muxer rewrites one into the box layout.
+- AAC at 64 kHz and above reported the sample entry's `samplerate` (a 16.16 field that cannot hold the rate); the AudioSpecificConfig now decides. FLAC takes its rate, channel count and sample depth from STREAMINFO.
+- A media header duration of all ones ("unknown") was reported as `-1`, and a fragmented track reported the duration of its `moov` samples only (zero for an empty `moov`); both now report the end of the track's last sample.
+- `StreamInfo::start_time` was 0 for every track without an edit list; it is the first presented timestamp (the first composition offset of a stream with B-frames and no edit list).
+- `mp4v` with `objectTypeIndication` 0x6E is `jpeg2000` (ISO/IEC 14496-1 Table 5), not `mpeg4video`.
+
 - Tracks could each claim the same file bytes through a constant-size `stsz`, so a file of many small `trak` boxes described (and made the demuxer expand) far more samples than it had bytes; a movie describing more than two samples per byte of file is now refused at open.
 - A trailing `moov` (or `meta`, `mfra`, …) whose size field is zero — the ISO/IEC 14496-12 §4.2 "extends to the end of the file" form — failed to open; `boxes::read_box_body` now reads such a box to the end of the input.
 - `wave` atoms nested inside one another were followed without bound: a sample entry made of `wave` headers (eight bytes a level) overflowed the stack. Nesting is now followed four levels deep.
@@ -19,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Uncompressed audio (one table sample per audio frame) is delivered up to 1024 frames to a packet instead of one packet a frame, and a constant-size `stsz` is no longer expanded into a size per sample: an hour of 48 kHz PCM is 170 000 packets rather than 173 million.
 - The non-fragmented muxer no longer writes a sync-sample table for a track whose samples are all sync samples (ISO/IEC 14496-12 §8.6.2.1: an absent table means exactly that); the `moov` of an audio track shrinks by four bytes a sample.
 - `seek_to` is a binary search over a per-stream sync-sample index built on first use (was a scan of every sample), and for an audio stream with a `roll` / `prol` group lands the roll distance before the target packet.
 - Opening a file walks each sample table with run cursors (no per-sample side tables, no per-sample rescan of the chunk), merges the tracks into file order as it goes instead of sorting afterwards, borrows nested box bodies instead of copying them at every nesting level, and skips the per-sample passes a file does not need: 140 ms → 25–49 ms on a two-million-sample file.
@@ -27,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/mp4dump.rs`: prints the streams, options and packets (timestamps, flags, Adler-32) the demuxer reports for a file.
+- `tests/blackbox_pins.rs` with `tests/fixtures/blackbox/`: demuxer behaviours pinned on small files from a black-box muxer.
 - `Mp4Demuxer::sidxes()` / `tfras()`: the parsed segment-index and random-access tables.
 - `ChunkPolicy::TrackRuns` (one chunk per run of a track's consecutive samples, capped at 1024) and `Mp4MuxerOptions::compact_sample_sizes` (`stz2` at 4 / 8 / 16 bits a sample): opt-in compact sample tables for the non-fragmented muxer.
 - `benches/throughput.rs`: timed mux / finalisation / open / read / seek run on large self-muxed progressive and fragmented files.

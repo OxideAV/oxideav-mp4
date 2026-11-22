@@ -105,7 +105,9 @@ fn trailing_moov_with_size_zero_extends_to_the_end() {
     let mut patched = bytes.clone();
     patched[at..at + 4].copy_from_slice(&0u32.to_be_bytes());
     assert_eq!(payloads(&patched), payloads(&bytes));
-    assert_eq!(payloads(&patched).len(), 50);
+    // One-tick PCM frames arrive concatenated: 50 two-byte frames.
+    let bytes_out: usize = payloads(&patched).iter().map(|(_, d)| d.len()).sum();
+    assert_eq!(bytes_out, 100);
 }
 
 #[test]
@@ -168,11 +170,13 @@ fn tracks_cannot_claim_the_same_bytes_without_bound() {
     let two = with_trak_copies(&bytes, 2);
     let mut d = open(&two).unwrap();
     assert_eq!(d.streams().len(), 2, "two tracks may share their data");
-    let mut n = 0;
-    while d.next_packet().is_ok() {
-        n += 1;
+    // 3000 one-tick frames a track, concatenated into packets.
+    let mut frames = 0;
+    while let Ok(p) = d.next_packet() {
+        assert_eq!(p.duration, Some((p.data.len() / 2) as i64));
+        frames += p.data.len() / 2;
     }
-    assert_eq!(n, 6000);
+    assert_eq!(frames, 6000);
 
     // Forty copies: 120 000 samples from a file of some 30 kB — more
     // than two a byte, which no real table reaches.

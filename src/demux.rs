@@ -380,6 +380,45 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         samples.sort_by_key(|s| s.offset);
     }
 
+    // Per stream: the timestamp of the first presented packet (the
+    // smallest one — composition offsets reorder, and a file without
+    // an edit list need not start at zero) and, where the media header
+    // cannot state it, the duration. `mdhd.duration` covers the
+    // samples of the `moov` only (§8.4.2.3, all ones when unknown), so
+    // a track with fragments runs to the end of its last sample.
+    {
+        let mut first_pts: Vec<Option<i64>> = vec![None; streams.len()];
+        let mut media_end: Vec<i64> = vec![0; streams.len()];
+        for s in &samples {
+            let i = s.track_idx as usize;
+            media_end[i] = media_end[i].max(s.media_dts.saturating_add(s.duration));
+            if !s.discard && first_pts[i].is_none_or(|p| s.pts < p) {
+                first_pts[i] = Some(s.pts);
+            }
+        }
+        for (i, st) in streams.iter_mut().enumerate() {
+            if let Some(p) = first_pts[i] {
+                // A packet an edit cuts into starts before the edit
+                // does; the stream starts where the edit list says.
+                let tl = &parsed.tracks[i].elst_timeline;
+                let edit_start = if tl.mapped {
+                    tl.segments.first().map(|seg| seg.pres_start)
+                } else {
+                    None
+                };
+                st.start_time = Some(edit_start.map_or(p, |e| p.max(e)));
+            }
+            let declared = parsed.tracks[i].duration;
+            let unknown = declared.is_none_or(|d| {
+                d == u64::MAX || (parsed.tracks[i].mdhd_version == 0 && d == u64::from(u32::MAX))
+            });
+            if unknown || !moofs.is_empty() {
+                let known = if unknown { 0 } else { st.duration.unwrap_or(0) };
+                st.duration = Some(known.max(media_end[i]));
+            }
+        }
+    }
+
     // Movie duration from mvhd (§8.2.2), with §8.8.2 `mehd`
     // (MovieExtendsHeaderBox) as fall-back for fragmented files. When
     // a fragmented file is sealed with a known overall duration, the
@@ -1781,6 +1820,9 @@ struct Track {
     /// (`mdhd` describes when the *media* was created, `tkhd` the
     /// track), so both are kept rather than collapsed.
     mdhd_timestamps: HeaderTimestamps,
+    /// `mdhd` FullBox version: 0 has a 32-bit duration, whose
+    /// "unknown" value is 32 ones.
+    mdhd_version: u8,
     // Audio
     channels: Option<u16>,
     sample_rate: Option<u32>,
@@ -1803,7 +1845,7 @@ struct Track {
     // Sample tables.
     stts: Vec<(u32, u32)>, // (sample_count, sample_delta) — in media timescale
     stsc: Vec<(u32, u32, u32)>, // (first_chunk, samples_per_chunk, sample_description_index)
-    stsz: Vec<u32>,        // per-sample sizes (or `uniform`-derived vec of same size)
+    stsz: SampleSizes,
     chunk_offsets: Vec<u64>, // absolute file offsets (stco or co64)
     /// 1-based sample indices that are sync (key) frames. Empty means
     /// "all samples are sync frames" per ISO/IEC 14496-12.
@@ -3088,6 +3130,23 @@ impl ElstTimeline {
     /// a segment start is presented: part of its output (the tail of
     /// an audio frame the edit cuts into, §8.6.6) is on the timeline,
     /// and trimming inside it is the consumer's job.
+    /// The first media time after `t` at which a mapped segment starts
+    /// or ends.
+    fn next_boundary_after(&self, t: i64) -> Option<i64> {
+        if !self.mapped {
+            return None;
+        }
+        self.segments
+            .iter()
+            .flat_map(|s| {
+                let end = (s.dur > 0).then(|| s.media_start.saturating_add(s.dur));
+                [Some(s.media_start), end]
+            })
+            .flatten()
+            .filter(|&b| b > t)
+            .min()
+    }
+
     fn delta_for_span(&self, cts: i64, duration: i64) -> (i64, bool) {
         if !self.mapped || self.segments.is_empty() {
             // Legacy single-shift behaviour: subtract the first
@@ -5746,6 +5805,7 @@ fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
         duration: None,
         tkhd_timestamps: HeaderTimestamps::default(),
         mdhd_timestamps: HeaderTimestamps::default(),
+        mdhd_version: 0,
         channels: None,
         sample_rate: None,
         sample_size_bits: None,
@@ -5757,7 +5817,7 @@ fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
         esds_oti: None,
         stts: Vec::new(),
         stsc: Vec::new(),
-        stsz: Vec::new(),
+        stsz: SampleSizes::default(),
         chunk_offsets: Vec::new(),
         stss: Vec::new(),
         ctts: Vec::new(),
@@ -7307,6 +7367,7 @@ fn parse_mdhd(body: &[u8], t: &mut Track) -> Result<()> {
     };
     t.timescale = timescale;
     t.duration = Some(duration);
+    t.mdhd_version = version;
     t.mdhd_timestamps = read_header_timestamps(body, version);
     t.header.media_timescale = timescale;
     t.header.media_duration = duration;
@@ -8062,7 +8123,7 @@ fn parse_stbl(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
             STTS => t.stts = parse_stts(b)?,
             STSC => t.stsc = parse_stsc(b)?,
             STSZ => t.stsz = parse_stsz(b, file_size)?,
-            STZ2 => t.stsz = parse_stz2(b)?,
+            STZ2 => t.stsz = SampleSizes::Table(parse_stz2(b)?),
             STCO => t.chunk_offsets = parse_stco(b)?,
             CO64 => t.chunk_offsets = parse_co64(b)?,
             STSS => t.stss = parse_stss(b)?,
@@ -8552,8 +8613,14 @@ fn fix_legacy_pcm_sample_sizes(t: &mut Track) {
         return;
     };
     let frame = u32::from(t.channels.unwrap_or(1).max(1)) * u32::from(layout.bits.div_ceil(8));
-    if frame > 1 && !t.stsz.is_empty() && t.stsz.iter().all(|&s| s == 1) {
-        t.stsz.fill(frame);
+    match &mut t.stsz {
+        SampleSizes::Uniform { size, .. } if frame > 1 && *size == 1 => *size = frame,
+        SampleSizes::Table(sizes)
+            if frame > 1 && !sizes.is_empty() && sizes.iter().all(|&s| s == 1) =>
+        {
+            sizes.fill(frame);
+        }
+        _ => {}
     }
 }
 
@@ -8617,13 +8684,13 @@ fn parse_audio_children(buf: &[u8], t: &mut Track, hints: &mut PcmHints, depth: 
             b"dfLa" if body.len() > 4 => {
                 t.extradata = body[4..].to_vec();
             }
-            // Opus-in-MP4 dOps: a subset of OpusHead without the 8-byte magic.
-            // We rebuild OpusHead so our downstream code can treat it uniformly.
-            b"dOps" if body.len() >= 11 => {
-                let mut oh = Vec::with_capacity(body.len() + 8);
-                oh.extend_from_slice(b"OpusHead");
-                oh.extend_from_slice(body);
-                t.extradata = oh;
+            // OpusSpecificBox: the identification header's fields in
+            // big-endian order, without the magic. Rebuilt into the
+            // RFC 7845 §5.1 header every Opus consumer parses.
+            b"dOps" => {
+                if let Some(head) = crate::sample_entries::opus_head_from_dops(body) {
+                    t.extradata = head;
+                }
             }
             // ES Descriptor box for MPEG-4 audio (mp4a): strip the nested
             // descriptor wrappers and hand the DecoderSpecificInfo (the AAC
@@ -9251,7 +9318,7 @@ fn parse_stsc(body: &[u8]) -> Result<Vec<(u32, u32, u32)>> {
     Ok(out)
 }
 
-fn parse_stsz(body: &[u8], file_size: u64) -> Result<Vec<u32>> {
+fn parse_stsz(body: &[u8], file_size: u64) -> Result<SampleSizes> {
     if body.len() < 12 {
         return Err(Error::invalid("MP4: stsz too short"));
     }
@@ -9268,7 +9335,10 @@ fn parse_stsz(body: &[u8], file_size: u64) -> Result<Vec<u32>> {
                 "MP4: stsz constant-size sample_count exceeds what the file can back",
             ));
         }
-        return Ok(vec![uniform; count]);
+        return Ok(SampleSizes::Uniform {
+            size: uniform,
+            count: count as u32,
+        });
     }
     // Per-sample shape: one u32 per sample — cap the reservation at
     // what the table bytes can back (the loop still reports precise
@@ -9287,7 +9357,7 @@ fn parse_stsz(body: &[u8], file_size: u64) -> Result<Vec<u32>> {
         ]));
         off += 4;
     }
-    Ok(out)
+    Ok(SampleSizes::Table(out))
 }
 
 fn parse_stz2(body: &[u8]) -> Result<Vec<u32>> {
@@ -10773,6 +10843,10 @@ fn parse_moof(
     // the identical deferred treatment.
     let mut pending_pssh_bodies: Vec<Vec<u8>> = Vec::new();
     let mut pending_piff_pssh_bodies: Vec<Vec<u8>> = Vec::new();
+    // §8.8.7.1 — end of the data the preceding track fragment of this
+    // movie fragment defined: the implicit base of a `traf` that has
+    // neither an explicit base nor `default-base-is-moof`.
+    let mut prev_traf_data_end: Option<u64> = None;
     while cur.position() < end {
         let hdr = match read_box_header(&mut cur)? {
             Some(h) => h,
@@ -10795,6 +10869,7 @@ fn parse_moof(
                 parse_traf(
                     &body,
                     moof.moof_start,
+                    &mut prev_traf_data_end,
                     tracks,
                     samples,
                     next_dts,
@@ -10858,15 +10933,11 @@ struct TrafState {
     track_idx: usize,
     /// `tfhd.flags` — selects which optional fields are present.
     tfhd_flags: u32,
-    /// Effective base offset for `trun` entries that have no explicit
-    /// per-sample offset. Built from `tfhd.base_data_offset` when
-    /// present, or the start of the containing `moof` when the
-    /// `default-base-is-moof` flag (0x020000) is set, or — failing
-    /// both — the start of the first `mdat` after this `moof`. The
-    /// last fall-back is rare in practice; we approximate it by
-    /// using the moof start, which matches every fragment in our
-    /// test corpus and the §8.8.7.1 spec text "either the first byte
-    /// of the enclosing Movie Fragment Box".
+    /// Base of the `trun` data offsets (§8.8.7.1): the explicit
+    /// `tfhd.base_data_offset`; else the first byte of the enclosing
+    /// `moof` when `default-base-is-moof` is set or this is the first
+    /// traf of the movie fragment; else the end of the data the
+    /// preceding traf defined.
     base_data_offset: u64,
     /// Per-track defaults from `tfhd`, falling back to `trex`.
     default_sample_duration: u32,
@@ -10895,11 +10966,9 @@ const TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT: u32 = 0x000020;
 /// are no samples, and per §8.8.8.1 "If the duration-is-empty flag is
 /// set in the tf_flags, there are no track runs".
 const TFHD_DURATION_IS_EMPTY: u32 = 0x010000;
-// `default-base-is-moof` (0x020000) is implicit in our base resolution:
-// when no explicit `base_data_offset` is present we already use
-// `moof_start`, which matches both the 0x020000 semantic and the
-// "first byte of the enclosing Movie Fragment Box" spec fall-back.
-#[allow(dead_code)]
+/// `default-base-is-moof` (§8.8.7.1, 0x020000): without an explicit
+/// `base_data_offset`, every traf of the movie fragment is anchored at
+/// the first byte of the enclosing `moof`.
 const TFHD_DEFAULT_BASE_IS_MOOF: u32 = 0x020000;
 
 /// `trun` flag bits (ISO/IEC 14496-12 §8.8.8.1).
@@ -11043,6 +11112,7 @@ pub fn parse_sample_flags(raw: u32) -> SampleFlags {
 fn parse_traf(
     body: &[u8],
     moof_start: u64,
+    prev_traf_data_end: &mut Option<u64>,
     tracks: &[Track],
     samples: &mut Vec<SampleRef>,
     next_dts: &mut [i64],
@@ -11089,7 +11159,7 @@ fn parse_traf(
         match hdr.fourcc {
             TFHD => {
                 let b = take_slice(&mut cur, psz)?;
-                parse_tfhd(b, moof_start, tracks, &mut state)?;
+                parse_tfhd(b, moof_start, *prev_traf_data_end, tracks, &mut state)?;
                 tfhd_seen = true;
             }
             TFDT => {
@@ -11379,6 +11449,7 @@ fn parse_traf(
     }
 
     next_dts[state.track_idx] = frag_dts;
+    *prev_traf_data_end = Some(next_data_offset_within_traf);
     Ok(())
 }
 
@@ -11387,7 +11458,13 @@ fn parse_traf(
 /// Layout: FullBox header (4 bytes) + track_ID (u32). Then optional
 /// fields gated by the flag bits in the lower 24 bits of the FullBox
 /// header (in the order they appear in the spec table).
-fn parse_tfhd(body: &[u8], moof_start: u64, tracks: &[Track], state: &mut TrafState) -> Result<()> {
+fn parse_tfhd(
+    body: &[u8],
+    moof_start: u64,
+    prev_traf_data_end: Option<u64>,
+    tracks: &[Track],
+    state: &mut TrafState,
+) -> Result<()> {
     if body.len() < 8 {
         return Err(Error::invalid("MP4: tfhd too short"));
     }
@@ -11474,16 +11551,18 @@ fn parse_tfhd(body: &[u8], moof_start: u64, tracks: &[Track], state: &mut TrafSt
         // off += 4; // last optional, no further reads
     }
 
-    // Resolve effective base_data_offset:
-    // 1. explicit base_data_offset wins.
-    // 2. otherwise, default-base-is-moof flag (0x020000) → moof_start.
-    // 3. otherwise, per spec the "first byte of the enclosing Movie
-    //    Fragment Box" — same as moof_start. (Spec actually says
-    //    "first byte of the enclosing Movie Fragment Box" for the
-    //    *first* traf in the moof, and "end of the previous traf's
-    //    data" for subsequent ones, but every real fragmented file we
-    //    care about either sets explicit base or default-base-is-moof.)
-    state.base_data_offset = explicit_base.unwrap_or(moof_start);
+    // Resolve the effective base data offset (§8.8.7.1):
+    // 1. an explicit `base_data_offset` wins;
+    // 2. else `default-base-is-moof` anchors every traf at the first
+    //    byte of the enclosing `moof`;
+    // 3. else the first traf of the movie fragment is anchored at the
+    //    `moof` start, and each later one at "the end of the data
+    //    defined by the preceding track fragment".
+    state.base_data_offset = match explicit_base {
+        Some(base) => base,
+        None if flags & TFHD_DEFAULT_BASE_IS_MOOF != 0 => moof_start,
+        None => prev_traf_data_end.unwrap_or(moof_start),
+    };
 
     Ok(())
 }
@@ -12425,6 +12504,52 @@ fn read_var_u32(buf: &[u8]) -> u32 {
 
 // --- Sample-table expansion ----------------------------------------------
 
+/// The sample sizes of a track (§8.7.3): one size for every sample, or
+/// a table. The constant form is kept as the two numbers the box holds
+/// — an hour of uncompressed audio counts one "sample" per audio frame.
+#[derive(Clone, Debug)]
+enum SampleSizes {
+    Uniform { size: u32, count: u32 },
+    Table(Vec<u32>),
+}
+
+impl Default for SampleSizes {
+    fn default() -> Self {
+        SampleSizes::Table(Vec::new())
+    }
+}
+
+impl From<Vec<u32>> for SampleSizes {
+    fn from(sizes: Vec<u32>) -> Self {
+        SampleSizes::Table(sizes)
+    }
+}
+
+impl SampleSizes {
+    fn len(&self) -> usize {
+        match self {
+            SampleSizes::Uniform { count, .. } => *count as usize,
+            SampleSizes::Table(sizes) => sizes.len(),
+        }
+    }
+
+    /// Size of sample `i` (0-based), which must be below [`Self::len`].
+    fn get(&self, i: usize) -> u32 {
+        match self {
+            SampleSizes::Uniform { size, .. } => *size,
+            SampleSizes::Table(sizes) => sizes[i],
+        }
+    }
+
+    /// The one size every sample has, when the box states it that way.
+    fn uniform(&self) -> Option<u32> {
+        match self {
+            SampleSizes::Uniform { size, .. } => Some(*size),
+            SampleSizes::Table(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SampleRef {
     track_idx: u32,
@@ -12491,6 +12616,14 @@ impl<'a, T: Copy> RunCursor<'a, T> {
         }
         self.left -= 1;
         self.value
+    }
+
+    /// Consume up to `max` more entries of the run the last
+    /// [`Self::next`] value came from; returns how many.
+    fn take_same(&mut self, max: u32) -> u32 {
+        let k = max.min(self.left);
+        self.left -= k;
+        k
     }
 }
 
@@ -12580,6 +12713,25 @@ struct SampleWalk<'a> {
     last_placed: Option<(usize, u32)>,
     /// Offset every sample the `stsc` runs did not cover is given.
     leftover_at: Option<u64>,
+    /// Most table samples one packet takes: 1, or
+    /// [`PCM_FRAMES_PER_PACKET`] for uncompressed audio.
+    group: u32,
+}
+
+/// Uncompressed audio counts one sample per audio frame (QuickTime File
+/// Format, "Sound Sample Descriptions"; ISO/IEC 23003-5 does the same),
+/// a few bytes each. Frames lasting one media tick are delivered this
+/// many to a packet — fewer at the end of a chunk, where the sample
+/// duration changes and at an edit boundary.
+const PCM_FRAMES_PER_PACKET: u32 = 1024;
+
+/// True when a track's table samples are single frames of uncompressed
+/// (or G.711 companded) audio that can be concatenated into packets.
+fn groups_pcm_frames(t: &Track) -> bool {
+    (t.pcm.is_some() || matches!(&t.codec_id_fourcc, b"ulaw" | b"alaw"))
+        && t.stsz.uniform().is_some()
+        && t.ctts.is_empty()
+        && t.stss.is_empty()
 }
 
 impl<'a> SampleWalk<'a> {
@@ -12605,7 +12757,25 @@ impl<'a> SampleWalk<'a> {
             sdi: 1,
             last_placed: None,
             leftover_at: None,
+            group: if groups_pcm_frames(t) {
+                PCM_FRAMES_PER_PACKET
+            } else {
+                1
+            },
         }
+    }
+
+    /// Upper bound on the packets this walk emits.
+    fn packet_bound(&self) -> usize {
+        if self.group <= 1 {
+            return self.n;
+        }
+        // A packet ends at a chunk end, at an `stts` run end and at an
+        // edit boundary as well as when it is full.
+        let breaks = self.t.chunk_offsets.len()
+            + self.t.stts.len()
+            + 2 * self.t.elst_timeline.segments.len();
+        (self.n / self.group as usize + 1).saturating_add(breaks)
     }
 
     fn chunk_offset(&self, chunk: usize) -> Result<u64> {
@@ -12698,10 +12868,26 @@ impl<'a> SampleWalk<'a> {
     /// Produce the sample [`Self::peek_offset`] just located.
     fn emit(&mut self, out: &mut Vec<SampleRef>) {
         let t = self.t;
-        let size = t.stsz[self.i];
+        let mut size = t.stsz.get(self.i);
         // Past the end of the stts runs the delta is zero.
-        let dur = self.stts.next().map_or(0, i64::from);
+        let mut dur = self.stts.next().map_or(0, i64::from);
         let cts_offset = self.ctts.next().map_or(0, i64::from);
+        // Uncompressed audio, one frame a media tick: take the frames
+        // that follow in the chunk with this one, up to a full packet
+        // — stopping where the frame duration changes and at the next
+        // edit boundary, so the edit list still cuts between packets.
+        let mut taken = 1u32;
+        if self.group > 1 && dur == 1 {
+            let room = u32::try_from(self.n - self.i).unwrap_or(u32::MAX);
+            let mut want = self.group.min(self.left).min(room);
+            if let Some(boundary) = t.elst_timeline.next_boundary_after(self.media_dts) {
+                let frames = boundary - self.media_dts;
+                want = want.min(u32::try_from(frames).unwrap_or(u32::MAX));
+            }
+            taken += self.stts.take_same(want.saturating_sub(1));
+            size = size.saturating_mul(taken);
+            dur = dur.saturating_mul(i64::from(taken));
+        }
         // CTS = DTS + ctts_offset (§8.6.1.3). Streams without a ctts
         // box take the DTS path unchanged.
         //
@@ -12732,8 +12918,8 @@ impl<'a> SampleWalk<'a> {
         });
         self.media_dts = self.media_dts.saturating_add(dur);
         self.offset = self.offset.saturating_add(u64::from(size));
-        self.left = self.left.saturating_sub(1);
-        self.i += 1;
+        self.left = self.left.saturating_sub(taken);
+        self.i += taken as usize;
     }
 }
 
@@ -12741,7 +12927,7 @@ impl<'a> SampleWalk<'a> {
 #[cfg(test)]
 fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result<()> {
     let mut walk = SampleWalk::new(t, track_idx);
-    out.reserve(walk.n);
+    out.reserve(walk.packet_bound());
     while walk.peek_offset()?.is_some() {
         walk.emit(out);
     }
@@ -12756,12 +12942,12 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
 fn expand_tracks(tracks: &[Track], out: &mut Vec<SampleRef>) -> Result<()> {
     use std::cmp::Reverse;
     let start = out.len();
-    out.reserve(tracks.iter().map(|t| t.stsz.len()).sum());
     let mut walks: Vec<SampleWalk> = tracks
         .iter()
         .enumerate()
         .map(|(i, t)| SampleWalk::new(t, i as u32))
         .collect();
+    out.reserve(walks.iter().map(SampleWalk::packet_bound).sum());
     // (offset of the track's next sample, track)
     let mut heads = std::collections::BinaryHeap::with_capacity(walks.len());
     for (i, w) in walks.iter_mut().enumerate() {
@@ -12961,13 +13147,44 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     {
         params.channels = Some(n);
     }
+    // The entry's 16.16 `samplerate` cannot hold 64 kHz and above
+    // (§12.2.3) and writers leave something else there (half the rate,
+    // or zero), so the AudioSpecificConfig decides. An entry at twice
+    // the core rate of a config without explicit SBR signalling is
+    // left alone: that is a writer stating the output rate of
+    // implicitly signalled SBR.
     if params.codec_id.as_str() == "aac"
         && let Some(r) = crate::aac::asc_rates(&params.extradata)
-        && let (Some(out), Some(entry)) = (r.sbr_rate, params.sample_rate)
-        && entry == r.core_rate
-        && out != entry
     {
-        params.sample_rate = Some(out);
+        let declared = r.sbr_rate.unwrap_or(r.core_rate);
+        let implicit_sbr = r.sbr_rate.is_none() && params.sample_rate == r.core_rate.checked_mul(2);
+        if declared != 0 && !implicit_sbr {
+            params.sample_rate = Some(declared);
+        }
+    }
+    // FLAC: the STREAMINFO block (RFC 9639 §8.2) behind its 4-byte
+    // metadata block header declares the stream's rate (20 bits),
+    // channel count and sample depth; the entry's 16.16 `samplerate`
+    // cannot hold the rates above 65535 Hz.
+    if params.codec_id.as_str() == "flac"
+        && params.extradata.len() >= 4 + 18
+        && params.extradata[0] & 0x7F == 0
+    {
+        let si = &params.extradata[4..];
+        let rate = u32::from(si[10]) << 12 | u32::from(si[11]) << 4 | u32::from(si[12]) >> 4;
+        let channels = u16::from((si[12] >> 1) & 0x7) + 1;
+        let bits = (u16::from(si[12] & 1) << 4 | u16::from(si[13] >> 4)) + 1;
+        if rate != 0 {
+            params.sample_rate = Some(rate);
+        }
+        params.channels = Some(channels);
+        params.sample_format = match bits {
+            8 => Some(SampleFormat::U8),
+            16 => Some(SampleFormat::S16),
+            24 => Some(SampleFormat::S24),
+            32 => Some(SampleFormat::S32),
+            _ => params.sample_format,
+        };
     }
     // ALAC: the `alac` sample entry's channelcount, samplesize and
     // samplerate are legacy fields (macOS's ALAC writer leaves them at
@@ -15128,6 +15345,9 @@ impl Mp4Demuxer {
     /// The stream's samples in decode order: its sample table, then its
     /// movie fragments in file order. Times are on the media timeline;
     /// [`Self::edit_list`] maps them onto the presentation.
+    ///
+    /// Uncompressed audio is listed as the packets it is delivered in
+    /// (up to 1024 one-tick audio frames each), not frame by frame.
     pub fn samples(&self, stream_index: u32) -> Vec<SampleInfo> {
         let mut track: Vec<&SampleRef> = self
             .samples
@@ -16195,6 +16415,7 @@ mod tests {
             duration: None,
             tkhd_timestamps: super::HeaderTimestamps::default(),
             mdhd_timestamps: super::HeaderTimestamps::default(),
+            mdhd_version: 0,
             channels: None,
             sample_rate: None,
             sample_size_bits: None,
@@ -16206,7 +16427,7 @@ mod tests {
             esds_oti: None,
             stts: Vec::new(),
             stsc: Vec::new(),
-            stsz: Vec::new(),
+            stsz: super::SampleSizes::default(),
             chunk_offsets: Vec::new(),
             stss: Vec::new(),
             ctts: Vec::new(),
@@ -16805,7 +17026,7 @@ mod tests {
     #[test]
     fn expand_samples_clamps_giant_samples_per_chunk() {
         let mut t = fresh_track();
-        t.stsz = vec![1, 1, 1, 1]; // 4 samples
+        t.stsz = vec![1, 1, 1, 1].into(); // 4 samples
         t.stts = vec![(4, 100)]; // 4 samples × delta 100
         t.stsc = vec![(1, u32::MAX, 1)]; // adversarial: spc = 2^32 - 1
         t.chunk_offsets = vec![0, 100, 200, 300]; // 4 chunks
@@ -17252,7 +17473,7 @@ mod tests {
         // of u32::MAX: walked chunk by chunk this is four billion
         // iterations. The one sample falls back to the first chunk.
         let mut t = fresh_track();
-        t.stsz = vec![10];
+        t.stsz = vec![10].into();
         t.chunk_offsets = vec![100];
         t.stsc = vec![(1, 0, 1), (u32::MAX, 1, 1)];
         t.stts = vec![(1, 5)];
@@ -17268,7 +17489,7 @@ mod tests {
         // sample description from the third chunk on; stts and ctts
         // runs that end before the samples do; an unsorted stss.
         let mut t = fresh_track();
-        t.stsz = vec![1, 2, 3, 4, 5, 6, 7];
+        t.stsz = vec![1, 2, 3, 4, 5, 6, 7].into();
         t.chunk_offsets = vec![1000, 2000, 3000];
         t.stsc = vec![(1, 2, 1), (3, 3, 2)];
         t.stts = vec![(2, 10), (3, 20)];
@@ -17355,7 +17576,7 @@ mod tests {
         }
         let track = |sizes: &[u32], chunks: &[u64], spc: u32| {
             let mut t = fresh_track();
-            t.stsz = sizes.to_vec();
+            t.stsz = sizes.to_vec().into();
             t.chunk_offsets = chunks.to_vec();
             t.stsc = vec![(1, spc, 1)];
             t.stts = vec![(sizes.len() as u32, 7)];
@@ -24316,6 +24537,7 @@ mod tests {
         super::parse_traf(
             &traf_body,
             0,
+            &mut None,
             &tracks,
             &mut samples,
             &mut next_dts,
@@ -24373,6 +24595,7 @@ mod tests {
         super::parse_traf(
             &traf_body,
             0,
+            &mut None,
             &tracks,
             &mut samples,
             &mut next_dts,

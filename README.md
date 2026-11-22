@@ -129,8 +129,26 @@ Sample-entry FourCCs resolve to these codec ids:
 | any other                | `mp4:<fourcc>` — callers can register their own decoder |
 
 - Codec-specific config records (`avcC`, `hvcC`, `av1C`, `vpcC`,
-  `dfLa`, `dOps`, `dac3`, `dec3`, esds DSI) are forwarded as
-  `extradata`.
+  `dfLa`, `dac3`, `dec3`, esds DSI) are forwarded as `extradata`; an
+  Opus `dOps` box is rebuilt into the RFC 7845 §5.1 identification
+  header (`OpusHead`, version 1, little-endian fields).
+- Audio stream parameters follow the codec configuration where the
+  sample entry cannot be trusted: AAC rate and channel count from the
+  AudioSpecificConfig, FLAC rate / channels / depth from STREAMINFO,
+  ALAC from the magic cookie (the entry's 16.16 `samplerate` cannot
+  hold 64 kHz and above).
+- Uncompressed audio (`ipcm` / `fpcm`, `sowt` / `twos` / `in24` /
+  `in32` / `fl32` / `fl64` / `raw ` / `lpcm`, and `ulaw` / `alaw`)
+  counts one table sample per audio frame. Frames lasting one media
+  tick are delivered up to 1024 to a packet — fewer at the end of a
+  chunk, where the frame duration changes, and at an edit boundary —
+  and `Mp4Demuxer::samples` lists those packets. Big-endian samples
+  are delivered little-endian.
+- `StreamInfo::start_time` is the timestamp of the first presented
+  packet (not before the start of the first edit);
+  `StreamInfo::duration` is the media header's duration, or, for a
+  track with fragments or an unknown (all-ones) duration, the end of
+  its last sample.
 - Video stream parameters state what the decoder will emit:
   `pixel_format` from `avcC` (SPS, or the record's high-profile fields
   when it holds no SPS), `hvcC` and `av1C`, and for VP9 from the first
@@ -1455,9 +1473,12 @@ parentheses):
 - `mp3` → `mp4a` with `esds` `objectTypeIndication = 0x6B` (MPEG-1 audio;
   no DecoderSpecificInfo — the demuxer's OTI refinement resolves it back
   to `mp3`)
-- `opus` → `Opus` with `dOps` (extradata is the demuxer's surfaced form —
-  the dOps body behind an `OpusHead` magic; the magic is stripped on
-  write and re-prepended on read, byte-exact both ways)
+- `opus` → `Opus` with `dOps` (extradata is the RFC 7845 §5.1
+  identification header, `OpusHead`…, as the demuxer reports it and as
+  an Ogg source hands it over; it is rewritten into the box's layout —
+  version 0, big-endian fields — on write and back on read. Extradata
+  without the magic, or with the magic in front of a version-0 body, is
+  written as the box body unchanged)
 - `alac` → `alac` with `alac` magic-cookie config child (extradata is the
   cookie; the FullBox version/flags word is added on write / stripped on
   read)

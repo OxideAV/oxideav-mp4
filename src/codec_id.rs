@@ -114,6 +114,7 @@ pub fn from_sample_entry(fourcc: &[u8; 4]) -> CodecId {
 /// | 0x6A | MPEG-1 Video                          |
 /// | 0x6B | MPEG-1 Audio Part 3 Layer I/II/III    |
 /// | 0x6C | JPEG image                            |
+/// | 0x6E | JPEG 2000 (ISO/IEC 15444-1)           |
 /// | 0xA5 | AC-3 (Dolby Digital)                  |
 /// | 0xA6 | E-AC-3 (Dolby Digital Plus)           |
 /// | 0xA9 | DTS Coherent Acoustics                |
@@ -154,6 +155,7 @@ pub fn from_sample_entry_with_oti(fourcc: &[u8; 4], oti: u8) -> CodecId {
                 0x21 => "h264",
                 0x23 => "h265",
                 0x6C => "mjpeg",
+                0x6E => "jpeg2000",
                 _ => "mpeg4video",
             };
             CodecId::new(id)

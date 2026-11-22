@@ -1622,13 +1622,14 @@ fn video_codecs_roundtrip_extradata() {
 
 #[test]
 fn audio_codecs_roundtrip_extradata() {
-    // Opus: extradata carries the OpusHead magic on both sides of the trip
-    // (the demuxer re-prepends what the muxer strips).
+    // Opus: extradata is the RFC 7845 §5.1 identification header on
+    // both sides of the trip (the muxer rewrites it into the `dOps`
+    // layout, the demuxer back).
     let mut opus_head = b"OpusHead".to_vec();
-    opus_head.extend_from_slice(&[1, 2, 0x01, 0x38, 0, 0, 0xBB, 0x80, 0, 0, 0]);
+    opus_head.extend_from_slice(&[1, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0]);
     let (params, _) = remux(&audio_stream("opus", &opus_head));
     assert_eq!(params.codec_id, CodecId::new("opus"));
-    assert_eq!(params.extradata, opus_head, "OpusHead magic re-prepended");
+    assert_eq!(params.extradata, opus_head, "identification header");
 
     // ALAC: the magic cookie survives (demux strips the FullBox word the
     // muxer adds).
