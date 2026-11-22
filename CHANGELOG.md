@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - AAC at 64 kHz and above reported the sample entry's `samplerate` (a 16.16 field that cannot hold the rate); the AudioSpecificConfig now decides. FLAC takes its rate, channel count and sample depth from STREAMINFO.
 - A media header duration of all ones ("unknown") was reported as `-1`, and a fragmented track reported the duration of its `moov` samples only (zero for an empty `moov`); both now report the end of the track's last sample.
 - `StreamInfo::start_time` was 0 for every track without an edit list; it is the first presented timestamp (the first composition offset of a stream with B-frames and no edit list).
-- `mp4v` with `objectTypeIndication` 0x6E is `jpeg2000` (ISO/IEC 14496-1 Table 5), not `mpeg4video`.
+- `mp4v` with `objectTypeIndication` 0x6E is `jpeg2000` (ISO/IEC 14496-1 Table 5), not `mpeg4video`; an `mp4v` / `mp4a` entry whose object type is outside the table is reported as `mp4v:0x<oti>` / `mp4a:0x<oti>` instead of being handed to the MPEG-4 Visual / AAC decoder.
+- Metadata items are decoded by their `data` type indicator (QuickTime File Format Table 3-5): UTF-16 and integer values read correctly, and a binary value is no longer emitted as a string of control characters (`track` / `disc` are dropped until their record layout is documented).
 
 - Tracks could each claim the same file bytes through a constant-size `stsz`, so a file of many small `trak` boxes described (and made the demuxer expand) far more samples than it had bytes; a movie describing more than two samples per byte of file is now refused at open.
 - A trailing `moov` (or `meta`, `mfra`, …) whose size field is zero — the ISO/IEC 14496-12 §4.2 "extends to the end of the file" form — failed to open; `boxes::read_box_body` now reads such a box to the end of the input.
@@ -35,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Demuxer::attached_pictures()`: the JPEG / PNG / BMP images of the movie's metadata item list (cover art).
+- `Demuxer::chapters()`: the chapter list — the text track a `chap` track reference names (QuickTime File Format, "Chapter Lists"), one chapter a sample.
+- QuickTime compression types in the static codec table: `cvid`, `rle `, `png `, `gif `, `tiff`, `SVQ1`, `SVQ3`, `dvc ` / `dvcp`, `ima4`, `.mp3`, the `ms` ACM codes 0x55 / 0x02 / 0x11; `NONE` and an all-zero format as `raw ` / `twos` by sample size.
+- `tests/blackbox_matrix.rs`: the live matrix against a black-box muxer and reader — every codec the muxer writes into `mp4` / `mov` / `3gp` / `m4a` / `ismv`, every `-movflags` layout and their combinations, rate × channel and size × pixel format × GOP sweeps, subtitles, chapters, cover art, protected files; skipped when the tools are absent.
 - `examples/mp4dump.rs`: prints the streams, options and packets (timestamps, flags, Adler-32) the demuxer reports for a file.
 - `tests/blackbox_pins.rs` with `tests/fixtures/blackbox/`: demuxer behaviours pinned on small files from a black-box muxer.
 - `Mp4Demuxer::sidxes()` / `tfras()`: the parsed segment-index and random-access tables.

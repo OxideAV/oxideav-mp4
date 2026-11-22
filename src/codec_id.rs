@@ -64,6 +64,21 @@ pub fn from_sample_entry(fourcc: &[u8; 4]) -> CodecId {
         // (with a `d263`/`bitr` configuration sub-box); some legacy QuickTime
         // movies use `h263` directly.
         b"s263" | b"h263" => "h263",
+        // QuickTime File Format, "Video Sample Description" Table 4-1
+        // and the sound "Format" table: the compression types with a
+        // codec id in this framework.
+        b"cvid" => "cinepak",
+        b"rle " => "qtrle",
+        b"png " => "png",
+        b"gif " => "gif",
+        b"tiff" => "tiff",
+        b"SVQ1" => "svq1",
+        b"SVQ3" => "svq3",
+        b"dvc " | b"dvcp" => "dvvideo",
+        b"ima4" => "adpcm_ima_qt",
+        b".mp3" | b"ms\0\x55" => "mp3",
+        b"ms\0\x02" => "adpcm_ms",
+        b"ms\0\x11" => "adpcm_ima_wav",
         b"lpcm" | b"sowt" | b"twos" => "pcm_s16le",
         // Subtitle / timed-text sample entries (ISO/IEC 14496-12 §12.5–6
         // and the 3GPP TS 26.245 `tx3g` registration).
@@ -124,7 +139,7 @@ pub fn from_sample_entry_with_oti(fourcc: &[u8; 4], oti: u8) -> CodecId {
             // The `mp4a` sample entry carries any codec that speaks the
             // MPEG-4 ES descriptor framework. Disambiguate by OTI.
             let id = match oti {
-                0x40 | 0x66 | 0x67 | 0x68 => "aac",
+                0x66..=0x68 => "aac",
                 // 0x69 = MPEG-2 audio, 0x6B = MPEG-1 audio. Both cover
                 // Layers I-III; the actual layer lives in each frame's
                 // syncword — map the container-level id to the most common
@@ -139,12 +154,13 @@ pub fn from_sample_entry_with_oti(fourcc: &[u8; 4], oti: u8) -> CodecId {
                 0xA5 => "ac3",
                 0xA6 => "eac3",
                 0xA9 => "dts",
-                _ => {
-                    // Unknown/reserved OTI: keep the bare AAC default —
-                    // matches historical behaviour. Callers who need the
-                    // raw OTI can reach for `CodecId::new(format!("mp4a:0x{:02x}", oti))`.
-                    "aac"
-                }
+                // 0x40 is MPEG-4 audio; a forbidden / unspecified value
+                // (0x00, 0xFF) is read as the entry type's namesake.
+                0x40 | 0x00 | 0xFF => "aac",
+                // Any other value names a format this table does not
+                // know (the registration-authority ranges): say so
+                // rather than hand the samples to an AAC decoder.
+                other => return CodecId::new(format!("mp4a:0x{other:02x}")),
             };
             CodecId::new(id)
         }
@@ -156,7 +172,8 @@ pub fn from_sample_entry_with_oti(fourcc: &[u8; 4], oti: u8) -> CodecId {
                 0x23 => "h265",
                 0x6C => "mjpeg",
                 0x6E => "jpeg2000",
-                _ => "mpeg4video",
+                0x20 | 0x00 | 0xFF => "mpeg4video",
+                other => return CodecId::new(format!("mp4v:0x{other:02x}")),
             };
             CodecId::new(id)
         }
@@ -234,6 +251,36 @@ mod tests {
             from_sample_entry_with_oti(b"avc1", 0x6A),
             CodecId::new("h264")
         );
+    }
+
+    #[test]
+    fn quicktime_compression_types() {
+        for (fourcc, id) in [
+            (b"rle ", "qtrle"),
+            (b"png ", "png"),
+            (b"SVQ1", "svq1"),
+            (b"dvcp", "dvvideo"),
+            (b"ima4", "adpcm_ima_qt"),
+            (b".mp3", "mp3"),
+            (b"ms\0\x55", "mp3"),
+            (b"ms\0\x11", "adpcm_ima_wav"),
+        ] {
+            assert_eq!(from_sample_entry(fourcc).as_str(), id);
+        }
+        assert_eq!(
+            from_sample_entry_with_oti(b"mp4v", 0x6E).as_str(),
+            "jpeg2000"
+        );
+        // Values outside the table are named, not guessed.
+        assert_eq!(
+            from_sample_entry_with_oti(b"mp4v", 0x6D).as_str(),
+            "mp4v:0x6d"
+        );
+        assert_eq!(
+            from_sample_entry_with_oti(b"mp4a", 0xDD).as_str(),
+            "mp4a:0xdd"
+        );
+        assert_eq!(from_sample_entry_with_oti(b"mp4a", 0x00).as_str(), "aac");
     }
 
     #[test]

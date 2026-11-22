@@ -13,11 +13,11 @@ mod video_config;
 use std::collections::HashSet;
 use std::io::SeekFrom;
 
+use oxideav_core::{AttachedPicture, Chapter, Demuxer, PictureType, ReadSeek, Timestamp};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, ProbeContext,
     Rational, Result, SampleFormat, StreamInfo, TimeBase,
 };
-use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::boxes::*;
 use crate::cenc::{
@@ -273,7 +273,6 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         t.elst_timeline = build_elst_timeline(&t.elst, movie_timescale, t.timescale);
         fix_legacy_pcm_sample_sizes(t);
     }
-    let parsed = parsed;
     // Big-endian PCM tracks are delivered little-endian (the PCM
     // codecs are little-endian): bytes per sample to reverse, per
     // stream.
@@ -447,6 +446,8 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // that wants the untranslated number (e.g. CMAF live-edge probes
     // wanting to confirm a producer's sealed total against their own
     // running tally). Absent `mehd`, no key is emitted.
+    let pictures = std::mem::take(&mut parsed.pictures);
+    let chapters = read_chapter_list(&parsed.tracks, &samples, &mut *input, file_size);
     let mut metadata = parsed.metadata;
     if let Some(d) = parsed.mehd_fragment_duration {
         metadata.push(("mehd_fragment_duration".to_string(), d.to_string()));
@@ -1002,6 +1003,8 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         read_block_start: 0,
         read_block_size: DEFAULT_READ_BLOCK_SIZE,
         metadata,
+        pictures,
+        chapters,
         duration_micros,
         sidxes,
         ssixes,
@@ -1765,6 +1768,8 @@ struct ParsedMoov {
     /// total is the `mehd`.
     mehd_fragment_duration: Option<u64>,
     metadata: Vec<(String, String)>,
+    /// Images held by the movie's metadata item list.
+    pictures: Vec<AttachedPicture>,
     /// §8.1 (ISO/IEC 23001-7) — `pssh`
     /// ProtectionSystemSpecificHeaderBox entries collected at moov
     /// level. Each entry corresponds to one DRM system signalled in
@@ -3305,11 +3310,11 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
             }
             UDTA => {
                 let body = take_slice(&mut cur, psz)?;
-                parse_udta(body, &mut out.metadata);
+                parse_udta(body, &mut out.metadata, &mut out.pictures);
             }
             META => {
                 let body = take_slice(&mut cur, psz)?;
-                parse_meta(body, &mut out.metadata);
+                parse_meta(body, &mut out.metadata, &mut out.pictures);
             }
             MVEX => {
                 let body = take_slice(&mut cur, psz)?;
@@ -3584,7 +3589,11 @@ fn read_matrix(d: &[u8]) -> [i32; 9] {
 
 /// Parse a `udta` box body. May contain 3GPP-style boxes (titl/auth/cprt/…)
 /// and/or an iTunes-style `meta` subtree.
-fn parse_udta(body: &[u8], metadata: &mut Vec<(String, String)>) {
+fn parse_udta(
+    body: &[u8],
+    metadata: &mut Vec<(String, String)>,
+    pictures: &mut Vec<AttachedPicture>,
+) {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
     while cur.position() < end {
@@ -3600,7 +3609,7 @@ fn parse_udta(body: &[u8], metadata: &mut Vec<(String, String)>) {
         cur.set_position((start + psz) as u64);
         let payload = &body[start..start + psz];
         match &hdr.fourcc {
-            b"meta" => parse_meta(payload, metadata),
+            b"meta" => parse_meta(payload, metadata, pictures),
             // 3GPP TS 26.244: titl / auth / cprt / dscp — body is a
             // FullBox (1 version + 3 flags) then 2-byte language code
             // then UTF-8 (or UTF-16 if BOM) string.
@@ -3630,7 +3639,11 @@ fn parse_udta(body: &[u8], metadata: &mut Vec<(String, String)>) {
 /// Parse a `meta` box body (iTunes-style or ISO-BMFF). The body is a
 /// FullBox (4 bytes of version/flags), then a series of child boxes
 /// including `hdlr` (identifies the scheme) and `ilst` (the item list).
-fn parse_meta(body: &[u8], metadata: &mut Vec<(String, String)>) {
+fn parse_meta(
+    body: &[u8],
+    metadata: &mut Vec<(String, String)>,
+    pictures: &mut Vec<AttachedPicture>,
+) {
     if body.len() < 4 {
         return;
     }
@@ -3649,14 +3662,79 @@ fn parse_meta(body: &[u8], metadata: &mut Vec<(String, String)>) {
         }
         cur.set_position((start + psz) as u64);
         if hdr.fourcc == ILST {
-            parse_ilst(&body[4 + start..4 + start + psz], metadata);
+            parse_ilst(&body[4 + start..4 + start + psz], metadata, pictures);
         }
     }
 }
 
+/// What the `data` atom of a metadata item holds, by its type
+/// indicator (QuickTime File Format, "Well-known data types",
+/// Table 3-5).
+enum ItemValue {
+    Text(String),
+    Picture(&'static str, Vec<u8>),
+}
+
+/// Decode a metadata `data` atom body: a 4-byte type indicator (a zero
+/// byte, then the 24-bit well-known type), a 4-byte locale, the value.
+fn decode_item_data(data_body: &[u8]) -> Option<ItemValue> {
+    if data_body.len() <= 8 || data_body[0] != 0 {
+        return None;
+    }
+    let value = &data_body[8..];
+    let well_known = u32::from_be_bytes([0, data_body[1], data_body[2], data_body[3]]);
+    let text = |s: String| {
+        let s = s.trim().to_string();
+        (!s.is_empty()).then_some(ItemValue::Text(s))
+    };
+    match well_known {
+        // UTF-8 (1) and its sort variant (4).
+        1 | 4 => text(String::from_utf8_lossy(value).into_owned()),
+        // UTF-16BE (2) and its sort variant (5).
+        2 | 5 => {
+            let units: Vec<u16> = value
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| u16::from_be_bytes(*p))
+                .collect();
+            text(String::from_utf16_lossy(&units))
+        }
+        13 => Some(ItemValue::Picture("image/jpeg", value.to_vec())),
+        14 => Some(ItemValue::Picture("image/png", value.to_vec())),
+        27 => Some(ItemValue::Picture("image/bmp", value.to_vec())),
+        // Big-endian signed (21) / unsigned (22) integers of 1, 2, 3,
+        // 4 or 8 bytes.
+        21 | 22 if matches!(value.len(), 1 | 2 | 3 | 4 | 8) => {
+            let negative = well_known == 21 && value[0] & 0x80 != 0;
+            let mut wide = [if negative { 0xFF } else { 0 }; 8];
+            wide[8 - value.len()..].copy_from_slice(value);
+            Some(ItemValue::Text(if well_known == 21 {
+                i64::from_be_bytes(wide).to_string()
+            } else {
+                u64::from_be_bytes(wide).to_string()
+            }))
+        }
+        // No type indicated (0): text when it is text. A binary record
+        // (track / disc numbers) has no documented layout here and is
+        // not passed off as a string.
+        0 => match std::str::from_utf8(value) {
+            Ok(v) if !v.chars().any(char::is_control) => text(v.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Parse an `ilst` (iTunes-style item list). Each child is a FourCC-keyed
-/// box whose payload contains a `data` subbox with the value.
-fn parse_ilst(body: &[u8], metadata: &mut Vec<(String, String)>) {
+/// box whose payload contains a `data` subbox with the value. An item
+/// whose value is an image (well-known type JPEG / PNG / BMP) becomes an
+/// attached picture whatever its key.
+fn parse_ilst(
+    body: &[u8],
+    metadata: &mut Vec<(String, String)>,
+    pictures: &mut Vec<AttachedPicture>,
+) {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
     while cur.position() < end {
@@ -3679,10 +3757,6 @@ fn parse_ilst(body: &[u8], metadata: &mut Vec<(String, String)>) {
             continue;
         }
         let key = ilst_key_for(&hdr.fourcc);
-        if key.is_none() {
-            continue;
-        }
-        let key = key.unwrap();
         let mut sub = std::io::Cursor::new(item);
         let sub_end = item.len() as u64;
         while sub.position() < sub_end {
@@ -3696,15 +3770,25 @@ fn parse_ilst(body: &[u8], metadata: &mut Vec<(String, String)>) {
                 break;
             }
             sub.set_position((sub_start + sub_psz) as u64);
-            if sh.fourcc == DATA {
-                // data box: 4 bytes type_indicator + 4 bytes locale + payload.
-                let data_body = &item[sub_start..sub_start + sub_psz];
-                if data_body.len() > 8 {
-                    let value = String::from_utf8_lossy(&data_body[8..]).trim().to_string();
-                    if !value.is_empty() {
+            if sh.fourcc != DATA {
+                continue;
+            }
+            match decode_item_data(&item[sub_start..sub_start + sub_psz]) {
+                Some(ItemValue::Text(value)) => {
+                    if let Some(key) = key {
                         metadata.push((key.into(), value));
                     }
                 }
+                Some(ItemValue::Picture(mime, data)) => {
+                    // The first image of an item list is the cover.
+                    let role = if pictures.is_empty() {
+                        PictureType::FrontCover
+                    } else {
+                        PictureType::Other
+                    };
+                    pictures.push(AttachedPicture::new(mime, role).with_data(data));
+                }
+                None => {}
             }
         }
     }
@@ -8776,13 +8860,18 @@ impl PcmLayout {
             // signed integers, 8 or 16 bits (`samplesize`).
             b"sowt" => int(sample_size.unwrap_or(16), false),
             b"twos" => int(sample_size.unwrap_or(16), true),
-            // QuickTime `raw `: 8-bit offset-binary (unsigned).
-            b"raw " if sample_size.unwrap_or(8) == 8 => PcmLayout {
+            // QuickTime `raw `: 8-bit offset-binary (unsigned). `NONE`
+            // and an all-zero format "should not be used, but may be
+            // found in some files" and mean `raw ` or `twos` by the
+            // sample size (QuickTime File Format, sound "Format"
+            // table).
+            b"raw " | b"NONE" | [0, 0, 0, 0] if sample_size.unwrap_or(8) == 8 => PcmLayout {
                 bits: 8,
                 float: false,
                 signed: false,
                 big_endian: false,
             },
+            b"NONE" | [0, 0, 0, 0] if sample_size == Some(16) => int(16, true),
             // QuickTime `in24` / `in32` / `fl32` / `fl64`: big-endian
             // unless an `enda` atom says little-endian.
             b"in24" => int(24, !qt_le),
@@ -14575,6 +14664,11 @@ pub struct Mp4Demuxer {
     read_block_start: u64,
     read_block_size: usize,
     metadata: Vec<(String, String)>,
+    /// Images of the movie's metadata item list (cover art).
+    pictures: Vec<AttachedPicture>,
+    /// The chapter list: the samples of the text track a `chap` track
+    /// reference names.
+    chapters: Vec<Chapter>,
     duration_micros: i64,
     /// Parsed `sidx` SegmentIndexBoxes; one per top-level sidx encountered.
     /// Consulted by `seek_to` as a secondary fast-path when no `tfra`
@@ -15515,6 +15609,14 @@ impl Demuxer for Mp4Demuxer {
         &self.metadata
     }
 
+    fn attached_pictures(&self) -> &[AttachedPicture] {
+        &self.pictures
+    }
+
+    fn chapters(&self) -> &[Chapter] {
+        &self.chapters
+    }
+
     fn duration_micros(&self) -> Option<i64> {
         if self.duration_micros > 0 {
             Some(self.duration_micros)
@@ -15522,6 +15624,65 @@ impl Demuxer for Mp4Demuxer {
             None
         }
     }
+}
+
+/// Most chapters read from a chapter track, and the longest title.
+const MAX_CHAPTERS: usize = 4096;
+const MAX_CHAPTER_TITLE: u32 = 4096;
+
+/// The movie's chapter list (QuickTime File Format, "Chapter Lists"):
+/// a text track that some track names with a `chap` track reference —
+/// the first such reference found — holds one sample a chapter, shown
+/// from the chapter's start. A text sample is a 16-bit length and that
+/// many bytes of text ("Text Sample Data"); 3GPP timed text samples
+/// begin the same way.
+fn read_chapter_list(
+    tracks: &[Track],
+    samples: &[SampleRef],
+    input: &mut dyn ReadSeek,
+    file_size: u64,
+) -> Vec<Chapter> {
+    let Some(list) = tracks
+        .iter()
+        .flat_map(|t| t.tref.iter())
+        .filter(|(kind, _)| kind == b"chap")
+        .flat_map(|(_, ids)| ids.iter())
+        .find_map(|&id| tracks.iter().position(|t| t.track_id == id))
+    else {
+        return Vec::new();
+    };
+    let t = &tracks[list];
+    if !matches!(&t.codec_id_fourcc, b"text" | b"tx3g") {
+        return Vec::new();
+    }
+    let base = TimeBase::new(1, i64::from(t.timescale.max(1)));
+    let mut own: Vec<&SampleRef> = samples
+        .iter()
+        .filter(|s| s.track_idx as usize == list && !s.discard)
+        .take(MAX_CHAPTERS)
+        .collect();
+    own.sort_by_key(|s| s.pts);
+    let mut out = Vec::with_capacity(own.len());
+    for s in own {
+        let size = s.size.min(MAX_CHAPTER_TITLE);
+        if size < 2 || s.offset.saturating_add(u64::from(size)) > file_size {
+            continue;
+        }
+        let mut data = vec![0u8; size as usize];
+        if input.seek(SeekFrom::Start(s.offset)).is_err() || input.read_exact(&mut data).is_err() {
+            continue;
+        }
+        let len = usize::from(u16::from_be_bytes([data[0], data[1]])).min(data.len() - 2);
+        let title = decode_utf8_or_utf16(&data[2..2 + len]);
+        out.push(Chapter {
+            id: out.len() as u64,
+            start: Timestamp::new(s.pts, base),
+            end: Timestamp::new(s.pts.saturating_add(s.duration), base),
+            title: (!title.is_empty()).then_some(title),
+            language: None,
+        });
+    }
+    out
 }
 
 /// Default size of the demuxer's read-ahead block

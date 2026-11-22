@@ -102,8 +102,8 @@ Sample-entry FourCCs resolve to these codec ids:
 
 | FourCC                   | Codec id                                |
 |--------------------------|-----------------------------------------|
-| `mp4a`                   | `aac` (default); esds OTI refines to `mp3` (0x69/0x6B), `ac3` (0xA5), `eac3` (0xA6), `dts` (0xA9) |
-| `mp4v`                   | `mpeg4video` (default); esds OTI refines to `mpeg1video`, `mpeg2video`, `h264`, `h265`, `mjpeg` |
+| `mp4a`                   | `aac` (no esds, OTI 0x40 / 0x66–0x68); esds OTI refines to `mp3` (0x69/0x6B), `ac3` (0xA5), `eac3` (0xA6), `dts` (0xA9); any other OTI is `mp4a:0x<oti>` |
+| `mp4v`                   | `mpeg4video` (no esds, OTI 0x20); esds OTI refines to `mpeg1video`, `mpeg2video`, `h264`, `h265`, `mjpeg`, `jpeg2000`; any other OTI is `mp4v:0x<oti>` |
 | `alac`                   | `alac`                                  |
 | `fLaC` / `flac`          | `flac`                                  |
 | `Opus` / `opus`          | `opus`                                  |
@@ -118,6 +118,8 @@ Sample-entry FourCCs resolve to these codec ids:
 | `av01`                   | `av1`                                   |
 | `jpeg` / `mjpa` / `mjpb` | `mjpeg`                                 |
 | `s263` / `h263`          | `h263`                                  |
+| `cvid` / `rle ` / `png ` / `gif ` / `tiff` / `SVQ1` / `SVQ3` / `dvc ` / `dvcp` | `cinepak` / `qtrle` / `png` / `gif` / `tiff` / `svq1` / `svq3` / `dvvideo` (QuickTime compression types) |
+| `ima4` / `.mp3` / `ms\0\x55` / `ms\0\x02` / `ms\0\x11` | `adpcm_ima_qt` / `mp3` / `mp3` / `adpcm_ms` / `adpcm_ima_wav` (QuickTime sound formats) |
 | `lpcm` / `sowt` / `twos` | `pcm_s16le` (endianness of `twos` is not re-swapped) |
 | `tx3g`                   | `mov_text` (3GPP TS 26.245 timed text — "movtext") |
 | `text`                   | `text` (QuickTime plain text)            |
@@ -144,6 +146,16 @@ Sample-entry FourCCs resolve to these codec ids:
   chunk, where the frame duration changes, and at an edit boundary —
   and `Mp4Demuxer::samples` lists those packets. Big-endian samples
   are delivered little-endian.
+- Cover art: every image (well-known `data` type JPEG / PNG / BMP,
+  QuickTime File Format Table 3-5) of the movie's metadata item list
+  is an entry of `Demuxer::attached_pictures()`, the first one as the
+  front cover. Metadata values are decoded by their type indicator
+  (UTF-8, UTF-16, big-endian integers); a binary value is not surfaced
+  as text.
+- Chapters: `Demuxer::chapters()` lists the samples of the text track
+  that a `chap` track reference names (QuickTime File Format, "Chapter
+  Lists") — title from the text sample, start and end from its
+  timestamps. The text track stays a stream.
 - `StreamInfo::start_time` is the timestamp of the first presented
   packet (not before the start of the first edit);
   `StreamInfo::duration` is the media header's duration, or, for a

@@ -75,6 +75,12 @@ fn main() {
             println!("M,{k}={v}");
         }
     }
+    for p in d.attached_pictures() {
+        println!("P,{},{} bytes", p.mime_type, p.data.len());
+    }
+    for c in d.chapters() {
+        println!("C,{:?}..{:?},{:?}", c.start, c.end, c.title);
+    }
     loop {
         match d.next_packet() {
             Ok(p) => println!(
